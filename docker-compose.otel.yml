@@ -1,0 +1,52 @@
+# LiteLLM + LLMRouter with Jaeger Tracing
+# Simple OTEL setup for local development
+#
+# Usage:
+#   docker-compose -f docker-compose.otel.yml up -d
+#
+# Access:
+#   - LiteLLM Gateway: http://localhost:4001
+#   - Jaeger UI:       http://localhost:16686
+
+services:
+  litellm-gateway-otel:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.local
+    container_name: litellm-gateway-otel
+    ports:
+      - "4001:4000"
+    volumes:
+      - ./config/config.bedrock.yaml:/app/config/config.yaml:ro
+      - ./models:/app/models:ro
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-dev-key}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      # OpenTelemetry Configuration
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+    depends_on:
+      - jaeger
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    restart: unless-stopped
+

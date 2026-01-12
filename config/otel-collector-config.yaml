@@ -1,0 +1,47 @@
+# AWS Distro for OpenTelemetry (ADOT) Collector Configuration
+# Exports traces to AWS X-Ray via CloudWatch
+#
+# Usage: Mount this file to /etc/otel-config.yaml in the ADOT collector container
+# Requires IAM permissions for xray:PutTraceSegments, xray:PutTelemetryRecords
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 50
+  
+  # Add resource attributes
+  resource:
+    attributes:
+      - key: service.namespace
+        value: litellm
+        action: upsert
+      - key: deployment.environment
+        value: ${ENVIRONMENT:-development}
+        action: upsert
+
+exporters:
+  # AWS X-Ray exporter
+  awsxray:
+    region: ${AWS_REGION:-us-east-1}
+    # Uses IAM Instance Profile on EC2 - no explicit credentials needed
+    # For local dev, uses ~/.aws/credentials or env vars
+
+  # Debug exporter for troubleshooting (optional)
+  # logging:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [awsxray]
+
