@@ -1,0 +1,52 @@
+# LiteLLM + LLMRouter Configuration for AWS Bedrock
+# ==================================================
+# Uses IAM Instance Profile for authentication (no API keys needed)
+
+model_list:
+  # Claude 3.5 Sonnet v2 (Claude 4.5)
+  - model_name: claude-sonnet
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+      # No api_key needed - uses IAM profile
+
+  # Claude 3.5 Haiku
+  - model_name: claude-haiku
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-haiku-20241022-v1:0
+
+  # Claude 3 Opus
+  - model_name: claude-opus
+    litellm_params:
+      model: bedrock/anthropic.claude-3-opus-20240229-v1:0
+
+  # Claude 3 Sonnet
+  - model_name: claude-3-sonnet
+    litellm_params:
+      model: bedrock/anthropic.claude-3-sonnet-20240229-v1:0
+
+  # Claude 3 Haiku  
+  - model_name: claude-3-haiku
+    litellm_params:
+      model: bedrock/anthropic.claude-3-haiku-20240307-v1:0
+
+router_settings:
+  # Start with simple shuffle, can switch to llmrouter-* strategies later
+  routing_strategy: simple-shuffle
+  
+  # Retry settings
+  num_retries: 2
+  retry_after: 5
+  timeout: 300
+
+general_settings:
+  # Master key for admin access
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  # Logging
+  set_verbose: true
+  drop_params: true  # Drop unsupported params instead of erroring
+  
+  # AWS Region (uses instance metadata if not set)
+  # aws_region_name: us-east-1
+
