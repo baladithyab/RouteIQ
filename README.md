@@ -96,16 +96,18 @@ docker run -d \
 - `cost-based-routing` - Route to minimize cost
 - `usage-based-routing` - Route based on TPM/RPM usage
 
-### LLMRouter ML Strategies
+### LLMRouter ML Strategies (12 available)
 - `llmrouter-knn` - K-Nearest Neighbors based routing
 - `llmrouter-svm` - Support Vector Machine routing
 - `llmrouter-mlp` - Multi-Layer Perceptron routing
 - `llmrouter-mf` - Matrix Factorization routing
 - `llmrouter-elo` - Elo Rating based routing
 - `llmrouter-hybrid` - Hybrid probabilistic routing
-- `llmrouter-graph` - Graph-based routing
+- `llmrouter-graph` - Graph neural network routing
 - `llmrouter-automix` - Automatic model mixing
 - `llmrouter-causallm` - Causal LM router
+- `llmrouter-smallest` - Always route to smallest model (cost baseline)
+- `llmrouter-largest` - Always route to largest model (quality baseline)
 - `llmrouter-custom` - Your custom trained models
 
 ## Configuration Example

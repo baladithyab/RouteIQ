@@ -53,4 +53,3 @@ RUN mkdir -p /app/data /app/models /app/notebooks /app/configs
 WORKDIR /app
 
 CMD ["bash"]
-

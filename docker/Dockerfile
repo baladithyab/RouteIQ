@@ -115,4 +115,3 @@ USER litellm
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["--config", "/app/config/config.yaml", "--port", "4000"]
-

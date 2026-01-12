@@ -129,4 +129,3 @@ router_settings:
 ```
 
 The gateway will automatically load the new model.
-

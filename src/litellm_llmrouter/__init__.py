@@ -7,7 +7,7 @@ infrastructure and LLMRouter's ML-based routing strategies.
 
 Usage:
     from litellm_llmrouter import register_llmrouter_strategies
-    
+
     # Register all LLMRouter strategies with LiteLLM
     register_llmrouter_strategies()
 """
@@ -34,4 +34,3 @@ __all__ = [
     "download_model_from_s3",
     "download_custom_router_from_s3",
 ]
-

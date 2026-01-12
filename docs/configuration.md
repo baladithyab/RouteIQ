@@ -22,7 +22,7 @@ model_list:
     litellm_params:
       model: openai/gpt-4
       api_key: os.environ/OPENAI_API_KEY
-      
+
   - model_name: claude-3-opus
     litellm_params:
       model: anthropic/claude-3-opus-20240229
@@ -37,14 +37,14 @@ Configure routing behavior:
 router_settings:
   # Choose routing strategy
   routing_strategy: llmrouter-knn
-  
+
   # LLMRouter-specific settings
   routing_strategy_args:
     model_path: /app/models/knn_router.pt
     llm_data_path: /app/config/llm_candidates.json
     hot_reload: true
     reload_interval: 300
-    
+
   # Retry settings
   num_retries: 2
   timeout: 600
@@ -119,4 +119,3 @@ The `llm_candidates.json` file describes available models for LLMRouter:
   }
 }
 ```
-

@@ -40,92 +40,159 @@ router_settings:
 
 ## LLMRouter ML-Based Strategies
 
-These strategies use machine learning models to intelligently route queries.
+These strategies use machine learning models from [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) to intelligently route queries. All 12 strategies are available:
 
-### llmrouter-knn
+### Single-Round Routers
+
+#### llmrouter-knn
 K-Nearest Neighbors based routing. Fast and interpretable.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-knn
   routing_strategy_args:
-    model_path: /app/models/knn_router.pt
-    llm_data_path: /app/config/llm_candidates.json
+    config_path: /app/config/knn_config.yaml
 ```
 
 **Best for:** Quick deployment, interpretable decisions
 
-### llmrouter-svm
-Support Vector Machine routing. Good generalization.
+#### llmrouter-svm
+Support Vector Machine routing. Good generalization with margin-based selection.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-svm
   routing_strategy_args:
-    model_path: /app/models/svm_router.pt
+    config_path: /app/config/svm_config.yaml
 ```
 
-**Best for:** Binary routing decisions, margin-based selection
+**Best for:** Binary routing decisions, high generalization
 
-### llmrouter-mlp
+#### llmrouter-mlp
 Multi-Layer Perceptron routing. Neural network based.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-mlp
   routing_strategy_args:
-    model_path: /app/models/mlp_router.pt
+    config_path: /app/config/mlp_config.yaml
 ```
 
 **Best for:** Complex query patterns, high accuracy requirements
 
-### llmrouter-mf
+#### llmrouter-mf
 Matrix Factorization routing. Collaborative filtering approach.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-mf
   routing_strategy_args:
-    model_path: /app/models/mf_router.pt
+    config_path: /app/config/mf_config.yaml
 ```
 
 **Best for:** User preference learning, collaborative scenarios
 
-### llmrouter-bert
-BERT-based routing. Transformer embeddings for queries.
+#### llmrouter-elo
+Elo Rating based routing. Uses competitive ranking to select models.
 
 ```yaml
 router_settings:
-  routing_strategy: llmrouter-bert
+  routing_strategy: llmrouter-elo
   routing_strategy_args:
-    model_path: /app/models/bert_router.pt
+    config_path: /app/config/elo_config.yaml
 ```
 
-**Best for:** Semantic understanding, complex text analysis
+**Best for:** Model quality ranking, tournament-style selection
 
-### llmrouter-hybrid
-Combines multiple routing signals probabilistically.
+#### llmrouter-hybrid
+HybridLLM probabilistic routing. Combines multiple signals.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-hybrid
   routing_strategy_args:
-    model_path: /app/models/hybrid_router.pt
-    threshold: 0.7
+    config_path: /app/config/hybrid_config.yaml
 ```
 
-**Best for:** Production deployments, balanced decisions
+**Best for:** Production deployments, balanced cost-quality decisions
 
-### llmrouter-custom
-Load your own trained routing model.
+#### llmrouter-causallm
+Causal Language Model router. Transformer-based routing decisions.
+
+```yaml
+router_settings:
+  routing_strategy: llmrouter-causallm
+  routing_strategy_args:
+    config_path: /app/config/causallm_config.yaml
+```
+
+**Best for:** Deep semantic understanding, complex reasoning tasks
+**Note:** Requires PyTorch with transformers support
+
+#### llmrouter-graph
+Graph Neural Network routing. Models query-model relationships as graphs.
+
+```yaml
+router_settings:
+  routing_strategy: llmrouter-graph
+  routing_strategy_args:
+    config_path: /app/config/graph_config.yaml
+```
+
+**Best for:** Relationship modeling, complex query dependencies
+**Note:** Requires PyTorch Geometric
+
+#### llmrouter-automix
+Automatic model mixing. Dynamically blends responses from multiple models.
+
+```yaml
+router_settings:
+  routing_strategy: llmrouter-automix
+  routing_strategy_args:
+    config_path: /app/config/automix_config.yaml
+```
+
+**Best for:** Ensemble approaches, quality optimization
+
+### Baseline Routers
+
+#### llmrouter-smallest
+Always routes to the smallest model. Useful for cost optimization baseline.
+
+```yaml
+router_settings:
+  routing_strategy: llmrouter-smallest
+  routing_strategy_args:
+    config_path: /app/config/baseline_config.yaml
+```
+
+**Best for:** Cost minimization, testing, baseline comparison
+
+#### llmrouter-largest
+Always routes to the largest model. Useful for quality baseline.
+
+```yaml
+router_settings:
+  routing_strategy: llmrouter-largest
+  routing_strategy_args:
+    config_path: /app/config/baseline_config.yaml
+```
+
+**Best for:** Maximum quality, testing, baseline comparison
+
+### Custom Routers
+
+#### llmrouter-custom
+Load your own trained routing model from the custom routers directory.
 
 ```yaml
 router_settings:
   routing_strategy: llmrouter-custom
   routing_strategy_args:
-    model_path: /app/models/my_custom_router.pt
-    config_path: /app/configs/custom_router_config.yaml
+    config_path: /app/custom_routers/my_router_config.yaml
 ```
+
+See [Creating Custom Routers](https://github.com/ulab-uiuc/LLMRouter#-creating-custom-routers) for details.
 
 ## Hot Reloading
 
@@ -143,4 +210,3 @@ The gateway will automatically detect model file changes and reload.
 ## Training Custom Models
 
 See [MLOps Training Guide](mlops-training.md) for training your own routing models.
-

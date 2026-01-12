@@ -16,7 +16,7 @@ processors:
   batch:
     timeout: 1s
     send_batch_size: 50
-  
+
   # Add resource attributes
   resource:
     attributes:
@@ -44,4 +44,3 @@ service:
       receivers: [otlp]
       processors: [batch, resource]
       exporters: [awsxray]
-

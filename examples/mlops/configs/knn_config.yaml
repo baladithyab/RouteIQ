@@ -24,4 +24,3 @@ output:
   model_path: /app/models/knn_router
   # Save embeddings cache
   save_embeddings: true
-

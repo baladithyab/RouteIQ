@@ -175,4 +175,3 @@ curl -X POST http://localhost:4000/chat/completions \
     "stream": true
   }'
 ```
-

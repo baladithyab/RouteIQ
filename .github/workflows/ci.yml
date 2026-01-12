@@ -11,22 +11,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
+
       - name: Install linting tools
         run: |
           pip install ruff black isort
-          
+
       - name: Run ruff
         run: ruff check src/
-        
+
       - name: Check formatting with black
         run: black --check src/
-        
+
       - name: Check imports with isort
         run: isort --check-only src/
 
@@ -35,18 +35,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         # Note: submodules not needed - source deps from pip
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
+
       - name: Install dependencies
         run: |
           pip install -e reference/LLMRouter
           pip install litellm pytest pytest-asyncio
           pip install -r requirements.txt
-          
+
       - name: Run tests
         run: |
           pytest tests/ -v --tb=short
@@ -58,10 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         # Note: submodules not needed - Dockerfile clones from GitHub
-          
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        
+
       - name: Build Docker image (test)
         uses: docker/build-push-action@v5
         with:
@@ -76,13 +76,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Validate docker-compose.yml
         run: docker compose -f docker-compose.yml config
-        
+
       - name: Validate docker-compose.ha.yml
         run: docker compose -f docker-compose.ha.yml config
-        
+
       - name: Validate MLOps compose
         run: docker compose -f examples/mlops/docker-compose.mlops.yml config
-

@@ -139,4 +139,3 @@ litellm_settings:
 ```
 
 Access metrics at `GET /metrics`.
-

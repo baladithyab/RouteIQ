@@ -138,4 +138,3 @@ Add to your GitHub Actions:
       --model-name ${{ inputs.model_name }} \
       --model-stage Production
 ```
-

@@ -22,4 +22,3 @@ opentelemetry-instrumentation-requests>=0.43b0
 # Optional: Additional LLM providers
 google-cloud-aiplatform>=1.38.0
 azure-identity>=1.15.0
-

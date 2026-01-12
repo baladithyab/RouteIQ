@@ -71,4 +71,3 @@ if [ -n "$OTEL_EXPORTER_OTLP_ENDPOINT" ] && command -v opentelemetry-instrument 
 else
     exec litellm "$@"
 fi
-

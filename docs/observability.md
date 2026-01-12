@@ -224,4 +224,3 @@ environment:
   - OTEL_METRICS_EXPORTER=none
   - OTEL_LOGS_EXPORTER=none
 ```
-

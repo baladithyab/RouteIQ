@@ -22,4 +22,3 @@ COPY examples/mlops/scripts/deploy_model.py /app/scripts/deploy_model.py
 RUN mkdir -p /app/models /app/scripts
 
 CMD ["python", "/app/scripts/deploy_model.py"]
-

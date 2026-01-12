@@ -44,13 +44,13 @@ model_list:
 # =============================================================================
 router_settings:
   # Routing strategy options:
-  # LiteLLM built-in: simple-shuffle, least-busy, latency-based-routing, 
+  # LiteLLM built-in: simple-shuffle, least-busy, latency-based-routing,
   #                   cost-based-routing, usage-based-routing
   # LLMRouter ML-based: llmrouter-knn, llmrouter-svm, llmrouter-mlp,
   #                     llmrouter-mf, llmrouter-elo, llmrouter-hybrid,
   #                     llmrouter-custom
   routing_strategy: simple-shuffle
-  
+
   # LLMRouter strategy arguments (used when routing_strategy starts with 'llmrouter-')
   routing_strategy_args:
     # Path to trained model file
@@ -69,7 +69,7 @@ router_settings:
   num_retries: 2
   retry_after: 5
   timeout: 600
-  
+
   # Enable routing caching
   cache_responses: true
 
@@ -79,10 +79,10 @@ router_settings:
 general_settings:
   # Master key for admin access
   master_key: os.environ/LITELLM_MASTER_KEY
-  
+
   # Database for persistence (optional)
   database_url: os.environ/DATABASE_URL
-  
+
   # Disable storing prompts in DB for privacy
   store_model_in_db: true
 
@@ -97,14 +97,14 @@ litellm_settings:
     host: os.environ/REDIS_HOST
     port: os.environ/REDIS_PORT
     ttl: 3600
-  
+
   # Logging
   set_verbose: false
-  
+
   # Cost tracking
   success_callback: ["langfuse"]
   failure_callback: ["langfuse"]
-  
+
   # Rate limiting (optional)
   # max_budget: 100
   # budget_duration: 30d
@@ -123,4 +123,3 @@ litellm_settings:
 #   - REDIS_PORT: Redis port (default: 6379)
 #   - AZURE_API_KEY: Azure OpenAI API key
 #   - AZURE_API_BASE: Azure OpenAI endpoint
-

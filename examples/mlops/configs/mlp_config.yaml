@@ -26,4 +26,3 @@ output:
   model_path: /app/models/mlp_router
   save_checkpoints: true
   checkpoint_interval: 10
-

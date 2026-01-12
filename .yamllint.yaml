@@ -1,0 +1,45 @@
+# YAML linting configuration
+extends: default
+
+rules:
+  # Allow long lines for URLs and base64 content
+  line-length:
+    max: 200
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # Allow duplicate keys for YAML anchors
+  key-duplicates: enable
+
+  # Relaxed indentation rules
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+  # Allow document start markers to be optional
+  document-start: disable
+
+  # Truthy values configuration
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no', 'on', 'off']
+    check-keys: false
+
+  # Comments configuration
+  comments:
+    require-starting-space: true
+    ignore-shebangs: true
+    min-spaces-from-content: 1
+
+  # Braces configuration
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+
+  # Brackets configuration
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+
+ignore:
+  - reference/
+  - .github/

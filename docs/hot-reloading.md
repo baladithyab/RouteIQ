@@ -141,4 +141,3 @@ View detailed logs:
 export LITELLM_LOG=DEBUG
 docker compose up
 ```
-
