@@ -1,0 +1,42 @@
+# LiteLLM + LLMRouter - Basic Docker Compose Setup
+# For production HA setup, use docker-compose.ha.yml
+
+services:
+  litellm-llmrouter:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: litellm-llmrouter
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
+      # LLM Provider API Keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AZURE_API_KEY=${AZURE_API_KEY:-}
+      - AZURE_API_BASE=${AZURE_API_BASE:-}
+      # LLMRouter Settings
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=${LLMROUTER_HOT_RELOAD:-true}
+      - LLMROUTER_RELOAD_INTERVAL=${LLMROUTER_RELOAD_INTERVAL:-300}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+networks:
+  litellm-network:
+    driver: bridge
+

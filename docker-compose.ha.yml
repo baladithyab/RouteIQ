@@ -1,0 +1,166 @@
+# LiteLLM + LLMRouter - High Availability Production Setup
+# Includes: PostgreSQL, Redis, multiple gateway instances
+
+services:
+  # ==========================================================================
+  # PostgreSQL - Persistent storage for LiteLLM
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: litellm-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm_password}
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-litellm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # Redis - Caching and distributed state
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: litellm-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # LiteLLM + LLMRouter Gateway (Primary)
+  # ==========================================================================
+  litellm-gateway-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: litellm-gateway-1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # LLM Provider API Keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AZURE_API_KEY=${AZURE_API_KEY:-}
+      # LLMRouter Settings
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=true
+      - LLMROUTER_RELOAD_INTERVAL=300
+      # S3/GCS Config Sync (optional)
+      - CONFIG_S3_BUCKET=${CONFIG_S3_BUCKET:-}
+      - CONFIG_S3_KEY=${CONFIG_S3_KEY:-}
+      - LLMROUTER_MODEL_S3_BUCKET=${LLMROUTER_MODEL_S3_BUCKET:-}
+      - LLMROUTER_MODEL_S3_KEY=${LLMROUTER_MODEL_S3_KEY:-}
+      # AWS Credentials (if using S3)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # LiteLLM + LLMRouter Gateway (Replica for HA)
+  # ==========================================================================
+  litellm-gateway-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: litellm-gateway-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4001:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # Nginx Load Balancer
+  # ==========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: litellm-nginx
+    depends_on:
+      - litellm-gateway-1
+      - litellm-gateway-2
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  litellm-network:
+    driver: bridge
+
