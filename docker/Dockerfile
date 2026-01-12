@@ -4,7 +4,7 @@
 # Uses pinned GitHub versions for reproducible builds
 
 ARG PYTHON_VERSION=3.11
-ARG LITELLM_VERSION=1.72.6
+ARG LITELLM_VERSION=1.80.15.rc2
 # LLMRouter pinned to specific commit
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 

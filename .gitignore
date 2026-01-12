@@ -79,3 +79,6 @@ tmp/
 temp/
 *.tmp
 
+# Reference repos (local dev only)
+reference/
+
