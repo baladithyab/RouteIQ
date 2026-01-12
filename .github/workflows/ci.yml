@@ -18,23 +18,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install linting tools
-        run: |
-          pip install ruff black isort
+        run: pip install ruff
 
-      - name: Run ruff
+      - name: Run ruff check
         run: ruff check src/
 
-      - name: Check formatting with black
-        run: black --check src/
-
-      - name: Check imports with isort
-        run: isort --check-only src/
+      - name: Check formatting with ruff
+        run: ruff format --check src/
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        # Note: submodules not needed - source deps from pip
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,7 +38,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e reference/LLMRouter
+          pip install git+https://github.com/ulab-uiuc/LLMRouter.git
           pip install litellm pytest pytest-asyncio
           pip install -r requirements.txt
 
