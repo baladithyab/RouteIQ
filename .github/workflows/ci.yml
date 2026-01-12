@@ -7,8 +7,37 @@ on:
     branches: [main]
 
 jobs:
+  # Detect what changed to optimize CI
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      docker: ${{ steps.filter.outputs.docker }}
+      compose: ${{ steps.filter.outputs.compose }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'src/**'
+              - 'tests/**'
+              - 'requirements.txt'
+              - 'pyproject.toml'
+            docker:
+              - 'docker/**'
+              - 'src/**'
+              - 'requirements.txt'
+              - 'config/**'
+            compose:
+              - 'docker-compose*.yml'
+              - 'examples/mlops/docker-compose*.yml'
+
   lint:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +57,8 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +66,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
@@ -50,14 +82,32 @@ jobs:
 
   docker-build-test:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' || github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
-        # Note: submodules not needed - Dockerfile clones from GitHub
+
+      - name: Compute Docker content hash
+        id: docker-hash
+        run: |
+          # Compute hash of all Docker-relevant files for cache key
+          HASH=$(cat docker/Dockerfile src/**/*.py requirements.txt config/*.yaml 2>/dev/null | sha256sum | cut -d' ' -f1)
+          echo "hash=${HASH:0:16}" >> $GITHUB_OUTPUT
+          echo "Docker content hash: ${HASH:0:16}"
+
+      - name: Check cache for existing build
+        id: cache-check
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.docker-build-marker
+          key: docker-build-${{ steps.docker-hash.outputs.hash }}
 
       - name: Set up Docker Buildx
+        if: steps.cache-check.outputs.cache-hit != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image (test)
+        if: steps.cache-check.outputs.cache-hit != 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -67,8 +117,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Mark build complete
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: mkdir -p /tmp && echo "${{ steps.docker-hash.outputs.hash }}" > /tmp/.docker-build-marker
+
+      - name: Skip build (cached)
+        if: steps.cache-check.outputs.cache-hit == 'true'
+        run: echo "Docker build skipped - no changes detected (hash ${{ steps.docker-hash.outputs.hash }})"
+
   validate-compose:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.compose == 'true' || github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
 

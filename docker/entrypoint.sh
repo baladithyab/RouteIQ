@@ -2,10 +2,31 @@
 set -e
 
 # LiteLLM + LLMRouter Production Entrypoint
-# Handles config loading, OTEL setup, and startup
+# Handles config loading, OTEL setup, A2A/MCP gateway, and startup
 
 echo "🚀 Starting LiteLLM + LLMRouter Gateway..."
 echo "   Config: ${LITELLM_CONFIG_PATH:-/app/config/config.yaml}"
+
+# =============================================================================
+# Feature Detection
+# =============================================================================
+
+# A2A Gateway (Agent-to-Agent protocol)
+if [ "${A2A_GATEWAY_ENABLED:-false}" = "true" ]; then
+    echo "🤖 A2A Gateway: ENABLED"
+    echo "   Agents can be added via /v1/agents API or UI"
+fi
+
+# MCP Gateway (Model Context Protocol)
+if [ "${MCP_GATEWAY_ENABLED:-false}" = "true" ]; then
+    echo "🔧 MCP Gateway: ENABLED"
+    echo "   MCP servers can be added via API or config"
+fi
+
+# Hot Reload
+if [ "${CONFIG_HOT_RELOAD:-false}" = "true" ]; then
+    echo "🔄 Hot Reload: ENABLED (sync interval: ${CONFIG_SYNC_INTERVAL:-60}s)"
+fi
 
 # =============================================================================
 # OpenTelemetry Configuration
@@ -56,6 +77,18 @@ if [ -n "$LLMROUTER_MODEL_S3_BUCKET" ] && [ -n "$LLMROUTER_MODEL_S3_KEY" ]; then
 from litellm_llmrouter.config_loader import download_model_from_s3
 download_model_from_s3('${LLMROUTER_MODEL_S3_BUCKET}', '${LLMROUTER_MODEL_S3_KEY}', '/app/models/')
 " || echo "⚠️ Failed to download model from S3"
+fi
+
+# =============================================================================
+# Start Background Config Sync (if enabled)
+# =============================================================================
+
+if [ "${CONFIG_HOT_RELOAD:-false}" = "true" ] && [ -n "$CONFIG_S3_BUCKET" ]; then
+    echo "🔄 Starting background config sync..."
+    python3 -c "
+from litellm_llmrouter.config_sync import start_config_sync
+start_config_sync()
+" &
 fi
 
 # =============================================================================

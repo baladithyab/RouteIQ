@@ -110,6 +110,28 @@ litellm_settings:
   # budget_duration: 30d
 
 # =============================================================================
+# MCP Servers - Model Context Protocol (optional)
+# =============================================================================
+# Uncomment and configure to enable MCP tools
+# mcp_servers:
+#   # HTTP-based MCP server
+#   my_mcp_server:
+#     url: "http://localhost:8080/mcp"
+#     transport: "streamable_http"  # or "sse", "stdio"
+#
+#   # OpenAPI-to-MCP conversion
+#   petstore_api:
+#     url: "https://petstore.swagger.io/v2"
+#     spec_path: "/path/to/openapi.json"
+#     auth_type: "none"  # or "api_key", "bearer_token", "oauth2"
+
+# =============================================================================
+# A2A Agents - Agent-to-Agent Protocol (optional)
+# =============================================================================
+# Agents are typically added via the UI or API, but can also be pre-configured
+# See docs: https://docs.litellm.ai/docs/a2a
+
+# =============================================================================
 # Environment Variables Reference
 # =============================================================================
 # Required:
@@ -123,3 +145,14 @@ litellm_settings:
 #   - REDIS_PORT: Redis port (default: 6379)
 #   - AZURE_API_KEY: Azure OpenAI API key
 #   - AZURE_API_BASE: Azure OpenAI endpoint
+#
+# Gateway Features:
+#   - A2A_GATEWAY_ENABLED: Enable A2A agent gateway (default: false)
+#   - MCP_GATEWAY_ENABLED: Enable MCP server gateway (default: false)
+#   - STORE_MODEL_IN_DB: Store models/MCPs in database (default: false)
+#
+# Config Sync & Hot Reload:
+#   - CONFIG_S3_BUCKET: S3 bucket for config sync
+#   - CONFIG_S3_KEY: S3 key for config file
+#   - CONFIG_HOT_RELOAD: Enable hot reload on config changes (default: false)
+#   - CONFIG_SYNC_INTERVAL: Sync interval in seconds (default: 60)

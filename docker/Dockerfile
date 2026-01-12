@@ -103,7 +103,16 @@ ENV PYTHONUNBUFFERED=1 \
     OTEL_SERVICE_NAME=litellm-gateway \
     OTEL_TRACES_EXPORTER=none \
     OTEL_METRICS_EXPORTER=none \
-    OTEL_LOGS_EXPORTER=none
+    OTEL_LOGS_EXPORTER=none \
+    # Gateway features (A2A, MCP)
+    A2A_GATEWAY_ENABLED=false \
+    MCP_GATEWAY_ENABLED=false \
+    # Config sync and hot reload
+    CONFIG_HOT_RELOAD=false \
+    CONFIG_SYNC_ENABLED=true \
+    CONFIG_SYNC_INTERVAL=60 \
+    # Store models/MCPs in database for persistence
+    STORE_MODEL_IN_DB=false
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \

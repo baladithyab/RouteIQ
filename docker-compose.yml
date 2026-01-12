@@ -26,6 +26,16 @@ services:
       - LLMROUTER_MODELS_PATH=/app/models
       - LLMROUTER_HOT_RELOAD=${LLMROUTER_HOT_RELOAD:-true}
       - LLMROUTER_RELOAD_INTERVAL=${LLMROUTER_RELOAD_INTERVAL:-300}
+      # Gateway Features (A2A, MCP)
+      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
+      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
+      # Config Sync & Hot Reload
+      - CONFIG_HOT_RELOAD=${CONFIG_HOT_RELOAD:-false}
+      - CONFIG_SYNC_ENABLED=${CONFIG_SYNC_ENABLED:-true}
+      - CONFIG_SYNC_INTERVAL=${CONFIG_SYNC_INTERVAL:-60}
+      # S3/GCS Config Sync (optional)
+      - CONFIG_S3_BUCKET=${CONFIG_S3_BUCKET:-}
+      - CONFIG_S3_KEY=${CONFIG_S3_KEY:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
       interval: 30s
