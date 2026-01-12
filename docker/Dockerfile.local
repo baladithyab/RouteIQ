@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.4
 # LiteLLM + LLMRouter Local Development Dockerfile
-# Uses local reference/ folder for development iteration
+# Uses uv for fast package management and local reference/ folder for dev iteration
 
-ARG PYTHON_VERSION=3.11
-ARG LITELLM_VERSION=1.72.6
+ARG PYTHON_VERSION=3.14
+ARG UV_VERSION=0.9
+ARG LITELLM_VERSION=1.80.15
 
-FROM python:${PYTHON_VERSION}-slim-bookworm
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim
 
 LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Local Development Build"
 
@@ -13,23 +14,17 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    g++ \
     git \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
 # Install LiteLLM with proxy extras
 ARG LITELLM_VERSION
-RUN pip install --no-cache-dir "litellm[proxy]==${LITELLM_VERSION}"
+RUN uv pip install --system "litellm[proxy]==${LITELLM_VERSION}"
 
 # Install OpenTelemetry for tracing
-RUN pip install --no-cache-dir \
+RUN uv pip install --system \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp \
@@ -39,11 +34,11 @@ RUN pip install --no-cache-dir \
 
 # Install additional dependencies
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt || true
+RUN uv pip install --system -r /tmp/requirements.txt || true
 
 # Copy and install LLMRouter from local reference
 COPY reference/LLMRouter /tmp/LLMRouter
-RUN cd /tmp/LLMRouter && pip install --no-cache-dir . || echo "LLMRouter install skipped"
+RUN cd /tmp/LLMRouter && uv pip install --system . || echo "LLMRouter install skipped"
 
 # Copy custom routing integration
 COPY src/litellm_llmrouter /app/litellm_llmrouter

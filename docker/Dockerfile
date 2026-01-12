@@ -1,47 +1,39 @@
 # syntax=docker/dockerfile:1.4
 # LiteLLM + LLMRouter Production Dockerfile
+# Uses uv for fast, reproducible Python package management
 # Supports: linux/amd64, linux/arm64
-# Uses pinned GitHub versions for reproducible builds
 
-ARG PYTHON_VERSION=3.11
-ARG LITELLM_VERSION=1.80.15.rc2
+ARG PYTHON_VERSION=3.14
+ARG UV_VERSION=0.9
+ARG LITELLM_VERSION=1.80.15
 # LLMRouter pinned to specific commit
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
 # ==============================================================================
-# Stage 1: Builder - Clone repos and build wheels
+# Stage 1: Builder - Clone repos and build wheels with uv
 # ==============================================================================
-FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm AS builder
 
 ARG LLMROUTER_COMMIT
 ARG LITELLM_VERSION
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    g++ \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install git for cloning LLMRouter
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# Clone and install LLMRouter from GitHub at pinned commit
-RUN git clone https://github.com/MasterGodzworng/LLMRouter.git /tmp/LLMRouter && \
+# Clone and build LLMRouter wheel from GitHub at pinned commit
+RUN git clone --depth 1 https://github.com/ulab-uiuc/LLMRouter.git /tmp/LLMRouter && \
     cd /tmp/LLMRouter && \
+    git fetch --depth 1 origin ${LLMROUTER_COMMIT} && \
     git checkout ${LLMROUTER_COMMIT} && \
-    pip wheel --no-deps --wheel-dir /wheels .
-
-# Build LiteLLM wheel
-RUN pip wheel --no-deps --wheel-dir /wheels "litellm[proxy]==${LITELLM_VERSION}"
+    uv build --wheel --out-dir /wheels
 
 # ==============================================================================
-# Stage 2: Runtime - Production image with OTEL support
+# Stage 2: Runtime - Production image with uv and OTEL support
 # ==============================================================================
-FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim AS runtime
 
 ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
@@ -57,24 +49,22 @@ RUN groupadd -r litellm && useradd -r -g litellm litellm
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install build tools (needed for uvloop) and runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip
-
 # Copy and install wheels from builder
 COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl || true
+RUN uv pip install --system /wheels/*.whl || true
 
 # Install LiteLLM (ensure it's installed even if wheel failed)
-RUN pip install --no-cache-dir "litellm[proxy]==${LITELLM_VERSION}"
+RUN uv pip install --system "litellm[proxy]==${LITELLM_VERSION}"
 
 # Install OpenTelemetry for distributed tracing
-RUN pip install --no-cache-dir \
+RUN uv pip install --system \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp \
@@ -87,7 +77,7 @@ RUN pip install --no-cache-dir \
 
 # Install additional runtime dependencies
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt || true && \
+RUN uv pip install --system -r /tmp/requirements.txt || true && \
     rm -rf /wheels /tmp/*
 
 # Copy custom routing integration
