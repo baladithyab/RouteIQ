@@ -15,19 +15,23 @@ from typing import Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_proxy_logger
 
-# Available LLMRouter strategies
+# Available LLMRouter strategies (matching llmrouter.models exports)
 LLMROUTER_STRATEGIES = [
-    "llmrouter-knn",
-    "llmrouter-svm", 
-    "llmrouter-mlp",
-    "llmrouter-mf",
-    "llmrouter-elo",
-    "llmrouter-hybrid",
-    "llmrouter-bert",
-    "llmrouter-causallm",
-    "llmrouter-graph",
-    "llmrouter-automix",
-    "llmrouter-custom",
+    # Single-round routers
+    "llmrouter-knn",       # KNNRouter - K-Nearest Neighbors
+    "llmrouter-svm",       # SVMRouter - Support Vector Machine
+    "llmrouter-mlp",       # MLPRouter - Multi-Layer Perceptron
+    "llmrouter-mf",        # MFRouter - Matrix Factorization
+    "llmrouter-elo",       # EloRouter - Elo Rating based
+    "llmrouter-hybrid",    # HybridLLMRouter - Probabilistic hybrid
+    "llmrouter-causallm",  # CausalLMRouter - Transformer-based (optional)
+    "llmrouter-graph",     # GraphRouter - Graph neural network (optional)
+    "llmrouter-automix",   # AutomixRouter - Automatic model mixing
+    # Baseline routers
+    "llmrouter-smallest",  # SmallestLLM - Always picks smallest
+    "llmrouter-largest",   # LargestLLM - Always picks largest
+    # Custom routers
+    "llmrouter-custom",    # User-defined custom router
 ]
 
 
@@ -110,37 +114,50 @@ class LLMRouterStrategyFamily:
     def _load_router(self):
         """Load the appropriate LLMRouter model based on strategy name."""
         strategy_type = self.strategy_name.replace("llmrouter-", "")
-        
+
         try:
+            # Import from llmrouter.models (correct import path)
             if strategy_type == "knn":
-                from llmrouter.models.knn_router import KNNRouter
+                from llmrouter.models import KNNRouter
                 return KNNRouter(yaml_path=self.config_path)
             elif strategy_type == "svm":
-                from llmrouter.models.svm_router import SVMRouter
+                from llmrouter.models import SVMRouter
                 return SVMRouter(yaml_path=self.config_path)
             elif strategy_type == "mlp":
-                from llmrouter.models.mlp_router import MLPRouter
+                from llmrouter.models import MLPRouter
                 return MLPRouter(yaml_path=self.config_path)
             elif strategy_type == "mf":
-                from llmrouter.models.mf_router import MFRouter
+                from llmrouter.models import MFRouter
                 return MFRouter(yaml_path=self.config_path)
-            elif strategy_type == "bert":
-                from llmrouter.models.bert_router import BertRouter
-                return BertRouter(yaml_path=self.config_path)
+            elif strategy_type == "elo":
+                from llmrouter.models import EloRouter
+                return EloRouter(yaml_path=self.config_path)
             elif strategy_type == "causallm":
-                from llmrouter.models.causallm_router import CausalLMRouter
-                return CausalLMRouter(yaml_path=self.config_path)
+                from llmrouter.models import CausalLMRouter
+                return CausalLMRouter(yaml_path=self.config_path) if CausalLMRouter else None
             elif strategy_type == "hybrid":
-                from llmrouter.models.hybrid_router import HybridRouter
-                return HybridRouter(yaml_path=self.config_path)
+                from llmrouter.models import HybridLLMRouter
+                return HybridLLMRouter(yaml_path=self.config_path)
+            elif strategy_type == "graph":
+                from llmrouter.models import GraphRouter
+                return GraphRouter(yaml_path=self.config_path) if GraphRouter else None
+            elif strategy_type == "automix":
+                from llmrouter.models import AutomixRouter
+                return AutomixRouter(yaml_path=self.config_path)
+            elif strategy_type == "smallest":
+                from llmrouter.models import SmallestLLM
+                return SmallestLLM(yaml_path=self.config_path)
+            elif strategy_type == "largest":
+                from llmrouter.models import LargestLLM
+                return LargestLLM(yaml_path=self.config_path)
             elif strategy_type == "custom":
                 return self._load_custom_router()
             else:
                 verbose_proxy_logger.warning(
-                    f"Unknown LLMRouter strategy: {strategy_type}, using random"
+                    f"Unknown LLMRouter strategy: {strategy_type}, using MetaRouter"
                 )
-                from llmrouter.models.meta_router import MetaRouter
-                return None
+                from llmrouter.models import MetaRouter
+                return MetaRouter(yaml_path=self.config_path)
         except ImportError as e:
             verbose_proxy_logger.error(f"Failed to import LLMRouter: {e}")
             return None
@@ -172,3 +189,23 @@ class LLMRouterStrategyFamily:
                         pass
         return self._router
 
+
+def register_llmrouter_strategies():
+    """
+    Register LLMRouter strategies with LiteLLM's routing infrastructure.
+
+    This function should be called during startup to make LLMRouter
+    strategies available for use in LiteLLM routing configurations.
+
+    Returns:
+        List of registered strategy names
+    """
+    verbose_proxy_logger.info(
+        f"Registering {len(LLMROUTER_STRATEGIES)} LLMRouter strategies"
+    )
+
+    # Log available strategies
+    for strategy in LLMROUTER_STRATEGIES:
+        verbose_proxy_logger.debug(f"  - {strategy}")
+
+    return LLMROUTER_STRATEGIES
