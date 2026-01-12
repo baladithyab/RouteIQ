@@ -1,0 +1,27 @@
+# KNN Router Training Configuration
+# ==================================
+
+data_path:
+  # Path to training data
+  train_data: /app/data/train.json
+  # Path to LLM candidates information
+  llm_data: /app/data/llm_candidates.json
+  # Optional: validation data
+  val_data: /app/data/val.json
+
+hparam:
+  # Number of neighbors for KNN
+  k: 5
+  # Embedding model for query encoding
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  # Distance metric: cosine, euclidean, manhattan
+  distance_metric: cosine
+  # Whether to use weighted voting based on distance
+  weighted: true
+
+output:
+  # Model output path
+  model_path: /app/models/knn_router
+  # Save embeddings cache
+  save_embeddings: true
+

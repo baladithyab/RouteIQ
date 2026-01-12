@@ -1,0 +1,25 @@
+# LLMRouter Model Deployer
+# For deploying trained models to production
+
+FROM python:3.11-slim-bookworm
+
+LABEL org.opencontainers.image.description="LLMRouter Model Deployer"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    mlflow>=2.10.0 \
+    boto3 \
+    pyyaml \
+    click
+
+COPY examples/mlops/scripts/deploy_model.py /app/scripts/deploy_model.py
+
+RUN mkdir -p /app/models /app/scripts
+
+CMD ["python", "/app/scripts/deploy_model.py"]
+

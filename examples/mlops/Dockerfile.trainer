@@ -1,0 +1,56 @@
+# LLMRouter Training Environment
+# For training/finetuning routing models
+
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+LABEL org.opencontainers.image.description="LLMRouter Training Environment"
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install ML/Training dependencies
+RUN pip install --no-cache-dir \
+    mlflow>=2.10.0 \
+    wandb \
+    jupyter \
+    jupyterlab \
+    scikit-learn \
+    pandas \
+    numpy \
+    matplotlib \
+    seaborn \
+    transformers \
+    datasets \
+    accelerate \
+    peft \
+    bitsandbytes \
+    sentencepiece \
+    boto3 \
+    pyyaml \
+    tqdm \
+    optuna
+
+# Install LLMRouter
+COPY reference/LLMRouter /tmp/LLMRouter
+RUN cd /tmp/LLMRouter && pip install --no-cache-dir -e .
+
+# Copy training utilities
+COPY examples/mlops/scripts /app/scripts
+
+# Create data directories
+RUN mkdir -p /app/data /app/models /app/notebooks /app/configs
+
+WORKDIR /app
+
+CMD ["bash"]
+

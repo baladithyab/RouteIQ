@@ -1,0 +1,29 @@
+# MLP Router Training Configuration
+# ==================================
+
+data_path:
+  train_data: /app/data/train.json
+  llm_data: /app/data/llm_candidates.json
+  val_data: /app/data/val.json
+
+hparam:
+  # Embedding model for query encoding
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  # MLP architecture
+  hidden_dims: [256, 128, 64]
+  dropout: 0.3
+  activation: relu
+  # Training parameters
+  learning_rate: 0.001
+  batch_size: 32
+  epochs: 100
+  early_stopping_patience: 10
+  # Optimizer
+  optimizer: adam
+  weight_decay: 0.0001
+
+output:
+  model_path: /app/models/mlp_router
+  save_checkpoints: true
+  checkpoint_interval: 10
+
