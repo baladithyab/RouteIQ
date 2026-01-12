@@ -176,7 +176,21 @@ class LLMRouterStrategyFamily:
                 else:
                     raise ImportError(f"Router class {router_class_name} not found")
 
-            return router_class(yaml_path=self.config_path)
+            router = router_class(yaml_path=self.config_path)
+
+            # Load trained model if model_path is provided
+            if self.model_path and hasattr(router, "load_router"):
+                try:
+                    router.load_router(self.model_path)
+                    verbose_proxy_logger.info(
+                        f"Loaded trained model from: {self.model_path}"
+                    )
+                except Exception as e:
+                    verbose_proxy_logger.warning(
+                        f"Could not load trained model: {e}. Using untrained router."
+                    )
+
+            return router
 
         except ImportError as e:
             verbose_proxy_logger.error(f"Failed to import LLMRouter: {e}")

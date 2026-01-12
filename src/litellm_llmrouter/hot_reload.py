@@ -120,6 +120,15 @@ class HotReloadManager:
         sync_manager = get_sync_manager()
         return sync_manager.get_status()
 
+    def get_router_info(self) -> dict[str, Any]:
+        """Get information about the current routing configuration."""
+        strategies = list(self._router_reload_callbacks.keys())
+        return {
+            "registered_strategies": strategies,
+            "strategy_count": len(strategies),
+            "hot_reload_enabled": len(strategies) > 0,
+        }
+
 
 # Singleton instance
 _hot_reload_manager: HotReloadManager | None = None

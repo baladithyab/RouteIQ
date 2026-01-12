@@ -51,6 +51,7 @@ from .mcp_gateway import (
     MCPTransport,
     get_mcp_gateway,
 )
+from .routes import router as api_router
 
 __version__ = "0.1.0"
 __all__ = [
@@ -80,4 +81,6 @@ __all__ = [
     "MCPGateway",
     "MCPTransport",
     "get_mcp_gateway",
+    # API Router
+    "api_router",
 ]
