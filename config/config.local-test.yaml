@@ -4,14 +4,16 @@
 
 # =============================================================================
 # Model List - AWS Bedrock Models (IAM Profile auth)
+# Uses Cross-Region Inference Profiles for Claude models
 # =============================================================================
 model_list:
   # ---------------------------------------------------------------------------
-  # Claude 4.5 Family (Anthropic via Bedrock)
+  # Claude 4.5 Family (Anthropic via Bedrock - Cross-Region Inference)
+  # Uses us. prefix for cross-region inference profiles
   # ---------------------------------------------------------------------------
   - model_name: claude-4.5-sonnet
     litellm_params:
-      model: bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0
+      model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
       aws_region_name: us-east-1
     model_info:
       id: claude-4.5-sonnet
@@ -20,7 +22,7 @@ model_list:
 
   - model_name: claude-4.5-opus
     litellm_params:
-      model: bedrock/anthropic.claude-opus-4-5-20251101-v1:0
+      model: bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0
       aws_region_name: us-east-1
     model_info:
       id: claude-4.5-opus
@@ -29,17 +31,17 @@ model_list:
 
   - model_name: claude-4.5-haiku
     litellm_params:
-      model: bedrock/anthropic.claude-haiku-4-5-20251001-v1:0
+      model: bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
       aws_region_name: us-east-1
     model_info:
       id: claude-4.5-haiku
       mode: chat
       description: "Claude 4.5 Haiku - Fast and cost-effective"
 
-  # Claude 4 Sonnet (previous generation)
+  # Claude 4 Sonnet (previous generation - cross-region)
   - model_name: claude-4-sonnet
     litellm_params:
-      model: bedrock/anthropic.claude-sonnet-4-20250514-v1:0
+      model: bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0
       aws_region_name: us-east-1
     model_info:
       id: claude-4-sonnet
@@ -47,19 +49,7 @@ model_list:
       description: "Claude 4 Sonnet - Balanced performance"
 
   # ---------------------------------------------------------------------------
-  # Amazon Nova 2 Family
-  # ---------------------------------------------------------------------------
-  - model_name: nova-2-lite
-    litellm_params:
-      model: bedrock/amazon.nova-2-lite-v1:0
-      aws_region_name: us-east-1
-    model_info:
-      id: nova-2-lite
-      mode: chat
-      description: "Nova 2 Lite - Cost-effective with extended thinking"
-
-  # ---------------------------------------------------------------------------
-  # Amazon Nova Family (Original)
+  # Amazon Nova Family (on-demand available)
   # ---------------------------------------------------------------------------
   - model_name: nova-pro
     litellm_params:

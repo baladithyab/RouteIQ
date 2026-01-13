@@ -20,6 +20,13 @@ if [ -n "$OTEL_EXPORTER_OTLP_ENDPOINT" ]; then
     export OTEL_METRICS_EXPORTER="${OTEL_METRICS_EXPORTER:-none}"
     export OTEL_LOGS_EXPORTER="${OTEL_LOGS_EXPORTER:-none}"
     export OTEL_EXPORTER_OTLP_INSECURE="${OTEL_EXPORTER_OTLP_INSECURE:-true}"
+    # Set protocol based on port (4318 = HTTP, 4317 = gRPC)
+    if echo "$OTEL_EXPORTER_OTLP_ENDPOINT" | grep -q ":4318"; then
+        export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
+    else
+        export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}"
+    fi
+    echo "   Protocol: $OTEL_EXPORTER_OTLP_PROTOCOL"
 fi
 
 # =============================================================================

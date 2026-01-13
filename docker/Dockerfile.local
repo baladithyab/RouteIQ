@@ -1,6 +1,14 @@
 # syntax=docker/dockerfile:1.4
+# =============================================================================
 # LiteLLM + LLMRouter Local Development Dockerfile
-# Uses uv for fast package management and local reference/ folder for dev iteration
+# =============================================================================
+# Optimized for development iteration with local reference/ folder
+# Uses uv for fast package management
+#
+# Usage:
+#   docker build -f docker/Dockerfile.local -t litellm-llmrouter:local .
+#   docker compose -f docker-compose.local-test.yml up
+# =============================================================================
 
 ARG PYTHON_VERSION=3.12
 ARG UV_VERSION=0.9
@@ -8,19 +16,23 @@ ARG LITELLM_VERSION=1.80.15
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim
 
+ARG LITELLM_VERSION
+
 LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Local Development Build"
+LABEL org.opencontainers.image.version="${LITELLM_VERSION}-dev"
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (including dev tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/*
 
 # Install LiteLLM with proxy extras
-ARG LITELLM_VERSION
 RUN uv pip install --system "litellm[proxy]==${LITELLM_VERSION}"
 
 # Install OpenTelemetry for tracing and Prisma for database
@@ -28,21 +40,25 @@ RUN uv pip install --system \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp \
+    opentelemetry-exporter-otlp-proto-grpc \
+    opentelemetry-exporter-otlp-proto-http \
     opentelemetry-instrumentation-fastapi \
     opentelemetry-instrumentation-httpx \
     opentelemetry-instrumentation-logging \
     prisma
 
-# Generate Prisma client
+# Generate Prisma client (may fail if no schema, that's OK)
 RUN prisma generate || true
 
 # Install additional dependencies
 COPY requirements.txt /tmp/requirements.txt
-RUN uv pip install --system -r /tmp/requirements.txt || true
+RUN uv pip install --system -r /tmp/requirements.txt || true && \
+    rm -rf /root/.cache
 
-# Copy and install LLMRouter from local reference
+# Copy and install LLMRouter from local reference (for dev iteration)
 COPY reference/LLMRouter /tmp/LLMRouter
-RUN cd /tmp/LLMRouter && uv pip install --system . || echo "LLMRouter install skipped"
+RUN cd /tmp/LLMRouter && uv pip install --system . || echo "LLMRouter install skipped" && \
+    rm -rf /tmp/LLMRouter
 
 # Copy custom routing integration
 COPY src/litellm_llmrouter /app/litellm_llmrouter
@@ -58,15 +74,17 @@ RUN mkdir -p /app/models /app/data /app/custom_routers && \
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONFAULTHANDLER=1 \
+    PYTHONPATH=/app \
     LITELLM_CONFIG_PATH=/app/config/config.yaml \
-    LLMROUTER_MODELS_PATH=/app/models \
-    PYTHONPATH=/app
+    LLMROUTER_MODELS_PATH=/app/models
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:4000/health/liveliness || exit 1
 
 EXPOSE 4000
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Use tini for proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--config", "/app/config/config.yaml", "--port", "4000"]

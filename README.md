@@ -78,14 +78,34 @@ docker run -d \
 
 ## Documentation
 
+### Getting Started
 | Document | Description |
 |----------|-------------|
 | [Configuration Guide](docs/configuration.md) | Complete configuration reference |
 | [Routing Strategies](docs/routing-strategies.md) | Available routing strategies and usage |
+| [API Reference](docs/api-reference.md) | REST API documentation |
+
+### Deployment & Operations
+| Document | Description |
+|----------|-------------|
+| [Architecture Overview](docs/architecture/overview.md) | System architecture and data flow |
+| [AWS Deployment Guide](docs/architecture/aws-deployment.md) | ECS, EKS, Fargate deployment patterns |
 | [High Availability Setup](docs/high-availability.md) | HA deployment with Redis, PostgreSQL, S3 |
 | [Hot Reloading](docs/hot-reloading.md) | Dynamic strategy updates without restarts |
+
+### Observability & Training
+| Document | Description |
+|----------|-------------|
+| [Observability Guide](docs/observability.md) | Tracing with Jaeger, Tempo, CloudWatch X-Ray |
+| [Observability Training](docs/observability-training.md) | Using traces for model training |
 | [MLOps Training](docs/mlops-training.md) | Training and finetuning routing models |
-| [API Reference](docs/api-reference.md) | REST API documentation |
+
+### Extensions
+| Document | Description |
+|----------|-------------|
+| [A2A Gateway](docs/a2a-gateway.md) | Agent-to-Agent protocol support |
+| [MCP Gateway](docs/mcp-gateway.md) | Model Context Protocol support |
+| [Vector Stores](docs/vector-stores.md) | Vector database integration |
 
 ## Supported Routing Strategies
 
@@ -153,6 +173,37 @@ litellm_settings:
     host: os.environ/REDIS_HOST
     port: 6379
 ```
+
+## AWS Deployment
+
+Deploy to AWS using ECS Fargate, EKS, or App Runner:
+
+```bash
+# Build and push to ECR
+aws ecr get-login-password | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+docker build -t litellm-llmrouter -f docker/Dockerfile .
+docker tag litellm-llmrouter:latest <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
+docker push <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
+```
+
+Key AWS integrations:
+- **Amazon Bedrock**: Native Claude, Titan, and other foundation models
+- **CloudWatch X-Ray**: Distributed tracing via ADOT sidecar
+- **S3**: Configuration and model storage with hot-reload
+- **Secrets Manager**: Secure API key management
+- **ElastiCache Redis**: Distributed caching and rate limiting
+
+See [AWS Deployment Guide](docs/architecture/aws-deployment.md) for complete instructions.
+
+## Container Features
+
+| Feature | Description |
+|---------|-------------|
+| **Non-root user** | Runs as `litellm` user (UID 1000) |
+| **tini init** | Proper signal handling and zombie process reaping |
+| **Health checks** | `/health/liveliness` endpoint for orchestrators |
+| **Multi-arch** | Supports `linux/amd64` and `linux/arm64` |
+| **OCI labels** | Standard container metadata |
 
 ## License
 

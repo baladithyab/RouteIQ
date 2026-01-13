@@ -1,119 +1,79 @@
 {
-  "gpt-4": {
-    "provider": "openai",
-    "model_id": "gpt-4",
-    "description": "OpenAI GPT-4 - Most capable model for complex reasoning",
-    "capabilities": ["reasoning", "coding", "creative", "analysis"],
-    "cost_per_1k_tokens": {
-      "input": 0.03,
-      "output": 0.06
-    },
-    "context_window": 8192,
-    "latency_class": "high",
-    "quality_score": 0.95
-  },
-  "gpt-4-turbo": {
-    "provider": "openai",
-    "model_id": "gpt-4-turbo",
-    "description": "OpenAI GPT-4 Turbo - Fast, capable, large context",
+  "claude-4.5-sonnet": {
+    "provider": "bedrock",
+    "model_id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "description": "Claude 4.5 Sonnet - Latest and most capable Sonnet model",
     "capabilities": ["reasoning", "coding", "creative", "analysis", "vision"],
-    "cost_per_1k_tokens": {
-      "input": 0.01,
-      "output": 0.03
-    },
+    "cost_per_1k_tokens": {"input": 0.003, "output": 0.015},
+    "context_window": 200000,
+    "latency_class": "medium",
+    "quality_score": 0.94,
+    "tier": "premium"
+  },
+  "claude-4.5-opus": {
+    "provider": "bedrock",
+    "model_id": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    "description": "Claude 4.5 Opus - Highest capability for complex tasks",
+    "capabilities": ["reasoning", "coding", "creative", "analysis", "vision", "extended-thinking"],
+    "cost_per_1k_tokens": {"input": 0.015, "output": 0.075},
+    "context_window": 200000,
+    "latency_class": "high",
+    "quality_score": 0.98,
+    "tier": "premium"
+  },
+  "claude-4.5-haiku": {
+    "provider": "bedrock",
+    "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "description": "Claude 4.5 Haiku - Fast and cost-effective",
+    "capabilities": ["general", "chat", "coding"],
+    "cost_per_1k_tokens": {"input": 0.0008, "output": 0.004},
+    "context_window": 200000,
+    "latency_class": "low",
+    "quality_score": 0.85,
+    "tier": "budget"
+  },
+  "claude-4-sonnet": {
+    "provider": "bedrock",
+    "model_id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "description": "Claude 4 Sonnet - Balanced performance",
+    "capabilities": ["reasoning", "coding", "creative", "analysis"],
+    "cost_per_1k_tokens": {"input": 0.003, "output": 0.015},
+    "context_window": 200000,
+    "latency_class": "medium",
+    "quality_score": 0.92,
+    "tier": "mid"
+  },
+  "nova-pro": {
+    "provider": "bedrock",
+    "model_id": "amazon.nova-pro-v1:0",
+    "description": "Nova Pro - Highly capable multimodal model",
+    "capabilities": ["reasoning", "coding", "vision", "video"],
+    "cost_per_1k_tokens": {"input": 0.0008, "output": 0.0032},
+    "context_window": 300000,
+    "latency_class": "medium",
+    "quality_score": 0.88,
+    "tier": "mid"
+  },
+  "nova-lite": {
+    "provider": "bedrock",
+    "model_id": "amazon.nova-lite-v1:0",
+    "description": "Nova Lite - Fast multimodal processing",
+    "capabilities": ["general", "chat", "vision", "video"],
+    "cost_per_1k_tokens": {"input": 0.00006, "output": 0.00024},
+    "context_window": 300000,
+    "latency_class": "low",
+    "quality_score": 0.80,
+    "tier": "budget"
+  },
+  "nova-micro": {
+    "provider": "bedrock",
+    "model_id": "amazon.nova-micro-v1:0",
+    "description": "Nova Micro - Ultra-fast text-only model",
+    "capabilities": ["general", "chat"],
+    "cost_per_1k_tokens": {"input": 0.000035, "output": 0.00014},
     "context_window": 128000,
-    "latency_class": "medium",
-    "quality_score": 0.93
-  },
-  "gpt-3.5-turbo": {
-    "provider": "openai",
-    "model_id": "gpt-3.5-turbo",
-    "description": "OpenAI GPT-3.5 Turbo - Fast and cost-effective",
-    "capabilities": ["general", "coding", "chat"],
-    "cost_per_1k_tokens": {
-      "input": 0.0005,
-      "output": 0.0015
-    },
-    "context_window": 16385,
     "latency_class": "low",
-    "quality_score": 0.80
-  },
-  "claude-3-opus": {
-    "provider": "anthropic",
-    "model_id": "claude-3-opus-20240229",
-    "description": "Anthropic Claude 3 Opus - Most powerful Claude model",
-    "capabilities": ["reasoning", "coding", "creative", "analysis", "vision"],
-    "cost_per_1k_tokens": {
-      "input": 0.015,
-      "output": 0.075
-    },
-    "context_window": 200000,
-    "latency_class": "high",
-    "quality_score": 0.96
-  },
-  "claude-3-sonnet": {
-    "provider": "anthropic",
-    "model_id": "claude-3-sonnet-20240229",
-    "description": "Anthropic Claude 3 Sonnet - Balanced performance and cost",
-    "capabilities": ["reasoning", "coding", "creative", "analysis", "vision"],
-    "cost_per_1k_tokens": {
-      "input": 0.003,
-      "output": 0.015
-    },
-    "context_window": 200000,
-    "latency_class": "medium",
-    "quality_score": 0.90
-  },
-  "claude-3-haiku": {
-    "provider": "anthropic",
-    "model_id": "claude-3-haiku-20240307",
-    "description": "Anthropic Claude 3 Haiku - Fastest Claude model",
-    "capabilities": ["general", "chat", "summarization"],
-    "cost_per_1k_tokens": {
-      "input": 0.00025,
-      "output": 0.00125
-    },
-    "context_window": 200000,
-    "latency_class": "low",
-    "quality_score": 0.82
-  },
-  "claude-haiku": {
-    "provider": "bedrock",
-    "model_id": "anthropic.claude-3-haiku-20240307-v1:0",
-    "description": "Claude Haiku via AWS Bedrock",
-    "capabilities": ["general", "chat", "summarization"],
-    "cost_per_1k_tokens": {
-      "input": 0.00025,
-      "output": 0.00125
-    },
-    "context_window": 200000,
-    "latency_class": "low",
-    "quality_score": 0.82
-  },
-  "claude-opus": {
-    "provider": "bedrock",
-    "model_id": "anthropic.claude-3-opus-20240229-v1:0",
-    "description": "Claude Opus via AWS Bedrock",
-    "capabilities": ["reasoning", "coding", "creative", "analysis"],
-    "cost_per_1k_tokens": {
-      "input": 0.015,
-      "output": 0.075
-    },
-    "context_window": 200000,
-    "latency_class": "high",
-    "quality_score": 0.96
-  },
-  "claude-sonnet": {
-    "provider": "bedrock",
-    "model_id": "anthropic.claude-3-sonnet-20240229-v1:0",
-    "description": "Claude Sonnet via AWS Bedrock",
-    "capabilities": ["reasoning", "coding", "creative", "analysis"],
-    "cost_per_1k_tokens": {
-      "input": 0.003,
-      "output": 0.015
-    },
-    "context_window": 200000,
-    "latency_class": "medium",
-    "quality_score": 0.90
+    "quality_score": 0.75,
+    "tier": "budget"
   }
 }

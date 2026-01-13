@@ -1,0 +1,106 @@
+# =============================================================================
+# Docker Build Exclusions for LiteLLM + LLMRouter
+# =============================================================================
+# Reduces build context size and speeds up Docker builds
+
+# Git and version control
+.git
+.gitignore
+.github
+
+# Documentation (not needed in container)
+docs/
+*.md
+!README.md
+
+# Tests (not needed in production image)
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.pyenv/
+.python-version
+
+# Build artifacts
+build/
+dist/
+eggs/
+*.egg-info/
+*.egg
+*.whl
+*.tar.gz
+
+# Docker files (prevent nested contexts)
+docker-compose*.yml
+Dockerfile*
+!docker/Dockerfile
+!docker/Dockerfile.local
+
+# Environment and secrets
+.env
+.env.*
+*.local
+secrets/
+*.key
+*.pem
+
+# IDE and editor
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Examples (not needed in main image)
+examples/
+notebooks/
+*.ipynb
+
+# Reference libraries (large, built separately)
+reference/
+
+# MLOps artifacts (handled separately)
+models/*.pt
+models/*.pkl
+data/
+mlruns/
+artifacts/
+
+# Misc
+LICENSE
+CHANGELOG.md
+CONTRIBUTING.md
+Makefile
+*.tgz
