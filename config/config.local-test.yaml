@@ -78,6 +78,48 @@ model_list:
       mode: chat
       description: "Nova Micro - Ultra-fast text-only model"
 
+  # ---------------------------------------------------------------------------
+  # Embedding Models
+  # ---------------------------------------------------------------------------
+  - model_name: titan-embed-text-v2
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0
+      aws_region_name: us-east-1
+    model_info:
+      id: titan-embed-text-v2
+      mode: embedding
+      description: "Titan Text Embeddings V2 - High quality text embeddings"
+
+  - model_name: titan-embed-image-v1
+    litellm_params:
+      model: bedrock/amazon.titan-embed-image-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      id: titan-embed-image-v1
+      mode: embedding
+      description: "Titan Multimodal Embeddings - Text and image embeddings"
+
+  # ---------------------------------------------------------------------------
+  # Image Generation Models
+  # ---------------------------------------------------------------------------
+  - model_name: nova-canvas
+    litellm_params:
+      model: bedrock/amazon.nova-canvas-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      id: nova-canvas
+      mode: image_generation
+      description: "Nova Canvas - High quality image generation"
+
+  - model_name: titan-image-generator
+    litellm_params:
+      model: bedrock/amazon.titan-image-generator-v2:0
+      aws_region_name: us-east-1
+    model_info:
+      id: titan-image-generator
+      mode: image_generation
+      description: "Titan Image Generator V2 - Versatile image generation"
+
 # =============================================================================
 # Router Settings - Test Multiple Strategies
 # =============================================================================
@@ -102,9 +144,9 @@ router_settings:
 # =============================================================================
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  # Disable database for testing (avoid Prisma issues)
-  # database_url: os.environ/DATABASE_URL
-  store_model_in_db: false
+  # Enable database for full feature testing
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
   # Enable detailed logging for testing
   # alerting: ["slack"]
 

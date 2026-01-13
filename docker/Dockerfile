@@ -78,11 +78,13 @@ WORKDIR /app
 
 # Install minimal runtime dependencies in single layer
 # Note: build-essential needed for uvloop compilation
+# Note: libatomic1 needed for Prisma/Node.js on slim images
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     ca-certificates \
     tini \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/* \
     && rm -rf /root/.cache

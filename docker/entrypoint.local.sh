@@ -7,6 +7,25 @@ echo "🚀 Starting LiteLLM + LLMRouter Gateway (Local Dev)..."
 echo "   Config: ${LITELLM_CONFIG_PATH:-/app/config/config.yaml}"
 
 # =============================================================================
+# Database & Prisma Setup
+# =============================================================================
+
+if [ -n "$DATABASE_URL" ]; then
+    echo "🗄️  Database configured, generating Prisma client..."
+
+    # Find litellm's schema.prisma location
+    SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))" 2>/dev/null || echo "")
+
+    if [ -n "$SCHEMA_PATH" ] && [ -f "$SCHEMA_PATH" ]; then
+        echo "   Schema: $SCHEMA_PATH"
+        prisma generate --schema="$SCHEMA_PATH" 2>&1 || echo "   Warning: prisma generate failed, continuing..."
+        prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1 || echo "   Warning: prisma db push failed, continuing..."
+    else
+        echo "   Warning: Could not find Prisma schema, skipping..."
+    fi
+fi
+
+# =============================================================================
 # OpenTelemetry Configuration
 # =============================================================================
 

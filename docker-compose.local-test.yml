@@ -156,8 +156,8 @@ services:
       # Core settings
       - LITELLM_CONFIG_PATH=/app/config/config.local-test.yaml
       - LITELLM_MASTER_KEY=sk-test-master-key
-      # Disable database for local testing to avoid Prisma setup issues
-      # - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
+      # Enable database for full feature testing
+      - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       # AWS Bedrock - Use EC2 instance metadata service (IMDSv2)

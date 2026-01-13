@@ -2,7 +2,7 @@
 # =============================================================================
 # LiteLLM + LLMRouter Local Development Dockerfile
 # =============================================================================
-# Optimized for development iteration with local reference/ folder
+# Clones LLMRouter from GitHub with pinned version for reproducibility
 # Uses uv for fast package management
 #
 # Usage:
@@ -13,22 +13,27 @@
 ARG PYTHON_VERSION=3.12
 ARG UV_VERSION=0.9
 ARG LITELLM_VERSION=1.80.15
+# LLMRouter pinned to specific commit for reproducibility
+ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim
 
 ARG LITELLM_VERSION
+ARG LLMROUTER_COMMIT
 
 LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Local Development Build"
 LABEL org.opencontainers.image.version="${LITELLM_VERSION}-dev"
+LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
 
 WORKDIR /app
 
-# Install system dependencies (including dev tools)
+# Install system dependencies (including dev tools and libatomic for Prisma/Node)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
     tini \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/*
 
@@ -47,17 +52,20 @@ RUN uv pip install --system \
     opentelemetry-instrumentation-logging \
     prisma
 
-# Generate Prisma client (may fail if no schema, that's OK)
-RUN prisma generate || true
+# Note: Prisma client is generated at runtime in entrypoint.sh
+# This allows the container to work with different database configurations
 
 # Install additional dependencies
 COPY requirements.txt /tmp/requirements.txt
 RUN uv pip install --system -r /tmp/requirements.txt || true && \
     rm -rf /root/.cache
 
-# Copy and install LLMRouter from local reference (for dev iteration)
-COPY reference/LLMRouter /tmp/LLMRouter
-RUN cd /tmp/LLMRouter && uv pip install --system . || echo "LLMRouter install skipped" && \
+# Clone and install LLMRouter from GitHub at pinned commit
+RUN git clone --depth 1 https://github.com/ulab-uiuc/LLMRouter.git /tmp/LLMRouter && \
+    cd /tmp/LLMRouter && \
+    git fetch --depth 1 origin ${LLMROUTER_COMMIT} && \
+    git checkout ${LLMROUTER_COMMIT} && \
+    uv pip install --system . && \
     rm -rf /tmp/LLMRouter
 
 # Copy custom routing integration
