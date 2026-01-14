@@ -1,10 +1,27 @@
 """
 Tests for LLMRouter strategy integration.
+
+These tests require the litellm package to be installed.
+They will be skipped if litellm is not available.
 """
 
 import os
 import json
 import tempfile
+
+import pytest
+
+# Check if litellm is available
+try:
+    import litellm
+    LITELLM_AVAILABLE = True
+except ImportError:
+    LITELLM_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not LITELLM_AVAILABLE,
+    reason="litellm package not installed - unit tests require litellm"
+)
 
 
 class TestLLMRouterStrategies:
