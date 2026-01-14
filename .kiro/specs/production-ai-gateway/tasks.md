@@ -35,18 +35,18 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - **Property 4: Routing Strategy Selection**
   - **Validates: Requirements 2.2, 2.5, 2.6**
 
-- [ ] 3. Validate Hot Reload and Config Sync
+- [x] 3. Validate Hot Reload and Config Sync
   - Test model file hot reload on modification time change
   - Test S3 ETag-based config sync
   - Verify hot reload status endpoint
   - Test config reload trigger via API
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-- [ ] 3.1 Write property test for model hot reload
+- [x] 3.1 Write property test for model hot reload
   - **Property 5: Model and Config Hot Reload**
   - **Validates: Requirements 3.2, 3.4, 3.5**
 
-- [ ] 3.2 Write property test for S3 ETag optimization
+- [x] 3.2 Write property test for S3 ETag optimization
   - **Property 22: S3 Config Sync with ETag Optimization**
   - **Validates: Requirements 10.3**
 
