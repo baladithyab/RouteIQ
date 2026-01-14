@@ -102,7 +102,7 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - Test log correlation with trace context
   - Test OTLP exporter configuration
 
-- [ ] 8. Validate Observability and Tracing
+- [x] 8. Validate Observability and Tracing
   - Test Prometheus metrics endpoint
   - Verify OpenTelemetry span emission with OTLP exporter
   - Verify OpenTelemetry structured logging with trace correlation
@@ -111,11 +111,11 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - Test semantic conventions compliance
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9_
 
-- [ ] 8.1 Write property test for observability span and log emission
+- [x] 8.1 Write property test for observability span and log emission
   - **Property 15: Observability Span and Log Emission**
   - **Validates: Requirements 6.3, 6.4, 6.5, 6.9, 13.5, 14.6, 15.2, 15.4, 15.5**
 
-- [ ] 8.2 Write property test for per-team observability
+- [x] 8.2 Write property test for per-team observability
   - **Property 16: Per-Team Observability Settings**
   - **Validates: Requirements 6.8**
 
