@@ -79,5 +79,5 @@ tmp/
 temp/
 *.tmp
 
-# Reference repos (local dev only)
-reference/
+# Reference repos are now git submodules
+# reference/

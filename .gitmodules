@@ -1,0 +1,6 @@
+[submodule "reference/litellm"]
+	path = reference/litellm
+	url = https://github.com/BerriAI/litellm.git
+[submodule "reference/LLMRouter"]
+	path = reference/LLMRouter
+	url = https://github.com/ulab-uiuc/LLMRouter.git
