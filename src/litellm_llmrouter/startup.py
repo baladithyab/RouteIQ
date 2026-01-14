@@ -60,6 +60,29 @@ def start_config_sync_if_enabled():
             print(f"⚠️ Could not start config sync: {e}")
 
 
+def init_observability_if_enabled():
+    """Initialize OpenTelemetry observability if enabled."""
+    if os.getenv("OTEL_ENABLED", "true").lower() == "true":
+        try:
+            from litellm_llmrouter.observability import init_observability
+
+            otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+            service_name = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
+            
+            init_observability(
+                service_name=service_name,
+                otlp_endpoint=otlp_endpoint,
+                enable_traces=True,
+                enable_logs=True,
+                enable_metrics=True,
+            )
+            print(f"✅ OpenTelemetry observability initialized (service: {service_name})")
+        except ImportError as e:
+            print(f"⚠️ Could not initialize observability: {e}")
+        except Exception as e:
+            print(f"⚠️ Observability initialization failed: {e}")
+
+
 def main():
     """Main entry point for LiteLLM + LLMRouter."""
     import argparse
@@ -71,6 +94,9 @@ def main():
     args, unknown = parser.parse_known_args()
 
     print("🚀 Starting LiteLLM + LLMRouter Gateway...")
+
+    # Initialize observability first (so it's available for other components)
+    init_observability_if_enabled()
 
     # Register strategies
     register_strategies()

@@ -15,6 +15,12 @@ from typing import Any, Dict, Optional
 
 from litellm._logging import verbose_proxy_logger
 
+try:
+    from opentelemetry import trace
+    OTEL_AVAILABLE = True
+except ImportError:
+    OTEL_AVAILABLE = False
+
 # Available LLMRouter strategies (matching llmrouter.models exports)
 # See: https://github.com/ulab-uiuc/LLMRouter#-supported-routers
 LLMROUTER_STRATEGIES = [
@@ -221,6 +227,62 @@ class LLMRouterStrategyFamily:
                     except OSError:
                         pass
         return self._router
+
+    def route_with_observability(
+        self, query: str, model_list: list[str]
+    ) -> Optional[str]:
+        """
+        Route a query with OpenTelemetry observability.
+        
+        Args:
+            query: User query to route
+            model_list: List of available models
+            
+        Returns:
+            Selected model name or None
+        """
+        start_time = time.time()
+        selected_model = None
+        
+        # Create span if OpenTelemetry is available
+        if OTEL_AVAILABLE:
+            try:
+                from litellm_llmrouter.observability import get_observability_manager
+                
+                obs_manager = get_observability_manager()
+                if obs_manager:
+                    span = obs_manager.create_routing_span(
+                        self.strategy_name, len(model_list)
+                    )
+                    
+                    with trace.use_span(span, end_on_exit=True):
+                        # Perform routing
+                        if self.router and hasattr(self.router, "route"):
+                            selected_model = self.router.route(query)
+                        
+                        # Add result to span
+                        if selected_model:
+                            span.set_attribute("llm.routing.selected_model", selected_model)
+                        
+                        latency_ms = (time.time() - start_time) * 1000
+                        span.set_attribute("llm.routing.latency_ms", latency_ms)
+                        
+                        # Log routing decision
+                        obs_manager.log_routing_decision(
+                            strategy=self.strategy_name,
+                            selected_model=selected_model or "none",
+                            latency_ms=latency_ms,
+                        )
+                    
+                    return selected_model
+            except Exception as e:
+                verbose_proxy_logger.warning(f"Observability error: {e}")
+        
+        # Fallback: route without observability
+        if self.router and hasattr(self.router, "route"):
+            selected_model = self.router.route(query)
+        
+        return selected_model
 
 
 def register_llmrouter_strategies():
