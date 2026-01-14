@@ -150,24 +150,29 @@ async def test_redis_caching(redis_client):
 
 ## Running Tests
 
+**IMPORTANT**: Always use `uv run` to execute tests to ensure the correct virtual environment and dependencies are used.
+
 ```bash
 # All tests
-pytest
+uv run pytest
 
 # Unit tests only
-pytest tests/unit/
+uv run pytest tests/unit/
 
 # Property tests only
-pytest tests/property/
+uv run pytest tests/property/
 
 # Integration tests (requires Docker)
-pytest tests/integration/ --docker
+uv run pytest tests/integration/ --docker
 
 # With coverage
-pytest --cov=src/litellm_llmrouter --cov-report=html
+uv run pytest --cov=src/litellm_llmrouter --cov-report=html
 
 # Specific property
-pytest -k "test_authentication_enforcement"
+uv run pytest -k "test_authentication_enforcement"
+
+# Verbose output
+uv run pytest tests/property/ -v --tb=short
 ```
 
 ## Test Naming
