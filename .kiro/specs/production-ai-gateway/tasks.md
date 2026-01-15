@@ -119,7 +119,7 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - **Property 16: Per-Team Observability Settings**
   - **Validates: Requirements 6.8**
 
-- [ ] 9. Validate A2A Gateway
+- [-] 9. Validate A2A Gateway
   - Test A2A agent registration via API
   - Test agent discovery and filtering by capability
   - Verify agent card endpoint returns A2A-compliant format
@@ -127,64 +127,64 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - Test A2A authentication with virtual keys
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6_
 
-- [ ] 9.1 Write property test for A2A agent registration
+- [x] 9.1 Write property test for A2A agent registration
   - **Property 11: A2A Agent Registration and Discovery**
   - **Validates: Requirements 7.2, 7.6, 7.13**
 
-- [ ] 9.2 Implement A2A Agent Invocation Endpoint
+- [x] 9.2 Implement A2A Agent Invocation Endpoint
   - Add POST `/a2a/{agent_id}` endpoint for JSON-RPC 2.0 message handling
   - Implement `message/send` method to forward messages to agent backend
   - Return JSON-RPC 2.0 compliant responses
   - _Requirements: 7.8, 7.9_
 
-- [ ] 9.3 Write property test for A2A agent invocation
+- [x] 9.3 Write property test for A2A agent invocation
   - **Property 23: A2A Agent Invocation**
   - **Validates: Requirements 7.8, 7.9**
 
-- [ ] 9.4 Implement A2A Streaming Support
+- [x] 9.4 Implement A2A Streaming Support
   - Add `message/stream` method support to `/a2a/{agent_id}` endpoint
   - Implement Server-Sent Events (SSE) streaming for agent responses
   - Handle streaming errors and connection management
   - _Requirements: 7.10_
 
-- [ ] 9.5 Write property test for A2A streaming
+- [x] 9.5 Write property test for A2A streaming
   - **Property 24: A2A Streaming Response**
   - **Validates: Requirements 7.10**
 
-- [ ] 9.6 Implement A2A Database Persistence
+- [x] 9.6 Implement A2A Database Persistence
   - Create `a2a_agents` table schema in PostgreSQL
   - Implement DB persistence for agent registration (POST `/v1/agents`)
   - Implement DB retrieval for agent listing (GET `/v1/agents`)
   - Add migration scripts for A2A tables
   - _Requirements: 7.7_
 
-- [ ] 9.7 Write property test for A2A database persistence
+- [x] 9.7 Write property test for A2A database persistence
   - **Property 25: A2A Database Persistence**
   - **Validates: Requirements 7.7**
 
-- [ ] 9.8 Implement A2A Agent Updates
+- [x] 9.8 Implement A2A Agent Updates
   - Add PUT `/v1/agents/{agent_id}` endpoint for full agent updates
   - Add PATCH `/v1/agents/{agent_id}` endpoint for partial updates
   - Implement permission checks for update operations
   - _Requirements: 7.11, 7.12_
 
-- [ ] 9.9 Write property test for A2A agent updates
+- [x] 9.9 Write property test for A2A agent updates
   - **Property 26: A2A Agent Updates**
   - **Validates: Requirements 7.11, 7.12**
 
-- [ ] 9.10 Implement A2A Permission Filtering
+- [x] 9.10 Implement A2A Permission Filtering
   - Add user_id and team_id filtering to agent listing
   - Implement is_public flag support for public agents
   - Add `/v1/agents/{agent_id}/make_public` endpoint
   - _Requirements: 7.13_
 
-- [ ] 9.11 Implement A2A Analytics Endpoint
+- [x] 9.11 Implement A2A Analytics Endpoint
   - Add `/agent/daily/activity` endpoint for usage analytics
   - Track agent invocation counts and latency
   - Support date range filtering
   - _Requirements: 7.14_
 
-- [ ] 10. Validate MCP Gateway
+- [x] 10. Validate MCP Gateway
   - Test MCP server registration via configuration
   - Verify tool loading from MCP servers
   - Test MCP tool invocation in chat completions
@@ -192,33 +192,33 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - Verify support for different MCP transports
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6_
 
-- [ ] 10.1 Write property test for MCP tool loading
+- [x] 10.1 Write property test for MCP tool loading
   - **Property 12: MCP Server Tool Loading**
   - **Validates: Requirements 8.2, 8.3, 8.4**
 
-- [ ] 10.2 Write property test for OpenAPI to MCP conversion
+- [x] 10.2 Write property test for OpenAPI to MCP conversion
   - **Property 13: OpenAPI to MCP Conversion**
   - **Validates: Requirements 8.6**
 
-- [ ] 10.3 Implement MCP Tool Invocation Endpoint
+- [x] 10.3 Implement MCP Tool Invocation Endpoint
   - Add POST `/mcp/tools/call` endpoint for direct tool invocation
   - Add GET `/mcp/tools/list` endpoint for listing available tools
   - Implement tool argument validation against input schema
   - Handle tool execution errors gracefully
   - _Requirements: 8.8, 8.9_
 
-- [ ] 10.4 Write property test for MCP tool invocation
+- [x] 10.4 Write property test for MCP tool invocation
   - **Property 27: MCP Tool Invocation**
   - **Validates: Requirements 8.8**
 
-- [ ] 10.5 Implement MCP Database Persistence
+- [x] 10.5 Implement MCP Database Persistence
   - Create `mcp_servers`, `mcp_tools`, `mcp_resources` table schemas
   - Implement DB persistence for server registration (POST `/v1/mcp/server`)
   - Implement DB retrieval for server listing (GET `/v1/mcp/server`)
   - Add migration scripts for MCP tables
   - _Requirements: 8.7_
 
-- [ ] 10.6 Write property test for MCP database persistence
+- [x] 10.6 Write property test for MCP database persistence
   - **Property 28: MCP Database Persistence**
   - **Validates: Requirements 8.7**
 
@@ -233,37 +233,37 @@ This implementation plan focuses on validating the existing LiteLLM + LLMRouter 
   - **Property 29: MCP OAuth Flow**
   - **Validates: Requirements 8.10, 8.11**
 
-- [ ] 10.9 Implement MCP Server Health Checks
+- [x] 10.9 Implement MCP Server Health Checks
   - Add GET `/v1/mcp/server/health` endpoint
   - Implement connectivity checks for each registered server
   - Return health status with latency metrics
   - _Requirements: 8.13_
 
-- [ ] 10.10 Write property test for MCP health checks
+- [x] 10.10 Write property test for MCP health checks
   - **Property 30: MCP Server Health Check**
   - **Validates: Requirements 8.13**
 
-- [ ] 10.11 Implement MCP Registry Endpoint
+- [x] 10.11 Implement MCP Registry Endpoint
   - Add GET `/v1/mcp/registry.json` endpoint for MCP discovery
   - Generate registry document listing all servers and capabilities
   - Support filtering by access groups
   - _Requirements: 8.12_
 
-- [ ] 10.12 Write property test for MCP registry
+- [x] 10.12 Write property test for MCP registry
   - **Property 31: MCP Registry Discovery**
   - **Validates: Requirements 8.12**
 
-- [ ] 10.13 Implement MCP Server Updates
+- [x] 10.13 Implement MCP Server Updates
   - Add PUT `/v1/mcp/server/{server_id}` endpoint for full server updates
   - Implement tool and resource refresh on server update
   - _Requirements: 8.14_
 
-- [ ] 10.14 Implement MCP Access Groups
+- [x] 10.14 Implement MCP Access Groups
   - Add GET `/v1/mcp/access_groups` endpoint for listing access groups
   - Implement access group filtering for server visibility
   - _Requirements: 8.15_
 
-- [ ] 11. Checkpoint - Ensure all gateway extension tests pass
+- [x] 11. Checkpoint - Ensure all gateway extension tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 12. Validate Docker Multi-Architecture Support
