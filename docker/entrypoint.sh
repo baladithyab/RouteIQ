@@ -29,19 +29,40 @@ if [ "${CONFIG_HOT_RELOAD:-false}" = "true" ]; then
 fi
 
 # =============================================================================
-# Database & Prisma Setup
+# Database & Prisma Setup (HA-Safe)
+# =============================================================================
+# ⚠️  IMPORTANT: Database migrations are DISABLED by default for HA safety.
+#     Running `prisma db push --accept-data-loss` per-replica in a multi-node
+#     setup can cause data loss and race conditions.
+#
+#     To run migrations, set LITELLM_RUN_DB_MIGRATIONS=true on ONE replica ONLY
+#     (e.g., via a separate init job, or on a single designated leader).
 # =============================================================================
 
 if [ -n "$DATABASE_URL" ]; then
-    echo "🗄️  Database configured, generating Prisma client..."
+    echo "🗄️  Database configured"
 
     # Find litellm's schema.prisma location
     SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))" 2>/dev/null || echo "")
 
     if [ -n "$SCHEMA_PATH" ] && [ -f "$SCHEMA_PATH" ]; then
         echo "   Schema: $SCHEMA_PATH"
+
+        # Always generate Prisma client (safe, no DB changes)
         prisma generate --schema="$SCHEMA_PATH" 2>&1 || echo "   Warning: prisma generate failed, continuing..."
-        prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1 || echo "   Warning: prisma db push failed, continuing..."
+
+        # Only run migrations if explicitly enabled
+        if [ "${LITELLM_RUN_DB_MIGRATIONS:-false}" = "true" ]; then
+            echo "   ⚠️  LITELLM_RUN_DB_MIGRATIONS=true - running migrations (use with caution in HA!)"
+            # Use 'prisma migrate deploy' for production (applies existing migrations)
+            # Fallback to 'db push' if migrate deploy fails (for dev-style schema sync)
+            prisma migrate deploy --schema="$SCHEMA_PATH" 2>&1 || \
+                prisma db push --schema="$SCHEMA_PATH" 2>&1 || \
+                echo "   Warning: prisma migration failed, continuing..."
+        else
+            echo "   ℹ️  Skipping migrations (LITELLM_RUN_DB_MIGRATIONS not set)"
+            echo "      For HA deployments, run migrations via a separate init job or leader election"
+        fi
     else
         echo "   Warning: Could not find Prisma schema, skipping..."
     fi
@@ -111,15 +132,21 @@ start_config_sync()
 fi
 
 # =============================================================================
-# Start LiteLLM Proxy
+# Start LiteLLM Proxy via LLMRouter Startup Module
+# =============================================================================
+# We use our startup module instead of `litellm` CLI directly because:
+# 1. The routing_strategy_patch MUST be imported BEFORE any Router is created
+# 2. Using `exec litellm` would spawn a new process without our patches
+# 3. The startup module runs uvicorn in-process, preserving monkey-patches
 # =============================================================================
 
-echo "🌐 Starting LiteLLM Proxy Server..."
+echo "🌐 Starting LiteLLM Proxy Server via LLMRouter startup module..."
+echo "   ✅ llmrouter-* routing strategies will be available"
 
-# Use opentelemetry-instrument if OTEL is configured
+# Use opentelemetry-instrument if OTEL is configured for additional auto-instrumentation
 if [ -n "$OTEL_EXPORTER_OTLP_ENDPOINT" ] && command -v opentelemetry-instrument &> /dev/null; then
     echo "   With OpenTelemetry instrumentation"
-    exec opentelemetry-instrument litellm "$@"
+    exec opentelemetry-instrument python -m litellm_llmrouter.startup "$@"
 else
-    exec litellm "$@"
+    exec python -m litellm_llmrouter.startup "$@"
 fi

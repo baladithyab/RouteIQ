@@ -109,10 +109,23 @@ RUN uv pip install --system \
     opentelemetry-instrumentation-requests \
     && rm -rf /root/.cache/uv
 
-# Install additional runtime dependencies
-COPY requirements.txt /tmp/requirements.txt
-RUN uv pip install --system -r /tmp/requirements.txt || true && \
+# Copy pyproject.toml and install litellm-llmrouter with all optional dependencies
+# This ensures single source of truth for dependencies (pyproject.toml)
+COPY pyproject.toml /tmp/pyproject.toml
+COPY src/ /tmp/src/
+RUN cd /tmp && uv pip install --system ".[prod]" && \
     rm -rf /wheels /tmp/* /root/.cache
+
+# Pre-generate Prisma client and fix permissions on LiteLLM directories
+# This is done as root to avoid runtime permission errors
+RUN SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
+    if [ -f "$SCHEMA_PATH" ]; then \
+        echo "Generating Prisma client from $SCHEMA_PATH..." && \
+        python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
+    fi && \
+    # Fix permissions on LiteLLM directories that need write access at runtime
+    chmod -R 777 /usr/local/lib/python3.12/site-packages/prisma/ 2>/dev/null || true && \
+    chmod -R 777 /usr/local/lib/python3.12/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true
 
 # Copy application files
 COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter

@@ -28,6 +28,65 @@ environment:
 
 ## API Endpoints
 
+### Invoke an Agent (Canonical)
+
+The primary endpoint for invoking an A2A agent using JSON-RPC:
+
+```bash
+POST /a2a/{agent_id}
+Authorization: Bearer <master_key>
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "method": "message/send",
+  "id": "1",
+  "params": {
+    "message": {
+      "role": "user",
+      "content": "Hello, agent!"
+    }
+  }
+}
+```
+
+This endpoint supports both synchronous responses and Server-Sent Events (SSE) streaming based on the `Accept` header.
+
+### Invoke an Agent (Streaming Alias)
+
+An explicit streaming alias endpoint that proxies to the canonical endpoint:
+
+```bash
+POST /a2a/{agent_id}/message/stream
+Authorization: Bearer <master_key>
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "jsonrpc": "2.0",
+  "method": "message/send",
+  "id": "1",
+  "params": {
+    "message": {
+      "role": "user",
+      "content": "Hello, agent!"
+    }
+  }
+}
+```
+
+This is useful when you need an explicit streaming URL for load balancers or client frameworks that route based on URL patterns.
+
+### Get Agent Card
+
+Retrieve the A2A agent card for discovery:
+
+```bash
+GET /a2a/{agent_id}/.well-known/agent-card.json
+```
+
+The returned URL in the agent card will include the load balancer port (e.g., `:8080`) when accessed through nginx.
+
 ### Register an Agent
 
 ```bash

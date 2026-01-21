@@ -3,13 +3,27 @@ LiteLLM + LLMRouter Startup Script
 ===================================
 
 This script starts LiteLLM proxy with LLMRouter extensions:
-- A2A Gateway routes
+- A2A Gateway convenience routes (/a2a/agents - wraps LiteLLM's global_agent_registry)
 - MCP Gateway routes
 - Hot reload routes
-- Custom routing strategies
+- Custom routing strategies (llmrouter-*)
+
+Note: The main A2A functionality is provided by LiteLLM's built-in endpoints:
+- POST /v1/agents - Create agent (DB-backed)
+- GET /v1/agents - List agents (DB-backed)
+- DELETE /v1/agents/{agent_id} - Delete agent (DB-backed)
+- POST /a2a/{agent_id} - Invoke agent (A2A JSON-RPC protocol)
+
+The key difference from the standard LiteLLM startup is that we run
+the proxy IN-PROCESS using uvicorn, not via os.execvp. This ensures
+our monkey-patches to LiteLLM's Router class persist.
 
 Usage:
     python -m litellm_llmrouter.startup --config config.yaml --port 4000
+
+Docker Usage:
+    # These are the same args that litellm CLI accepts
+    python -m litellm_llmrouter.startup --config /app/config/config.yaml --port 4000
 """
 
 import os
@@ -18,17 +32,40 @@ import sys
 # Ensure src is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# CRITICAL: Import litellm_llmrouter FIRST to apply the routing_strategy_patch
+# This patches LiteLLM's Router class to accept llmrouter-* strategies
+# BEFORE any Router instances are created.
+import litellm_llmrouter  # noqa: F401 - Import for side effect (applies patch)
+
 
 def register_routes_with_litellm():
-    """Register LLMRouter routes with LiteLLM's FastAPI app."""
+    """
+    Register LLMRouter routes with LiteLLM's FastAPI app.
+
+    Note: LiteLLM already registers its own A2A routes:
+    - agent_endpoints_router: /v1/agents (CRUD, DB-backed)
+    - a2a_router: /a2a/{agent_id} (A2A JSON-RPC protocol)
+
+    Our router adds:
+    - /a2a/agents (convenience wrapper to global_agent_registry)
+    - /mcp/* (MCP gateway endpoints)
+    - /router/* and /config/* (hot reload endpoints)
+    """
     try:
         from litellm.proxy.proxy_server import app
         from litellm_llmrouter.routes import router
 
-        # Add our routes to LiteLLM's app
+        # Register LLMRouter routes
+        # These add MCP gateway, hot reload, and /a2a/agents convenience endpoints
         app.include_router(router, prefix="")
 
         print("✅ LLMRouter routes registered with LiteLLM")
+        print("   ├── /a2a/agents (convenience wrapper)")
+        print("   ├── /mcp/* (MCP gateway)")
+        print("   └── /router/*, /config/* (hot reload)")
+        print(
+            "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
+        )
         return True
     except ImportError as e:
         print(f"⚠️ Could not register routes: {e}")
@@ -68,7 +105,7 @@ def init_observability_if_enabled():
 
             otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
             service_name = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
-            
+
             init_observability(
                 service_name=service_name,
                 otlp_endpoint=otlp_endpoint,
@@ -76,27 +113,188 @@ def init_observability_if_enabled():
                 enable_logs=True,
                 enable_metrics=True,
             )
-            print(f"✅ OpenTelemetry observability initialized (service: {service_name})")
+            print(
+                f"✅ OpenTelemetry observability initialized (service: {service_name})"
+            )
         except ImportError as e:
             print(f"⚠️ Could not initialize observability: {e}")
         except Exception as e:
             print(f"⚠️ Observability initialization failed: {e}")
 
 
+def init_mcp_tracing_if_enabled():
+    """Initialize MCP tracing with OTel if MCP gateway is enabled."""
+    if os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true":
+        try:
+            from litellm_llmrouter.mcp_tracing import instrument_mcp_gateway
+
+            if instrument_mcp_gateway():
+                print("✅ MCP gateway tracing initialized")
+            else:
+                print("⚠️ MCP tracing not enabled (OTel not available or disabled)")
+        except ImportError as e:
+            print(f"⚠️ Could not initialize MCP tracing: {e}")
+        except Exception as e:
+            print(f"⚠️ MCP tracing initialization failed: {e}")
+
+
+def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs):
+    """
+    Run LiteLLM proxy in-process using uvicorn.
+
+    This is the preferred method because it preserves our monkey-patches
+    to LiteLLM's Router class. Using os.execvp() would replace the process
+    and lose all patches.
+
+    Args:
+        config_path: Path to the LiteLLM config file
+        host: Host to bind to
+        port: Port to listen on
+        **kwargs: Additional arguments passed to uvicorn
+    """
+    import uvicorn
+
+    # Set environment variables that LiteLLM expects
+    if config_path:
+        os.environ["LITELLM_CONFIG_PATH"] = config_path
+        # Also set the path that LiteLLM's proxy_server reads
+        os.environ["CONFIG_FILE_PATH"] = config_path
+
+    # Import after setting env vars so LiteLLM picks them up
+    from litellm.proxy.proxy_server import app, initialize
+
+    # Initialize LiteLLM with the config
+    # This is what litellm --config does internally
+    import asyncio
+
+    async def init_litellm():
+        """Initialize LiteLLM proxy with config."""
+        try:
+            await initialize(
+                config=config_path,
+                debug=kwargs.get("debug", False),
+            )
+            print(f"✅ LiteLLM initialized with config: {config_path}")
+        except Exception as e:
+            print(f"⚠️ LiteLLM initialization warning: {e}")
+            # Continue anyway - some initialization errors are non-fatal
+
+    # Run initialization
+    try:
+        asyncio.get_event_loop().run_until_complete(init_litellm())
+    except RuntimeError:
+        # No event loop in current thread
+        asyncio.run(init_litellm())
+
+    # Register our custom routes AFTER LiteLLM initializes
+    register_routes_with_litellm()
+
+    # Configure uvicorn
+    uvicorn_config = {
+        "app": app,
+        "host": host,
+        "port": port,
+        "log_level": kwargs.get("log_level", "info"),
+        "access_log": kwargs.get("access_log", True),
+        "workers": kwargs.get("workers", 1),  # Use 1 worker to preserve patches
+    }
+
+    # Add SSL config if provided
+    if kwargs.get("ssl_keyfile"):
+        uvicorn_config["ssl_keyfile"] = kwargs["ssl_keyfile"]
+    if kwargs.get("ssl_certfile"):
+        uvicorn_config["ssl_certfile"] = kwargs["ssl_certfile"]
+
+    print(f"🚀 Starting LiteLLM proxy on {host}:{port}")
+    uvicorn.run(**uvicorn_config)
+
+
 def main():
-    """Main entry point for LiteLLM + LLMRouter."""
+    """
+    Main entry point for LiteLLM + LLMRouter.
+
+    CLI Args Supported (compatible with litellm CLI):
+        --config PATH    Path to config file (also: -c, --config_file)
+        --port PORT      Port to listen on (default: 4000)
+        --host HOST      Host to bind to (default: 0.0.0.0)
+        --debug          Enable debug mode
+        --workers N      Number of uvicorn workers (1 recommended for patches)
+        --ssl-keyfile    SSL key file path
+        --ssl-certfile   SSL certificate file path
+
+    Environment Variables:
+        LITELLM_CONFIG_PATH  Default config path if --config not provided
+    """
     import argparse
 
-    parser = argparse.ArgumentParser(description="LiteLLM + LLMRouter Gateway")
-    parser.add_argument("--config", type=str, help="Path to config file")
-    parser.add_argument("--port", type=int, default=4000, help="Port to listen on")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
+    parser = argparse.ArgumentParser(
+        description="LiteLLM + LLMRouter Gateway",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python -m litellm_llmrouter.startup --config config.yaml --port 4000
+    python -m litellm_llmrouter.startup --config /app/config/config.yaml --port 4000 --host 0.0.0.0
+        """,
+    )
+    # Config file - support multiple aliases for compat with litellm CLI
+    parser.add_argument(
+        "--config",
+        "-c",
+        "--config_file",
+        type=str,
+        dest="config",
+        default=os.getenv("LITELLM_CONFIG_PATH"),
+        help="Path to config file (default: $LITELLM_CONFIG_PATH)",
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=int(os.getenv("LITELLM_PORT", "4000")),
+        help="Port to listen on (default: 4000)",
+    )
+    parser.add_argument(
+        "--host",
+        "-H",
+        type=str,
+        default=os.getenv("LITELLM_HOST", "0.0.0.0"),
+        help="Host to bind to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        default=os.getenv("LITELLM_DEBUG", "false").lower() == "true",
+        help="Enable debug mode",
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=1,
+        help="Number of workers (1 recommended to preserve patches)",
+    )
+    parser.add_argument("--ssl-keyfile", type=str, help="SSL key file path")
+    parser.add_argument("--ssl-certfile", type=str, help="SSL certificate file path")
+
+    # Parse known args and pass through unknown args (for forward compatibility)
     args, unknown = parser.parse_known_args()
 
+    if unknown:
+        print(f"   Note: Ignoring unknown args: {unknown}")
+
     print("🚀 Starting LiteLLM + LLMRouter Gateway...")
+    print(
+        f"   Patch status: {'✅ applied' if litellm_llmrouter.is_patch_applied() else '❌ NOT applied'}"
+    )
+    print(f"   Config: {args.config or '(none)'}")
+    print(f"   Host: {args.host}")
+    print(f"   Port: {args.port}")
 
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()
+
+    init_mcp_tracing_if_enabled()
 
     # Register strategies
     register_strategies()
@@ -104,24 +302,17 @@ def main():
     # Start config sync if enabled
     start_config_sync_if_enabled()
 
-    # Build litellm command
-    litellm_args = ["litellm"]
-
-    if args.config:
-        litellm_args.extend(["--config", args.config])
-
-    litellm_args.extend(["--port", str(args.port)])
-    litellm_args.extend(["--host", args.host])
-
-    # Add any additional args
-    litellm_args.extend(unknown)
-
-    # Register routes after LiteLLM starts (via callback)
-    os.environ["LITELLM_LLMROUTER_REGISTER_ROUTES"] = "true"
-
-    # Execute litellm
-    print(f"   Running: {' '.join(litellm_args)}")
-    os.execvp("litellm", litellm_args)
+    # Run LiteLLM proxy IN-PROCESS
+    # This is critical - using os.execvp would lose our patches!
+    run_litellm_proxy_inprocess(
+        config_path=args.config,
+        host=args.host,
+        port=args.port,
+        debug=args.debug,
+        workers=args.workers,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_certfile=args.ssl_certfile,
+    )
 
 
 if __name__ == "__main__":

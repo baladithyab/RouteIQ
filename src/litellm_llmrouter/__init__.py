@@ -19,6 +19,15 @@ Usage:
     register_llmrouter_strategies()
 """
 
+# IMPORTANT: Import the routing strategy patch FIRST
+# This ensures llmrouter-* strategies are accepted by LiteLLM's Router
+# before any Router instances are created.
+from .routing_strategy_patch import (
+    patch_litellm_router,
+    unpatch_litellm_router,
+    is_patch_applied,
+)
+
 from .strategies import (
     LLMRouterStrategyFamily,
     register_llmrouter_strategies,
@@ -55,6 +64,10 @@ from .routes import router as api_router
 
 __version__ = "0.1.0"
 __all__ = [
+    # Router patch (for llmrouter-* strategies)
+    "patch_litellm_router",
+    "unpatch_litellm_router",
+    "is_patch_applied",
     # Strategies
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",

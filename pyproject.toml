@@ -10,14 +10,27 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
+    # Core application framework
+    "fastapi>=0.109.0",
+    "pydantic>=2.5.0",
+    "httpx>=0.26.0",
+    # LiteLLM core (provides Router, logging, etc.)
+    "litellm>=1.30.0",
+    # A2A Protocol SDK (Agent-to-Agent communication)
+    "a2a-sdk>=0.2.0",
+    # Configuration and utilities
     "pyyaml>=6.0",
-    "boto3>=1.34.0",
+    "boto3>=1.42.30",
     "aiofiles>=23.0.0",
     "watchdog>=3.0.0",
-    "prometheus-client>=0.19.0",
+    # Observability: OpenTelemetry core
+    "prometheus-client>=0.24.1",
     "opentelemetry-api>=1.22.0",
     "opentelemetry-sdk>=1.22.0",
     "opentelemetry-exporter-otlp>=1.22.0",
+    # OTEL instrumentation (required for observability module imports)
+    "opentelemetry-instrumentation>=0.43b0",
+    "opentelemetry-instrumentation-logging>=0.43b0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +41,36 @@ dev = [
     "black>=24.0.0",
     "ruff>=0.3.0",
     "mypy>=1.8.0",
+]
+# Database support (PostgreSQL with asyncpg and Prisma client for LiteLLM)
+db = [
+    "asyncpg>=0.29.0",
+    "prisma>=0.13.0",
+]
+# Full observability with all OTEL instrumentation
+otel = [
+    "opentelemetry-exporter-otlp-proto-grpc>=1.22.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.22.0",
+    "opentelemetry-instrumentation-fastapi>=0.43b0",
+    "opentelemetry-instrumentation-httpx>=0.43b0",
+    "opentelemetry-instrumentation-requests>=0.43b0",
+]
+# Cloud provider SDKs (optional)
+cloud = [
+    "google-cloud-aiplatform>=1.134.0",
+    "azure-identity>=1.15.0",
+]
+# Callback integrations (langfuse, etc.)
+callbacks = [
+    "langfuse>=3.0.0",
+]
+# Production extras (for Docker builds) - db, otel, cloud, callbacks without dev tools
+prod = [
+    "litellm-llmrouter[db,otel,cloud,callbacks]",
+]
+# All optional dependencies (including dev tools)
+all = [
+    "litellm-llmrouter[dev,db,otel,cloud]",
 ]
 
 [tool.setuptools.packages.find]

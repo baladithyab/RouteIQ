@@ -49,6 +49,7 @@ router_settings:
   # LLMRouter ML-based: llmrouter-knn, llmrouter-svm, llmrouter-mlp,
   #                     llmrouter-mf, llmrouter-elo, llmrouter-hybrid,
   #                     llmrouter-custom
+  # NOTE: llmrouter-* strategies require registration with LiteLLM - see ISSUE#1
   routing_strategy: llmrouter-knn
 
   # LLMRouter strategy arguments (used when routing_strategy starts with 'llmrouter-')
@@ -80,10 +81,10 @@ general_settings:
   # Master key for admin access
   master_key: os.environ/LITELLM_MASTER_KEY
 
-  # Database for persistence (optional)
+  # Database for persistence
   database_url: os.environ/DATABASE_URL
 
-  # Disable storing prompts in DB for privacy
+  # Store models in DB
   store_model_in_db: true
 
 # =============================================================================
@@ -101,9 +102,12 @@ litellm_settings:
   # Logging
   set_verbose: false
 
-  # Cost tracking
-  success_callback: ["langfuse"]
-  failure_callback: ["langfuse"]
+  # Cost tracking callbacks (optional)
+  # Uncomment and configure to enable Langfuse LLM observability:
+  # Requires: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY env vars
+  # Optional: LANGFUSE_HOST (defaults to https://cloud.langfuse.com)
+  # success_callback: ["langfuse"]
+  # failure_callback: ["langfuse"]
 
   # Rate limiting (optional)
   # max_budget: 100
