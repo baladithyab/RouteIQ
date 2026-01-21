@@ -1,0 +1,52 @@
+# HA Stack Observability Overlay
+# Adds OpenTelemetry support to the HA deployment for Gate 8 validation
+#
+# Usage:
+#   docker compose -f docker-compose.ha.yml -f docker-compose.ha-otel.yml up -d
+
+services:
+  litellm-gateway-1:
+    environment:
+      # OpenTelemetry Configuration
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger-otel:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway-1
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_ENABLED=true
+      # Enable A2A and MCP for testing
+      - A2A_GATEWAY_ENABLED=true
+      - MCP_GATEWAY_ENABLED=true
+      - MCP_TRACING_ENABLED=true
+    networks:
+      - litellm-network
+      - otel-network
+
+  litellm-gateway-2:
+    environment:
+      # OpenTelemetry Configuration
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger-otel:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway-2
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_ENABLED=true
+      # Enable A2A and MCP for testing
+      - A2A_GATEWAY_ENABLED=true
+      - MCP_GATEWAY_ENABLED=true
+      - MCP_TRACING_ENABLED=true
+    networks:
+      - litellm-network
+      - otel-network
+
+  nginx:
+    networks:
+      - litellm-network
+      - otel-network
+
+networks:
+  otel-network:
+    external: true
+    name: litellm-llm-router_otel-network

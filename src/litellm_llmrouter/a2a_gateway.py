@@ -18,6 +18,18 @@ import httpx
 
 from litellm._logging import verbose_proxy_logger
 
+# Import tracing utilities for W3C trace context propagation
+try:
+    from .a2a_tracing import inject_trace_headers
+
+    TRACING_AVAILABLE = True
+except ImportError:
+    TRACING_AVAILABLE = False
+
+    def inject_trace_headers(headers: dict[str, str]) -> dict[str, str]:
+        """No-op fallback when tracing module is not available."""
+        return headers
+
 
 @dataclass
 class A2AAgent:
@@ -206,11 +218,15 @@ class A2AGateway:
 
         try:
             # Forward the request to the agent backend
+            # Inject W3C trace context headers for distributed tracing
+            headers = {"Content-Type": "application/json"}
+            headers = inject_trace_headers(headers)
+
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     agent.url,
                     json=request.to_dict(),
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -239,7 +255,9 @@ class A2AGateway:
                 request.id, -32000, f"HTTP error: {e.response.status_code}"
             )
         except Exception as e:
-            verbose_proxy_logger.exception(f"A2A: Error invoking agent '{agent_id}': {e}")
+            verbose_proxy_logger.exception(
+                f"A2A: Error invoking agent '{agent_id}': {e}"
+            )
             return JSONRPCResponse.error_response(
                 request.id, -32603, f"Internal error: {str(e)}"
             )
@@ -258,41 +276,52 @@ class A2AGateway:
             JSON-encoded response chunks as newline-delimited JSON
         """
         if not self.enabled:
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32000, "A2A Gateway is not enabled"
-                ).to_dict()
-            ) + "\n"
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, "A2A Gateway is not enabled"
+                    ).to_dict()
+                )
+                + "\n"
+            )
             return
 
         agent = self.get_agent(agent_id)
         if not agent:
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32000, f"Agent '{agent_id}' not found"
-                ).to_dict()
-            ) + "\n"
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent '{agent_id}' not found"
+                    ).to_dict()
+                )
+                + "\n"
+            )
             return
 
         if not agent.url:
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32000, f"Agent '{agent_id}' has no URL configured"
-                ).to_dict()
-            ) + "\n"
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent '{agent_id}' has no URL configured"
+                    ).to_dict()
+                )
+                + "\n"
+            )
             return
 
-        verbose_proxy_logger.info(
-            f"A2A: Streaming from agent '{agent_id}'"
-        )
+        verbose_proxy_logger.info(f"A2A: Streaming from agent '{agent_id}'")
 
         try:
+            # Inject W3C trace context headers for distributed tracing
+            headers = {"Content-Type": "application/json"}
+            headers = inject_trace_headers(headers)
+
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream(
                     "POST",
                     agent.url,
                     json=request.to_dict(),
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 ) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -300,30 +329,41 @@ class A2AGateway:
                             yield line + "\n"
 
         except httpx.TimeoutException:
-            verbose_proxy_logger.error(f"A2A: Timeout streaming from agent '{agent_id}'")
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32000, f"Timeout streaming from agent '{agent_id}'"
-                ).to_dict()
-            ) + "\n"
+            verbose_proxy_logger.error(
+                f"A2A: Timeout streaming from agent '{agent_id}'"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Timeout streaming from agent '{agent_id}'"
+                    ).to_dict()
+                )
+                + "\n"
+            )
         except httpx.HTTPStatusError as e:
             verbose_proxy_logger.error(
                 f"A2A: HTTP error streaming from agent '{agent_id}': {e}"
             )
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32000, f"HTTP error: {e.response.status_code}"
-                ).to_dict()
-            ) + "\n"
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"HTTP error: {e.response.status_code}"
+                    ).to_dict()
+                )
+                + "\n"
+            )
         except Exception as e:
             verbose_proxy_logger.exception(
                 f"A2A: Error streaming from agent '{agent_id}': {e}"
             )
-            yield json.dumps(
-                JSONRPCResponse.error_response(
-                    request.id, -32603, f"Streaming error: {str(e)}"
-                ).to_dict()
-            ) + "\n"
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32603, f"Streaming error: {str(e)}"
+                    ).to_dict()
+                )
+                + "\n"
+            )
 
 
 # Singleton instance

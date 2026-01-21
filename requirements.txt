@@ -1,0 +1,2 @@
+# Additional runtime dependencies
+# (Core deps managed via pyproject.toml)

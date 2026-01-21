@@ -26,6 +26,7 @@ Docker Usage:
     python -m litellm_llmrouter.startup --config /app/config/config.yaml --port 4000
 """
 
+import logging
 import os
 import sys
 
@@ -36,6 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # This patches LiteLLM's Router class to accept llmrouter-* strategies
 # BEFORE any Router instances are created.
 import litellm_llmrouter  # noqa: F401 - Import for side effect (applies patch)
+
+# Configure module logger
+logger = logging.getLogger(__name__)
 
 
 def register_routes_with_litellm():
@@ -119,6 +123,8 @@ def init_observability_if_enabled():
         except ImportError as e:
             print(f"⚠️ Could not initialize observability: {e}")
         except Exception as e:
+            # Use logger.exception to capture full stack trace
+            logger.exception(f"Observability initialization failed: {e}")
             print(f"⚠️ Observability initialization failed: {e}")
 
 
@@ -135,7 +141,61 @@ def init_mcp_tracing_if_enabled():
         except ImportError as e:
             print(f"⚠️ Could not initialize MCP tracing: {e}")
         except Exception as e:
+            # Use logger.exception to capture full stack trace
+            logger.exception(f"MCP tracing initialization failed: {e}")
             print(f"⚠️ MCP tracing initialization failed: {e}")
+
+
+def init_a2a_tracing_if_enabled():
+    """
+    Initialize A2A tracing with OTel if A2A gateway is enabled.
+
+    This function:
+    1. Instruments the A2A gateway (wraps gateway methods) if A2A_GATEWAY_ENABLED=true
+    2. Registers A2A tracing middleware with LiteLLM's FastAPI app (always, for /a2a/* routes)
+
+    The middleware is separate from gateway instrumentation because:
+    - The A2A gateway is an optional component we provide
+    - LiteLLM's built-in /a2a/* routes are always present when A2A is configured
+    - We want to capture spans for LiteLLM's native A2A routes regardless of our gateway
+    """
+    # Always try to register the A2A middleware for LiteLLM's /a2a/* routes
+    # This is independent of our A2A gateway - it instruments LiteLLM's built-in routes
+    try:
+        from litellm.proxy.proxy_server import app
+        from litellm_llmrouter.a2a_tracing import register_a2a_middleware
+
+        if register_a2a_middleware(app):
+            print("✅ A2A HTTP tracing middleware registered for /a2a/* routes")
+        else:
+            print(
+                "⚠️ A2A HTTP tracing middleware not registered (OTel not available or disabled)"
+            )
+    except ImportError as e:
+        logger.warning(f"Could not register A2A middleware: {e}")
+        print(f"⚠️ Could not register A2A middleware: {e}")
+    except Exception as e:
+        # Use logger.exception to capture full stack trace for debugging
+        logger.exception(f"A2A tracing middleware registration failed: {e}")
+        print(f"⚠️ A2A tracing middleware registration failed: {e}")
+
+    # Also instrument our A2A gateway if it's enabled
+    if os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true":
+        try:
+            from litellm_llmrouter.a2a_tracing import instrument_a2a_gateway
+
+            if instrument_a2a_gateway():
+                print("✅ A2A gateway tracing initialized")
+            else:
+                print(
+                    "⚠️ A2A gateway tracing not enabled (OTel not available or disabled)"
+                )
+        except ImportError as e:
+            print(f"⚠️ Could not initialize A2A gateway tracing: {e}")
+        except Exception as e:
+            # Use logger.exception to capture full stack trace
+            logger.exception(f"A2A gateway tracing initialization failed: {e}")
+            print(f"⚠️ A2A gateway tracing initialization failed: {e}")
 
 
 def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs):
@@ -295,6 +355,8 @@ Examples:
     init_observability_if_enabled()
 
     init_mcp_tracing_if_enabled()
+
+    init_a2a_tracing_if_enabled()
 
     # Register strategies
     register_strategies()

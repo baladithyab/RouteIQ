@@ -9,6 +9,11 @@ This module provides unified observability via OpenTelemetry:
 
 The module integrates with LiteLLM's existing observability while adding
 LLMRouter-specific instrumentation for routing decisions.
+
+IMPORTANT: This module is designed to REUSE existing TracerProvider/MeterProvider
+if one is already configured (e.g., by LiteLLM or FastAPI instrumentation).
+This prevents "provider mismatch" issues where custom spans are exported to
+a different provider than the one used by auto-instrumentation.
 """
 
 import logging
@@ -32,15 +37,42 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 logger = logging.getLogger(__name__)
 
 
+def _is_sdk_tracer_provider(provider: Any) -> bool:
+    """
+    Check if the provider is an SDK TracerProvider that can accept span processors.
+
+    We check for the actual SDK TracerProvider type because the ProxyTracerProvider
+    returned by trace.get_tracer_provider() when no SDK is configured cannot accept
+    span processors.
+
+    Args:
+        provider: The tracer provider to check
+
+    Returns:
+        True if it's an SDK TracerProvider with add_span_processor capability
+    """
+    # Check if it's the actual SDK TracerProvider class
+    if isinstance(provider, TracerProvider):
+        return True
+    # Also check by attribute in case of wrapped providers
+    return hasattr(provider, "add_span_processor") and hasattr(
+        provider, "_active_span_processor"
+    )
+
+
 class ObservabilityManager:
     """
     Manages OpenTelemetry observability for the LiteLLM + LLMRouter Gateway.
-    
+
     This class provides:
     - Tracer initialization with OTLP exporters
     - Logger setup with trace correlation
     - Meter setup for custom metrics
     - Integration with LiteLLM's existing observability
+
+    IMPORTANT: This manager is designed to REUSE existing SDK providers rather
+    than creating new ones. This ensures all spans (from auto-instrumentation,
+    LiteLLM, and our custom code) are exported through the same provider.
     """
 
     def __init__(
@@ -55,7 +87,7 @@ class ObservabilityManager:
     ):
         """
         Initialize the observability manager.
-        
+
         Args:
             service_name: Name of the service for telemetry
             service_version: Version of the service
@@ -90,11 +122,12 @@ class ObservabilityManager:
         self._meter_provider: Optional[MeterProvider] = None
         self._tracer: Optional[trace.Tracer] = None
         self._meter: Optional[metrics.Meter] = None
+        self._span_processor_added: bool = False
 
     def initialize(self) -> None:
         """
         Initialize all OpenTelemetry providers and exporters.
-        
+
         This method should be called during application startup.
         """
         if self.enable_traces:
@@ -112,23 +145,52 @@ class ObservabilityManager:
         )
 
     def _init_tracing(self) -> None:
-        """Initialize distributed tracing with OTLP exporter."""
-        # Check if a tracer provider already exists (from LiteLLM)
+        """
+        Initialize distributed tracing with OTLP exporter.
+
+        IMPORTANT: This method is designed to REUSE an existing SDK TracerProvider
+        if one is already configured. This ensures that all spans from all sources
+        (auto-instrumentation, LiteLLM, our custom code) go through the same provider
+        and are exported together.
+
+        The logic is:
+        1. Check if an SDK TracerProvider already exists (from LiteLLM or auto-instrumentation)
+        2. If yes, reuse it and just add our OTLP BatchSpanProcessor
+        3. If no, create a new SDK TracerProvider with our resource
+        """
         existing_provider = trace.get_tracer_provider()
-        if hasattr(existing_provider, "add_span_processor"):
-            # Use existing provider
+
+        # Check if we have an actual SDK TracerProvider we can reuse
+        if _is_sdk_tracer_provider(existing_provider):
+            # Reuse existing SDK provider - this is the preferred path
+            # It ensures all spans go to the same exporter
             self._tracer_provider = existing_provider
-            logger.info("Using existing TracerProvider from LiteLLM")
+            logger.info("Reusing existing SDK TracerProvider - attaching OTLP exporter")
         else:
-            # Create new provider
+            # No SDK provider exists yet - create one with our resource
+            # This happens when our code runs before any auto-instrumentation
             self._tracer_provider = TracerProvider(resource=self.resource)
             trace.set_tracer_provider(self._tracer_provider)
-            logger.info("Created new TracerProvider")
+            logger.info(
+                "Created new SDK TracerProvider with resource: %s", self.service_name
+            )
 
-        # Add OTLP exporter
-        otlp_exporter = OTLPSpanExporter(endpoint=self.otlp_endpoint, insecure=True)
-        span_processor = BatchSpanProcessor(otlp_exporter)
-        self._tracer_provider.add_span_processor(span_processor)
+        # Add our OTLP exporter as a BatchSpanProcessor
+        # This ensures spans are exported even if LiteLLM didn't configure OTLP
+        if not self._span_processor_added:
+            try:
+                otlp_exporter = OTLPSpanExporter(
+                    endpoint=self.otlp_endpoint, insecure=True
+                )
+                span_processor = BatchSpanProcessor(otlp_exporter)
+                self._tracer_provider.add_span_processor(span_processor)
+                self._span_processor_added = True
+                logger.info(
+                    "Added OTLP BatchSpanProcessor to TracerProvider "
+                    f"(endpoint: {self.otlp_endpoint})"
+                )
+            except Exception as e:
+                logger.error(f"Failed to add OTLP span processor: {e}", exc_info=True)
 
         # Get tracer for this module
         self._tracer = trace.get_tracer(__name__, self.service_version)
@@ -212,16 +274,14 @@ class ObservabilityManager:
             raise RuntimeError("Metrics not initialized. Call initialize() first.")
         return self._meter
 
-    def create_routing_span(
-        self, strategy_name: str, model_count: int
-    ) -> trace.Span:
+    def create_routing_span(self, strategy_name: str, model_count: int) -> trace.Span:
         """
         Create a span for a routing decision.
-        
+
         Args:
             strategy_name: Name of the routing strategy
             model_count: Number of models being considered
-            
+
         Returns:
             OpenTelemetry span for the routing operation
         """
@@ -234,11 +294,11 @@ class ObservabilityManager:
     def create_cache_span(self, operation: str, cache_key: str) -> trace.Span:
         """
         Create a span for a cache operation.
-        
+
         Args:
             operation: Cache operation (lookup, set, delete)
             cache_key: Cache key (truncated for privacy)
-            
+
         Returns:
             OpenTelemetry span for the cache operation
         """
@@ -258,7 +318,7 @@ class ObservabilityManager:
     ) -> None:
         """
         Log a routing decision with trace correlation.
-        
+
         Args:
             strategy: Routing strategy used
             selected_model: Model that was selected
@@ -291,7 +351,7 @@ class ObservabilityManager:
     ) -> None:
         """
         Log an error with trace correlation and stack trace.
-        
+
         Args:
             error: The exception that occurred
             context: Additional context about the error
@@ -327,9 +387,9 @@ def init_observability(
 ) -> ObservabilityManager:
     """
     Initialize the global observability manager.
-    
+
     This function should be called once during application startup.
-    
+
     Args:
         service_name: Name of the service (default: from env or "litellm-gateway")
         service_version: Version of the service (default: from env or "1.0.0")
@@ -338,7 +398,7 @@ def init_observability(
         enable_traces: Whether to enable tracing
         enable_logs: Whether to enable logging
         enable_metrics: Whether to enable metrics
-        
+
     Returns:
         Initialized ObservabilityManager instance
     """
@@ -369,7 +429,7 @@ def init_observability(
 def get_observability_manager() -> Optional[ObservabilityManager]:
     """
     Get the global observability manager instance.
-    
+
     Returns:
         ObservabilityManager instance or None if not initialized
     """
@@ -379,28 +439,32 @@ def get_observability_manager() -> Optional[ObservabilityManager]:
 def get_tracer() -> trace.Tracer:
     """
     Get the global tracer instance.
-    
+
     Returns:
         OpenTelemetry Tracer
-        
+
     Raises:
         RuntimeError: If observability is not initialized
     """
     if _observability_manager is None:
-        raise RuntimeError("Observability not initialized. Call init_observability() first.")
+        raise RuntimeError(
+            "Observability not initialized. Call init_observability() first."
+        )
     return _observability_manager.get_tracer()
 
 
 def get_meter() -> metrics.Meter:
     """
     Get the global meter instance.
-    
+
     Returns:
         OpenTelemetry Meter
-        
+
     Raises:
         RuntimeError: If observability is not initialized
     """
     if _observability_manager is None:
-        raise RuntimeError("Observability not initialized. Call init_observability() first.")
+        raise RuntimeError(
+            "Observability not initialized. Call init_observability() first."
+        )
     return _observability_manager.get_meter()

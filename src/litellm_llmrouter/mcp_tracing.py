@@ -14,10 +14,11 @@ Usage:
     instrument_mcp_gateway()
 """
 
+import contextlib
 import functools
 import os
 import time
-from typing import Any
+from typing import Any, Generator
 
 from litellm._logging import verbose_proxy_logger
 
@@ -66,11 +67,30 @@ def get_tracer() -> Any:
         return None
 
 
+class _DummySpan:
+    """Dummy span for when tracing is disabled."""
+
+    def set_attribute(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def set_status(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def record_exception(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+@contextlib.contextmanager
 def trace_tool_call(
     tracer: Any, tool_name: str, server_id: str, server_name: str, transport: str
-):
+) -> Generator[Any, None, None]:
     """
     Context manager for tracing an MCP tool call.
+
+    Uses start_as_current_span to ensure the span is:
+    - Made the active span in the current context
+    - Properly parented to any existing HTTP request span
+    - Exported to the OTLP collector when the context manager exits
 
     Args:
         tracer: OTel tracer instance
@@ -80,68 +100,49 @@ def trace_tool_call(
         transport: Transport type (e.g., "streamable_http", "sse")
 
     Yields:
-        The span, or None if tracing is disabled
+        The span, or a DummySpan if tracing is disabled
     """
     if tracer is None:
-        # Tracing disabled - use a dummy context manager
-        class DummySpan:
-            def set_attribute(self, *args, **kwargs):
-                pass
+        yield _DummySpan()
+        return
 
-            def set_status(self, *args, **kwargs):
-                pass
+    start_time = time.perf_counter()
 
-            def record_exception(self, *args, **kwargs):
-                pass
+    # Use start_as_current_span to ensure span is active and exported
+    with tracer.start_as_current_span(f"mcp.tool.call/{tool_name}") as span:
+        span.set_attribute(ATTR_MCP_TOOL_NAME, tool_name)
+        span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
+        span.set_attribute(ATTR_MCP_SERVER_NAME, server_name)
+        span.set_attribute(ATTR_MCP_TRANSPORT, transport)
 
-        class DummyContext:
-            def __enter__(self):
-                return DummySpan()
-
-            def __exit__(self, *args):
-                pass
-
-        return DummyContext()
-
-    # Start span with tool call name
-    span = tracer.start_span(f"mcp.tool.call/{tool_name}")
-    span.set_attribute(ATTR_MCP_TOOL_NAME, tool_name)
-    span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
-    span.set_attribute(ATTR_MCP_SERVER_NAME, server_name)
-    span.set_attribute(ATTR_MCP_TRANSPORT, transport)
-
-    class SpanContext:
-        def __init__(self, span):
-            self._span = span
-            self._start_time = time.perf_counter()
-
-        def __enter__(self):
-            return self._span
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            duration_ms = (time.perf_counter() - self._start_time) * 1000
-            self._span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
-
-            if exc_val is not None:
-                self._span.set_attribute(ATTR_MCP_SUCCESS, False)
-                self._span.set_attribute(ATTR_MCP_ERROR, str(exc_val))
-                self._span.record_exception(exc_val)
-                self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            else:
-                self._span.set_attribute(ATTR_MCP_SUCCESS, True)
-                self._span.set_status(Status(StatusCode.OK))
-
-            self._span.end()
-            return False  # Don't suppress exceptions
-
-    return SpanContext(span)
+        try:
+            yield span
+        except Exception as e:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_attribute(ATTR_MCP_SUCCESS, False)
+            span.set_attribute(ATTR_MCP_ERROR, str(e))
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        else:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_attribute(ATTR_MCP_SUCCESS, True)
+            span.set_status(Status(StatusCode.OK))
 
 
+@contextlib.contextmanager
 def trace_server_registration(
     tracer: Any, server_id: str, server_name: str, url: str, transport: str
-):
+) -> Generator[Any, None, None]:
     """
     Context manager for tracing MCP server registration.
+
+    Uses start_as_current_span to ensure the span is:
+    - Made the active span in the current context
+    - Properly parented to any existing HTTP request span
+    - Exported to the OTLP collector when the context manager exits
 
     Args:
         tracer: OTel tracer instance
@@ -151,108 +152,72 @@ def trace_server_registration(
         transport: Transport type
 
     Yields:
-        The span, or None if tracing is disabled
+        The span, or a DummySpan if tracing is disabled
     """
     if tracer is None:
+        yield _DummySpan()
+        return
 
-        class DummyContext:
-            def __enter__(self):
-                return type(
-                    "DummySpan",
-                    (),
-                    {
-                        "set_attribute": lambda *a, **k: None,
-                        "set_status": lambda *a, **k: None,
-                    },
-                )()
+    start_time = time.perf_counter()
 
-            def __exit__(self, *args):
-                pass
+    # Use start_as_current_span to ensure span is active and exported
+    with tracer.start_as_current_span(f"mcp.server.register/{server_id}") as span:
+        span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
+        span.set_attribute(ATTR_MCP_SERVER_NAME, server_name)
+        span.set_attribute("mcp.server.url", url)
+        span.set_attribute(ATTR_MCP_TRANSPORT, transport)
 
-        return DummyContext()
-
-    span = tracer.start_span(f"mcp.server.register/{server_id}")
-    span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
-    span.set_attribute(ATTR_MCP_SERVER_NAME, server_name)
-    span.set_attribute("mcp.server.url", url)
-    span.set_attribute(ATTR_MCP_TRANSPORT, transport)
-
-    class SpanContext:
-        def __init__(self, span):
-            self._span = span
-            self._start_time = time.perf_counter()
-
-        def __enter__(self):
-            return self._span
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            duration_ms = (time.perf_counter() - self._start_time) * 1000
-            self._span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
-
-            if exc_val is not None:
-                self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            else:
-                self._span.set_status(Status(StatusCode.OK))
-
-            self._span.end()
-            return False
-
-    return SpanContext(span)
+        try:
+            yield span
+        except Exception as e:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        else:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_status(Status(StatusCode.OK))
 
 
-def trace_health_check(tracer: Any, server_id: str):
+@contextlib.contextmanager
+def trace_health_check(tracer: Any, server_id: str) -> Generator[Any, None, None]:
     """
     Context manager for tracing MCP server health checks.
+
+    Uses start_as_current_span to ensure the span is:
+    - Made the active span in the current context
+    - Properly parented to any existing HTTP request span
+    - Exported to the OTLP collector when the context manager exits
 
     Args:
         tracer: OTel tracer instance
         server_id: ID of the MCP server being checked
 
     Yields:
-        The span, or None if tracing is disabled
+        The span, or a DummySpan if tracing is disabled
     """
     if tracer is None:
+        yield _DummySpan()
+        return
 
-        class DummyContext:
-            def __enter__(self):
-                return type(
-                    "DummySpan",
-                    (),
-                    {
-                        "set_attribute": lambda *a, **k: None,
-                        "set_status": lambda *a, **k: None,
-                    },
-                )()
+    start_time = time.perf_counter()
 
-            def __exit__(self, *args):
-                pass
+    # Use start_as_current_span to ensure span is active and exported
+    with tracer.start_as_current_span(f"mcp.server.health/{server_id}") as span:
+        span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
 
-        return DummyContext()
-
-    span = tracer.start_span(f"mcp.server.health/{server_id}")
-    span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
-
-    class SpanContext:
-        def __init__(self, span):
-            self._span = span
-            self._start_time = time.perf_counter()
-
-        def __enter__(self):
-            return self._span
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            duration_ms = (time.perf_counter() - self._start_time) * 1000
-            self._span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
-
-            if exc_val is not None:
-                self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            else:
-                self._span.set_status(Status(StatusCode.OK))
-
-            self._span.end()
-            return False
-
-    return SpanContext(span)
+        try:
+            yield span
+        except Exception as e:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        else:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            span.set_attribute(ATTR_MCP_DURATION_MS, round(duration_ms, 2))
+            span.set_status(Status(StatusCode.OK))
 
 
 class TracedMCPGatewayMixin:
