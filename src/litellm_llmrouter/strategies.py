@@ -17,6 +17,7 @@ from litellm._logging import verbose_proxy_logger
 
 try:
     from opentelemetry import trace
+
     OTEL_AVAILABLE = True
 except ImportError:
     OTEL_AVAILABLE = False
@@ -88,10 +89,61 @@ class LLMRouterStrategyFamily:
         self._last_load_time = 0
         self._model_mtime = 0
 
+        # Resolve model_path if it's a directory (find .pkl file inside)
+        self.model_path = self._resolve_model_path(self.model_path)
+
         # Load LLM candidates data
         self._llm_data = self._load_llm_data()
 
         verbose_proxy_logger.info(f"Initialized LLMRouter strategy: {strategy_name}")
+
+    def _resolve_model_path(self, model_path: Optional[str]) -> Optional[str]:
+        """
+        Resolve model path to an actual file.
+
+        If model_path is a directory, look for a .pkl file inside.
+        This allows flexibility: users can specify either the directory
+        or the exact .pkl file path.
+
+        Args:
+            model_path: Path to model file or directory
+
+        Returns:
+            Resolved path to the actual model file, or original path if resolution fails
+        """
+        if not model_path:
+            return None
+
+        path = Path(model_path)
+
+        # If it's already a file, use it directly
+        if path.is_file():
+            return str(path)
+
+        # If it's a directory, look for .pkl files
+        if path.is_dir():
+            pkl_files = list(path.glob("*.pkl"))
+            if len(pkl_files) == 1:
+                resolved = str(pkl_files[0])
+                verbose_proxy_logger.info(
+                    f"Resolved model directory to file: {resolved}"
+                )
+                return resolved
+            elif len(pkl_files) > 1:
+                # Multiple .pkl files - use the most recently modified
+                pkl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                resolved = str(pkl_files[0])
+                verbose_proxy_logger.warning(
+                    f"Multiple .pkl files found, using most recent: {resolved}"
+                )
+                return resolved
+            else:
+                verbose_proxy_logger.warning(
+                    f"Directory {model_path} contains no .pkl files"
+                )
+
+        # Return original path (may not exist yet, will be created by training)
+        return model_path
 
     def _load_llm_data(self) -> Dict[str, Any]:
         """Load LLM candidates data from JSON file."""
@@ -233,55 +285,57 @@ class LLMRouterStrategyFamily:
     ) -> Optional[str]:
         """
         Route a query with OpenTelemetry observability.
-        
+
         Args:
             query: User query to route
             model_list: List of available models
-            
+
         Returns:
             Selected model name or None
         """
         start_time = time.time()
         selected_model = None
-        
+
         # Create span if OpenTelemetry is available
         if OTEL_AVAILABLE:
             try:
                 from litellm_llmrouter.observability import get_observability_manager
-                
+
                 obs_manager = get_observability_manager()
                 if obs_manager:
                     span = obs_manager.create_routing_span(
                         self.strategy_name, len(model_list)
                     )
-                    
+
                     with trace.use_span(span, end_on_exit=True):
                         # Perform routing
                         if self.router and hasattr(self.router, "route"):
                             selected_model = self.router.route(query)
-                        
+
                         # Add result to span
                         if selected_model:
-                            span.set_attribute("llm.routing.selected_model", selected_model)
-                        
+                            span.set_attribute(
+                                "llm.routing.selected_model", selected_model
+                            )
+
                         latency_ms = (time.time() - start_time) * 1000
                         span.set_attribute("llm.routing.latency_ms", latency_ms)
-                        
+
                         # Log routing decision
                         obs_manager.log_routing_decision(
                             strategy=self.strategy_name,
                             selected_model=selected_model or "none",
                             latency_ms=latency_ms,
                         )
-                    
+
                     return selected_model
             except Exception as e:
                 verbose_proxy_logger.warning(f"Observability error: {e}")
-        
+
         # Fallback: route without observability
         if self.router and hasattr(self.router, "route"):
             selected_model = self.router.route(query)
-        
+
         return selected_model
 
 

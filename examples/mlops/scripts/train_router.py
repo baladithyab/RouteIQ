@@ -84,10 +84,22 @@ def _run_training(router_type: str, config: str, cfg: dict, output_dir: str):
     elif hasattr(router, "metrics"):
         mlflow.log_metrics(router.metrics)
 
-    # Model is saved by the trainer to the path in config
-    # Just copy the config to output_dir for reference
+    # Model is saved by the trainer to the path specified in config (model_path.save_model_path)
+    # Get the saved model path from config
+    model_path_cfg = cfg.get("model_path", {})
+    saved_model_path = model_path_cfg.get("save_model_path")
+
     output_path = Path(output_dir) / f"{router_type}_router"
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # Copy trained model to output_dir for deployment
+    if saved_model_path and Path(saved_model_path).exists():
+        import shutil
+
+        dest_model = output_path / Path(saved_model_path).name
+        shutil.copy2(saved_model_path, dest_model)
+        print(f"   Model copied to: {dest_model}")
+        mlflow.log_param("model_output_path", str(dest_model))
 
     # Save config alongside model
     with open(output_path / "config.yaml", "w") as f:
@@ -103,6 +115,8 @@ def _run_training(router_type: str, config: str, cfg: dict, output_dir: str):
 
     print("✅ Training complete!")
     print(f"   Config saved to: {output_path}")
+    if saved_model_path:
+        print(f"   Trained model: {saved_model_path}")
 
 
 @click.command()

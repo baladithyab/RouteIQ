@@ -1,0 +1,42 @@
+# KNN Router Training Configuration for MLOps Pipeline
+# ==================================
+# Schema aligned with UIUC LLMRouter (https://github.com/ulab-uiuc/LLMRouter)
+
+data_path:
+  # Historical routing performance data (query-LLM pairs with scores) - REQUIRED for training
+  routing_data_train: '/home/ubuntu/litellm-llm-router/examples/mlops/data/llmrouter_data/routing_train.jsonl'
+  # Pre-computed query embeddings (PyTorch tensor file)
+  query_embedding_data: '/home/ubuntu/litellm-llm-router/examples/mlops/data/llmrouter_data/query_embeddings.pt'
+  # LLM candidate information (models, API names, metadata)
+  llm_data: '/home/ubuntu/litellm-llm-router/examples/mlops/data/llmrouter_data/llm_data.json'
+  # Optional: test data for evaluation
+  query_data_test: '/home/ubuntu/litellm-llm-router/examples/mlops/data/llmrouter_data/routing_test.jsonl'
+
+model_path:
+  # Where to save the KNN model after training (.pkl file)
+  save_model_path: '/home/ubuntu/litellm-llm-router/examples/mlops/data/trained_models/knn_router.pkl'
+  # Optional: pre-trained model to initialize from
+  ini_model_path: ''
+
+hparam:
+  # K value - number of neighbors to consider (typical range: 3-10)
+  n_neighbors: 5
+  # Voting weight: "uniform" or "distance" (closer neighbors have more influence)
+  weights: "distance"
+  # Neighbor search algorithm: "auto", "ball_tree", "kd_tree", "brute"
+  algorithm: "auto"
+  # Tree algorithm leaf size parameter
+  leaf_size: 30
+  # Distance metric power (2 = Euclidean)
+  p: 2
+  # Distance metric: "minkowski", "euclidean", "cosine" (cosine recommended for text)
+  metric: "cosine"
+  # Number of parallel jobs (-1 = use all CPU cores)
+  n_jobs: -1
+
+metric:
+  # Weighted scoring for routing decisions
+  weights:
+    performance: 1
+    cost: 0
+    llm_judge: 0

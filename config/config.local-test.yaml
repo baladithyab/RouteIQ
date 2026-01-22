@@ -124,15 +124,20 @@ model_list:
 # Router Settings - Test Multiple Strategies
 # =============================================================================
 router_settings:
-  # Default to simple-shuffle, can be changed via API
-  routing_strategy: simple-shuffle
+  # Use LLMRouter KNN strategy for trained model-based routing
+  routing_strategy: llmrouter-knn
 
   # LLMRouter strategy arguments
   routing_strategy_args:
-    model_path: /app/models/router_model.pt
+    # Path to the trained KNN router model (.pkl file)
+    # Must be a FILE not a directory for proper mtime-based hot reload
+    model_path: /app/models/knn_router.pkl
+    # Path to LLM candidates JSON (model metadata for routing decisions)
     llm_data_path: /app/config/llm_candidates.json
+    # Enable hot reload: gateway watches model_path for changes
     hot_reload: true
-    reload_interval: 30
+    # Reload interval in seconds (check for model updates every 10s for demo)
+    reload_interval: 10
 
   num_retries: 2
   retry_after: 5

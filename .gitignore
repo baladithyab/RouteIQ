@@ -38,11 +38,20 @@ env/
 *.swo
 *~
 
-# Models (large files)
-models/*.pt
-models/*.bin
-models/*.safetensors
+# Models - ignore all generated models except .gitkeep
+models/**
+!models/.gitkeep
+
+# MLOps training data and outputs - ignore all except .gitkeep
+examples/mlops/data/**
+!examples/mlops/data/.gitkeep
+
+# General model files
 *.onnx
+*.pkl
+*.pt
+*.bin
+*.safetensors
 
 # Data
 data/*.json
