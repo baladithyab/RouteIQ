@@ -345,6 +345,7 @@ This section clarifies what the gateway does **NOT** aim to provide, to avoid du
 - **[`docs/mlops-training.md`](../../../docs/mlops-training.md)**: Training routing models from OTLP traces
 - **[`docs/observability.md`](../../../docs/observability.md)**: OpenTelemetry configuration and semantic conventions
 - **[`docs/high-availability.md`](../../../docs/high-availability.md)**: HA deployment patterns (Redis Sentinel, Postgres replication, load balancing)
+- **[`docs/litellm-cloud-native-enhancements.md`](../../../docs/litellm-cloud-native-enhancements.md)**: Prioritized backlog of cloud-native enhancements (HA, Security, Observability)
 
 ### Requirement 16: Moat-Mode / Air-Gapped Deployment Support
 

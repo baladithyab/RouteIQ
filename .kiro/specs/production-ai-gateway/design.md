@@ -4,7 +4,7 @@
 
 This design document describes a production-ready AI Gateway that serves as an **enhancement layer on top of the LiteLLM Proxy**. The system integrates LiteLLM (unified LLM API gateway) with LLMRouter (ML-based intelligent routing) into a single, production-hardened container.
 
-** Enhancement Layer Philosophy:** We inherit all LiteLLM capabilities (authentication, caching, rate limiting, 100+ provider integrations, Skills endpoints) and extend them with ML routing, hot-reload, standardized HA protocols (HTTP/SSE/OTLP/Postgres/Redis), and agentic gateway support (MCP, A2A).
+**Enhancement Layer Philosophy:** We inherit all LiteLLM capabilities (authentication, caching, rate limiting, 100+ provider integrations, Skills endpoints) and extend them with ML routing, hot-reload, standardized HA protocols (HTTP/SSE/OTLP/Postgres/Redis), and agentic gateway support (MCP, A2A).
 
 The system provides a single OpenAI-compatible API endpoint that can route requests to 100+ LLM providers using 18+ intelligent routing strategies, with enterprise features including high availability, persistence, observability, hot reload, and support for modern protocols (A2A, MCP, Skills).
 
@@ -17,6 +17,10 @@ The system provides a single OpenAI-compatible API endpoint that can route reque
 5. **Protocol Extensibility**: Support for emerging standards (A2A, MCP, Skills) alongside OpenAI compatibility
 6. **ML-Powered Intelligence**: Use trained routing models to optimize for cost, latency, and quality
 7. **Moat-Mode Ready**: Support air-gapped and controlled-egress deployments with standardized protocols
+
+### Enhancement Backlog
+
+This design is complemented by a prioritized backlog of cloud-native enhancements (HA, Security, Observability) detailed in **[`docs/litellm-cloud-native-enhancements.md`](../../../docs/litellm-cloud-native-enhancements.md)**. This backlog tracks the implementation of advanced features like hot-reload sync, streaming-aware shutdown, and durable audit exports.
 
 ## Architecture
 
@@ -254,7 +258,7 @@ class A2AMessagePart:
 - `DELETE /v1/agents/{agent_id}` - Unregister agent
 - `POST /v1/agents/{agent_id}/make_public` - Make agent public
 - `POST /a2a/{agent_id}` - Invoke agent (JSON-RPC 2.0)
-- `GET /a2a/{agent_id}/.well-known/agent-card.json` - Get agent card
+- `GET /v1/agents/{agent_id}/.well-known/agent-card.json` - Get agent card
 - `GET /agent/daily/activity` - Agent analytics
 
 **Database Schema**:
@@ -813,6 +817,8 @@ mcp_servers:
     transport: string            # Transport type (streamable_http, sse, stdio)
     spec_path: string            # Optional OpenAPI spec path
     auth_type: string            # Authentication type (none, api_key, bearer_token, oauth2)
+    created_at: datetime
+    updated_at: datetime
 ```
 
 ### LLM Candidates JSON
@@ -1031,180 +1037,4 @@ async def test_routing_with_cache():
 
 ### Property 2: Authentication Enforcement
 
-*For any* request to the Gateway when master_key is configured, the request should be accepted if and only if it includes a valid API key (either master_key or a valid virtual key from the database).
-
-**Validates: Requirements 1.3, 7.5, 11.1, 11.4**
-
-### Property 3: Configuration Loading
-
-*For any* valid YAML configuration file containing model_list, router_settings, and general_settings, the Gateway should successfully load the configuration and make all configured models and settings available.
-
-**Validates: Requirements 1.5**
-
-### Property 4: Routing Strategy Selection
-
-*For any* configured routing strategy name (either `llmrouter-*` or LiteLLM built-in), when a request is made, the Gateway should use the correct routing strategy to select a model and return a valid model name from the configured model list.
-
-**Validates: Requirements 2.2, 2.5, 2.6**
-
-### Property 5: Model and Config Hot Reload
-
-*For any* model file or configuration file that changes (detected via modification time or ETag), when hot reload is enabled, the Gateway should detect the change and reload the affected component without requiring a service restart.
-
-**Validates: Requirements 3.2, 3.4, 3.5**
-
-### Property 6: Data Persistence
-
-*For any* request processed by the Gateway when database_url is configured, all relevant data (virtual keys, request logs, cost data) should be persisted to PostgreSQL and be retrievable via database queries.
-
-**Validates: Requirements 4.1, 12.2**
-
-### Property 7: Response Caching
-
-*For any* two identical requests made to the Gateway when caching is enabled, the second request should return a cached response (indicated by cache hit metrics) without invoking the LLM provider, and the cached response should expire after the configured TTL.
-
-**Validates: Requirements 4.2, 13.1, 13.3**
-
-### Property 8: Cache Key Generation
-
-*For any* request with provider-specific optional parameters, when enable_caching_on_provider_specific_optional_params is true, the cache key should include those parameters such that requests differing only in provider-specific params produce different cache keys.
-
-**Validates: Requirements 13.4**
-
-### Property 9: Rate Limiting Enforcement
-
-*For any* virtual key with a configured rate limit, when the number of requests exceeds the limit within the time window, the Gateway should reject subsequent requests with HTTP 429 status until the window resets.
-
-**Validates: Requirements 11.6**
-
-### Property 10: Budget Tracking and Enforcement
-
-*For any* virtual key with a configured max_budget, the Gateway should track cumulative costs across all requests and reject requests that would exceed the budget, and the budget should reset after the configured budget_duration.
-
-**Validates: Requirements 11.5, 12.1, 12.3, 12.6**
-
-### Property 11: A2A Agent Registration and Discovery
-
-*For any* A2A agent registered via configuration or API, the agent should be discoverable via the `/v1/agents` endpoint and should be filterable by capability and permission, and the agent card should be retrievable in A2A protocol format at `/.well-known/agent-card.json`.
-
-**Validates: Requirements 7.2, 7.6, 7.13**
-
-### Property 23: A2A Agent Invocation
-
-*For any* registered A2A agent, when a valid JSON-RPC 2.0 request with method `message/send` is POSTed to `/a2a/{agent_id}`, the Gateway should forward the message to the agent backend and return a valid JSON-RPC 2.0 response.
-
-**Validates: Requirements 7.8, 7.9**
-
-### Property 24: A2A Streaming Response
-
-*For any* registered A2A agent, when a valid JSON-RPC 2.0 request with method `message/stream` is POSTed to `/a2a/{agent_id}`, the Gateway should stream the response using Server-Sent Events with proper event formatting.
-
-**Validates: Requirements 7.10**
-
-### Property 25: A2A Database Persistence
-
-*For any* A2A agent registered when database_url is configured, the agent should be persisted to PostgreSQL and should survive Gateway restarts, and should be retrievable via the `/v1/agents` endpoint after restart.
-
-**Validates: Requirements 7.7**
-
-### Property 26: A2A Agent Updates
-
-*For any* registered A2A agent, PUT requests to `/v1/agents/{agent_id}` should fully replace the agent data, and PATCH requests should merge the provided fields with existing data while preserving unspecified fields.
-
-**Validates: Requirements 7.11, 7.12**
-
-### Property 12: MCP Server Tool Loading
-
-*For any* MCP server configured in mcp_servers section or registered via API, the Gateway should load all tool definitions from the server and make them available in the tools list, and requests with `tools` type `mcp` should invoke the correct server.
-
-**Validates: Requirements 8.2, 8.3, 8.4**
-
-### Property 27: MCP Tool Invocation
-
-*For any* registered MCP server with available tools, when a POST request is made to `/mcp/tools/call` with a valid tool name and arguments, the Gateway should invoke the tool on the MCP server and return the tool's response.
-
-**Validates: Requirements 8.8**
-
-### Property 28: MCP Database Persistence
-
-*For any* MCP server registered when database_url is configured, the server and its tools should be persisted to PostgreSQL and should survive Gateway restarts, and should be retrievable via the `/v1/mcp/server` endpoint after restart.
-
-**Validates: Requirements 8.7**
-
-### Property 29: MCP OAuth Flow
-
-*For any* MCP server configured with OAuth authentication, the Gateway should support the complete OAuth 2.0 authorization code flow including session creation, authorization redirect, and token exchange.
-
-**Validates: Requirements 8.10, 8.11**
-
-### Property 30: MCP Server Health Check
-
-*For any* registered MCP server, when a GET request is made to `/v1/mcp/server/health`, the Gateway should check connectivity to the server and return the health status for each server.
-
-**Validates: Requirements 8.13**
-
-### Property 31: MCP Registry Discovery
-
-*For any* set of registered MCP servers, the `/v1/mcp/registry.json` endpoint should return a valid MCP registry document listing all servers and their capabilities for client discovery.
-
-**Validates: Requirements 8.12**
-
-### Property 13: OpenAPI to MCP Conversion
-
-*For any* valid OpenAPI specification provided via spec_path configuration, the Gateway should generate corresponding MCP tool definitions that can be invoked via the MCP protocol.
-
-**Validates: Requirements 8.6**
-
-### Property 14: MLOps Model Training
-
-*For any* valid training data in LLMRouter format, the MLOps pipeline should successfully train a routing model for the specified strategy type and save model artifacts that are compatible with the Gateway's hot reload mechanism.
-
-**Validates: Requirements 5.2, 5.3, 5.5**
-
-### Property 15: Observability Span and Log Emission
-
-*For any* request processed by the Gateway when observability is configured, the system should emit OpenTelemetry spans for all key events (routing decision, LLM call, cache hit/miss), emit structured logs with trace correlation IDs, and update metrics (request count, latency, error rate, cost).
-
-**Validates: Requirements 6.3, 6.4, 6.5, 6.9, 13.5, 14.6, 15.2, 15.4, 15.5**
-
-### Property 16: Per-Team Observability Settings
-
-*For any* team configured in default_team_settings with specific observability callbacks, requests made with that team's virtual keys should send traces, logs, and metrics to the team-specific observability backend (e.g., team-specific Langfuse project) with proper trace correlation.
-
-**Validates: Requirements 6.8**
-
-### Property 17: Retry with Exponential Backoff
-
-*For any* failed request when num_retries is configured, the Gateway should retry the request up to the specified count, and when all retries are exhausted, should return an error response with details about the failure.
-
-**Validates: Requirements 14.1, 14.5**
-
-### Property 18: Context Window Fallback
-
-*For any* request that exceeds the selected model's context window when context_window_fallbacks is configured, the Gateway should automatically fall back to the next model in the fallback list and successfully process the request.
-
-**Validates: Requirements 14.3**
-
-### Property 19: Timeout Enforcement
-
-*For any* request with a configured timeout (either global request_timeout or per-model timeout), the Gateway should cancel the request and return a timeout error if the LLM provider does not respond within the specified time.
-
-**Validates: Requirements 14.4**
-
-### Property 20: Routing Decision Logging with Trace Correlation
-
-*For any* request processed by the Gateway, the system should log the routing decision including the strategy used and model selected via OpenTelemetry structured logging with trace correlation IDs, and when store_model_in_db is false, should not log sensitive prompt content.
-
-**Validates: Requirements 15.2, 15.3, 15.5**
-
-### Property 21: Error Logging with Trace Context
-
-*For any* error that occurs during request processing, the Gateway should log the error via OpenTelemetry with a stack trace, relevant context (request ID, user ID, model name), and trace correlation IDs to enable debugging across distributed traces.
-
-**Validates: Requirements 15.7**
-
-### Property 22: S3 Config Sync with ETag Optimization
-
-*For any* configuration file stored in S3, the Config Sync Manager should only download the file when the ETag changes, avoiding unnecessary downloads when the content is unchanged.
-
-**Validates: Requirements 10.3**
+*For any* request to the Gateway when master_key is configured, the request should be accepted if and only if it includes a valid API key (either master_key or a valid virtual key from the database).*
