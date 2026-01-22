@@ -15,12 +15,12 @@ dependencies = [
     "pydantic>=2.5.0",
     "httpx>=0.26.0",
     # LiteLLM core (provides Router, logging, etc.)
-    "litellm>=1.30.0",
+    "litellm>=1.81.1",
     # A2A Protocol SDK (Agent-to-Agent communication)
     "a2a-sdk>=0.2.0",
     # Configuration and utilities
     "pyyaml>=6.0",
-    "boto3>=1.42.30",
+    "boto3>=1.42.32",
     "aiofiles>=23.0.0",
     "watchdog>=3.0.0",
     # Observability: OpenTelemetry core
@@ -38,8 +38,8 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "hypothesis>=6.100.0",
-    "black>=24.0.0",
-    "ruff>=0.3.0",
+    "black>=26.1.0",
+    "ruff>=0.14.13",
     "mypy>=1.8.0",
 ]
 # Database support (PostgreSQL with asyncpg and Prisma client for LiteLLM)
@@ -64,13 +64,18 @@ cloud = [
 callbacks = [
     "langfuse>=3.0.0",
 ]
-# Production extras (for Docker builds) - db, otel, cloud, callbacks without dev tools
+# KNN routing inference dependencies (sentence-transformers for embeddings)
+knn = [
+    "sentence-transformers>=5.2.0",
+    "scikit-learn>=1.3.0",
+]
+# Production extras (for Docker builds) - db, otel, cloud, callbacks, knn without dev tools
 prod = [
-    "litellm-llmrouter[db,otel,cloud,callbacks]",
+    "litellm-llmrouter[db,otel,cloud,callbacks,knn]",
 ]
 # All optional dependencies (including dev tools)
 all = [
-    "litellm-llmrouter[dev,db,otel,cloud]",
+    "litellm-llmrouter[dev,db,otel,cloud,knn]",
 ]
 
 [tool.setuptools.packages.find]

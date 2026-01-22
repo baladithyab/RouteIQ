@@ -8,11 +8,14 @@ routing strategies and LiteLLM's routing infrastructure.
 
 import json
 import os
+import pickle
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import tempfile
+import yaml
 from litellm._logging import verbose_proxy_logger
 
 try:
@@ -21,6 +24,174 @@ try:
     OTEL_AVAILABLE = True
 except ImportError:
     OTEL_AVAILABLE = False
+
+# Lazy import for sentence-transformers to avoid startup cost if not needed
+_sentence_transformer_model = None
+_sentence_transformer_lock = threading.Lock()
+
+
+def _get_sentence_transformer(model_name: str, device: str = "cpu"):
+    """
+    Get or create a cached SentenceTransformer model.
+
+    Uses lazy loading with thread-safe singleton pattern to avoid
+    loading the model multiple times across requests.
+
+    Args:
+        model_name: HuggingFace model name for sentence-transformers
+        device: Device to load model on ('cpu', 'cuda', etc.)
+
+    Returns:
+        SentenceTransformer model instance
+    """
+    global _sentence_transformer_model
+
+    with _sentence_transformer_lock:
+        if _sentence_transformer_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                verbose_proxy_logger.info(
+                    f"Loading SentenceTransformer model: {model_name} on {device}"
+                )
+                _sentence_transformer_model = SentenceTransformer(
+                    model_name, device=device
+                )
+                verbose_proxy_logger.info(
+                    "SentenceTransformer model loaded successfully"
+                )
+            except ImportError:
+                raise ImportError(
+                    "sentence-transformers package is required for KNN inference. "
+                    "Install with: pip install sentence-transformers"
+                )
+        return _sentence_transformer_model
+
+
+# Default embedding model matching the training pipeline
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+class InferenceKNNRouter:
+    """
+    Lightweight inference-only KNN router that loads sklearn models directly.
+
+    This class bypasses the UIUC LLMRouter's MetaRouter initialization which
+    requires training data. Instead, it:
+    - Loads a pre-trained sklearn KNeighborsClassifier from a .pkl file
+    - Uses sentence-transformers for text embedding (same as training)
+    - Predicts the best model label for a given query
+
+    The trained .pkl file is produced by UIUC's KNNRouterTrainer which calls
+    sklearn's KNeighborsClassifier.fit() and saves via pickle.
+
+    Attributes:
+        model_path: Path to the trained .pkl model file
+        embedding_model: Name of the sentence-transformer model
+        embedding_device: Device for embedding model ('cpu', 'cuda')
+        knn_model: Loaded sklearn KNeighborsClassifier
+        label_mapping: Optional mapping from predicted labels to LLM candidate keys
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_device: str = "cpu",
+        label_mapping: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Initialize inference-only KNN router.
+
+        Args:
+            model_path: Path to the trained sklearn KNN model (.pkl file)
+            embedding_model: HuggingFace model name for sentence embeddings
+            embedding_device: Device for embedding model ('cpu', 'cuda', etc.)
+            label_mapping: Optional dict mapping predicted labels to LLM keys
+        """
+        self.model_path = model_path
+        self.embedding_model = embedding_model
+        self.embedding_device = embedding_device
+        self.label_mapping = label_mapping or {}
+        self.knn_model = None
+
+        # Load the model
+        self._load_model()
+
+    def _load_model(self):
+        """Load the sklearn KNN model from pickle file."""
+        if not self.model_path:
+            raise ValueError("model_path is required for InferenceKNNRouter")
+
+        path = Path(self.model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"KNN model file not found: {self.model_path}")
+
+        verbose_proxy_logger.info(f"Loading KNN model from: {self.model_path}")
+
+        with open(self.model_path, "rb") as f:
+            self.knn_model = pickle.load(f)
+
+        # Verify it's a sklearn model with predict method
+        if not hasattr(self.knn_model, "predict"):
+            raise TypeError(
+                f"Loaded model does not have 'predict' method. "
+                f"Expected sklearn KNeighborsClassifier, got {type(self.knn_model)}"
+            )
+
+        verbose_proxy_logger.info(
+            f"KNN model loaded successfully. Type: {type(self.knn_model).__name__}"
+        )
+
+    def reload_model(self):
+        """Reload the model from disk (for hot reload support)."""
+        self._load_model()
+
+    def route(self, query: str) -> Optional[str]:
+        """
+        Route a query to the best model using KNN prediction.
+
+        Args:
+            query: User query text to route
+
+        Returns:
+            Predicted model label/key, or None if prediction fails
+        """
+        if self.knn_model is None:
+            verbose_proxy_logger.warning("KNN model not loaded, cannot route")
+            return None
+
+        try:
+            # Get embedding using the same model used in training
+            embedder = _get_sentence_transformer(
+                self.embedding_model, self.embedding_device
+            )
+
+            # Encode the query to get embedding vector
+            # Shape: (embedding_dim,) -> need (1, embedding_dim) for predict
+            embedding = embedder.encode([query], convert_to_numpy=True)
+
+            # Predict using the KNN model
+            predicted_label = self.knn_model.predict(embedding)[0]
+
+            verbose_proxy_logger.debug(
+                f"KNN routing: query='{query[:50]}...' -> predicted={predicted_label}"
+            )
+
+            # Apply label mapping if configured
+            if self.label_mapping and predicted_label in self.label_mapping:
+                mapped_label = self.label_mapping[predicted_label]
+                verbose_proxy_logger.debug(
+                    f"KNN label mapping: {predicted_label} -> {mapped_label}"
+                )
+                return mapped_label
+
+            return str(predicted_label)
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"KNN routing error: {e}")
+            return None
+
 
 # Available LLMRouter strategies (matching llmrouter.models exports)
 # See: https://github.com/ulab-uiuc/LLMRouter#-supported-routers
@@ -51,6 +222,66 @@ LLMROUTER_STRATEGIES = [
 ]
 
 
+# Default hyperparameters for each router type when no config is provided
+# These match the defaults used in the UIUC LLMRouter library
+DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
+    "knn": {
+        "n_neighbors": 5,
+        "metric": "cosine",
+        "weights": "distance",
+    },
+    "svm": {
+        "C": 1.0,
+        "kernel": "rbf",
+        "gamma": "scale",
+    },
+    "mlp": {
+        "hidden_layer_sizes": [128, 64],
+        "activation": "relu",
+        "max_iter": 500,
+    },
+    "mf": {
+        "n_factors": 64,
+        "n_epochs": 20,
+        "lr": 0.01,
+    },
+    "elo": {
+        "k_factor": 32,
+        "initial_rating": 1500,
+    },
+    "routerdc": {
+        "temperature": 0.07,
+        "hidden_size": 768,
+    },
+    "hybrid": {
+        "threshold": 0.5,
+    },
+    "causallm": {
+        "model_name": "gpt2",
+        "max_length": 512,
+    },
+    "graph": {
+        "hidden_dim": 128,
+        "num_layers": 2,
+    },
+    "automix": {
+        "alpha": 0.5,
+    },
+    "gmt": {
+        "hidden_dim": 64,
+    },
+    "knn-multiround": {
+        "n_neighbors": 5,
+        "max_rounds": 3,
+    },
+    "llm-multiround": {
+        "max_rounds": 3,
+    },
+    "smallest": {},
+    "largest": {},
+}
+
+
 class LLMRouterStrategyFamily:
     """
     Wraps LLMRouter routing models to work with LiteLLM's routing infrastructure.
@@ -72,6 +303,11 @@ class LLMRouterStrategyFamily:
         reload_interval: int = 300,
         model_s3_bucket: Optional[str] = None,
         model_s3_key: Optional[str] = None,
+        # New inference-only KNN config keys
+        embedding_model: Optional[str] = None,
+        embedding_device: str = "cpu",
+        label_mapping: Optional[Dict[str, str]] = None,
+        use_inference_only: bool = True,  # Default to inference-only for KNN
         **kwargs,
     ):
         self.strategy_name = strategy_name
@@ -82,6 +318,15 @@ class LLMRouterStrategyFamily:
         self.reload_interval = reload_interval
         self.model_s3_bucket = model_s3_bucket
         self.model_s3_key = model_s3_key
+        # New inference-only config
+        self.embedding_model = embedding_model or os.environ.get(
+            "LLMROUTER_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+        )
+        self.embedding_device = embedding_device or os.environ.get(
+            "LLMROUTER_EMBEDDING_DEVICE", "cpu"
+        )
+        self.label_mapping = label_mapping or {}
+        self.use_inference_only = use_inference_only
         self.extra_kwargs = kwargs
 
         self._router = None
@@ -96,6 +341,10 @@ class LLMRouterStrategyFamily:
         self._llm_data = self._load_llm_data()
 
         verbose_proxy_logger.info(f"Initialized LLMRouter strategy: {strategy_name}")
+        if self.use_inference_only and strategy_name == "llmrouter-knn":
+            verbose_proxy_logger.info(
+                f"  Using inference-only mode with embedding_model={self.embedding_model}"
+            )
 
     def _resolve_model_path(self, model_path: Optional[str]) -> Optional[str]:
         """
@@ -176,9 +425,68 @@ class LLMRouterStrategyFamily:
 
         return False
 
+    def _get_or_create_config_path(self, strategy_type: str) -> str:
+        """
+        Get or create a temporary configuration file for the router.
+
+        If config_path is provided, use it directly.
+        Otherwise, create a temporary YAML file with default hyperparameters
+        and placeholder paths for the given router type.
+
+        The LLMRouter library expects a YAML config with specific keys:
+        - hparam: Hyperparameters for the router algorithm
+        - data_path: Paths to training data (placeholders for inference-only mode)
+        - model_path: Paths for model loading/saving
+
+        Args:
+            strategy_type: The type of router (e.g., "knn", "svm", etc.)
+
+        Returns:
+            Path to the configuration file
+        """
+        if self.config_path:
+            return self.config_path
+
+        # Get default hyperparameters for the given router type
+        hparams = DEFAULT_ROUTER_HPARAMS.get(strategy_type, {})
+
+        # Build a minimal config structure that LLMRouter expects
+        config = {
+            "hparam": hparams,
+            "data_path": {
+                # Placeholder paths - not used during inference
+                "routing_data_train": "/tmp/placeholder_train.jsonl",
+                "routing_data_test": "/tmp/placeholder_test.jsonl",
+                "query_embedding_data": "/tmp/placeholder_embeddings.pt",
+                "llm_data": self.llm_data_path or "/tmp/placeholder_llm_data.json",
+            },
+            "model_path": {
+                "load_model_path": self.model_path or "/tmp/placeholder_model.pkl",
+                "save_model_path": self.model_path or "/tmp/placeholder_model.pkl",
+            },
+        }
+
+        # Create a temporary YAML file
+        fd, tmp_path = tempfile.mkstemp(suffix=".yaml", prefix="llmrouter_config_")
+        try:
+            with os.fdopen(fd, "w") as tmp:
+                yaml.dump(config, tmp, default_flow_style=False)
+            verbose_proxy_logger.info(
+                f"Created temporary config for {strategy_type} router: {tmp_path}"
+            )
+            return tmp_path
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to create temporary config: {e}")
+            os.close(fd)
+            raise
+
     def _load_router(self):
         """Load the appropriate LLMRouter model based on strategy name."""
         strategy_type = self.strategy_name.replace("llmrouter-", "")
+
+        # For KNN with inference-only mode, use our lightweight InferenceKNNRouter
+        if strategy_type == "knn" and self.use_inference_only:
+            return self._load_inference_knn_router()
 
         # Map strategy names to router classes
         router_map = {
@@ -215,7 +523,8 @@ class LLMRouterStrategyFamily:
                 )
                 from llmrouter.models import MetaRouter
 
-                return MetaRouter(yaml_path=self.config_path)
+                config_path = self._get_or_create_config_path(strategy_type)
+                return MetaRouter(yaml_path=config_path)
 
             router_class_name, is_optional = router_map[strategy_type]
 
@@ -234,7 +543,9 @@ class LLMRouterStrategyFamily:
                 else:
                     raise ImportError(f"Router class {router_class_name} not found")
 
-            router = router_class(yaml_path=self.config_path)
+            # Get or create config path with defaults if not provided
+            config_path = self._get_or_create_config_path(strategy_type)
+            router = router_class(yaml_path=config_path)
 
             # Load trained model if model_path is provided
             if self.model_path and hasattr(router, "load_router"):
@@ -257,6 +568,45 @@ class LLMRouterStrategyFamily:
             verbose_proxy_logger.error(f"Failed to load router: {e}")
             return None
 
+    def _load_inference_knn_router(self) -> Optional[InferenceKNNRouter]:
+        """
+        Load inference-only KNN router that bypasses UIUC MetaRouter.
+
+        This avoids the 'hparam' / NoneType.loc errors that occur when
+        UIUC's KNNRouter tries to load training data that doesn't exist
+        in the gateway container.
+
+        Returns:
+            InferenceKNNRouter instance, or None if loading fails
+        """
+        if not self.model_path:
+            verbose_proxy_logger.error(
+                "model_path is required for inference-only KNN router. "
+                "Set routing_strategy_args.model_path in config."
+            )
+            return None
+
+        try:
+            router = InferenceKNNRouter(
+                model_path=self.model_path,
+                embedding_model=self.embedding_model,
+                embedding_device=self.embedding_device,
+                label_mapping=self.label_mapping,
+            )
+            verbose_proxy_logger.info(
+                f"Loaded inference-only KNN router from: {self.model_path}"
+            )
+            return router
+        except FileNotFoundError as e:
+            verbose_proxy_logger.warning(
+                f"KNN model file not found: {e}. "
+                "Ensure model is trained and deployed to model_path."
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to load inference-only KNN router: {e}")
+            return None
+
     def _load_custom_router(self):
         """Load a custom router from the custom routers directory."""
         custom_path = os.environ.get(
@@ -271,7 +621,19 @@ class LLMRouterStrategyFamily:
         """Get the router instance, loading/reloading as needed."""
         with self._router_lock:
             if self._router is None or self._should_reload():
-                self._router = self._load_router()
+                # For inference-only KNN, check if we need to reload the model
+                if (
+                    self._router is not None
+                    and isinstance(self._router, InferenceKNNRouter)
+                    and self._should_reload()
+                ):
+                    verbose_proxy_logger.info(
+                        "Hot reloading KNN model due to file change"
+                    )
+                    self._router.reload_model()
+                else:
+                    self._router = self._load_router()
+
                 self._last_load_time = time.time()
                 if self.model_path:
                     try:
