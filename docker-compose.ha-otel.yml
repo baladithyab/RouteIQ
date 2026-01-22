@@ -22,6 +22,11 @@ services:
     networks:
       - litellm-network
       - otel-network
+    depends_on:
+      jaeger-otel:
+        condition: service_started
+      mcp-stub-server:
+        condition: service_healthy
 
   litellm-gateway-2:
     environment:
@@ -40,13 +45,64 @@ services:
     networks:
       - litellm-network
       - otel-network
+    depends_on:
+      jaeger-otel:
+        condition: service_started
+      mcp-stub-server:
+        condition: service_healthy
 
   nginx:
     networks:
       - litellm-network
       - otel-network
 
+  # ==========================================================================
+  # Jaeger - Distributed Tracing Backend
+  # ==========================================================================
+  jaeger-otel:
+    image: jaegertracing/all-in-one:1.54
+    container_name: jaeger-otel
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+      - otel-network
+
+  # ==========================================================================
+  # MCP Stub Server - For E2E MCP Gateway Testing
+  # ==========================================================================
+  mcp-stub-server:
+    image: python:3.12-slim
+    container_name: mcp-stub-server
+    working_dir: /app
+    volumes:
+      - ./scripts/mcp_stub_server.py:/app/mcp_stub_server.py:ro
+    command: >
+      sh -c "pip install --quiet fastapi uvicorn pydantic &&
+             uvicorn mcp_stub_server:app --host 0.0.0.0 --port 9100"
+    ports:
+      - "9100:9100"
+    environment:
+      - MCP_STUB_NAME=Stub MCP Server
+      - MCP_STUB_VERSION=0.1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/mcp/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks:
+      - litellm-network
+
 networks:
   otel-network:
-    external: true
-    name: litellm-llm-router_otel-network
+    driver: bridge

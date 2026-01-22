@@ -13,8 +13,9 @@ set -euo pipefail
 LB_URL="http://localhost:8080"
 REPLICA1_URL="http://localhost:4000"
 REPLICA2_URL="http://localhost:4001"
-STUB_CONTAINER_URL="http://172.17.0.1:9100/mcp"
-STUB_LOCAL_URL="http://localhost:9100/mcp"
+# MCP stub server URL as seen by containers (service name in Docker network)
+STUB_CONTAINER_URL="${MCP_STUB_URL:-http://mcp-stub-server:9100/mcp}"
+STUB_LOCAL_URL="${MCP_STUB_LOCAL_URL:-http://localhost:9100/mcp}"
 AUTH_HEADER="Authorization: Bearer sk-master-key-change-me"
 
 # Colors for output

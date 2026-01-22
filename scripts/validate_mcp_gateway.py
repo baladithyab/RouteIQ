@@ -13,7 +13,8 @@ import httpx
 DEFAULT_LB_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:8080")
 DEFAULT_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-master-key-change-me")
 DEFAULT_REPLICA_URLS = ["http://localhost:4000", "http://localhost:4001"]
-DEFAULT_STUB_URL = os.getenv("MCP_STUB_URL", "http://172.17.0.1:9100/mcp")
+# MCP stub server URL as seen by containers (service name in Docker network)
+DEFAULT_STUB_URL = os.getenv("MCP_STUB_URL", "http://mcp-stub-server:9100/mcp")
 DEFAULT_STUB_LOCAL_URL = os.getenv("MCP_STUB_LOCAL_URL", "http://localhost:9100/mcp")
 STREAMING_CONTENT_TYPE = "text/event-stream"
 
