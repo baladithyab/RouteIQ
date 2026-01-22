@@ -1,6 +1,16 @@
 # Validation Plan: LiteLLM + LLMRouter vs Original LiteLLM
 
-This document outlines the validation strategy to ensure our container provides feature parity with the original LiteLLM Docker image, plus LLMRouter enhancements.
+This document outlines the validation strategy to ensure our container provides feature parity with the original LiteLLM Docker image, while delivering significant enhancements: **High Availability (HA)**, **OpenTelemetry (OTEL)**, **LLMRouter intelligent routing**, **Hot Reloading**, and **A2A/MCP Gateways**.
+
+Our implementation leverages standardized protocols (HTTP, SSE, OTLP, Postgres, Redis) to ensure robust, scalable integration.
+
+## Completed Validation Gates
+
+The following validation gates have been successfully completed. Refer to the detailed reports for findings and verification steps:
+
+- **Gate 6: MCP Validation**: [`GATE6_MCP_VALIDATION_REPORT.md`](GATE6_MCP_VALIDATION_REPORT.md:1)
+- **Gate 7: Security Validation**: [`GATE7_SECURITY_VALIDATION_REPORT.md`](GATE7_SECURITY_VALIDATION_REPORT.md:1)
+- **Gate 8: Observability Validation**: [`GATE8_OBSERVABILITY_VALIDATION_REPORT.md`](GATE8_OBSERVABILITY_VALIDATION_REPORT.md:1)
 
 ## Feature Comparison Matrix
 
@@ -49,8 +59,8 @@ This document outlines the validation strategy to ensure our container provides 
 | MLflow tracking | ✅ Tested | Experiment tracking |
 | Training pipeline | ✅ Tested | `train_from_traces.py` |
 | S3 config sync | ✅ Tested | Config from S3 |
-| A2A Gateway | ⏳ Need Test | Agent-to-Agent |
-| MCP Gateway | ⏳ Need Test | Model Context Protocol |
+| A2A Gateway | ✅ Tested | Agent-to-Agent |
+| MCP Gateway | ✅ Tested | Model Context Protocol |
 
 ---
 
@@ -115,6 +125,48 @@ docker compose -f docker-compose.ha.yml up -d
 | No shell escape | `docker exec sh` | Should fail |
 | Secret handling | Check logs | No key leakage |
 | TLS support | Test with HTTPS | Works |
+
+### 6. Gate 8b: MCP & Observability Validation
+
+To validate the MCP Gateway integration with full observability (HA + OTEL), use the dedicated overlay:
+
+```bash
+docker compose -f docker-compose.ha-otel.yml up -d --build
+```
+
+This configuration spins up the LiteLLM container with the MCP Gateway enabled, alongside Jaeger for tracing and Prometheus/Grafana for metrics.
+
+### 7. MLOps E2E Pipeline
+
+This section validates the complete MLOps loop: **Traces → Convert → Train → Deploy → Hot Reload**.
+
+**Pipeline Steps:**
+
+1.  **Extract Traces**: Pull traces from Jaeger.
+    ```bash
+    python examples/mlops/scripts/extract_jaeger_traces.py
+    ```
+    Reference: [`examples/mlops/scripts/extract_jaeger_traces.py`](examples/mlops/scripts/extract_jaeger_traces.py:1)
+
+2.  **Convert Data**: Transform traces into LLMRouter training format.
+    ```bash
+    python examples/mlops/scripts/convert_traces_to_llmrouter.py
+    ```
+    Reference: [`examples/mlops/scripts/convert_traces_to_llmrouter.py`](examples/mlops/scripts/convert_traces_to_llmrouter.py:1)
+
+3.  **Train Router**: Train the routing model.
+    ```bash
+    python examples/mlops/scripts/train_router.py
+    ```
+    Reference: [`examples/mlops/scripts/train_router.py`](examples/mlops/scripts/train_router.py:1)
+
+4.  **Deploy & Hot Reload**: The system is configured to hot-reload the new model.
+    See config example: [`config/config.local-test.yaml`](config/config.local-test.yaml:1)
+
+### 8. Gate 9: Moat Mode
+
+For the upcoming "Moat Mode" validation (Gate 9), refer to the detailed plan:
+[`docs/moat-mode.md`](docs/moat-mode.md:1)
 
 ---
 
