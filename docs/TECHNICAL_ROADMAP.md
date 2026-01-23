@@ -9,7 +9,7 @@ For a detailed backlog of specific enhancements, see **[LiteLLM Cloud-Native Enh
 *   **Goal**: A stable, production-ready container combining LiteLLM Proxy and LLMRouter.
 *   **Key Deliverables**:
     *   [x] Unified Docker container (LiteLLM + LLMRouter).
-    *   [x] Basic ML Routing strategies (KNN, SVM).
+    *   [x] Basic ML Routing strategies (KNN, SVM) - see [ML Routing Architecture](architecture/ml-routing-cloud-native.md).
     *   [ ] **P0: Hot-Reload Config Sync**: Dynamic updates for models and config without restart.
     *   [ ] **P0: Routing Decision Visibility**: Full OTel instrumentation for routing logic.
     *   [ ] **P1: Streaming-Aware Shutdown**: Graceful termination for long-running LLM streams.
