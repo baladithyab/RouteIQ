@@ -75,6 +75,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write  # Required for SLSA provenance attestations
+      attestations: write  # Required for artifact attestations
 
     strategy:
       fail-fast: false
@@ -133,6 +135,9 @@ jobs:
           cache-from: type=gha,scope=build-${{ steps.platform.outputs.pair }}
           cache-to: type=gha,mode=max,scope=build-${{ steps.platform.outputs.pair }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          # Enable provenance and SBOM generation for supply-chain security
+          provenance: ${{ github.event_name != 'pull_request' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'

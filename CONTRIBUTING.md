@@ -28,6 +28,30 @@ pip install -r requirements.txt
 docker compose -f docker-compose.local-test.yml up -d
 ```
 
+### Git Hooks (Lefthook)
+
+This project uses [Lefthook](https://github.com/evilmartians/lefthook) for git hooks.
+Lefthook runs fast, parallel linting on staged files before each commit.
+
+```bash
+# Install Lefthook and configure git hooks
+./scripts/install_lefthook.sh
+
+# Manual hook runs
+lefthook run pre-commit    # Run pre-commit checks
+lefthook run post-commit   # Run post-commit reminder
+```
+
+**Hooks configured:**
+- `pre-commit`: Runs ruff format/check on Python files and yamllint on YAML files
+- `post-commit`: Displays a reminder to run tests before pushing
+
+The lint scripts prefer `uv` when available (the repo uses uv in containers), 
+but fall back to `python -m` if uv is not installed.
+
+> **Note:** The legacy `.pre-commit-config.yaml` file is retained for reference and 
+> CI compatibility (pre-commit.ci), but Lefthook is the recommended local setup.
+
 ### Building the Container
 
 ```bash

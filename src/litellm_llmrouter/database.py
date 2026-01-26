@@ -14,7 +14,6 @@ Database Schema:
 
 import os
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
@@ -100,7 +99,7 @@ class A2AAgentDB:
 class A2AAgentRepository:
     """
     Repository for A2A agent persistence.
-    
+
     Uses in-memory storage with optional PostgreSQL persistence.
     When database_url is configured, agents are persisted to PostgreSQL.
     """
@@ -114,14 +113,14 @@ class A2AAgentRepository:
         now = datetime.now(timezone.utc)
         agent.created_at = now
         agent.updated_at = now
-        
+
         # Store in memory
         self._agents[agent.agent_id] = agent
-        
+
         # Persist to database if configured
         if self._db_url:
             await self._persist_to_db(agent)
-        
+
         verbose_proxy_logger.info(f"A2A DB: Created agent {agent.agent_id}")
         return agent
 
@@ -130,14 +129,14 @@ class A2AAgentRepository:
         # Try memory first
         if agent_id in self._agents:
             return self._agents[agent_id]
-        
+
         # Try database if configured
         if self._db_url:
             agent = await self._load_from_db(agent_id)
             if agent:
                 self._agents[agent_id] = agent
                 return agent
-        
+
         return None
 
     async def list_all(
@@ -148,14 +147,14 @@ class A2AAgentRepository:
     ) -> list[A2AAgentDB]:
         """
         List all agents with optional filtering.
-        
+
         Args:
             user_id: Filter by user ID
             team_id: Filter by team ID
             include_public: Include public agents
         """
         agents = list(self._agents.values())
-        
+
         # Apply filters
         filtered = []
         for agent in agents:
@@ -163,57 +162,55 @@ class A2AAgentRepository:
             if include_public and agent.is_public:
                 filtered.append(agent)
                 continue
-            
+
             # Include if user matches
             if user_id and agent.user_id == user_id:
                 filtered.append(agent)
                 continue
-            
+
             # Include if team matches
             if team_id and agent.team_id == team_id:
                 filtered.append(agent)
                 continue
-            
+
             # Include if no filters specified
             if not user_id and not team_id:
                 filtered.append(agent)
-        
+
         return filtered
 
     async def update(self, agent_id: str, agent: A2AAgentDB) -> A2AAgentDB | None:
         """Update an existing agent (full update)."""
         if agent_id not in self._agents:
             return None
-        
+
         agent.updated_at = datetime.utcnow()
         agent.created_at = self._agents[agent_id].created_at
         self._agents[agent_id] = agent
-        
+
         if self._db_url:
             await self._persist_to_db(agent)
-        
+
         verbose_proxy_logger.info(f"A2A DB: Updated agent {agent_id}")
         return agent
 
-    async def patch(
-        self, agent_id: str, updates: dict[str, Any]
-    ) -> A2AAgentDB | None:
+    async def patch(self, agent_id: str, updates: dict[str, Any]) -> A2AAgentDB | None:
         """Partially update an agent."""
         agent = await self.get(agent_id)
         if not agent:
             return None
-        
+
         # Apply updates
         for key, value in updates.items():
             if hasattr(agent, key) and key not in ("agent_id", "created_at"):
                 setattr(agent, key, value)
-        
+
         agent.updated_at = datetime.utcnow()
         self._agents[agent_id] = agent
-        
+
         if self._db_url:
             await self._persist_to_db(agent)
-        
+
         verbose_proxy_logger.info(f"A2A DB: Patched agent {agent_id}")
         return agent
 
@@ -221,12 +218,12 @@ class A2AAgentRepository:
         """Delete an agent."""
         if agent_id not in self._agents:
             return False
-        
+
         del self._agents[agent_id]
-        
+
         if self._db_url:
             await self._delete_from_db(agent_id)
-        
+
         verbose_proxy_logger.info(f"A2A DB: Deleted agent {agent_id}")
         return True
 
@@ -243,7 +240,7 @@ class A2AAgentRepository:
         try:
             import asyncpg
             import json
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(
@@ -287,7 +284,7 @@ class A2AAgentRepository:
         try:
             import asyncpg
             import json
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 row = await conn.fetchrow(
@@ -300,7 +297,9 @@ class A2AAgentRepository:
                         name=row["name"],
                         description=row["description"],
                         url=row["url"],
-                        capabilities=json.loads(row["capabilities"]) if row["capabilities"] else [],
+                        capabilities=json.loads(row["capabilities"])
+                        if row["capabilities"]
+                        else [],
                         metadata=json.loads(row["metadata"]) if row["metadata"] else {},
                         team_id=row["team_id"],
                         user_id=row["user_id"],
@@ -320,7 +319,7 @@ class A2AAgentRepository:
         """Delete agent from PostgreSQL database."""
         try:
             import asyncpg
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(
@@ -370,7 +369,7 @@ async def run_migrations() -> None:
 
     try:
         import asyncpg
-        
+
         conn = await asyncpg.connect(db_url)
         try:
             await conn.execute(A2A_AGENTS_TABLE_SQL)
@@ -414,7 +413,7 @@ class A2AAgentActivity:
     total_latency_ms: int = 0
     success_count: int = 0
     error_count: int = 0
-    
+
     @property
     def avg_latency_ms(self) -> float:
         """Calculate average latency in milliseconds."""
@@ -437,7 +436,7 @@ class A2AAgentActivity:
 class A2AActivityTracker:
     """
     Tracks A2A agent invocation activity for analytics.
-    
+
     Uses in-memory storage with optional PostgreSQL persistence.
     Activity is aggregated by agent_id and date.
     """
@@ -455,7 +454,7 @@ class A2AActivityTracker:
     ) -> None:
         """
         Record an agent invocation.
-        
+
         Args:
             agent_id: The ID of the agent that was invoked
             latency_ms: The latency of the invocation in milliseconds
@@ -463,13 +462,13 @@ class A2AActivityTracker:
         """
         today = date.today()
         key = (agent_id, today)
-        
+
         if key not in self._activity:
             self._activity[key] = A2AAgentActivity(
                 agent_id=agent_id,
                 invocation_date=today,
             )
-        
+
         activity = self._activity[key]
         activity.invocation_count += 1
         activity.total_latency_ms += latency_ms
@@ -477,7 +476,7 @@ class A2AActivityTracker:
             activity.success_count += 1
         else:
             activity.error_count += 1
-        
+
         # Persist to database if configured
         if self._db_url:
             await self._persist_activity_to_db(activity)
@@ -490,30 +489,30 @@ class A2AActivityTracker:
     ) -> list[A2AAgentActivity]:
         """
         Get daily activity records with optional filtering.
-        
+
         Args:
             agent_id: Filter by agent ID (None for all agents)
             start_date: Start date for the range (inclusive)
             end_date: End date for the range (inclusive)
-        
+
         Returns:
             List of activity records matching the filters
         """
         results = []
-        
+
         for (aid, activity_date), activity in self._activity.items():
             # Filter by agent_id
             if agent_id and aid != agent_id:
                 continue
-            
+
             # Filter by date range
             if start_date and activity_date < start_date:
                 continue
             if end_date and activity_date > end_date:
                 continue
-            
+
             results.append(activity)
-        
+
         # Sort by date descending
         results.sort(key=lambda x: x.invocation_date, reverse=True)
         return results
@@ -526,17 +525,17 @@ class A2AActivityTracker:
     ) -> dict[str, Any]:
         """
         Get aggregated activity statistics.
-        
+
         Args:
             agent_id: Filter by agent ID (None for all agents)
             start_date: Start date for the range (inclusive)
             end_date: End date for the range (inclusive)
-        
+
         Returns:
             Aggregated statistics including total invocations, avg latency, etc.
         """
         activities = await self.get_daily_activity(agent_id, start_date, end_date)
-        
+
         if not activities:
             return {
                 "total_invocations": 0,
@@ -549,18 +548,20 @@ class A2AActivityTracker:
                     "end": end_date.isoformat() if end_date else None,
                 },
             }
-        
+
         total_invocations = sum(a.invocation_count for a in activities)
         total_latency = sum(a.total_latency_ms for a in activities)
         total_success = sum(a.success_count for a in activities)
         total_errors = sum(a.error_count for a in activities)
         unique_agents = len(set(a.agent_id for a in activities))
-        
+
         return {
             "total_invocations": total_invocations,
             "total_success": total_success,
             "total_errors": total_errors,
-            "avg_latency_ms": round(total_latency / total_invocations, 2) if total_invocations > 0 else 0.0,
+            "avg_latency_ms": round(total_latency / total_invocations, 2)
+            if total_invocations > 0
+            else 0.0,
             "unique_agents": unique_agents,
             "date_range": {
                 "start": min(a.invocation_date for a in activities).isoformat(),
@@ -572,7 +573,7 @@ class A2AActivityTracker:
         """Persist activity to PostgreSQL database."""
         try:
             import asyncpg
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(
@@ -597,7 +598,9 @@ class A2AActivityTracker:
             finally:
                 await conn.close()
         except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping activity persist")
+            verbose_proxy_logger.warning(
+                "asyncpg not installed, skipping activity persist"
+            )
         except Exception as e:
             verbose_proxy_logger.error(f"A2A DB: Error persisting activity: {e}")
 
@@ -700,7 +703,7 @@ class MCPServerDB:
 class MCPServerRepository:
     """
     Repository for MCP server persistence.
-    
+
     Uses in-memory storage with optional PostgreSQL persistence.
     When database_url is configured, servers are persisted to PostgreSQL.
     """
@@ -714,14 +717,14 @@ class MCPServerRepository:
         now = datetime.now(timezone.utc)
         server.created_at = now
         server.updated_at = now
-        
+
         # Store in memory
         self._servers[server.server_id] = server
-        
+
         # Persist to database if configured
         if self._db_url:
             await self._persist_to_db(server)
-        
+
         verbose_proxy_logger.info(f"MCP DB: Created server {server.server_id}")
         return server
 
@@ -730,14 +733,14 @@ class MCPServerRepository:
         # Try memory first
         if server_id in self._servers:
             return self._servers[server_id]
-        
+
         # Try database if configured
         if self._db_url:
             server = await self._load_from_db(server_id)
             if server:
                 self._servers[server_id] = server
                 return server
-        
+
         return None
 
     async def list_all(
@@ -748,14 +751,14 @@ class MCPServerRepository:
     ) -> list[MCPServerDB]:
         """
         List all servers with optional filtering.
-        
+
         Args:
             user_id: Filter by user ID
             team_id: Filter by team ID
             include_public: Include public servers
         """
         servers = list(self._servers.values())
-        
+
         # Apply filters
         filtered = []
         for server in servers:
@@ -763,35 +766,35 @@ class MCPServerRepository:
             if include_public and server.is_public:
                 filtered.append(server)
                 continue
-            
+
             # Include if user matches
             if user_id and server.user_id == user_id:
                 filtered.append(server)
                 continue
-            
+
             # Include if team matches
             if team_id and server.team_id == team_id:
                 filtered.append(server)
                 continue
-            
+
             # Include if no filters specified
             if not user_id and not team_id:
                 filtered.append(server)
-        
+
         return filtered
 
     async def update(self, server_id: str, server: MCPServerDB) -> MCPServerDB | None:
         """Update an existing server (full update)."""
         if server_id not in self._servers:
             return None
-        
+
         server.updated_at = datetime.now(timezone.utc)
         server.created_at = self._servers[server_id].created_at
         self._servers[server_id] = server
-        
+
         if self._db_url:
             await self._persist_to_db(server)
-        
+
         verbose_proxy_logger.info(f"MCP DB: Updated server {server_id}")
         return server
 
@@ -799,12 +802,12 @@ class MCPServerRepository:
         """Delete a server."""
         if server_id not in self._servers:
             return False
-        
+
         del self._servers[server_id]
-        
+
         if self._db_url:
             await self._delete_from_db(server_id)
-        
+
         verbose_proxy_logger.info(f"MCP DB: Deleted server {server_id}")
         return True
 
@@ -817,7 +820,7 @@ class MCPServerRepository:
         try:
             import asyncpg
             import json
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(
@@ -866,7 +869,7 @@ class MCPServerRepository:
         try:
             import asyncpg
             import json
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 row = await conn.fetchrow(
@@ -880,7 +883,9 @@ class MCPServerRepository:
                         url=row["url"],
                         transport=row["transport"],
                         tools=json.loads(row["tools"]) if row["tools"] else [],
-                        resources=json.loads(row["resources"]) if row["resources"] else [],
+                        resources=json.loads(row["resources"])
+                        if row["resources"]
+                        else [],
                         auth_type=row["auth_type"],
                         metadata=json.loads(row["metadata"]) if row["metadata"] else {},
                         team_id=row["team_id"],
@@ -901,7 +906,7 @@ class MCPServerRepository:
         """Delete server from PostgreSQL database."""
         try:
             import asyncpg
-            
+
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(

@@ -1,0 +1,36 @@
+# Lefthook - Git hooks manager
+# Install: ./scripts/install_lefthook.sh
+# Manual run: lefthook run pre-commit
+#
+# Note: This replaces pre-commit framework. The legacy .pre-commit-config.yaml
+# is kept for reference but should not be used for new setups.
+
+# Enable parallel execution for faster hooks
+assert_lefthook_installed: true
+
+pre-commit:
+  parallel: true
+  commands:
+    ruff-format:
+      glob: "*.py"
+      exclude: "^reference/"
+      run: ./scripts/lint.sh format {staged_files}
+      stage_fixed: true
+
+    ruff-check:
+      glob: "*.py"
+      exclude: "^reference/"
+      run: ./scripts/lint.sh check {staged_files}
+      stage_fixed: true
+
+    yamllint:
+      glob: "*.{yaml,yml}"
+      exclude: "(^reference/|^.github/)"
+      run: ./scripts/lint.sh yaml {staged_files}
+
+post-commit:
+  commands:
+    reminder:
+      run: |
+        echo "✅ Commit successful!"
+        echo "   Remember to run tests before pushing: pytest tests/"

@@ -93,3 +93,6 @@ temp/
 
 # Reference repos are now git submodules
 # reference/
+
+# Lefthook local installation
+.lefthook-local/
