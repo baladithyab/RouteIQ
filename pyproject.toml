@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.5.0",
     "httpx>=0.26.0",
     # LiteLLM core (provides Router, logging, etc.)
-    "litellm>=1.81.1",
+    "litellm>=1.81.3",
     # A2A Protocol SDK (Agent-to-Agent communication)
     "a2a-sdk>=0.2.0",
     # Configuration and utilities

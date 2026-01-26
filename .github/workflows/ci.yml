@@ -62,20 +62,23 @@ jobs:
           version: "0.9.26"
           enable-cache: true
 
-      - name: Install dependencies
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Create virtual environment and install dependencies
         run: |
-          uv pip install --system git+https://github.com/ulab-uiuc/LLMRouter.git
-          uv pip install --system litellm pytest pytest-asyncio
-          uv pip install --system -r requirements.txt
+          uv venv .venv
+          uv pip install --python .venv/bin/python git+https://github.com/ulab-uiuc/LLMRouter.git
+          uv pip install --python .venv/bin/python litellm pytest pytest-asyncio
+          uv pip install --python .venv/bin/python -r requirements.txt
 
       - name: Run unit tests
         run: |
-          uv run pytest tests/test_strategies.py -v --tb=short
+          .venv/bin/python -m pytest tests/test_strategies.py -v --tb=short
         env:
           PYTHONPATH: src
 
   # Docker build, smoke tests, and security scans are handled in docker-build.yml
-  # This workflow focuses on Python linting, unit tests, and compose validation
 
   validate-compose:
     runs-on: ubuntu-latest
