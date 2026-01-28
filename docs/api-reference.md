@@ -90,6 +90,20 @@ GET /health
 }
 ```
 
+### Cloud-Native Probes
+
+RouteIQ Gateway exposes standard liveness and readiness probes for Kubernetes/cloud environments:
+
+```http
+GET /_health/live
+```
+*Returns 200 OK if the service is running.*
+
+```http
+GET /_health/ready
+```
+*Returns 200 OK if the service is ready to accept traffic (DB/Redis connected).*
+
 ## Router-Specific Endpoints
 
 ### Get Current Routing Strategy
@@ -102,10 +116,9 @@ Authorization: Bearer sk-master-key
 **Response:**
 ```json
 {
-  "routing_strategy": "llmrouter-knn",
-  "model_path": "/app/models/knn_router.pt",
-  "hot_reload": true,
-  "last_reload": "2024-01-15T10:30:00Z"
+  "registered_strategies": ["llmrouter-knn", "llmrouter-mlp"],
+  "strategy_count": 2,
+  "hot_reload_enabled": true
 }
 ```
 
@@ -118,6 +131,8 @@ Authorization: Bearer sk-master-key
 
 ### Get Routing Decision (Debug)
 
+> **Note:** This endpoint is not yet implemented. Planned for future release.
+
 ```http
 POST /router/route
 Authorization: Bearer sk-master-key
@@ -128,7 +143,7 @@ Content-Type: application/json
 }
 ```
 
-**Response:**
+**Response (planned):**
 ```json
 {
   "selected_model": "claude-3-opus",
@@ -152,11 +167,12 @@ Authorization: Bearer sk-master-key
 Content-Type: application/json
 
 {
-  "agent_id": "my-agent",
-  "name": "My AI Agent",
+  "agent_name": "my-agent",
   "description": "Agent for customer support",
   "url": "http://agent-service:8000/a2a",
-  "capabilities": ["chat", "support"]
+  "capabilities": ["chat", "support"],
+  "agent_card_params": {},
+  "litellm_params": {}
 }
 ```
 
@@ -165,6 +181,20 @@ Content-Type: application/json
 ```http
 GET /a2a/agents
 Authorization: Bearer sk-master-key
+```
+
+**Response:**
+```json
+{
+  "agents": [
+    {
+      "agent_id": "abc123...",
+      "agent_name": "my-agent",
+      "description": "Agent for customer support",
+      "url": "http://agent-service:8000/a2a"
+    }
+  ]
+}
 ```
 
 ### Discover Agents by Capability
@@ -187,14 +217,35 @@ DELETE /a2a/agents/{agent_id}
 Authorization: Bearer sk-master-key
 ```
 
+### Streaming A2A Message
+
+```http
+POST /a2a/{agent_id}/message/stream
+Authorization: Bearer sk-master-key
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "method": "message/send",
+  "id": "1",
+  "params": { ... }
+}
+```
+
 ## MCP Gateway Endpoints
 
-> Requires `MCP_GATEWAY_ENABLED=true`
+> Requires `MCP_GATEWAY_ENABLED=true` and `LITELLM_ROUTER_MCP_MODE=true`
+> as MCP Gateway endpoints are not backwards-compatible with LiteLLM
+> native `/mcp` endpoints [using `/llmrouter/mcp`].
+> See README for details.
+
+> Note: These REST endpoints are prefixed with `/llmrouter/mcp` to avoid conflicts
+> with LiteLLM's native `/mcp` endpoint (which uses JSON-RPC over SSE).
 
 ### Register MCP Server
 
 ```http
-POST /mcp/servers
+POST /llmrouter/mcp/servers
 Authorization: Bearer sk-master-key
 Content-Type: application/json
 
@@ -210,28 +261,120 @@ Content-Type: application/json
 ### List MCP Servers
 
 ```http
-GET /mcp/servers
+GET /llmrouter/mcp/servers
+Authorization: Bearer sk-master-key
+```
+
+### Get MCP Server
+
+```http
+GET /llmrouter/mcp/servers/{server_id}
+Authorization: Bearer sk-master-key
+```
+
+### Update MCP Server
+
+```http
+PUT /llmrouter/mcp/servers/{server_id}
+Authorization: Bearer sk-master-key
+Content-Type: application/json
+
+{
+  "server_id": "my-mcp-server",
+  "name": "Updated MCP Server",
+  "url": "http://mcp-service:8080/mcp",
+  "transport": "streamable_http",
+  "tools": ["search", "fetch", "store"]
+}
+```
+
+### Unregister MCP Server
+
+```http
+DELETE /llmrouter/mcp/servers/{server_id}
 Authorization: Bearer sk-master-key
 ```
 
 ### List Available Tools
 
 ```http
-GET /mcp/tools
+GET /llmrouter/mcp/tools
 Authorization: Bearer sk-master-key
+```
+
+### List Available Tools (Detailed)
+
+```http
+GET /llmrouter/mcp/tools/list
+Authorization: Bearer sk-master-key
+```
+
+### Get Tool Details
+
+```http
+GET /llmrouter/mcp/tools/{tool_name}
+Authorization: Bearer sk-master-key
+```
+
+### Call MCP Tool
+
+```http
+POST /llmrouter/mcp/tools/call
+Authorization: Bearer sk-master-key
+Content-Type: application/json
+
+{
+  "tool_name": "search",
+  "arguments": { "query": "example" }
+}
+```
+
+### Register MCP Server Tool
+
+```http
+POST /llmrouter/mcp/servers/{server_id}/tools
+Authorization: Bearer sk-master-key
+Content-Type: application/json
+
+{
+  "name": "custom_tool",
+  "description": "A custom tool",
+  "input_schema": { "type": "object", "properties": {} }
+}
 ```
 
 ### List Available Resources
 
 ```http
-GET /mcp/resources
+GET /llmrouter/mcp/resources
 Authorization: Bearer sk-master-key
 ```
 
-### Unregister MCP Server
+### MCP Server Health
 
 ```http
-DELETE /mcp/servers/{server_id}
+GET /v1/llmrouter/mcp/server/health
+Authorization: Bearer sk-master-key
+```
+
+### Single MCP Server Health
+
+```http
+GET /v1/llmrouter/mcp/server/{server_id}/health
+Authorization: Bearer sk-master-key
+```
+
+### MCP Registry Document
+
+```http
+GET /v1/llmrouter/mcp/registry.json
+Authorization: Bearer sk-master-key
+```
+
+### MCP Access Groups
+
+```http
+GET /v1/llmrouter/mcp/access_groups
 Authorization: Bearer sk-master-key
 ```
 
@@ -266,6 +409,17 @@ Content-Type: application/json
 GET /v1/skills/{skill_id}
 Authorization: Bearer sk-proxy-key
 ```
+
+## Inherited API Families
+
+RouteIQ Gateway inherits the full suite of OpenAI-compatible endpoints from LiteLLM. For a complete analysis of supported endpoints, see [API Parity Analysis](api-parity-analysis.md).
+
+Key supported families include:
+
+- **Assistants**: `/v1/assistants*`, `/v1/threads*`, `/v1/runs*`
+- **Files**: `/v1/files*`
+- **Vector Stores**: `/v1/vector_stores*` (OpenAI-compatible file search)
+- **Responses**: `/v1/responses` (if configured)
 
 ## Config Sync Endpoints
 

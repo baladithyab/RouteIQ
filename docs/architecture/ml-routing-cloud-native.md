@@ -1,110 +1,106 @@
 # ML-Based Routing Architecture (Cloud-Native)
 
-This document outlines the architecture for deploying Machine Learning (ML) based routing strategies (KNN, MLP, SVM, etc.) within the [LiteLLM Cloud-Native Enhancement Layer](../litellm-cloud-native-enhancements.md). It details the end-to-end lifecycle from trace data to production inference, emphasizing High Availability (HA) and "Moat-Mode" (air-gapped) compatibility.
+This document describes the closed-loop MLOps architecture for **RouteIQ Gateway** routing.
 
-## 1. ML Routing Lifecycle
+Key principle: the **Data Plane** (serving) is decoupled from the **Control Plane** (training, registry, and rollout). The data plane should continue serving traffic even if control-plane systems are unavailable.
 
-The ML routing pipeline transforms historical traffic data into deployable routing artifacts that optimize for cost, latency, or quality.
+## 1. Planes and Responsibilities
 
-### 1.1 Data Sources & Feature Extraction
-The primary input for training is the **Trace History** of the gateway.
+### 1.1 Data Plane (Gateway Runtime)
 
-*   **Sources**:
-    *   **OTEL/Jaeger Traces**: Captured via OpenTelemetry instrumentation. Contains `query`, `model`, `latency`, `status_code`.
-    *   **Spend Logs**: LiteLLM's internal logging (Postgres/S3) for cost data.
-*   **Extraction**:
-    *   Scripts in [`examples/mlops/scripts/extract_jaeger_traces.py`](../../examples/mlops/scripts/extract_jaeger_traces.py:1) pull raw traces.
-    *   [`examples/mlops/scripts/convert_traces_to_llmrouter.py`](../../examples/mlops/scripts/convert_traces_to_llmrouter.py:1) normalizes data into the `JSONL` format required by `llmrouter`.
-    *   **Features**: Query text (embedded via `sentence-transformers`), historical latency, and success/failure signals.
+The data plane is the in-path serving runtime:
 
-### 1.2 Training & Artifact Registry
-Training is decoupled from the serving layer to ensure stability.
+- Receives client requests and enforces security controls.
+- Executes the **Routing Intelligence Layer** inline to select a provider/model per request.
+- Proxies requests via LiteLLM.
+- Emits telemetry (OpenTelemetry traces/logs) used for offline training.
 
-*   **Training Jobs**: Run as ephemeral containers (e.g., Kubernetes Jobs, Docker Compose) using [`examples/mlops/scripts/train_router.py`](../../examples/mlops/scripts/train_router.py:1).
-*   **Artifacts**:
-    *   **Model File**: `.pkl` (sklearn) or `.pt` (PyTorch) files containing the trained router logic.
-    *   **Config**: YAML metadata describing hyperparameters and label mappings.
-*   **Registry**:
-    *   **Standard**: S3-compatible object storage (AWS S3, MinIO, GCS).
-    *   **Moat-Mode**: Local filesystem or internal MinIO instance.
+Routing strategies are plugged into LiteLLM routing using [`python.LLMRouterStrategyFamily()`](../../src/litellm_llmrouter/strategies.py:318).
 
-### 1.3 Deployment & Hot Reload
-The gateway loads models dynamically without restarting.
+### 1.2 Control Plane (MLOps + Delivery)
 
-*   **Mechanism**: [`src/litellm_llmrouter/strategies.py`](../../src/litellm_llmrouter/strategies.py:1) implements `LLMRouterStrategyFamily`.
-*   **Hot Reload**:
-    *   The strategy checks for file modifications (`mtime`) or polls S3 at a configurable `reload_interval`.
-    *   **Zero-Downtime**: The old model services requests while the new model loads in the background. Swapping is atomic via thread locks.
+The control plane is out-of-path:
 
----
+- Extracts and labels training datasets.
+- Trains routing models.
+- Stores artifacts in a registry (MLflow and/or object storage).
+- Rolls out new configuration and model artifacts to the data plane (CI/CD, sidecars, init containers, or rolling deploys).
 
-## 2. Reference Architectures
+## 2. ML Routing Lifecycle (Telemetry → Train → Registry → Rollout)
 
-We support three primary deployment patterns ranging from simple file-based setups to complex, air-gapped enterprise environments.
+### 2.1 Data Sources & Feature Extraction
 
-### A. File/Artifact-Based (Sidecar Pattern)
+Primary input is the gateway's trace/log history.
+
+- **Sources**:
+  - **OTel/Jaeger traces** emitted by the data plane.
+  - Optional outcome signals (success/failure, latency, cost) depending on what you log/export.
+- **Extraction**:
+  - [`examples/mlops/scripts/extract_jaeger_traces.py`](../../examples/mlops/scripts/extract_jaeger_traces.py:1) pulls traces from Jaeger.
+  - [`examples/mlops/scripts/convert_traces_to_llmrouter.py`](../../examples/mlops/scripts/convert_traces_to_llmrouter.py:1) converts data into the JSONL + embeddings format expected by `llmrouter` training.
+
+### 2.2 Training & Artifact Registry
+
+Training is decoupled from serving to preserve stability.
+
+- **Training jobs**: run as ephemeral containers (Kubernetes Jobs, Docker Compose, CI runners) using [`examples/mlops/scripts/train_router.py`](../../examples/mlops/scripts/train_router.py:1).
+- **Artifacts** (examples):
+  - **KNN (sklearn)**: `.pkl` model files.
+  - **Torch-based routers**: `.pt` model files (router-dependent).
+  - **Config/metadata**: YAML and JSON files describing hyperparameters, label mappings, and candidate model keys.
+- **Registry / storage**:
+  - The example pipeline uses MLflow + object storage (see [`examples/mlops/scripts/deploy_model.py`](../../examples/mlops/scripts/deploy_model.py:1)).
+
+**Security note (pickle)**: Serving sklearn `.pkl` artifacts requires explicit opt-in. Pickle deserialization is disabled by default in the gateway and must be enabled via `LLMROUTER_ALLOW_PICKLE_MODELS=true`.
+
+### 2.3 Deployment & Hot Reload (Data Plane)
+
+The gateway loads routing artifacts from the **local filesystem** and can hot-reload when local artifacts change.
+
+- **Mechanism**: [`python.LLMRouterStrategyFamily()`](../../src/litellm_llmrouter/strategies.py:318) checks a local artifact file's modification time (`mtime`) and reloads under a lock.
+- **Reload trigger**: controlled by `hot_reload` + `reload_interval` in `routing_strategy_args`.
+- **Important**: the routing strategy does **not** fetch artifacts from S3/GCS at request time. If you want object-storage-backed rollouts, use a delivery mechanism that updates the local file (sidecar sync, init container, or rolling deploy).
+  - This repository also includes a one-time S3 model download in the container entrypoint when `LLMROUTER_MODEL_S3_BUCKET` and `LLMROUTER_MODEL_S3_KEY` are set (see [`docker/entrypoint.sh`](../../docker/entrypoint.sh:114)).
+
+## 3. Reference Deployment Patterns (Model Delivery)
+
+### A. File/Artifact Sync (Sidecar Pattern)
+
 *Best for: Kubernetes deployments, stateless gateways.*
 
-*   **Architecture**:
-    *   **Gateway Pod**: Runs LiteLLM Proxy + `llmrouter` logic.
-    *   **Sidecar**: A lightweight agent (e.g., `aws s3 sync` loop or custom Go binary) watches an S3 bucket.
-    *   **Shared Volume**: `ReadWriteMany` or `ReadWriteOnce` volume shared between Sidecar and Gateway.
-*   **Flow**:
-    1.  CI/CD pipeline pushes new `router.pkl` to S3.
-    2.  Sidecar detects change, downloads to `/app/models/router.pkl`.
-    3.  Gateway's `InferenceKNNRouter` detects file change and reloads.
-*   **Enhancements**:
-    *   **Config Sync**: Leverages the **Hot-Reload Config Sync** (P0) enhancement to coordinate model updates with general proxy config changes.
+- **Gateway Pod**: runs the data plane.
+- **Sidecar / init container**: syncs model artifacts from object storage to a shared volume.
+- **Gateway reload**: the routing strategy observes local file changes (`mtime`) and reloads.
 
-### B. DB-Config + Object Storage
-*Best for: Dynamic environments, centralized management.*
+Example flow:
 
-*   **Architecture**:
-    *   **Postgres**: Stores LiteLLM Proxy configuration (models, keys, routing rules) enabled via [`store_model_in_db`](../../reference/litellm/litellm/proxy/proxy_server.py:2557).
-    *   **Object Storage (S3)**: Stores large ML artifacts (too big for DB).
-*   **Flow**:
-    1.  Admin updates routing config in Postgres to point to `s3://my-bucket/v2/router.pkl`.
-    2.  Gateway polls DB, sees new config.
-    3.  Gateway downloads the specific S3 object referenced in the DB config.
-*   **Enhancements**:
-    *   **Distributed Locks**: Ensures multiple gateway replicas don't stampede S3 simultaneously during a rollout.
+1. CI/CD publishes a new router artifact (e.g., `router.pkl`) to object storage.
+2. Sidecar syncs it to the shared volume (e.g., `/app/models/router.pkl`).
+3. The data plane reloads the local artifact on the next reload check.
+
+### B. DB-Backed Config + Object Storage (Conceptual)
+
+*Best for: centralized config management with separate artifact delivery.*
+
+- Postgres can be used for centralized configuration (upstream LiteLLM capability).
+- Large routing artifacts still live in object storage.
+- A delivery mechanism (sidecar/CI/CD) must place artifacts onto the data plane filesystem; this repository does not automatically download routing artifacts from object storage based solely on DB config.
 
 ### C. Moat-Mode (Air-Gapped)
-*Best for: Defense, Finance, High-Security Enterprise.*
 
-*   **Architecture**:
-    *   **No External Internet**: All dependencies vendored.
-    *   **Internal Services**: Self-hosted Postgres, Redis, and MinIO running within the VPC/Cluster.
-    *   **Offline Training**: Training happens in a separate secure zone; artifacts are manually transferred or scanned before entering the production registry (MinIO).
-*   **Flow**:
-    1.  Artifacts are placed in the internal MinIO.
-    2.  Gateway is configured to trust *only* the internal CA and registry.
-    3.  **Fallback**: If ML router fails (e.g., corruption), system falls back to a static `weighted-round-robin` strategy defined in local YAML.
-*   **Enhancements**:
-    *   **Moat-Mode Hardening**: Strict validation of artifact signatures before loading.
-    *   **Degraded Mode**: Circuit breakers ensure the gateway functions even if the internal MinIO is unreachable.
+*Best for: defense/finance/high-security enterprise.*
 
----
-
-## 3. Integration with Enhancement Backlog
-
-This architecture relies on and drives several items in the [Enhancement Backlog](../litellm-cloud-native-enhancements.md).
-
-| Feature | Relevance to ML Routing |
-| :--- | :--- |
-| **Streaming-Aware Shutdown** (P1) | Critical for ML models. If a model is reloading or the pod is terminating, in-flight inferences (which may be part of a long-running stream) must complete. |
-| **Distributed Locks** (P2) | Prevents race conditions when 50+ replicas try to download a new 500MB router model simultaneously. |
-| **Observability Semantic Conventions** (P0) | The `route_with_observability` method in [`src/litellm_llmrouter/strategies.py`](../../src/litellm_llmrouter/strategies.py:645) emits standard OTel attributes (`router.strategy`, `router.score`) to debug ML decisions. |
-| **Config Sync** (P0) | The mechanism that triggers the ML model reload is the same sidecar/polling logic used for general config. |
-
----
+- No external internet.
+- Use internal-only services (self-hosted Postgres/Redis/MinIO) and controlled artifact transfer.
+- **Hardening recommendation**: treat the artifact registry as a trusted boundary. Signature verification for routing artifacts is an optional control-plane hardening step and is not enforced by default in the gateway runtime.
 
 ## 4. Validation
 
-All ML routing deployments must pass the validation checklist defined in [`docs/VALIDATION_PLAN.md`](../VALIDATION_PLAN.md:1).
+All ML routing deployments should follow the validation checklist in [`docs/VALIDATION_PLAN.md`](../VALIDATION_PLAN.md:1).
 
 ### Checklist
-- [ ] **Hot Reload Test**: Update `.pkl` file while load testing; ensure 0 errors and eventual convergence to new routing logic.
-- [ ] **Fallback Test**: Corrupt the model file; ensure gateway reverts to static routing or returns safe error (not crash).
-- [ ] **Latency Budget**: ML inference overhead must be < 50ms (P99).
-- [ ] **Observability**: Traces must show `llm.routing.selected_model` and `llm.routing.latency_ms`.
+
+- [ ] **Hot Reload Test**: replace the local routing artifact while load testing; ensure successful reload and eventual convergence to new routing behavior.
+- [ ] **Fallback Test**: corrupt or remove the artifact; ensure the gateway fails safe (fallback strategy or safe error) rather than crashing.
+- [ ] **Latency Budget**: routing overhead stays within an agreed budget.
+- [ ] **Observability**: traces include routing decision metadata (e.g., `llm.routing.strategy`, `llm.routing.selected_model`, `llm.routing.latency_ms`).

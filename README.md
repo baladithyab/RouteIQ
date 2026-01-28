@@ -1,8 +1,9 @@
-# LiteLLM + LLMRouter: Intelligent LLM Gateway with ML-Powered Routing
+# RouteIQ Gateway
+Cloud-native General AI Gateway (powered by LiteLLM) with pluggable routing intelligence + closed-loop MLOps
 
 <div align="center">
 
-  **A production-ready LLM Gateway combining LiteLLM's unified API with LLMRouter's intelligent routing strategies**
+  **A cloud-grade AI gateway with pluggable routing and end-to-end MLOps**
 
   [![Docker Build](https://github.com/baladithyab/litellm-llm-router/actions/workflows/docker-build.yml/badge.svg)](https://github.com/baladithyab/litellm-llm-router/actions/workflows/docker-build.yml)
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,24 +11,38 @@
 
 ## Overview
 
-This project serves as an **enhancement layer on top of the LiteLLM Proxy**. It combines [LiteLLM](https://github.com/BerriAI/litellm) (a unified LLM API gateway) with [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) (an intelligent routing library) into a single, production-ready Docker container.
+**RouteIQ Gateway** is a production-grade, cloud-native AI Gateway that extends the capabilities of the upstream [LiteLLM Proxy](https://github.com/BerriAI/litellm). It adds a layer of **pluggable routing intelligence** and a **closed-loop MLOps workflow**, enabling organizations to optimize LLM traffic for cost, latency, and quality using their own data.
 
-We extend the core LiteLLM Proxy with:
-- **Intelligent Routing**: 18+ ML-based routing strategies (KNN, MLP, RL, etc.)
-- **High Availability**: Standardized protocols for Redis (caching), PostgreSQL (persistence), and S3 (config sync)
-- **Observability**: Native OTLP/OpenTelemetry integration
-- **Hot-Reloading**: Update routing strategies without container restarts
-- **Agentic Gateways**: Support for both **MCP** (Model Context Protocol) and **Anthropic Skills**
+While LiteLLM provides the core proxy and protocol translation, RouteIQ Gateway adds:
+- **Intelligent Routing**: Pluggable strategies (KNN, MLP, etc.) that learn from your traffic.
+- **Closed-Loop MLOps**: A complete loop to collect telemetry, train routing models, register them, and roll them out without downtime.
+- **Enterprise Hardening**: Enhanced security, observability, and deployment patterns for cloud-native environments.
 
-### Key Features
+## Gateway Surfaces
 
-- 🚀 **Enhanced LiteLLM Proxy**: All LiteLLM features + ML routing + production hardening
-- 🧠 **ML-Powered Routing**: 18+ intelligent routing strategies across 4 categories (single-round, multi-round, personalized, agentic)
-- 🛠️ **Dual Agent Protocols**: Support for both **MCP** (standard) and **Anthropic Skills** (Computer Use)
-- 🔄 **Hot-Reloading**: Update routing strategies without container restarts
-- 📊 **High Availability**: Redis for distributed state, PostgreSQL for persistence, S3 for config sync
-- 🐳 **Multi-Architecture**: Supports both `linux/amd64` and `linux/arm64`
-- 🔧 **MLOps Ready**: Includes setup for training/finetuning routing models
+RouteIQ Gateway unifies multiple AI interaction patterns under a single endpoint:
+
+- **Standard OpenAI API**: Full compatibility for chat, completions, and embeddings.
+- **Extended API Families**: Inherits full support for `/v1/responses`, `/v1/assistants`, `/v1/files`, and more. See [API Parity Analysis](docs/api-parity-analysis.md).
+- **MCP (Model Context Protocol)**: Bridge MCP servers to LLMs, allowing models to use tools and resources securely.
+- **A2A (Agent-to-Agent)**: Standardized protocol for multi-agent communication and orchestration.
+- **Skills**: Register and execute Python functions as "skills" that can be invoked by models.
+- **Vector Stores**: *Inherited* OpenAI-compatible `/v1/vector_stores*` endpoints for file search.
+  > **Note**: Deep integration with external Vector Databases (Pinecone, Weaviate, etc.) is currently *planned* and not yet fully implemented.
+
+## Architecture
+
+The gateway operates as the central nervous system for your AI infrastructure, organized into two logical planes:
+
+1.  **Data Plane (Gateway Runtime)**: The in-path serving component (LiteLLM + Routing Intelligence Layer) that receives API traffic and forwards it to LLM providers.
+2.  **Control Plane (Management + Delivery)**: The out-of-path systems that configure the gateway and deliver routing models.
+
+### Core Loop
+
+1.  **Route**: Incoming requests are analyzed by the **Routing Intelligence Layer** (inside the Data Plane) and routed to the best model using the active strategy.
+2.  **Observe**: Execution data (latency, cost, feedback) is captured via OpenTelemetry.
+3.  **Learn**: The MLOps pipeline uses this data to train improved routing models.
+4.  **Update**: New models are hot-reloaded into the gateway without restarting.
 
 ## Quick Start
 
@@ -43,112 +58,62 @@ docker compose up -d
 
 # Or start with full HA stack (Redis + PostgreSQL)
 docker compose -f docker-compose.ha.yml up -d
+
+# Or start with Observability stack (Jaeger + Prometheus)
+docker compose -f docker-compose.otel.yml up -d
 ```
 
 ### Using Pre-built Image
 
 ```bash
-docker pull ghcr.io/baladithyab/litellm-llm-router:latest
-
-docker run -d \
-  -p 4000:4000 \
-  -v ./config.yaml:/app/config.yaml \
-  -e DATABASE_URL="postgresql://user:pass@host:5432/litellm" \
-  ghcr.io/baladithyab/litellm-llm-router:latest \
-  --config /app/config.yaml
+docker run -p 4000:4000 ghcr.io/baladithyab/litellm-llm-router:latest
 ```
 
-## Architecture
+## Deployment
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    LiteLLM + LLMRouter Gateway                  │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │   LiteLLM   │  │  LLMRouter  │  │    Custom Strategies    │  │
-│  │   Proxy     │◄─│  Strategies │◄─│    (Hot-Reloadable)     │  │
-│  │   Server    │  │   Family    │  │                         │  │
-│  └──────┬──────┘  └─────────────┘  └─────────────────────────┘  │
-│         │                                                        │
-│  ┌──────▼──────────────────────────────────────────────────────┐ │
-│  │              Routing Strategy Selection                     │ │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐    │ │
-│  │  │  KNN   │ │  MLP   │ │  SVM   │ │  ELO   │ │ Custom │    │ │
-│  │  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘    │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-    ┌─────────┐         ┌─────────┐         ┌─────────┐
-    │ OpenAI  │         │ Anthropic│        │  Azure  │
-    └─────────┘         └─────────┘         └─────────┘
-```
+RouteIQ Gateway is designed for cloud-native deployment:
+
+- **Docker**: Official images available on GHCR.
+- **Docker Compose**: Variants for local dev, HA (Redis/Postgres), and Observability (OTEL).
+- **Kubernetes**: Helm charts and K8s manifests available for scalable deployments.
+- **Health Probes**: Native support for cloud-native probes:
+  - `/_health/live`: Liveness probe
+  - `/_health/ready`: Readiness probe
+- **Config Management**: Supports loading configuration from local files, S3, or environment variables.
+
+## Security
+
+Security is a first-class citizen in RouteIQ Gateway:
+
+- **SSRF Protection**: Built-in guards against Server-Side Request Forgery.
+- **Artifact Safety**: Pickle loading for ML models is **disabled by default** (opt-in only) to prevent arbitrary code execution. Use `LLMROUTER_ALLOW_PICKLE_MODELS=true` to enable if necessary.
+- **Key Management**: Secure handling of API keys via environment variables or secret managers.
+- **Kubernetes Security**: Recommended security contexts (non-root user, read-only root filesystem) included in deployment examples.
 
 ## Documentation
 
-### Getting Started
 | Document | Description |
 |----------|-------------|
-| [Configuration Guide](docs/configuration.md) | Complete configuration reference |
-| [Routing Strategies](docs/routing-strategies.md) | Available routing strategies and usage |
-| [API Reference](docs/api-reference.md) | REST API documentation |
-
-### Deployment & Operations
-| Document | Description |
-|----------|-------------|
-| [Architecture Overview](docs/architecture/overview.md) | System architecture and data flow |
-| [AWS Deployment Guide](docs/architecture/aws-deployment.md) | ECS, EKS, Fargate deployment patterns |
-| [High Availability Setup](docs/high-availability.md) | HA deployment with Redis, PostgreSQL, S3 |
-| [Hot Reloading](docs/hot-reloading.md) | Dynamic strategy updates without restarts |
-
-### Observability & Training
-| Document | Description |
-|----------|-------------|
-| [Observability Guide](docs/observability.md) | Tracing with Jaeger, Tempo, CloudWatch X-Ray |
-| [Observability Training](docs/observability-training.md) | Using traces for model training |
-| [MLOps Training](docs/mlops-training.md) | Training and finetuning routing models |
-
-### Extensions
-| Document | Description |
-|----------|-------------|
-| [A2A Gateway](docs/a2a-gateway.md) | Agent-to-Agent protocol support |
-| [MCP Gateway](docs/mcp-gateway.md) | Model Context Protocol support |
-| [Skills Gateway](docs/skills-gateway.md) | Anthropic Skills (Computer Use) support |
-| [Vector Stores](docs/vector-stores.md) | Vector database integration |
+| [Getting Started](docs/index.md) | Comprehensive guide to setting up and using the gateway. |
+| [API Reference](docs/api-reference.md) | Detailed API documentation. |
+| [Routing Strategies](docs/routing-strategies.md) | Explanation of available routing strategies. |
+| [MLOps Training](docs/mlops-training.md) | Guide to the MLOps training loop. |
+| [MCP Gateway](docs/mcp-gateway.md) | Using the Model Context Protocol. |
+| [Skills Gateway](docs/skills-gateway.md) | Registering and using skills. |
 
 ## Supported Routing Strategies
 
 ### LiteLLM Built-in Strategies
 - `simple-shuffle` - Random load balancing (default)
-- `least-busy` - Route to least busy deployment
-- `latency-based-routing` - Route based on response latency
-- `cost-based-routing` - Route to minimize cost
-- `usage-based-routing` - Route based on TPM/RPM usage
+- `least-busy` - Route to the model with the fewest active requests
+- `latency-based` - Route based on historical latency
+- `usage-based` - Route based on token usage
 
-### LLMRouter ML Strategies (18+ available)
-
-**Single-Round:**
-- `llmrouter-knn` - K-Nearest Neighbors routing
-- `llmrouter-svm` - Support Vector Machine routing
+### RouteIQ ML Strategies (18+ available)
+- `llmrouter-knn` - K-Nearest Neighbors routing based on query embeddings
 - `llmrouter-mlp` - Multi-Layer Perceptron routing
-- `llmrouter-mf` - Matrix Factorization routing
-- `llmrouter-elo` - Elo Rating based routing
-- `llmrouter-routerdc` - Dual Contrastive learning (NeurIPS 2024)
-- `llmrouter-hybrid` - Hybrid probabilistic routing (ICLR 2024)
-- `llmrouter-graph` - Graph neural network routing (ICLR 2025)
-- `llmrouter-automix` - Automatic model mixing (NeurIPS 2024)
-- `llmrouter-causallm` - Causal LM router
-
-**Multi-Round/Personalized/Agentic:**
-- `llmrouter-r1` - Router-R1 multi-turn (NeurIPS 2025)
-- `llmrouter-gmt` - Personalized user-preference router
-- `llmrouter-knn-multiround` - KNN agentic router
-- `llmrouter-llm-multiround` - LLM agentic router
-
-**Baselines:**
-- `llmrouter-smallest` - Always smallest (cost baseline)
-- `llmrouter-largest` - Always largest (quality baseline)
-- `llmrouter-custom` - Custom trained models
+- `llmrouter-svm` - Support Vector Machine routing
+- ... and more
 
 ## Configuration Example
 
@@ -158,67 +123,20 @@ model_list:
     litellm_params:
       model: openai/gpt-4
       api_key: os.environ/OPENAI_API_KEY
-  - model_name: claude-3
-    litellm_params:
-      model: anthropic/claude-3-opus
-      api_key: os.environ/ANTHROPIC_API_KEY
 
 router_settings:
-  routing_strategy: llmrouter-knn  # Use LLMRouter KNN strategy
+  routing_strategy: llmrouter-knn  # Use RouteIQ KNN strategy
   routing_strategy_args:
-    model_path: /app/models/knn_router.pt
-    llm_data_path: /app/config/llm_candidates.json
+    model_path: /app/models/router_model.pkl
     hot_reload: true
     reload_interval: 300  # Check for updates every 5 minutes
-
-general_settings:
-  master_key: sk-1234
-  database_url: os.environ/DATABASE_URL
-
-litellm_settings:
-  cache: true
-  cache_params:
-    type: redis
-    host: os.environ/REDIS_HOST
-    port: 6379
 ```
-
-## AWS Deployment
-
-Deploy to AWS using ECS Fargate, EKS, or App Runner:
-
-```bash
-# Build and push to ECR
-aws ecr get-login-password | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
-docker build -t litellm-llmrouter -f docker/Dockerfile .
-docker tag litellm-llmrouter:latest <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
-docker push <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
-```
-
-Key AWS integrations:
-- **Amazon Bedrock**: Native Claude, Titan, and other foundation models
-- **CloudWatch X-Ray**: Distributed tracing via ADOT sidecar
-- **S3**: Configuration and model storage with hot-reload
-- **Secrets Manager**: Secure API key management
-- **ElastiCache Redis**: Distributed caching and rate limiting
-
-See [AWS Deployment Guide](docs/architecture/aws-deployment.md) for complete instructions.
-
-## Container Features
-
-| Feature | Description |
-|---------|-------------|
-| **Non-root user** | Runs as `litellm` user (UID 1000) |
-| **tini init** | Proper signal handling and zombie process reaping |
-| **Health checks** | `/health/liveliness` endpoint for orchestrators |
-| **Multi-arch** | Supports `linux/amd64` and `linux/arm64` |
-| **OCI labels** | Standard container metadata |
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-- [LiteLLM](https://github.com/BerriAI/litellm) - Unified LLM API Gateway
-- [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) - Intelligent LLM Routing Library
+- [LiteLLM](https://github.com/BerriAI/litellm) for the amazing proxy foundation.
+- [LLMRouter](https://github.com/ray-project/llm-router) for the routing intelligence concepts.

@@ -1,10 +1,12 @@
 # MCP Gateway - Model Context Protocol
 
+**RouteIQ Gateway** includes a fully integrated MCP (Model Context Protocol) Gateway, allowing you to bridge MCP servers to LLMs and expose tools and resources securely.
+
 This guide covers the MCP (Model Context Protocol) gateway functionality for extending LLMs with external tools and data sources.
 
 ## Overview
 
-The MCP Gateway enables integration with [Model Context Protocol](https://modelcontextprotocol.io/) servers, allowing LLMs to:
+The MCP Gateway acts as a centralized hub for Model Context Protocol interactions. It allows LLMs to:
 
 - Access external tools (search, file operations, APIs)
 - Query data sources and databases

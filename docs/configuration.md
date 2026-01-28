@@ -165,3 +165,249 @@ The local stack includes:
 - **MLflow** for experiment tracking
 - **MinIO** for S3-compatible storage
 - **MCP Proxy** for MCP server access
+
+## Kubernetes Deployment Notes
+
+This section covers configuration considerations for deploying the gateway in Kubernetes.
+
+### Environment Variables Reference
+
+The following tables list all environment variables relevant for Kubernetes deployments:
+
+#### Core Configuration
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `LITELLM_MASTER_KEY` | Admin API key | Yes | - |
+| `LITELLM_CONFIG_PATH` | Path to config file | No | `/app/config/config.yaml` |
+| `DATABASE_URL` | PostgreSQL connection string | For HA | - |
+| `STORE_MODEL_IN_DB` | Store models in database | Recommended for K8s | `false` |
+
+#### Redis Configuration
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `REDIS_HOST` | Redis hostname | For caching | - |
+| `REDIS_PORT` | Redis port | No | `6379` |
+| `REDIS_PASSWORD` | Redis password | If auth required | - |
+
+#### Object Storage Config Sync
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `CONFIG_S3_BUCKET` | S3 bucket for config | For S3 sync | - |
+| `CONFIG_S3_KEY` | S3 key for config file | For S3 sync | - |
+| `CONFIG_GCS_BUCKET` | GCS bucket for config | For GCS sync | - |
+| `CONFIG_GCS_KEY` | GCS key for config file | For GCS sync | - |
+| `CONFIG_HOT_RELOAD` | Enable hot reload | No | `false` |
+| `CONFIG_SYNC_ENABLED` | Enable config sync | No | `true` |
+| `CONFIG_SYNC_INTERVAL` | Sync interval in seconds | No | `60` |
+
+#### Feature Flags
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `MCP_GATEWAY_ENABLED` | Enable MCP gateway | No | `false` |
+| `A2A_GATEWAY_ENABLED` | Enable A2A gateway | No | `false` |
+| `MCP_HA_SYNC_ENABLED` | MCP registry sync via Redis | For MCP HA | `false` |
+
+#### OpenTelemetry
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTEL Collector endpoint | For observability | - |
+| `OTEL_SERVICE_NAME` | Service name for traces | No | `litellm-gateway` |
+| `OTEL_TRACES_EXPORTER` | Traces exporter type | No | `none` |
+| `OTEL_METRICS_EXPORTER` | Metrics exporter type | No | `none` |
+| `OTEL_LOGS_EXPORTER` | Logs exporter type | No | `none` |
+| `OTEL_ENABLED` | Enable OTEL integration | No | `true` |
+
+### Health Probes
+
+The gateway exposes both LiteLLM's native health endpoints and internal endpoints optimized for Kubernetes:
+
+#### Internal Endpoints (Recommended for K8s)
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /_health/live
+    port: 4000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /_health/ready
+    port: 4000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 3
+```
+
+| Endpoint | Auth Required | Checks | Use Case |
+|----------|---------------|--------|----------|
+| `/_health/live` | No | Process alive | Liveness probe |
+| `/_health/ready` | No | DB, Redis (if configured) | Readiness probe |
+| `/health/liveliness` | Depends on config | LiteLLM internal | Alternative liveness |
+| `/health/readiness` | Depends on config | LiteLLM internal | Alternative readiness |
+
+**Why use `/_health/*` endpoints?**
+- Always unauthenticated (no API key required)
+- Fast response times with short timeouts (2s)
+- Check only configured dependencies
+- Non-fatal for optional dependencies (MCP)
+
+### Database Migration Pattern
+
+**⚠️ Important:** Do NOT run database migrations on every replica. This can cause race conditions and data loss in multi-replica deployments.
+
+**Recommended Pattern: Init Container or Job**
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-db-migrate
+spec:
+  template:
+    spec:
+      containers:
+      - name: migrate
+        image: ghcr.io/baladithyab/litellm-llm-router:latest
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))")
+            prisma migrate deploy --schema="$SCHEMA_PATH"
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: litellm-secrets
+              key: database-url
+      restartPolicy: Never
+  backoffLimit: 3
+```
+
+**Alternative: Set migration flag on single replica**
+
+```yaml
+# Set on ONE replica only (e.g., via a separate Deployment)
+- name: LITELLM_RUN_DB_MIGRATIONS
+  value: "true"
+```
+
+### Network Policy Considerations
+
+The gateway requires egress to several external services. Here's a template NetworkPolicy:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: litellm-gateway
+  policyTypes:
+  - Egress
+  egress:
+  # DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+  
+  # PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - port: 5432
+  
+  # Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - port: 6379
+  
+  # OTEL Collector
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: observability
+    ports:
+    - port: 4317  # gRPC
+    - port: 4318  # HTTP
+  
+  # External LLM providers (OpenAI, Anthropic, etc.)
+  # Note: Use CIDR ranges or allow all for simplicity
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - port: 443
+```
+
+**MCP/A2A Egress Considerations:**
+- If `MCP_GATEWAY_ENABLED=true`, allow egress to MCP server URLs
+- If `A2A_GATEWAY_ENABLED=true`, allow egress to registered agent URLs
+- URLs are validated against SSRF attacks at runtime
+
+### ReadOnlyRootFilesystem Support
+
+The container supports `readOnlyRootFilesystem: true` with the following writable mounts:
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+
+volumeMounts:
+- name: tmp
+  mountPath: /tmp
+- name: data
+  mountPath: /app/data
+- name: models
+  mountPath: /app/models
+  readOnly: true  # If not hot-reloading
+
+volumes:
+- name: tmp
+  emptyDir: {}
+- name: data
+  emptyDir: {}
+- name: models
+  emptyDir: {}  # Or PVC for persistent models
+```
+
+### Resource Recommendations
+
+```yaml
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "2Gi"
+    cpu: "2000m"
+```
+
+Consider HPA based on:
+- CPU/Memory utilization
+- Custom metrics (requests per second, queue depth)
+- External metrics from OTEL

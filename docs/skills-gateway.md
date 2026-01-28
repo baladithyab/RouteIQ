@@ -1,5 +1,10 @@
-# Skills Gateway (Anthropic Skills)
+# Skills Gateway
 
+**RouteIQ Gateway** features a Skills Gateway that allows you to register and execute Python functions as "skills" that can be invoked by models or other agents.
+
+## Overview
+
+The Skills Gateway provides
 This guide covers the **Skills Gateway** functionality, which exposes Anthropic's "Skills" (Computer Use, Bash, Text Editor) via standard endpoints.
 
 ## Overview

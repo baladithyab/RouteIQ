@@ -167,7 +167,7 @@ docker push <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
         }
       },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:4000/health/liveliness || exit 1"],
+        "command": ["CMD-SHELL", "curl -f http://localhost:4000/_health/live || exit 1"],
         "interval": 30,
         "timeout": 5,
         "retries": 3,
@@ -177,6 +177,8 @@ docker push <account>.dkr.ecr.<region>.amazonaws.com/litellm-llmrouter:latest
   ]
 }
 ```
+
+> **Why use `/_health/live`?** It is an internal, unauthenticated liveness endpoint intended for orchestration health checks. LiteLLM's native `/health/*` endpoints can be auth-protected depending on configuration.
 
 ### Step 3: Create ECS Service with ALB
 
@@ -249,6 +251,8 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
 ```
+
+> **Health probes**: For Kubernetes, configure probes against `/_health/live` and `/_health/ready`.
 
 ---
 
@@ -475,7 +479,7 @@ environment:
 
 ## Object Storage Configuration (Optional)
 
-> **Note**: S3 is optional. Use it for storing config files, ML models, and enabling hot-reload.
+> **Note**: S3 is optional. Use it for storing config files and for delivering routing artifacts.
 
 ### S3 Bucket for Config and Models
 
@@ -486,7 +490,7 @@ aws s3 mb s3://litellm-config-${AWS_ACCOUNT_ID}
 # Upload config
 aws s3 cp config/config.yaml s3://litellm-config-${AWS_ACCOUNT_ID}/config/
 
-# Upload LLMRouter models (if using ML-based routing)
+# Upload routing artifacts (if using ML-based routing)
 aws s3 cp models/ s3://litellm-config-${AWS_ACCOUNT_ID}/models/ --recursive
 ```
 
@@ -498,8 +502,13 @@ environment:
   - CONFIG_S3_KEY=config/config.yaml
   - LLMROUTER_MODEL_S3_BUCKET=litellm-config-123456789
   - LLMROUTER_MODEL_S3_KEY=models/
-  - CONFIG_HOT_RELOAD=true  # Enable hot-reload from S3
+  - CONFIG_HOT_RELOAD=true  # Enable config sync + reload from S3
 ```
+
+**Important behavior notes**:
+
+- `CONFIG_S3_*` + `CONFIG_HOT_RELOAD=true` enables a background sync loop that checks the S3 object ETag and triggers a reload when the config file changes.
+- `LLMROUTER_MODEL_S3_*` performs a **startup-time download** of routing artifacts into the container filesystem (e.g., `/app/models/`). The routing strategy then reloads based on **local file changes**.
 
 ---
 

@@ -1,10 +1,10 @@
 # A2A Gateway - Agent-to-Agent Protocol
 
-This guide covers the A2A (Agent-to-Agent) gateway functionality for the LiteLLM + LLMRouter gateway.
+**RouteIQ Gateway** implements the A2A (Agent-to-Agent) protocol, enabling standardized communication and orchestration between AI agents.
 
 ## Overview
 
-The A2A Gateway enables AI agents to discover and communicate with each other using Google's [A2A protocol](https://google.github.io/A2A/). This allows you to:
+The A2A Gateway facilitates the discovery and communication of AI agents using Google's [A2A protocol](https://google.github.io/A2A/). This allows you to:
 
 - Register AI agents with their capabilities
 - Discover agents based on capabilities

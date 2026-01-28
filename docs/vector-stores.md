@@ -1,10 +1,29 @@
 # Vector Stores Integration
 
-> ⚠️ **Coming Soon**: Vector store integrations are planned for a future release.
+RouteIQ Gateway provides vector store capabilities through two primary mechanisms: inherited OpenAI-compatible endpoints and planned deep integrations with external vector databases.
 
-This guide covers integrating vector databases with the LiteLLM + LLMRouter gateway for RAG (Retrieval Augmented Generation) and semantic search capabilities.
+## Inherited OpenAI-Compatible Endpoints
 
-## Planned Integrations
+RouteIQ Gateway inherits the standard OpenAI `/v1/vector_stores` endpoints from the upstream LiteLLM proxy. This allows you to use the gateway as a drop-in replacement for OpenAI's file search and vector store APIs.
+
+### Supported Endpoints
+
+- `POST /v1/vector_stores` - Create a vector store.
+- `GET /v1/vector_stores` - List vector stores.
+- `GET /v1/vector_stores/{vector_store_id}` - Retrieve a vector store.
+- `POST /v1/vector_stores/{vector_store_id}` - Modify a vector store.
+- `DELETE /v1/vector_stores/{vector_store_id}` - Delete a vector store.
+- `POST /v1/vector_stores/{vector_store_id}/file_batches` - Create a file batch.
+- `GET /v1/vector_stores/{vector_store_id}/file_batches/{batch_id}` - Retrieve a file batch.
+- `GET /v1/vector_stores/{vector_store_id}/files` - List vector store files.
+
+These endpoints are fully compatible with the OpenAI SDK and can be used immediately with any model that supports file search tools.
+
+## Planned External Integrations
+
+> **Note**: Deep integration with external Vector Databases (Pinecone, Weaviate, etc.) is currently **planned** and not yet fully implemented in RouteIQ Gateway. The following configuration examples represent the target design for future releases.
+
+RouteIQ Gateway aims to provide a unified interface for external vector databases, allowing you to route RAG queries to different stores based on policy or performance.
 
 ### OpenSearch
 
