@@ -1,0 +1,62 @@
+# CODEOWNERS - defines code ownership for required reviews
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# These owners will be automatically requested for review when someone opens
+# a pull request that modifies code they own.
+#
+# Order matters: later rules override earlier ones. The last matching pattern
+# takes precedence.
+
+# Default: require review from maintainers for all changes
+* @maintainers
+
+# =============================================================================
+# SECURITY-SENSITIVE PATHS - require security team review
+# =============================================================================
+
+# GitHub workflows and CI/CD configuration
+.github/ @maintainers @security-team
+.github/workflows/ @maintainers @security-team
+.github/dependabot.yml @maintainers @security-team
+.github/CODEOWNERS @maintainers @security-team
+.github/SECURITY.md @maintainers @security-team
+
+# Docker and container configuration
+docker/ @maintainers @security-team
+docker/Dockerfile @maintainers @security-team
+docker-compose*.yml @maintainers @security-team
+
+# Configuration files that may contain sensitive settings
+config/ @maintainers @security-team
+.env* @maintainers @security-team
+
+# =============================================================================
+# CORE APPLICATION CODE
+# =============================================================================
+
+# Main application source
+src/ @maintainers
+
+# Custom routing logic
+custom_routers/ @maintainers
+
+# Test infrastructure
+tests/ @maintainers
+
+# =============================================================================
+# DOCUMENTATION
+# =============================================================================
+
+# Documentation changes (lower review bar)
+docs/ @maintainers
+*.md @maintainers
+
+# =============================================================================
+# INFRASTRUCTURE & DEPLOYMENT
+# =============================================================================
+
+# Infrastructure as code
+prisma/ @maintainers @security-team
+
+# Example configurations (may expose patterns)
+examples/ @maintainers

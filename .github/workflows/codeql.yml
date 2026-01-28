@@ -1,0 +1,63 @@
+# CodeQL security scanning for Python code
+# https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages
+
+name: CodeQL Security Scan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'custom_routers/**'
+      - 'examples/**/*.py'
+      - '.github/workflows/codeql.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'custom_routers/**'
+      - 'examples/**/*.py'
+      - '.github/workflows/codeql.yml'
+  schedule:
+    # Run weekly security scan on Sundays at 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+# Default: no permissions. Each job explicitly requests only what it needs.
+permissions: {}
+
+jobs:
+  analyze:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # Required for checkout
+      security-events: write  # Required for uploading SARIF results
+      # actions: read is only needed for private repos with on.pull_request
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['python']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2b983b380ce715a6c836c917154509c332c19b3a  # v3
+        with:
+          languages: ${{ matrix.language }}
+          # Use default queries plus security-extended for broader coverage
+          queries: security-extended
+
+      # Autobuild for Python (analyzes the source code)
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@2b983b380ce715a6c836c917154509c332c19b3a  # v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@2b983b380ce715a6c836c917154509c332c19b3a  # v3
+        with:
+          category: "/language:${{ matrix.language }}"

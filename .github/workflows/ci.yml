@@ -6,18 +6,24 @@ on:
   pull_request:
     branches: [main]
 
+# Default: no permissions. Each job explicitly requests only what it needs.
+permissions: {}
+
 # Removed IMAGE_NAME and TEST_PORT env vars - Docker builds moved to docker-build.yml
 
 jobs:
   # Detect what changed to optimize CI
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for checkout
+      pull-requests: read  # Required for dorny/paths-filter to list PR files
     outputs:
       python: ${{ steps.filter.outputs.python }}
       compose: ${{ steps.filter.outputs.compose }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3
         id: filter
         with:
           filters: |
@@ -32,13 +38,15 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for checkout
     needs: changes
     if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
         with:
           version: "0.9.26"
           enable-cache: true
@@ -51,13 +59,15 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for checkout
     needs: changes
     if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
         with:
           version: "0.9.26"
           enable-cache: true
@@ -82,10 +92,12 @@ jobs:
 
   validate-compose:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for checkout
     needs: changes
     if: ${{ needs.changes.outputs.compose == 'true' || github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Validate docker-compose.yml
         run: docker compose -f docker-compose.yml config
