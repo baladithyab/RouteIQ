@@ -34,9 +34,9 @@ exporters:
     # Uses IAM Instance Profile on EC2 - no explicit credentials needed
     # For local dev, uses ~/.aws/credentials or env vars
 
-  # Debug exporter for troubleshooting (optional)
-  # logging:
-  #   verbosity: detailed
+# Debug exporter for troubleshooting (optional)
+# logging:
+#   verbosity: detailed
 
 service:
   pipelines:

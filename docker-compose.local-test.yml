@@ -266,8 +266,8 @@ services:
       timeout: 10s
       retries: 3
 
-  # AWS Documentation MCP Server (uses public AWS docs, no key needed)
-  # This server is already available as part of the litellm-gateway via aws_knowledge_mcp tool
+# AWS Documentation MCP Server (uses public AWS docs, no key needed)
+# This server is already available as part of the litellm-gateway via aws_knowledge_mcp tool
 
 volumes:
   test_postgres_data:

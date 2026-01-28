@@ -1,5 +1,9 @@
 # LiteLLM + LLMRouter - High Availability Production Setup
 # Includes: PostgreSQL, Redis, multiple gateway instances
+#
+# SECURITY: Before running, set required secrets in your environment:
+#   export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
 
 services:
   # ==========================================================================
@@ -63,8 +67,10 @@ services:
       - ./custom_routers:/app/custom_routers:ro
     environment:
       - LITELLM_CONFIG_PATH=/app/config/config.yaml
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      # SECURITY: LITELLM_MASTER_KEY is REQUIRED - no default provided
+      # Generate with: openssl rand -hex 32
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY environment variable is required}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD environment variable is required}@postgres:5432/${POSTGRES_DB:-litellm}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       # LLM Provider API Keys
@@ -124,8 +130,10 @@ services:
       - ./custom_routers:/app/custom_routers:ro
     environment:
       - LITELLM_CONFIG_PATH=/app/config/config.yaml
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      # SECURITY: LITELLM_MASTER_KEY is REQUIRED - no default provided
+      # Generate with: openssl rand -hex 32
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY environment variable is required}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD environment variable is required}@postgres:5432/${POSTGRES_DB:-litellm}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       # LLM Provider API Keys

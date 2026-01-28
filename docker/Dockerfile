@@ -125,14 +125,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Pre-generate Prisma client and fix permissions on LiteLLM directories
 # This is done as root to avoid runtime permission errors
+# Security: Use least-privilege permissions instead of 777
 RUN SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
     if [ -f "$SCHEMA_PATH" ]; then \
         echo "Generating Prisma client from $SCHEMA_PATH..." && \
         python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
     fi && \
     # Fix permissions on LiteLLM directories that need write access at runtime
-    chmod -R 777 /usr/local/lib/python3.12/site-packages/prisma/ 2>/dev/null || true && \
-    chmod -R 777 /usr/local/lib/python3.12/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true
+    # Using least-privilege: litellm user owns directories with 755 (rwxr-xr-x)
+    chown -R litellm:litellm /usr/local/lib/python3.12/site-packages/prisma/ 2>/dev/null || true && \
+    chmod -R 755 /usr/local/lib/python3.12/site-packages/prisma/ 2>/dev/null || true && \
+    chown -R litellm:litellm /usr/local/lib/python3.12/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true && \
+    chmod -R 755 /usr/local/lib/python3.12/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true
 
 # Copy application files (after dependencies for better layer caching)
 COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter
@@ -172,13 +176,39 @@ ENV PYTHONUNBUFFERED=1 \
     STORE_MODEL_IN_DB=false
 
 # Health check for orchestrators (ECS, K8s, etc.)
+# Uses the internal health endpoint which is unauthenticated
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:4000/health/liveliness || exit 1
+    CMD curl -f http://localhost:4000/_health/live || exit 1
 
 EXPOSE 4000
 
+# Security: Ensure proper signal handling for graceful shutdown
+STOPSIGNAL SIGTERM
+
 # Security: Run as non-root user
 USER litellm
+
+# =============================================================================
+# ReadOnlyRootFilesystem Support
+# =============================================================================
+# This image supports Kubernetes readOnlyRootFilesystem: true with the following
+# writable volume mounts required:
+#   - /app/data      - Runtime data (if using local file storage)
+#   - /app/models    - Model files (if hot-reloading models)
+#   - /tmp           - Temporary files (Python, Prisma)
+#   - /app/.cache    - Application cache (optional)
+#
+# Example K8s securityContext:
+#   securityContext:
+#     readOnlyRootFilesystem: true
+#     runAsNonRoot: true
+#     runAsUser: 1000
+#   volumeMounts:
+#     - name: tmp-vol
+#       mountPath: /tmp
+#     - name: data-vol
+#       mountPath: /app/data
+# =============================================================================
 
 # Use tini as init system for proper signal handling
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

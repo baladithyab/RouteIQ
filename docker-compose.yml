@@ -1,5 +1,8 @@
 # LiteLLM + LLMRouter - Basic Docker Compose Setup
 # For production HA setup, use docker-compose.ha.yml
+#
+# SECURITY: Before running, set LITELLM_MASTER_KEY in your environment:
+#   export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 
 services:
   litellm-llmrouter:
@@ -16,7 +19,9 @@ services:
       - ./custom_routers:/app/custom_routers:ro
     environment:
       - LITELLM_CONFIG_PATH=/app/config/config.yaml
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-master-key-change-me}
+      # SECURITY: LITELLM_MASTER_KEY is REQUIRED - no default provided
+      # Generate with: openssl rand -hex 32
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY environment variable is required}
       # LLM Provider API Keys
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
