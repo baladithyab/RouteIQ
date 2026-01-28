@@ -11,6 +11,10 @@ Features:
 - OTel tracing integration (via mcp_tracing module)
 - HA-safe: Redis-backed registry syncs across replicas
 
+Security Notes:
+- Outbound URLs are validated against SSRF attacks before making requests
+- See url_security.py for details on blocked targets
+
 See: https://modelcontextprotocol.io/
 """
 
@@ -22,6 +26,19 @@ from enum import Enum
 from typing import Any
 
 from litellm._logging import verbose_proxy_logger
+
+# Import SSRF protection utilities
+try:
+    from .url_security import validate_outbound_url, SSRFBlockedError
+
+    SSRF_PROTECTION_AVAILABLE = True
+except ImportError:
+    SSRF_PROTECTION_AVAILABLE = False
+    SSRFBlockedError = Exception  # Fallback type
+
+    def validate_outbound_url(url: str, **kwargs) -> str:
+        """No-op fallback when url_security module is not available."""
+        return url
 
 
 # Redis for HA sync (optional)
@@ -325,10 +342,29 @@ class MCPGateway:
 
         If HA sync is enabled, the server is also saved to Redis for
         cross-replica visibility.
+
+        Security: Server URLs are validated against SSRF attacks before registration.
         """
         if not self.enabled:
             verbose_proxy_logger.warning("MCP Gateway is not enabled")
             return
+
+        # Security: Validate URL against SSRF attacks at registration time
+        if server.url:
+            try:
+                validate_outbound_url(
+                    server.url, resolve_dns=False
+                )  # Don't resolve during registration
+            except SSRFBlockedError as e:
+                verbose_proxy_logger.warning(
+                    f"MCP: SSRF blocked for server '{server.server_id}': {e}"
+                )
+                raise ValueError(f"Server URL blocked for security reasons: {e.reason}")
+            except ValueError as e:
+                verbose_proxy_logger.warning(
+                    f"MCP: Invalid URL for server '{server.server_id}': {e}"
+                )
+                raise ValueError(f"Server URL is invalid: {str(e)}")
 
         self.servers[server.server_id] = server
 
@@ -496,6 +532,8 @@ class MCPGateway:
         """
         Invoke an MCP tool.
 
+        Security: Server URLs are validated against SSRF attacks before making requests.
+
         Args:
             tool_name: Name of the tool to invoke
             arguments: Arguments to pass to the tool
@@ -510,6 +548,31 @@ class MCPGateway:
                 error=f"Tool '{tool_name}' not found",
                 tool_name=tool_name,
             )
+
+        # Security: Validate URL against SSRF attacks before making outbound call
+        if server.url:
+            try:
+                validate_outbound_url(server.url)
+            except SSRFBlockedError as e:
+                verbose_proxy_logger.warning(
+                    f"MCP: SSRF blocked for server '{server.server_id}' when invoking tool '{tool_name}': {e}"
+                )
+                return MCPToolResult(
+                    success=False,
+                    error=f"Server URL blocked for security reasons: {e.reason}",
+                    tool_name=tool_name,
+                    server_id=server.server_id,
+                )
+            except ValueError as e:
+                verbose_proxy_logger.warning(
+                    f"MCP: Invalid URL for server '{server.server_id}': {e}"
+                )
+                return MCPToolResult(
+                    success=False,
+                    error=f"Server URL is invalid: {str(e)}",
+                    tool_name=tool_name,
+                    server_id=server.server_id,
+                )
 
         # Validate arguments against schema if available
         tool_def = server.tool_definitions.get(tool_name)
@@ -593,6 +656,8 @@ class MCPGateway:
         """
         Check the health of an MCP server.
 
+        Security: Server URLs are validated against SSRF attacks before making requests.
+
         Args:
             server_id: ID of the server to check
 
@@ -610,6 +675,28 @@ class MCPGateway:
             }
 
         start_time = time.time()
+
+        # Security: Validate URL against SSRF attacks
+        if server.url:
+            try:
+                validate_outbound_url(server.url)
+            except SSRFBlockedError as e:
+                verbose_proxy_logger.warning(
+                    f"MCP: SSRF blocked for health check of server '{server_id}': {e}"
+                )
+                return {
+                    "server_id": server_id,
+                    "name": server.name,
+                    "status": "blocked",
+                    "error": f"URL blocked for security reasons: {e.reason}",
+                }
+            except ValueError as e:
+                return {
+                    "server_id": server_id,
+                    "name": server.name,
+                    "status": "invalid_url",
+                    "error": str(e),
+                }
 
         # In a real implementation, this would make an HTTP request to the server
         # For now, we simulate a health check based on URL validity

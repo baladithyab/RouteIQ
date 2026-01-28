@@ -6,6 +6,10 @@ Provides A2A (Agent-to-Agent) protocol gateway functionality for LiteLLM.
 A2A is a protocol for agent-to-agent communication, allowing AI agents
 to discover and communicate with each other.
 
+Security Notes:
+- Outbound URLs are validated against SSRF attacks before making requests
+- See url_security.py for details on blocked targets
+
 See: https://google.github.io/A2A/
 """
 
@@ -17,6 +21,20 @@ from typing import Any, AsyncIterator
 import httpx
 
 from litellm._logging import verbose_proxy_logger
+
+# Import SSRF protection utilities
+try:
+    from .url_security import validate_outbound_url, SSRFBlockedError
+
+    SSRF_PROTECTION_AVAILABLE = True
+except ImportError:
+    SSRF_PROTECTION_AVAILABLE = False
+    SSRFBlockedError = Exception  # Fallback type
+
+    def validate_outbound_url(url: str, **kwargs) -> str:
+        """No-op fallback when url_security module is not available."""
+        return url
+
 
 # Import tracing utilities for W3C trace context propagation
 try:
@@ -177,6 +195,8 @@ class A2AGateway:
         - message/send: Send a message and get a response
         - message/stream: Send a message and stream the response (returns first chunk)
 
+        Security: Agent URLs are validated against SSRF attacks before making requests.
+
         Args:
             agent_id: The ID of the agent to invoke
             request: The JSON-RPC 2.0 request
@@ -198,6 +218,26 @@ class A2AGateway:
         if not agent.url:
             return JSONRPCResponse.error_response(
                 request.id, -32000, f"Agent '{agent_id}' has no URL configured"
+            )
+
+        # Security: Validate URL against SSRF attacks
+        try:
+            validate_outbound_url(agent.url)
+        except SSRFBlockedError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: SSRF blocked for agent '{agent_id}': {e}"
+            )
+            return JSONRPCResponse.error_response(
+                request.id,
+                -32000,
+                f"Agent URL blocked for security reasons: {e.reason}",
+            )
+        except ValueError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: Invalid URL for agent '{agent_id}': {e}"
+            )
+            return JSONRPCResponse.error_response(
+                request.id, -32000, f"Agent URL is invalid: {str(e)}"
             )
 
         # Validate JSON-RPC format
@@ -268,6 +308,8 @@ class A2AGateway:
         """
         Stream response from an agent using Server-Sent Events.
 
+        Security: Agent URLs are validated against SSRF attacks before making requests.
+
         Args:
             agent_id: The ID of the agent to invoke
             request: The JSON-RPC 2.0 request with method 'message/stream'
@@ -303,6 +345,38 @@ class A2AGateway:
                 json.dumps(
                     JSONRPCResponse.error_response(
                         request.id, -32000, f"Agent '{agent_id}' has no URL configured"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+
+        # Security: Validate URL against SSRF attacks
+        try:
+            validate_outbound_url(agent.url)
+        except SSRFBlockedError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: SSRF blocked for agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id,
+                        -32000,
+                        f"Agent URL blocked for security reasons: {e.reason}",
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+        except ValueError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: Invalid URL for agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent URL is invalid: {str(e)}"
                     ).to_dict()
                 )
                 + "\n"

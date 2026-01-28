@@ -12,26 +12,42 @@ These routes extend the LiteLLM proxy server with:
   - POST /a2a/{agent_id}/message/stream - Streaming alias (proxies to canonical)
 - MCP (Model Context Protocol) gateway endpoints
 - Hot reload and config sync endpoints
+- Kubernetes health probe endpoints (/_health/live, /_health/ready)
 
 Usage:
-    from litellm_llmrouter.routes import router
-    app.include_router(router)
+    from litellm_llmrouter.routes import health_router, llmrouter_router
+    app.include_router(health_router)  # Unauthenticated health probes
+    app.include_router(llmrouter_router)  # Auth-protected custom routes
 """
 
+import asyncio
 import os
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
 from .mcp_gateway import MCPServer, MCPTransport, MCPToolDefinition, get_mcp_gateway
 from .hot_reload import get_hot_reload_manager
 from .config_sync import get_sync_manager
 
-# Main router for all LLMRouter routes
-router = APIRouter(tags=["llmrouter"])
+# Health router - unauthenticated endpoints for Kubernetes probes
+# These MUST remain accessible without credentials for K8s liveness/readiness
+health_router = APIRouter(tags=["health"])
+
+# Main router for all LLMRouter routes - requires LiteLLM API key authentication
+# This includes MCP, A2A convenience, hot reload, and config endpoints
+llmrouter_router = APIRouter(
+    tags=["llmrouter"],
+    dependencies=[Depends(user_api_key_auth)],
+)
+
+# Legacy alias for backwards compatibility (deprecated - use health_router + llmrouter_router)
+router = llmrouter_router
 
 
 # =============================================================================
@@ -86,6 +102,134 @@ class MCPToolRegister(BaseModel):
 
 
 # =============================================================================
+# Kubernetes Health Probe Endpoints (/_health/*)
+# =============================================================================
+# These are minimal, unauthenticated endpoints for K8s probes.
+# - /_health/live: Liveness probe - doesn't check external deps (DB/Redis)
+# - /_health/ready: Readiness probe - checks optional deps with short timeouts
+#
+# Use these in K8s manifests instead of /health/* which may be auth-protected.
+
+
+@health_router.get("/_health/live")
+async def liveness_probe():
+    """
+    Kubernetes liveness probe endpoint.
+
+    This endpoint verifies the application process is alive and responsive.
+    It does NOT check external dependencies (database, Redis, etc.) because
+    liveness failures trigger pod restarts, not traffic rerouting.
+
+    Returns:
+        200 OK if the process is alive
+    """
+    return {"status": "alive", "service": "litellm-llmrouter"}
+
+
+@health_router.get("/_health/ready")
+async def readiness_probe():
+    """
+    Kubernetes readiness probe endpoint.
+
+    This endpoint verifies the application is ready to accept traffic.
+    It checks optional external dependencies (database, Redis) with short
+    timeouts (2s) so the probe doesn't hang.
+
+    If a dependency is not configured, it's not checked (still returns ready).
+    If a dependency is configured but unreachable, returns 503.
+
+    Returns:
+        200 OK if all configured dependencies are healthy
+        503 Service Unavailable if any configured dependency is unhealthy
+    """
+    checks = {}
+    is_ready = True
+
+    # Check database if configured
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        try:
+            # Import here to avoid circular imports and optional dependency
+            import asyncpg
+
+            # Use short timeout for health check
+            conn = await asyncio.wait_for(
+                asyncpg.connect(db_url, timeout=2.0),
+                timeout=2.0,
+            )
+            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=1.0)
+            await conn.close()
+            checks["database"] = {"status": "healthy"}
+        except asyncio.TimeoutError:
+            checks["database"] = {"status": "unhealthy", "error": "connection timeout"}
+            is_ready = False
+        except ImportError:
+            # asyncpg not installed, try basic connectivity via litellm
+            checks["database"] = {
+                "status": "skipped",
+                "reason": "asyncpg not installed",
+            }
+        except Exception as e:
+            checks["database"] = {"status": "unhealthy", "error": str(e)[:100]}
+            is_ready = False
+
+    # Check Redis if configured
+    redis_host = os.getenv("REDIS_HOST")
+    if redis_host:
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        try:
+            import redis.asyncio as aioredis
+
+            r = aioredis.Redis(
+                host=redis_host,
+                port=redis_port,
+                socket_connect_timeout=2.0,
+                socket_timeout=2.0,
+            )
+            await asyncio.wait_for(r.ping(), timeout=2.0)
+            await r.aclose()
+            checks["redis"] = {"status": "healthy"}
+        except asyncio.TimeoutError:
+            checks["redis"] = {"status": "unhealthy", "error": "connection timeout"}
+            is_ready = False
+        except ImportError:
+            checks["redis"] = {
+                "status": "skipped",
+                "reason": "redis package not installed",
+            }
+        except Exception as e:
+            checks["redis"] = {"status": "unhealthy", "error": str(e)[:100]}
+            is_ready = False
+
+    # Check MCP gateway health if enabled
+    if os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true":
+        try:
+            gateway = get_mcp_gateway()
+            if gateway.is_enabled():
+                checks["mcp_gateway"] = {
+                    "status": "healthy",
+                    "servers": len(gateway.list_servers()),
+                }
+            else:
+                checks["mcp_gateway"] = {"status": "disabled"}
+        except Exception as e:
+            checks["mcp_gateway"] = {"status": "unhealthy", "error": str(e)[:100]}
+            # MCP gateway failure is non-fatal for readiness
+            # is_ready = False
+
+    response = {
+        "status": "ready" if is_ready else "not_ready",
+        "service": "litellm-llmrouter",
+        "checks": checks,
+    }
+
+    if not is_ready:
+        raise HTTPException(status_code=503, detail=response)
+
+    return response
+
+
+# =============================================================================
 # A2A Gateway Convenience Endpoints (/a2a/agents)
 # =============================================================================
 # These are thin wrappers around LiteLLM's global_agent_registry for convenience.
@@ -96,7 +240,7 @@ class MCPToolRegister(BaseModel):
 # - POST /a2a/{agent_id} - Invoke agent (A2A JSON-RPC protocol)
 
 
-@router.get("/a2a/agents")
+@llmrouter_router.get("/a2a/agents")
 async def list_a2a_agents_convenience():
     """
     List all registered A2A agents.
@@ -132,7 +276,7 @@ async def list_a2a_agents_convenience():
         )
 
 
-@router.post("/a2a/agents")
+@llmrouter_router.post("/a2a/agents")
 async def register_a2a_agent_convenience(agent: AgentRegistration):
     """
     Register a new A2A agent.
@@ -192,7 +336,7 @@ async def register_a2a_agent_convenience(agent: AgentRegistration):
         )
 
 
-@router.delete("/a2a/agents/{agent_id}")
+@llmrouter_router.delete("/a2a/agents/{agent_id}")
 async def unregister_a2a_agent_convenience(agent_id: str):
     """
     Unregister an A2A agent.
@@ -234,7 +378,7 @@ async def unregister_a2a_agent_convenience(agent_id: str):
         )
 
 
-@router.post("/a2a/{agent_id}/message/stream")
+@llmrouter_router.post("/a2a/{agent_id}/message/stream")
 async def a2a_streaming_alias(agent_id: str, request: Request):
     """
     Streaming alias endpoint for A2A JSON-RPC protocol.
@@ -318,7 +462,7 @@ async def a2a_streaming_alias(agent_id: str, request: Request):
 # with LiteLLM's native /mcp endpoint (which uses JSON-RPC over SSE).
 
 
-@router.get("/llmrouter/mcp/servers")
+@llmrouter_router.get("/llmrouter/mcp/servers")
 async def list_mcp_servers():
     """List all registered MCP servers (REST API)."""
     gateway = get_mcp_gateway()
@@ -340,7 +484,7 @@ async def list_mcp_servers():
     }
 
 
-@router.post("/llmrouter/mcp/servers")
+@llmrouter_router.post("/llmrouter/mcp/servers")
 async def register_mcp_server(server: ServerRegistration):
     """Register a new MCP server (REST API)."""
     gateway = get_mcp_gateway()
@@ -362,7 +506,7 @@ async def register_mcp_server(server: ServerRegistration):
     return {"status": "registered", "server_id": server.server_id}
 
 
-@router.get("/llmrouter/mcp/servers/{server_id}")
+@llmrouter_router.get("/llmrouter/mcp/servers/{server_id}")
 async def get_mcp_server(server_id: str):
     """Get a specific MCP server by ID (REST API)."""
     gateway = get_mcp_gateway()
@@ -382,7 +526,7 @@ async def get_mcp_server(server_id: str):
     }
 
 
-@router.delete("/llmrouter/mcp/servers/{server_id}")
+@llmrouter_router.delete("/llmrouter/mcp/servers/{server_id}")
 async def unregister_mcp_server(server_id: str):
     """Unregister an MCP server (REST API)."""
     gateway = get_mcp_gateway()
@@ -391,7 +535,7 @@ async def unregister_mcp_server(server_id: str):
     raise HTTPException(status_code=404, detail=f"Server {server_id} not found")
 
 
-@router.put("/llmrouter/mcp/servers/{server_id}")
+@llmrouter_router.put("/llmrouter/mcp/servers/{server_id}")
 async def update_mcp_server(server_id: str, server: ServerRegistration):
     """
     Update an MCP server (full update).
@@ -438,7 +582,7 @@ async def update_mcp_server(server_id: str, server: ServerRegistration):
     }
 
 
-@router.get("/llmrouter/mcp/tools")
+@llmrouter_router.get("/llmrouter/mcp/tools")
 async def list_mcp_tools():
     """List all available MCP tools across all servers."""
     gateway = get_mcp_gateway()
@@ -448,7 +592,7 @@ async def list_mcp_tools():
     return {"tools": gateway.list_tools()}
 
 
-@router.get("/llmrouter/mcp/resources")
+@llmrouter_router.get("/llmrouter/mcp/resources")
 async def list_mcp_resources():
     """List all available MCP resources across all servers."""
     gateway = get_mcp_gateway()
@@ -458,7 +602,7 @@ async def list_mcp_resources():
     return {"resources": gateway.list_resources()}
 
 
-@router.get("/llmrouter/mcp/tools/list")
+@llmrouter_router.get("/llmrouter/mcp/tools/list")
 async def list_mcp_tools_detailed():
     """
     List all available MCP tools with detailed information.
@@ -487,7 +631,7 @@ async def list_mcp_tools_detailed():
     return {"tools": tools, "count": len(tools)}
 
 
-@router.post("/llmrouter/mcp/tools/call")
+@llmrouter_router.post("/llmrouter/mcp/tools/call")
 async def call_mcp_tool(request: MCPToolCall):
     """
     Invoke an MCP tool by name.
@@ -534,7 +678,7 @@ async def call_mcp_tool(request: MCPToolCall):
     }
 
 
-@router.get("/llmrouter/mcp/tools/{tool_name}")
+@llmrouter_router.get("/llmrouter/mcp/tools/{tool_name}")
 async def get_mcp_tool(tool_name: str):
     """Get details about a specific MCP tool."""
     gateway = get_mcp_gateway()
@@ -555,7 +699,7 @@ async def get_mcp_tool(tool_name: str):
     }
 
 
-@router.post("/llmrouter/mcp/servers/{server_id}/tools")
+@llmrouter_router.post("/llmrouter/mcp/servers/{server_id}/tools")
 async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
     """
     Register a tool definition for an MCP server.
@@ -586,7 +730,7 @@ async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
         )
 
 
-@router.get("/v1/llmrouter/mcp/server/health")
+@llmrouter_router.get("/v1/llmrouter/mcp/server/health")
 async def get_mcp_servers_health():
     """
     Check the health of all registered MCP servers.
@@ -612,7 +756,7 @@ async def get_mcp_servers_health():
     }
 
 
-@router.get("/v1/llmrouter/mcp/server/{server_id}/health")
+@llmrouter_router.get("/v1/llmrouter/mcp/server/{server_id}/health")
 async def get_mcp_server_health(server_id: str):
     """
     Check the health of a specific MCP server.
@@ -631,7 +775,7 @@ async def get_mcp_server_health(server_id: str):
     return health
 
 
-@router.get("/v1/llmrouter/mcp/registry.json")
+@llmrouter_router.get("/v1/llmrouter/mcp/registry.json")
 async def get_mcp_registry(
     access_groups: str | None = Query(
         None, description="Comma-separated access groups"
@@ -659,7 +803,7 @@ async def get_mcp_registry(
     return registry
 
 
-@router.get("/v1/llmrouter/mcp/access_groups")
+@llmrouter_router.get("/v1/llmrouter/mcp/access_groups")
 async def list_mcp_access_groups():
     """
     List all access groups across all MCP servers.
@@ -683,7 +827,7 @@ async def list_mcp_access_groups():
 # =============================================================================
 
 
-@router.post("/router/reload")
+@llmrouter_router.post("/router/reload")
 async def reload_router(request: ReloadRequest | None = None):
     """Reload routing strategy/strategies."""
     manager = get_hot_reload_manager()
@@ -692,7 +836,7 @@ async def reload_router(request: ReloadRequest | None = None):
     return result
 
 
-@router.post("/config/reload")
+@llmrouter_router.post("/config/reload")
 async def reload_config(request: ReloadRequest | None = None):
     """Trigger a config reload, optionally syncing from remote."""
     manager = get_hot_reload_manager()
@@ -701,22 +845,17 @@ async def reload_config(request: ReloadRequest | None = None):
     return result
 
 
-@router.get("/config/sync/status")
+@llmrouter_router.get("/config/sync/status")
 async def get_sync_status():
     """Get the current config sync status."""
     sync_manager = get_sync_manager()
     if sync_manager is None:
         return {"enabled": False, "message": "Config sync is not enabled"}
 
-    return {
-        "enabled": True,
-        "last_sync": sync_manager.last_sync_time,
-        "sync_interval": sync_manager.sync_interval,
-        "source": sync_manager.source_type,
-    }
+    return sync_manager.get_status()
 
 
-@router.get("/router/info")
+@llmrouter_router.get("/router/info")
 async def get_router_info():
     """Get information about the current routing configuration."""
     manager = get_hot_reload_manager()

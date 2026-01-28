@@ -4,6 +4,10 @@ LLMRouter Routing Strategies for LiteLLM
 
 This module implements the integration between LLMRouter's ML-based
 routing strategies and LiteLLM's routing infrastructure.
+
+Security Notes:
+- Pickle loading is disabled by default due to RCE risk
+- Set LLMROUTER_ALLOW_PICKLE_MODELS=true to enable (only in trusted environments)
 """
 
 import json
@@ -71,6 +75,24 @@ def _get_sentence_transformer(model_name: str, device: str = "cpu"):
 # Default embedding model matching the training pipeline
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Security: Pickle loading is disabled by default to prevent RCE
+# Set LLMROUTER_ALLOW_PICKLE_MODELS=true to enable in trusted environments
+ALLOW_PICKLE_MODELS = (
+    os.getenv("LLMROUTER_ALLOW_PICKLE_MODELS", "false").lower() == "true"
+)
+
+
+class PickleSecurityError(Exception):
+    """Raised when pickle loading is attempted but not explicitly allowed."""
+
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        super().__init__(
+            f"Pickle loading is disabled for security (RCE risk). "
+            f"To enable pickle model loading, set LLMROUTER_ALLOW_PICKLE_MODELS=true. "
+            f"Model path: {model_path}"
+        )
+
 
 class InferenceKNNRouter:
     """
@@ -84,6 +106,10 @@ class InferenceKNNRouter:
 
     The trained .pkl file is produced by UIUC's KNNRouterTrainer which calls
     sklearn's KNeighborsClassifier.fit() and saves via pickle.
+
+    Security:
+    - Pickle loading requires LLMROUTER_ALLOW_PICKLE_MODELS=true
+    - This protects against RCE via malicious pickle files
 
     Attributes:
         model_path: Path to the trained .pkl model file
@@ -119,9 +145,17 @@ class InferenceKNNRouter:
         self._load_model()
 
     def _load_model(self):
-        """Load the sklearn KNN model from pickle file."""
+        """Load the sklearn KNN model from pickle file.
+
+        Security: Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
+        Pickle deserialization can execute arbitrary code, so it's disabled by default.
+        """
         if not self.model_path:
             raise ValueError("model_path is required for InferenceKNNRouter")
+
+        # Security check: pickle loading disabled by default
+        if not ALLOW_PICKLE_MODELS:
+            raise PickleSecurityError(self.model_path)
 
         path = Path(self.model_path)
         if not path.exists():
@@ -174,8 +208,9 @@ class InferenceKNNRouter:
             # Predict using the KNN model
             predicted_label = self.knn_model.predict(embedding)[0]
 
+            # Security: Log only query length and prediction, not query content (PII risk)
             verbose_proxy_logger.debug(
-                f"KNN routing: query='{query[:50]}...' -> predicted={predicted_label}"
+                f"KNN routing: query_length={len(query)} -> predicted={predicted_label}"
             )
 
             # Apply label mapping if configured

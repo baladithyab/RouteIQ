@@ -50,23 +50,26 @@ def register_routes_with_litellm():
     - agent_endpoints_router: /v1/agents (CRUD, DB-backed)
     - a2a_router: /a2a/{agent_id} (A2A JSON-RPC protocol)
 
-    Our router adds:
-    - /a2a/agents (convenience wrapper to global_agent_registry)
-    - /mcp/* (MCP gateway endpoints)
-    - /router/* and /config/* (hot reload endpoints)
+    Our routers add:
+    - health_router: /_health/* (K8s probes, unauthenticated)
+    - llmrouter_router: /a2a/agents, /mcp/*, /router/*, /config/* (auth-protected)
     """
     try:
         from litellm.proxy.proxy_server import app
-        from litellm_llmrouter.routes import router
+        from litellm_llmrouter.routes import health_router, llmrouter_router
 
-        # Register LLMRouter routes
+        # Register health router (unauthenticated - for K8s probes)
+        app.include_router(health_router, prefix="")
+
+        # Register LLMRouter routes (auth-protected via Depends(user_api_key_auth))
         # These add MCP gateway, hot reload, and /a2a/agents convenience endpoints
-        app.include_router(router, prefix="")
+        app.include_router(llmrouter_router, prefix="")
 
         print("✅ LLMRouter routes registered with LiteLLM")
-        print("   ├── /a2a/agents (convenience wrapper)")
-        print("   ├── /mcp/* (MCP gateway)")
-        print("   └── /router/*, /config/* (hot reload)")
+        print("   ├── /_health/* (K8s probes, unauthenticated)")
+        print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
+        print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
+        print("   └── /router/*, /config/* (hot reload, auth-protected)")
         print(
             "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
         )
