@@ -10,21 +10,26 @@ Features:
 - Tool discovery and invocation
 - OTel tracing integration (via mcp_tracing module)
 - HA-safe: Redis-backed registry syncs across replicas
+- Thread-safe singleton and registry operations
 
 Security Notes:
 - Outbound URLs are validated against SSRF attacks before making requests
 - See url_security.py for details on blocked targets
+- Remote tool invocation is disabled by default (enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true)
 
 See: https://modelcontextprotocol.io/
 """
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
+import httpx
 from litellm._logging import verbose_proxy_logger
 
 # Import SSRF protection utilities
@@ -163,17 +168,40 @@ class MCPGateway:
     When REDIS_HOST is set and MCP_HA_SYNC_ENABLED=true, server registrations
     are synchronized via Redis pub/sub, allowing all replicas to share the
     same registry state.
+    
+    Thread Safety:
+    All registry mutations are protected by a reentrant lock. Read operations
+    return immutable snapshots to avoid stale-read issues and allow iteration
+    without holding locks.
+    
+    Tool Invocation:
+    Remote tool invocation is DISABLED by default for security. To enable,
+    set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true. When disabled, invoke_tool()
+    returns an error with code "tool_invocation_disabled".
     """
 
     # Redis key prefix for MCP servers
     REDIS_KEY_PREFIX = "litellm:mcp:servers:"
     REDIS_PUBSUB_CHANNEL = "litellm:mcp:sync"
+    
+    # HTTP client timeouts for tool invocation (seconds)
+    TOOL_INVOCATION_CONNECT_TIMEOUT = 10.0
+    TOOL_INVOCATION_READ_TIMEOUT = 30.0
+    TOOL_INVOCATION_TOTAL_TIMEOUT = 60.0
 
     def __init__(self):
+        # Thread safety: RLock for registry mutations (reentrant to allow nested calls)
+        self._lock = threading.RLock()
+        
         self.servers: dict[str, MCPServer] = {}
         self.enabled = os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true"
         # Map tool names to server IDs for quick lookup
         self._tool_to_server: dict[str, str] = {}
+        
+        # Feature flag for remote tool invocation (disabled by default for security)
+        self._tool_invocation_enabled = (
+            os.getenv("LLMROUTER_ENABLE_MCP_TOOL_INVOCATION", "false").lower() == "true"
+        )
 
         # HA sync via Redis (optional)
         self._redis_client: Any = None
@@ -235,28 +263,34 @@ class MCPGateway:
             keys = self._redis_client.keys(pattern)
 
             loaded_count = 0
+            # Collect data outside lock, then apply inside lock
+            servers_to_load: list[MCPServer] = []
             for key in keys:
                 try:
                     data = self._redis_client.get(key)
                     if data:
                         server_dict = json.loads(data)
                         server = MCPServer.from_dict(server_dict)
-                        self.servers[server.server_id] = server
-                        # Update tool mapping
-                        for tool_name in server.tools:
-                            self._tool_to_server[tool_name] = server.server_id
-                        loaded_count += 1
+                        servers_to_load.append(server)
                 except Exception as e:
                     verbose_proxy_logger.warning(
                         f"MCP: Failed to load server from Redis key {key}: {e}"
                     )
 
+            # Apply under lock
+            with self._lock:
+                for server in servers_to_load:
+                    self.servers[server.server_id] = server
+                    # Update tool mapping
+                    for tool_name in server.tools:
+                        self._tool_to_server[tool_name] = server.server_id
+                    loaded_count += 1
+                self._last_sync_time = time.time()
+
             if loaded_count > 0:
                 verbose_proxy_logger.info(
                     f"MCP: Loaded {loaded_count} servers from Redis"
                 )
-
-            self._last_sync_time = time.time()
 
         except Exception as e:
             verbose_proxy_logger.warning(f"MCP: Failed to load servers from Redis: {e}")
@@ -320,14 +354,15 @@ class MCPGateway:
         if not self._redis_client:
             return 0
 
-        # Rate limit sync
+        # Rate limit sync - read _last_sync_time under lock
         now = time.time()
-        if now - self._last_sync_time < self._sync_interval:
-            return len(self.servers)
+        with self._lock:
+            if now - self._last_sync_time < self._sync_interval:
+                return len(self.servers)
 
         self._load_servers_from_redis()
-        return len(self.servers)
-
+        with self._lock:
+            return len(self.servers)
     def is_enabled(self) -> bool:
         """Check if MCP gateway is enabled."""
         return self.enabled
@@ -335,6 +370,10 @@ class MCPGateway:
     def is_ha_sync_enabled(self) -> bool:
         """Check if HA sync via Redis is enabled."""
         return self._ha_sync_enabled and self._redis_client is not None
+
+    def is_tool_invocation_enabled(self) -> bool:
+        """Check if remote tool invocation is enabled."""
+        return self._tool_invocation_enabled
 
     def register_server(self, server: MCPServer) -> None:
         """
@@ -344,12 +383,14 @@ class MCPGateway:
         cross-replica visibility.
 
         Security: Server URLs are validated against SSRF attacks before registration.
+        Thread Safety: Registry mutation is protected by lock.
         """
         if not self.enabled:
             verbose_proxy_logger.warning("MCP Gateway is not enabled")
             return
 
         # Security: Validate URL against SSRF attacks at registration time
+        # Done outside lock to avoid holding lock during validation
         if server.url:
             try:
                 validate_outbound_url(
@@ -366,13 +407,15 @@ class MCPGateway:
                 )
                 raise ValueError(f"Server URL is invalid: {str(e)}")
 
-        self.servers[server.server_id] = server
+        # Thread-safe registry update
+        with self._lock:
+            self.servers[server.server_id] = server
 
-        # Update tool-to-server mapping
-        for tool_name in server.tools:
-            self._tool_to_server[tool_name] = server.server_id
+            # Update tool-to-server mapping
+            for tool_name in server.tools:
+                self._tool_to_server[tool_name] = server.server_id
 
-        # Save to Redis for HA sync
+        # Save to Redis for HA sync (outside lock to avoid blocking on I/O)
         if self._ha_sync_enabled:
             self._save_server_to_redis(server)
 
@@ -386,16 +429,22 @@ class MCPGateway:
         Unregister an MCP server from the gateway.
 
         If HA sync is enabled, the server is also removed from Redis.
+        Thread Safety: Registry mutation is protected by lock.
         """
-        if server_id in self.servers:
-            server = self.servers[server_id]
-            # Remove tool mappings
-            for tool_name in server.tools:
-                if self._tool_to_server.get(tool_name) == server_id:
-                    del self._tool_to_server[tool_name]
-            del self.servers[server_id]
+        with self._lock:
+            if server_id in self.servers:
+                server = self.servers[server_id]
+                # Remove tool mappings
+                for tool_name in server.tools:
+                    if self._tool_to_server.get(tool_name) == server_id:
+                        del self._tool_to_server[tool_name]
+                del self.servers[server_id]
+                found = True
+            else:
+                found = False
 
-            # Remove from Redis for HA sync
+        if found:
+            # Remove from Redis for HA sync (outside lock)
             if self._ha_sync_enabled:
                 self._delete_server_from_redis(server_id)
 
@@ -404,23 +453,38 @@ class MCPGateway:
         return False
 
     def get_server(self, server_id: str) -> MCPServer | None:
-        """Get an MCP server by ID."""
+        """Get an MCP server by ID. Thread-safe."""
         # Sync from Redis if HA enabled (rate-limited)
         if self._ha_sync_enabled:
             self.sync_from_redis()
-        return self.servers.get(server_id)
+        with self._lock:
+            return self.servers.get(server_id)
 
     def list_servers(self) -> list[MCPServer]:
-        """List all registered MCP servers."""
+        """List all registered MCP servers. Returns a snapshot copy. Thread-safe."""
         # Sync from Redis if HA enabled (rate-limited)
         if self._ha_sync_enabled:
             self.sync_from_redis()
-        return list(self.servers.values())
+        with self._lock:
+            return list(self.servers.values())
+
+    def get_servers_snapshot(self) -> MappingProxyType[str, MCPServer]:
+        """
+        Get an immutable snapshot of the servers registry.
+        
+        Returns:
+            Read-only view of current servers dict.
+        """
+        with self._lock:
+            # Return immutable proxy to a copy to prevent mutation
+            return MappingProxyType(dict(self.servers))
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """List all tools from all registered servers."""
+        """List all tools from all registered servers. Thread-safe."""
         tools = []
-        for server in self.servers.values():
+        with self._lock:
+            servers_snapshot = list(self.servers.values())
+        for server in servers_snapshot:
             for tool in server.tools:
                 tools.append(
                     {
@@ -432,9 +496,11 @@ class MCPGateway:
         return tools
 
     def list_resources(self) -> list[dict[str, Any]]:
-        """List all resources from all registered servers."""
+        """List all resources from all registered servers. Thread-safe."""
         resources = []
-        for server in self.servers.values():
+        with self._lock:
+            servers_snapshot = list(self.servers.values())
+        for server in servers_snapshot:
             for resource in server.resources:
                 resources.append(
                     {
@@ -447,7 +513,7 @@ class MCPGateway:
 
     def get_tool(self, tool_name: str) -> MCPToolDefinition | None:
         """
-        Get a tool definition by name.
+        Get a tool definition by name. Thread-safe.
 
         Args:
             tool_name: Name of the tool to retrieve
@@ -455,31 +521,32 @@ class MCPGateway:
         Returns:
             Tool definition if found, None otherwise
         """
-        server_id = self._tool_to_server.get(tool_name)
-        if not server_id:
-            return None
+        with self._lock:
+            server_id = self._tool_to_server.get(tool_name)
+            if not server_id:
+                return None
 
-        server = self.servers.get(server_id)
-        if not server:
-            return None
+            server = self.servers.get(server_id)
+            if not server:
+                return None
 
-        # Check if we have a full definition
-        if tool_name in server.tool_definitions:
-            return server.tool_definitions[tool_name]
+            # Check if we have a full definition
+            if tool_name in server.tool_definitions:
+                return server.tool_definitions[tool_name]
 
-        # Return basic definition if tool exists in list
-        if tool_name in server.tools:
-            return MCPToolDefinition(
-                name=tool_name,
-                description=f"Tool from {server.name}",
-                server_id=server_id,
-            )
+            # Return basic definition if tool exists in list
+            if tool_name in server.tools:
+                return MCPToolDefinition(
+                    name=tool_name,
+                    description=f"Tool from {server.name}",
+                    server_id=server.server_id,
+                )
 
         return None
 
     def find_server_for_tool(self, tool_name: str) -> MCPServer | None:
         """
-        Find the server that provides a given tool.
+        Find the server that provides a given tool. Thread-safe.
 
         Args:
             tool_name: Name of the tool
@@ -487,9 +554,10 @@ class MCPGateway:
         Returns:
             Server that provides the tool, or None if not found
         """
-        server_id = self._tool_to_server.get(tool_name)
-        if server_id:
-            return self.servers.get(server_id)
+        with self._lock:
+            server_id = self._tool_to_server.get(tool_name)
+            if server_id:
+                return self.servers.get(server_id)
         return None
 
     def register_tool_definition(
@@ -498,7 +566,7 @@ class MCPGateway:
         tool: MCPToolDefinition,
     ) -> bool:
         """
-        Register a detailed tool definition for a server.
+        Register a detailed tool definition for a server. Thread-safe.
 
         Args:
             server_id: ID of the server providing the tool
@@ -507,17 +575,18 @@ class MCPGateway:
         Returns:
             True if registered successfully, False otherwise
         """
-        server = self.servers.get(server_id)
-        if not server:
-            return False
+        with self._lock:
+            server = self.servers.get(server_id)
+            if not server:
+                return False
 
-        tool.server_id = server_id
-        server.tool_definitions[tool.name] = tool
+            tool.server_id = server_id
+            server.tool_definitions[tool.name] = tool
 
-        # Add to tools list if not already there
-        if tool.name not in server.tools:
-            server.tools.append(tool.name)
-            self._tool_to_server[tool.name] = server_id
+            # Add to tools list if not already there
+            if tool.name not in server.tools:
+                server.tools.append(tool.name)
+                self._tool_to_server[tool.name] = server_id
 
         verbose_proxy_logger.info(
             f"MCP: Registered tool definition {tool.name} for server {server_id}"
@@ -532,7 +601,9 @@ class MCPGateway:
         """
         Invoke an MCP tool.
 
-        Security: Server URLs are validated against SSRF attacks before making requests.
+        Security: 
+        - Remote tool invocation is DISABLED by default. Enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true.
+        - Server URLs are validated against SSRF attacks before making requests.
 
         Args:
             tool_name: Name of the tool to invoke
@@ -541,6 +612,17 @@ class MCPGateway:
         Returns:
             Result of the tool invocation
         """
+        # Check feature flag first - disabled by default for security
+        if not self._tool_invocation_enabled:
+            verbose_proxy_logger.warning(
+                f"MCP: Tool invocation disabled. Set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true to enable."
+            )
+            return MCPToolResult(
+                success=False,
+                error="tool_invocation_disabled: Remote tool invocation is disabled. Enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true",
+                tool_name=tool_name,
+            )
+
         server = self.find_server_for_tool(tool_name)
         if not server:
             return MCPToolResult(
@@ -549,30 +631,38 @@ class MCPGateway:
                 tool_name=tool_name,
             )
 
+        # Validate server has a URL
+        if not server.url:
+            return MCPToolResult(
+                success=False,
+                error="Server URL is not configured",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
+
         # Security: Validate URL against SSRF attacks before making outbound call
-        if server.url:
-            try:
-                validate_outbound_url(server.url)
-            except SSRFBlockedError as e:
-                verbose_proxy_logger.warning(
-                    f"MCP: SSRF blocked for server '{server.server_id}' when invoking tool '{tool_name}': {e}"
-                )
-                return MCPToolResult(
-                    success=False,
-                    error=f"Server URL blocked for security reasons: {e.reason}",
-                    tool_name=tool_name,
-                    server_id=server.server_id,
-                )
-            except ValueError as e:
-                verbose_proxy_logger.warning(
-                    f"MCP: Invalid URL for server '{server.server_id}': {e}"
-                )
-                return MCPToolResult(
-                    success=False,
-                    error=f"Server URL is invalid: {str(e)}",
-                    tool_name=tool_name,
-                    server_id=server.server_id,
-                )
+        try:
+            validate_outbound_url(server.url)
+        except SSRFBlockedError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: SSRF blocked for server '{server.server_id}' when invoking tool '{tool_name}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"Server URL blocked for security reasons: {e.reason}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
+        except ValueError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: Invalid URL for server '{server.server_id}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"Server URL is invalid: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
 
         # Validate arguments against schema if available
         tool_def = server.tool_definitions.get(tool_name)
@@ -588,19 +678,153 @@ class MCPGateway:
                     server_id=server.server_id,
                 )
 
-        # In a real implementation, this would make an HTTP/SSE/stdio call
-        # to the MCP server. For now, we return a placeholder result.
+        # Build the tool invocation URL (per MCP stub server protocol)
+        # The server URL base + /mcp/tools/call endpoint
+        base_url = server.url.rstrip("/")
+        if not base_url.endswith("/mcp/tools/call"):
+            # Append standard endpoint if not already present
+            if base_url.endswith("/mcp"):
+                invocation_url = f"{base_url}/tools/call"
+            else:
+                invocation_url = f"{base_url}/mcp/tools/call"
+        else:
+            invocation_url = base_url
+
         verbose_proxy_logger.info(
-            f"MCP: Invoking tool {tool_name} on server {server.server_id}"
+            f"MCP: Invoking tool {tool_name} on server {server.server_id} at {invocation_url}"
         )
 
-        # Placeholder - actual implementation would call the MCP server
-        return MCPToolResult(
-            success=True,
-            result={"message": f"Tool {tool_name} invoked successfully"},
-            tool_name=tool_name,
-            server_id=server.server_id,
+        # Prepare request payload (matches MCP stub server format)
+        request_payload = {
+            "tool_name": tool_name,
+            "arguments": arguments,
+        }
+
+        # Build headers (include auth if configured)
+        headers = {"Content-Type": "application/json"}
+        if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
+            headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
+        elif server.auth_type == "api_key" and server.metadata.get("api_key"):
+            headers["X-API-Key"] = server.metadata["api_key"]
+
+        # Make HTTP request with strict timeouts
+        # Do NOT hold locks during I/O
+        timeout = httpx.Timeout(
+            connect=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+            read=self.TOOL_INVOCATION_READ_TIMEOUT,
+            write=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+            pool=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
         )
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    invocation_url,
+                    json=request_payload,
+                    headers=headers,
+                )
+
+                # Check HTTP status
+                if response.status_code >= 400:
+                    error_detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+                    verbose_proxy_logger.warning(
+                        f"MCP: Tool invocation failed with HTTP {response.status_code}: {error_detail}"
+                    )
+                    return MCPToolResult(
+                        success=False,
+                        error=f"HTTP {response.status_code}: {error_detail}",
+                        tool_name=tool_name,
+                        server_id=server.server_id,
+                    )
+
+                # Parse response JSON
+                try:
+                    response_data = response.json()
+                except json.JSONDecodeError as e:
+                    verbose_proxy_logger.warning(
+                        f"MCP: Invalid JSON response from server: {e}"
+                    )
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Invalid JSON response from MCP server: {str(e)}",
+                        tool_name=tool_name,
+                        server_id=server.server_id,
+                    )
+
+                # Parse MCP server response format
+                # Expected format: {"status": "success", "tool_name": "...", "result": {...}}
+                # or error: {"detail": "error message"}
+                if isinstance(response_data, dict):
+                    status = response_data.get("status", "")
+                    if status == "success":
+                        return MCPToolResult(
+                            success=True,
+                            result=response_data.get("result"),
+                            tool_name=response_data.get("tool_name", tool_name),
+                            server_id=server.server_id,
+                        )
+                    elif "detail" in response_data:
+                        # Error response format
+                        return MCPToolResult(
+                            success=False,
+                            error=response_data["detail"],
+                            tool_name=tool_name,
+                            server_id=server.server_id,
+                        )
+                    elif "error" in response_data:
+                        return MCPToolResult(
+                            success=False,
+                            error=response_data["error"],
+                            tool_name=tool_name,
+                            server_id=server.server_id,
+                        )
+                    else:
+                        # Unknown format - return as-is with success
+                        return MCPToolResult(
+                            success=True,
+                            result=response_data,
+                            tool_name=tool_name,
+                            server_id=server.server_id,
+                        )
+                else:
+                    # Non-dict response
+                    return MCPToolResult(
+                        success=True,
+                        result=response_data,
+                        tool_name=tool_name,
+                        server_id=server.server_id,
+                    )
+
+        except httpx.TimeoutException as e:
+            verbose_proxy_logger.warning(
+                f"MCP: Timeout invoking tool '{tool_name}' on server '{server.server_id}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"Timeout connecting to MCP server: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
+        except httpx.ConnectError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: Connection error invoking tool '{tool_name}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"Failed to connect to MCP server: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
+        except Exception as e:
+            verbose_proxy_logger.exception(
+                f"MCP: Unexpected error invoking tool '{tool_name}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"Unexpected error during tool invocation: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
 
     def _validate_arguments(
         self,
@@ -657,6 +881,7 @@ class MCPGateway:
         Check the health of an MCP server.
 
         Security: Server URLs are validated against SSRF attacks before making requests.
+        Thread Safety: Server lookup is protected by lock.
 
         Args:
             server_id: ID of the server to check
@@ -666,7 +891,10 @@ class MCPGateway:
         """
         import time
 
-        server = self.servers.get(server_id)
+        # Get server under lock
+        with self._lock:
+            server = self.servers.get(server_id)
+        
         if not server:
             return {
                 "server_id": server_id,
@@ -676,7 +904,7 @@ class MCPGateway:
 
         start_time = time.time()
 
-        # Security: Validate URL against SSRF attacks
+        # Security: Validate URL against SSRF attacks (outside lock)
         if server.url:
             try:
                 validate_outbound_url(server.url)
@@ -736,15 +964,19 @@ class MCPGateway:
         Returns:
             List of health status dicts for all servers
         """
+        # Get snapshot of server IDs under lock
+        with self._lock:
+            server_ids = list(self.servers.keys())
+        
         results = []
-        for server_id in self.servers:
+        for server_id in server_ids:
             health = await self.check_server_health(server_id)
             results.append(health)
         return results
 
     def get_registry(self, access_groups: list[str] | None = None) -> dict[str, Any]:
         """
-        Generate an MCP registry document for discovery.
+        Generate an MCP registry document for discovery. Thread-safe.
 
         Args:
             access_groups: Optional list of access groups to filter by
@@ -753,7 +985,10 @@ class MCPGateway:
             MCP registry document with all servers and capabilities
         """
         servers_list = []
-        for server in self.servers.values():
+        with self._lock:
+            servers_snapshot = list(self.servers.values())
+        
+        for server in servers_snapshot:
             # Filter by access groups if specified
             if access_groups:
                 server_groups = server.metadata.get("access_groups", [])
@@ -780,25 +1015,49 @@ class MCPGateway:
 
     def list_access_groups(self) -> list[str]:
         """
-        List all unique access groups across all servers.
+        List all unique access groups across all servers. Thread-safe.
 
         Returns:
             List of unique access group names
         """
         groups = set()
-        for server in self.servers.values():
+        with self._lock:
+            servers_snapshot = list(self.servers.values())
+        
+        for server in servers_snapshot:
             server_groups = server.metadata.get("access_groups", [])
             groups.update(server_groups)
         return sorted(groups)
 
 
-# Singleton instance
+# Singleton instance and lock for thread-safe initialization
 _mcp_gateway: MCPGateway | None = None
+_mcp_gateway_lock = threading.Lock()
 
 
 def get_mcp_gateway() -> MCPGateway:
-    """Get the global MCP gateway instance."""
+    """
+    Get the global MCP gateway instance.
+    
+    Thread-safe: Uses double-checked locking pattern for efficient
+    singleton initialization.
+    """
     global _mcp_gateway
     if _mcp_gateway is None:
-        _mcp_gateway = MCPGateway()
+        with _mcp_gateway_lock:
+            # Double-check after acquiring lock
+            if _mcp_gateway is None:
+                _mcp_gateway = MCPGateway()
     return _mcp_gateway
+
+
+def reset_mcp_gateway() -> None:
+    """
+    Reset the global MCP gateway instance.
+    
+    WARNING: For testing purposes only. Not safe to call while
+    requests are in flight.
+    """
+    global _mcp_gateway
+    with _mcp_gateway_lock:
+        _mcp_gateway = None
