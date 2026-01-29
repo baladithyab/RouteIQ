@@ -10,12 +10,19 @@ Security Notes:
 - Outbound URLs are validated against SSRF attacks before making requests
 - See url_security.py for details on blocked targets
 
+Thread Safety:
+- Singleton initialization is protected by a module-level lock
+- Registry mutations are protected by a reentrant lock
+- Read operations return snapshots to avoid stale-read issues
+
 See: https://google.github.io/A2A/
 """
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, AsyncIterator
 
 import httpx
@@ -121,9 +128,17 @@ class A2AGateway:
     - Registering AI agents with their capabilities
     - Discovering available agents
     - Routing requests to appropriate agents
+    
+    Thread Safety:
+    All registry mutations are protected by a reentrant lock. Read operations
+    return immutable snapshots to avoid stale-read issues and allow iteration
+    without holding locks.
     """
 
     def __init__(self):
+        # Thread safety: RLock for registry mutations (reentrant to allow nested calls)
+        self._lock = threading.RLock()
+        
         self.agents: dict[str, A2AAgent] = {}
         self.enabled = os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true"
 
@@ -132,41 +147,95 @@ class A2AGateway:
         return self.enabled
 
     def register_agent(self, agent: A2AAgent) -> None:
-        """Register an agent with the gateway."""
+        """
+        Register an agent with the gateway.
+        
+        Security: Agent URLs are validated against SSRF attacks before registration.
+        Thread Safety: Registry mutation is protected by lock.
+        """
         if not self.enabled:
             verbose_proxy_logger.warning("A2A Gateway is not enabled")
             return
 
-        self.agents[agent.agent_id] = agent
+        # Security: Validate URL against SSRF attacks at registration time
+        # Done outside lock to avoid holding lock during validation
+        if agent.url:
+            try:
+                validate_outbound_url(
+                    agent.url, resolve_dns=False
+                )  # Don't resolve during registration
+            except SSRFBlockedError as e:
+                verbose_proxy_logger.warning(
+                    f"A2A: SSRF blocked for agent '{agent.agent_id}': {e}"
+                )
+                raise ValueError(f"Agent URL blocked for security reasons: {e.reason}")
+            except ValueError as e:
+                verbose_proxy_logger.warning(
+                    f"A2A: Invalid URL for agent '{agent.agent_id}': {e}"
+                )
+                raise ValueError(f"Agent URL is invalid: {str(e)}")
+
+        # Thread-safe registry update
+        with self._lock:
+            self.agents[agent.agent_id] = agent
+        
         verbose_proxy_logger.info(
             f"A2A: Registered agent {agent.name} ({agent.agent_id})"
         )
 
     def unregister_agent(self, agent_id: str) -> bool:
-        """Unregister an agent from the gateway."""
-        if agent_id in self.agents:
-            del self.agents[agent_id]
+        """
+        Unregister an agent from the gateway.
+        
+        Thread Safety: Registry mutation is protected by lock.
+        """
+        with self._lock:
+            if agent_id in self.agents:
+                del self.agents[agent_id]
+                found = True
+            else:
+                found = False
+        
+        if found:
             verbose_proxy_logger.info(f"A2A: Unregistered agent {agent_id}")
             return True
         return False
 
     def get_agent(self, agent_id: str) -> A2AAgent | None:
-        """Get an agent by ID."""
-        return self.agents.get(agent_id)
+        """Get an agent by ID. Thread-safe."""
+        with self._lock:
+            return self.agents.get(agent_id)
 
     def list_agents(self) -> list[A2AAgent]:
-        """List all registered agents."""
-        return list(self.agents.values())
+        """List all registered agents. Returns a snapshot copy. Thread-safe."""
+        with self._lock:
+            return list(self.agents.values())
+
+    def get_agents_snapshot(self) -> MappingProxyType[str, A2AAgent]:
+        """
+        Get an immutable snapshot of the agents registry.
+        
+        Returns:
+            Read-only view of current agents dict.
+        """
+        with self._lock:
+            # Return immutable proxy to a copy to prevent mutation
+            return MappingProxyType(dict(self.agents))
 
     def discover_agents(self, capability: str | None = None) -> list[A2AAgent]:
-        """Discover agents, optionally filtered by capability."""
+        """Discover agents, optionally filtered by capability. Thread-safe."""
+        with self._lock:
+            agents_snapshot = list(self.agents.values())
+        
         if capability is None:
-            return self.list_agents()
-        return [a for a in self.agents.values() if capability in a.capabilities]
+            return agents_snapshot
+        return [a for a in agents_snapshot if capability in a.capabilities]
 
     def get_agent_card(self, agent_id: str) -> dict[str, Any] | None:
-        """Get the A2A agent card for an agent."""
-        agent = self.get_agent(agent_id)
+        """Get the A2A agent card for an agent. Thread-safe."""
+        with self._lock:
+            agent = self.agents.get(agent_id)
+        
         if not agent:
             return None
 
@@ -196,6 +265,7 @@ class A2AGateway:
         - message/stream: Send a message and stream the response (returns first chunk)
 
         Security: Agent URLs are validated against SSRF attacks before making requests.
+        Thread Safety: Agent lookup is protected by lock.
 
         Args:
             agent_id: The ID of the agent to invoke
@@ -209,7 +279,10 @@ class A2AGateway:
                 request.id, -32000, "A2A Gateway is not enabled"
             )
 
-        agent = self.get_agent(agent_id)
+        # Get agent under lock
+        with self._lock:
+            agent = self.agents.get(agent_id)
+        
         if not agent:
             return JSONRPCResponse.error_response(
                 request.id, -32000, f"Agent '{agent_id}' not found"
@@ -220,7 +293,7 @@ class A2AGateway:
                 request.id, -32000, f"Agent '{agent_id}' has no URL configured"
             )
 
-        # Security: Validate URL against SSRF attacks
+        # Security: Validate URL against SSRF attacks (outside lock)
         try:
             validate_outbound_url(agent.url)
         except SSRFBlockedError as e:
@@ -309,6 +382,7 @@ class A2AGateway:
         Stream response from an agent using Server-Sent Events.
 
         Security: Agent URLs are validated against SSRF attacks before making requests.
+        Thread Safety: Agent lookup is protected by lock.
 
         Args:
             agent_id: The ID of the agent to invoke
@@ -328,7 +402,10 @@ class A2AGateway:
             )
             return
 
-        agent = self.get_agent(agent_id)
+        # Get agent under lock
+        with self._lock:
+            agent = self.agents.get(agent_id)
+        
         if not agent:
             yield (
                 json.dumps(
@@ -351,7 +428,7 @@ class A2AGateway:
             )
             return
 
-        # Security: Validate URL against SSRF attacks
+        # Security: Validate URL against SSRF attacks (outside lock)
         try:
             validate_outbound_url(agent.url)
         except SSRFBlockedError as e:
@@ -440,13 +517,34 @@ class A2AGateway:
             )
 
 
-# Singleton instance
+# Singleton instance and lock for thread-safe initialization
 _a2a_gateway: A2AGateway | None = None
+_a2a_gateway_lock = threading.Lock()
 
 
 def get_a2a_gateway() -> A2AGateway:
-    """Get the global A2A gateway instance."""
+    """
+    Get the global A2A gateway instance.
+    
+    Thread-safe: Uses double-checked locking pattern for efficient
+    singleton initialization.
+    """
     global _a2a_gateway
     if _a2a_gateway is None:
-        _a2a_gateway = A2AGateway()
+        with _a2a_gateway_lock:
+            # Double-check after acquiring lock
+            if _a2a_gateway is None:
+                _a2a_gateway = A2AGateway()
     return _a2a_gateway
+
+
+def reset_a2a_gateway() -> None:
+    """
+    Reset the global A2A gateway instance.
+    
+    WARNING: For testing purposes only. Not safe to call while
+    requests are in flight.
+    """
+    global _a2a_gateway
+    with _a2a_gateway_lock:
+        _a2a_gateway = None
