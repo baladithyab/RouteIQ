@@ -1,0 +1,44 @@
+apiVersion: v2
+name: routeiq-gateway
+description: |
+  RouteIQ Gateway - Intelligent LLM Gateway with ML-Powered Routing.
+  Provides unified API proxy for multiple LLM providers with advanced routing strategies.
+
+type: application
+
+# Chart version - follows SemVer
+version: 0.1.0
+
+# Application version - matches container image tag
+appVersion: "1.81.3"
+
+# Keywords for discovery
+keywords:
+  - llm
+  - gateway
+  - litellm
+  - openai
+  - anthropic
+  - routing
+  - ai
+  - ml
+
+# Optional home and sources
+home: https://github.com/baladithyab/litellm-llm-router
+sources:
+  - https://github.com/baladithyab/litellm-llm-router
+
+maintainers:
+  - name: RouteIQ Team
+    email: team@routeiq.example.com
+
+# Kubernetes version constraint
+kubeVersion: ">=1.23.0-0"
+
+# Dependencies (none for minimal chart)
+dependencies: []
+
+# Annotations for additional metadata
+annotations:
+  category: AI/ML
+  licenses: MIT

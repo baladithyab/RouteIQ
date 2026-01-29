@@ -1,0 +1,61 @@
+===============================================================================
+ RouteIQ Gateway has been deployed!
+===============================================================================
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+{{- if .Values.ingress.enabled }}
+The gateway is accessible via Ingress:
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+The gateway is accessible via NodePort:
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "routeiq-gateway.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+The gateway is accessible via LoadBalancer:
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "routeiq-gateway.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+{{- else if contains "ClusterIP" .Values.service.type }}
+The gateway is accessible within the cluster:
+  Service: {{ include "routeiq-gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+For local testing, use port-forward:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "routeiq-gateway.fullname" . }} 4000:{{ .Values.service.port }}
+  curl http://localhost:4000/_health/live
+{{- end }}
+
+Health Endpoints:
+  - Liveness:  /_health/live
+  - Readiness: /_health/ready
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if not .Values.secrets.create }}
+
+⚠️  WARNING: No secrets configured!
+Create a Kubernetes Secret with your API keys:
+
+  kubectl create secret generic {{ include "routeiq-gateway.fullname" . }}-secrets \
+    --namespace {{ .Release.Namespace }} \
+    --from-literal=LITELLM_MASTER_KEY=<your-master-key> \
+    --from-literal=OPENAI_API_KEY=<your-openai-key>
+
+Then update the release:
+  helm upgrade {{ .Release.Name }} ./deploy/charts/routeiq-gateway \
+    --namespace {{ .Release.Namespace }} \
+    --set secrets.existingSecret={{ include "routeiq-gateway.fullname" . }}-secrets
+{{- end }}
+{{- end }}
+
+Documentation:
+  - Chart README: deploy/charts/routeiq-gateway/README.md
+  - Full deployment guide: docs/deployment.md
+
+For more information, visit:
+  https://github.com/baladithyab/litellm-llm-router

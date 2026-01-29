@@ -1,0 +1,96 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "routeiq-gateway.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from pods matching the configured selectors
+    - from:
+        {{- if .Values.networkPolicy.ingress.fromNamespaceSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingress.fromNamespaceSelector | nindent 14 }}
+        {{- end }}
+        {{- if .Values.networkPolicy.ingress.fromPodSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingress.fromPodSelector | nindent 14 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.ingress.fromCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- if and (not .Values.networkPolicy.ingress.fromNamespaceSelector) (not .Values.networkPolicy.ingress.fromPodSelector) (not .Values.networkPolicy.ingress.fromCidrs) }}
+        # Default: allow from all sources
+        - {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gateway.port }}
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDns }}
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.allowHttpsExternal }}
+    # Allow HTTPS to external services (LLM providers)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.to }}
+    # Additional egress rules
+    {{- range . }}
+    - to:
+        {{- if .namespaceSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceSelector.matchLabels | nindent 14 }}
+          {{- if .podSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podSelector.matchLabels | nindent 14 }}
+          {{- end }}
+        {{- end }}
+        {{- if .ipBlock }}
+        - ipBlock:
+            cidr: {{ .ipBlock.cidr }}
+            {{- if .ipBlock.except }}
+            except:
+              {{- toYaml .ipBlock.except | nindent 14 }}
+            {{- end }}
+        {{- end }}
+      {{- if .ports }}
+      ports:
+        {{- toYaml .ports | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}
