@@ -33,50 +33,8 @@ import sys
 # Ensure src is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# CRITICAL: Import litellm_llmrouter FIRST to apply the routing_strategy_patch
-# This patches LiteLLM's Router class to accept llmrouter-* strategies
-# BEFORE any Router instances are created.
-import litellm_llmrouter  # noqa: F401 - Import for side effect (applies patch)
-
 # Configure module logger
 logger = logging.getLogger(__name__)
-
-
-def register_routes_with_litellm():
-    """
-    Register LLMRouter routes with LiteLLM's FastAPI app.
-
-    Note: LiteLLM already registers its own A2A routes:
-    - agent_endpoints_router: /v1/agents (CRUD, DB-backed)
-    - a2a_router: /a2a/{agent_id} (A2A JSON-RPC protocol)
-
-    Our routers add:
-    - health_router: /_health/* (K8s probes, unauthenticated)
-    - llmrouter_router: /a2a/agents, /mcp/*, /router/*, /config/* (auth-protected)
-    """
-    try:
-        from litellm.proxy.proxy_server import app
-        from litellm_llmrouter.routes import health_router, llmrouter_router
-
-        # Register health router (unauthenticated - for K8s probes)
-        app.include_router(health_router, prefix="")
-
-        # Register LLMRouter routes (auth-protected via Depends(user_api_key_auth))
-        # These add MCP gateway, hot reload, and /a2a/agents convenience endpoints
-        app.include_router(llmrouter_router, prefix="")
-
-        print("✅ LLMRouter routes registered with LiteLLM")
-        print("   ├── /_health/* (K8s probes, unauthenticated)")
-        print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
-        print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
-        print("   └── /router/*, /config/* (hot reload, auth-protected)")
-        print(
-            "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
-        )
-        return True
-    except ImportError as e:
-        print(f"⚠️ Could not register routes: {e}")
-        return False
 
 
 def register_strategies():
@@ -149,7 +107,7 @@ def init_mcp_tracing_if_enabled():
             print(f"⚠️ MCP tracing initialization failed: {e}")
 
 
-def init_a2a_tracing_if_enabled():
+def init_a2a_tracing_if_enabled(app):
     """
     Initialize A2A tracing with OTel if A2A gateway is enabled.
 
@@ -165,7 +123,6 @@ def init_a2a_tracing_if_enabled():
     # Always try to register the A2A middleware for LiteLLM's /a2a/* routes
     # This is independent of our A2A gateway - it instruments LiteLLM's built-in routes
     try:
-        from litellm.proxy.proxy_server import app
         from litellm_llmrouter.a2a_tracing import register_a2a_middleware
 
         if register_a2a_middleware(app):
@@ -223,8 +180,20 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         # Also set the path that LiteLLM's proxy_server reads
         os.environ["CONFIG_FILE_PATH"] = config_path
 
-    # Import after setting env vars so LiteLLM picks them up
-    from litellm.proxy.proxy_server import app, initialize
+    # Import gateway factory AFTER setting env vars
+    # The factory applies the patch explicitly before importing litellm
+    from litellm_llmrouter.gateway import create_app
+
+    # Create and configure the app using the composition root
+    # This applies the patch, adds middleware, and registers routes
+    app = create_app(
+        apply_patch=True,
+        include_admin_routes=True,
+        enable_plugins=True,
+    )
+
+    # Get LiteLLM's initialize function
+    from litellm.proxy.proxy_server import initialize
 
     # Initialize LiteLLM with the config
     # This is what litellm --config does internally
@@ -249,8 +218,27 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         # No event loop in current thread
         asyncio.run(init_litellm())
 
-    # Register our custom routes AFTER LiteLLM initializes
-    register_routes_with_litellm()
+    # Initialize A2A tracing AFTER LiteLLM initialization
+    init_a2a_tracing_if_enabled(app)
+
+    # Run plugin startup if enabled
+    async def run_plugin_startup():
+        if hasattr(app.state, "llmrouter_plugin_startup"):
+            await app.state.llmrouter_plugin_startup()
+
+    try:
+        asyncio.get_event_loop().run_until_complete(run_plugin_startup())
+    except RuntimeError:
+        asyncio.run(run_plugin_startup())
+
+    print("✅ LLMRouter routes registered with LiteLLM")
+    print("   ├── /_health/* (K8s probes, unauthenticated)")
+    print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
+    print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
+    print("   └── /router/*, /config/* (hot reload, auth-protected)")
+    print(
+        "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
+    )
 
     # Configure uvicorn
     uvicorn_config = {
@@ -289,6 +277,9 @@ def main():
         LITELLM_CONFIG_PATH  Default config path if --config not provided
     """
     import argparse
+
+    # Import patch status check - does NOT apply patch
+    from litellm_llmrouter import is_patch_applied
 
     parser = argparse.ArgumentParser(
         description="LiteLLM + LLMRouter Gateway",
@@ -348,7 +339,7 @@ Examples:
 
     print("🚀 Starting LiteLLM + LLMRouter Gateway...")
     print(
-        f"   Patch status: {'✅ applied' if litellm_llmrouter.is_patch_applied() else '❌ NOT applied'}"
+        f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
     )
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
@@ -359,15 +350,13 @@ Examples:
 
     init_mcp_tracing_if_enabled()
 
-    init_a2a_tracing_if_enabled()
-
     # Register strategies
     register_strategies()
 
     # Start config sync if enabled
     start_config_sync_if_enabled()
 
-    # Run LiteLLM proxy IN-PROCESS
+    # Run LiteLLM proxy IN-PROCESS using the gateway factory
     # This is critical - using os.execvp would lose our patches!
     run_litellm_proxy_inprocess(
         config_path=args.config,
