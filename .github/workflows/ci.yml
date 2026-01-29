@@ -32,9 +32,34 @@ jobs:
               - 'tests/**'
               - 'requirements.txt'
               - 'pyproject.toml'
+              - 'uv.lock'
             compose:
               - 'docker-compose*.yml'
               - 'examples/mlops/docker-compose*.yml'
+
+  # ===========================================================================
+  # Lockfile integrity check - ensures reproducible builds
+  # ===========================================================================
+  lockfile-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # Required for checkout
+    needs: changes
+    if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Verify lockfile is up to date
+        run: |
+          echo "Checking if uv.lock is in sync with pyproject.toml..."
+          uv lock --check
+          echo "✅ Lockfile is up to date"
 
   lint:
     runs-on: ubuntu-latest
@@ -61,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read  # Required for checkout
-    needs: changes
+    needs: [changes, lockfile-check]
     if: ${{ needs.changes.outputs.python == 'true' || github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -75,12 +100,12 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      - name: Create virtual environment and install dependencies
+      - name: Install dependencies from lockfile
         run: |
-          uv venv .venv
+          # Use frozen install for reproducibility
+          uv sync --frozen --extra dev
+          # Install LLMRouter (not in lockfile, from source)
           uv pip install --python .venv/bin/python git+https://github.com/ulab-uiuc/LLMRouter.git
-          uv pip install --python .venv/bin/python litellm pytest pytest-asyncio
-          uv pip install --python .venv/bin/python -r requirements.txt
 
       - name: Run unit tests
         run: |

@@ -31,6 +31,7 @@ dependencies = [
     # OTEL instrumentation (required for observability module imports)
     "opentelemetry-instrumentation>=0.43b0",
     "opentelemetry-instrumentation-logging>=0.43b0",
+    "python-multipart>=0.0.22",
 ]
 
 [project.optional-dependencies]

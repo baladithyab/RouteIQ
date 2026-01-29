@@ -3,18 +3,20 @@
 # LiteLLM + LLMRouter Production Dockerfile
 # =============================================================================
 # Multi-stage build for minimal, secure production images
-# Uses uv for fast, reproducible Python package management
+# Uses uv for fast, reproducible Python package management with lockfile
 # Supports: linux/amd64, linux/arm64
 #
 # Build optimization:
-# - BuildKit cache mounts for uv/pip to avoid baking caches into layers
+# - Lockfile-driven installs via `uv sync --frozen` for reproducibility
+# - BuildKit cache mounts for uv to avoid baking caches into layers
 # - All cleanup in same RUN statements to minimize layer size
 # - Dependencies installed before app source for better layer reuse
 #
 # Security features:
+# - Pinned base images via sha256 digest for supply-chain integrity
+# - Lockfile verification (--frozen flag fails on mismatch)
 # - Non-root user execution
 # - Minimal base image (slim variant)
-# - No shell in final image (optional)
 # - Read-only filesystem compatible
 # - Health checks for orchestrators
 #
@@ -23,6 +25,10 @@
 #   UV_VERSION      - uv package manager version (default: 0.9)
 #   LITELLM_VERSION - LiteLLM version (default: 1.80.15)
 #   LLMROUTER_COMMIT - LLMRouter git commit hash
+#
+# Reproducible Builds:
+#   This Dockerfile uses uv.lock for deterministic dependency resolution.
+#   Run `uv lock --check` locally to verify lockfile is up-to-date before building.
 # =============================================================================
 
 ARG PYTHON_VERSION=3.12
@@ -32,9 +38,16 @@ ARG LITELLM_VERSION=1.81.3
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
 # ==============================================================================
+# Base image digests for reproducibility
+# To update: docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
+# ==============================================================================
+ARG BUILDER_DIGEST=sha256:d8c02dc966030abc9b0184685a451b593fe5ff339a26cfd6d2fbff2d256c960b
+ARG RUNTIME_DIGEST=sha256:a0cb65a2dada255d392fe0426d04ed50911f0b78b3295de0c3286c1c86148b15
+
+# ==============================================================================
 # Stage 1: Builder - Clone repos and build wheels with uv
 # ==============================================================================
-FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm AS builder
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm@${BUILDER_DIGEST} AS builder
 
 ARG LLMROUTER_COMMIT
 ARG LITELLM_VERSION
@@ -58,7 +71,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ==============================================================================
 # Stage 2: Runtime - Production image with uv and OTEL support
 # ==============================================================================
-FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim AS runtime
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${RUNTIME_DIGEST} AS runtime
 
 ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
@@ -75,6 +88,8 @@ LABEL org.opencontainers.image.revision="${VCS_REF}"
 LABEL org.opencontainers.image.vendor="LiteLLM + LLMRouter"
 LABEL org.opencontainers.image.title="LiteLLM Gateway"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
+LABEL build.reproducible="true"
+LABEL build.lockfile-driven="uv.lock"
 
 # Security: Create non-root user with specific UID/GID for consistency
 RUN groupadd -r -g 1000 litellm && \
@@ -96,40 +111,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy wheels from builder (can be cleaned after install)
 COPY --from=builder /wheels /wheels
 
-# Install all Python dependencies in a single layer with cache mounts
-# Order: wheels → LiteLLM → OTEL → project deps (for optimal cache reuse)
-# Copy pyproject.toml first for dependency layer caching
-COPY pyproject.toml /tmp/pyproject.toml
-COPY src/ /tmp/src/
+# =============================================================================
+# Lockfile-driven dependency installation for reproducibility
+# =============================================================================
+# Copy lockfile and project metadata first for layer caching
+COPY pyproject.toml uv.lock /app/
+COPY src/ /app/src/
 
+# Install all Python dependencies using uv sync --frozen
+# --frozen: Fail if lockfile is out of sync with pyproject.toml (ensures reproducibility)
+# Order: wheels → uv sync with all production extras
 RUN --mount=type=cache,target=/root/.cache/uv \
-    # Install LLMRouter wheel
+    # Install LLMRouter wheel first (not in lockfile, built from source)
     uv pip install --system /wheels/*.whl || true \
-    # Install LiteLLM with proxy extras
-    && uv pip install --system "litellm[proxy]==${LITELLM_VERSION}" \
-    # Install OpenTelemetry for distributed tracing
+    # Install project dependencies from lockfile with production extras
+    # --frozen ensures builds fail if lockfile is out of date
+    && cd /app && uv sync --frozen --no-dev --extra prod --extra db --extra otel --extra cloud --extra callbacks --extra knn \
+    # Install OpenTelemetry instrumentation packages (may not be in all lockfiles)
     && uv pip install --system \
-        opentelemetry-api \
-        opentelemetry-sdk \
-        opentelemetry-exporter-otlp \
-        opentelemetry-exporter-otlp-proto-grpc \
-        opentelemetry-exporter-otlp-proto-http \
-        opentelemetry-instrumentation-fastapi \
-        opentelemetry-instrumentation-httpx \
-        opentelemetry-instrumentation-logging \
-        opentelemetry-instrumentation-requests \
-    # Install litellm-llmrouter with all optional dependencies
-    && cd /tmp && uv pip install --system ".[prod]" \
+    opentelemetry-instrumentation-requests \
     # Cleanup wheels and temp files
-    && rm -rf /wheels /tmp/*
+    && rm -rf /wheels
 
 # Pre-generate Prisma client and fix permissions on LiteLLM directories
 # This is done as root to avoid runtime permission errors
 # Security: Use least-privilege permissions instead of 777
 RUN SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
     if [ -f "$SCHEMA_PATH" ]; then \
-        echo "Generating Prisma client from $SCHEMA_PATH..." && \
-        python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
+    echo "Generating Prisma client from $SCHEMA_PATH..." && \
+    python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
     fi && \
     # Fix permissions on LiteLLM directories that need write access at runtime
     # Using least-privilege: litellm user owns directories with 755 (rwxr-xr-x)

@@ -3,7 +3,11 @@
 # LiteLLM + LLMRouter Local Development Dockerfile
 # =============================================================================
 # Clones LLMRouter from GitHub with pinned version for reproducibility
-# Uses uv for fast package management
+# Uses uv for fast, lockfile-driven package management
+#
+# Reproducible Builds:
+#   This Dockerfile uses uv.lock for deterministic dependency resolution.
+#   Run `uv lock --check` locally to verify lockfile is up-to-date before building.
 #
 # Usage:
 #   docker build -f docker/Dockerfile.local -t litellm-llmrouter:local .
@@ -16,7 +20,13 @@ ARG LITELLM_VERSION=1.80.15
 # LLMRouter pinned to specific commit for reproducibility
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
-FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim
+# ==============================================================================
+# Base image digest for reproducibility
+# To update: docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
+# ==============================================================================
+ARG BASE_DIGEST=sha256:a0cb65a2dada255d392fe0426d04ed50911f0b78b3295de0c3286c1c86148b15
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${BASE_DIGEST}
 
 ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
@@ -24,6 +34,8 @@ ARG LLMROUTER_COMMIT
 LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Local Development Build"
 LABEL org.opencontainers.image.version="${LITELLM_VERSION}-dev"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
+LABEL build.reproducible="true"
+LABEL build.lockfile-driven="uv.lock"
 
 WORKDIR /app
 
@@ -37,11 +49,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/*
 
-# Install LiteLLM with proxy extras
-RUN uv pip install --system "litellm[proxy]==${LITELLM_VERSION}"
+# =============================================================================
+# Lockfile-driven dependency installation for reproducibility
+# =============================================================================
+# Copy lockfile and project metadata first for layer caching
+COPY pyproject.toml uv.lock /app/
+COPY src/ /app/src/
 
-# Install OpenTelemetry for tracing and Prisma for database
-RUN uv pip install --system \
+# Install dependencies using uv sync --frozen
+# --frozen: Fail if lockfile is out of sync with pyproject.toml (ensures reproducibility)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra db --extra otel
+
+# Install OpenTelemetry instrumentation packages (may have additional needs)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp \
@@ -54,11 +76,6 @@ RUN uv pip install --system \
 
 # Note: Prisma client is generated at runtime in entrypoint.sh
 # This allows the container to work with different database configurations
-
-# Install additional dependencies
-COPY requirements.txt /tmp/requirements.txt
-RUN uv pip install --system -r /tmp/requirements.txt || true && \
-    rm -rf /root/.cache
 
 # Clone and install LLMRouter from GitHub at pinned commit
 RUN git clone --depth 1 https://github.com/ulab-uiuc/LLMRouter.git /tmp/LLMRouter && \
