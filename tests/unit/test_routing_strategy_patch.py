@@ -2,9 +2,10 @@
 Tests for the LiteLLM Router strategy patch.
 
 These tests verify that:
-1. The patch is applied successfully
-2. llmrouter-* strategies are accepted by LiteLLM's Router
-3. Standard strategies still work as expected
+1. Importing litellm_llmrouter does NOT auto-apply the patch
+2. Patches can be applied explicitly via patch_litellm_router()
+3. llmrouter-* strategies are accepted by LiteLLM's Router after patching
+4. Standard strategies still work as expected
 """
 
 import pytest
@@ -18,15 +19,53 @@ except (ImportError, ValueError):
     LITELLM_AVAILABLE = False
 
 
+class TestImportBehavior:
+    """Test that importing does NOT auto-apply patches."""
+
+    def test_import_does_not_apply_patch(self):
+        """
+        Test that importing litellm_llmrouter does NOT automatically apply the patch.
+
+        This is a critical test for P1 architecture decoupling.
+        """
+        # We can't truly test "fresh import" in pytest since modules persist,
+        # but we can verify the module doesn't have auto-patch code anymore.
+        from litellm_llmrouter import routing_strategy_patch
+
+        # Read the module source and verify no auto-patch call at module level
+        import inspect
+
+        source = inspect.getsource(routing_strategy_patch)
+
+        # The old code had "patch_litellm_router()" as a bare call at module level
+        # The new code has a comment explaining it's NOT auto-applied
+        assert "Patch is NOT applied automatically on import" in source or \
+               "NOTE: Patch is NOT applied automatically on import" in source
+
+    def test_patch_is_explicit_and_idempotent(self):
+        """Test that patch_litellm_router() is explicit and idempotent."""
+        from litellm_llmrouter import patch_litellm_router, is_patch_applied
+
+        # First call applies the patch
+        result = patch_litellm_router()
+        assert result is True
+        assert is_patch_applied() is True
+
+        # Second call is idempotent
+        result2 = patch_litellm_router()
+        assert result2 is True
+        assert is_patch_applied() is True
+
+
 @pytest.mark.skipif(not LITELLM_AVAILABLE, reason="litellm package not installed")
 class TestRoutingStrategyPatch:
     """Test the routing strategy patch module."""
 
-    def test_patch_is_applied_on_import(self):
-        """Test that the patch is automatically applied when litellm_llmrouter is imported."""
-        import litellm_llmrouter
-
-        assert litellm_llmrouter.is_patch_applied() is True
+    @pytest.fixture(autouse=True)
+    def apply_patch(self):
+        """Ensure patch is applied before each test."""
+        from litellm_llmrouter import patch_litellm_router
+        patch_litellm_router()
 
     def test_llmrouter_knn_strategy_accepted(self):
         """
@@ -35,8 +74,6 @@ class TestRoutingStrategyPatch:
         This is the main Gate 2 test - it verifies that the Router no longer
         raises ValueError when routing_strategy='llmrouter-knn' is passed.
         """
-        # Import ensures patch is applied
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         # Create a minimal model list
@@ -65,7 +102,6 @@ class TestRoutingStrategyPatch:
 
     def test_llmrouter_mlp_strategy_accepted(self):
         """Test that llmrouter-mlp strategy is also accepted."""
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         model_list = [
@@ -88,7 +124,6 @@ class TestRoutingStrategyPatch:
 
     def test_llmrouter_svm_strategy_accepted(self):
         """Test that llmrouter-svm strategy is also accepted."""
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         model_list = [
@@ -111,7 +146,6 @@ class TestRoutingStrategyPatch:
 
     def test_standard_strategy_still_works(self):
         """Test that standard strategies like simple-shuffle still work."""
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         model_list = [
@@ -139,7 +173,6 @@ class TestRoutingStrategyPatch:
 
     def test_invalid_strategy_still_rejected(self):
         """Test that completely invalid strategies are still rejected."""
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         model_list = [
@@ -161,7 +194,6 @@ class TestRoutingStrategyPatch:
 
     def test_llmrouter_strategy_with_args(self):
         """Test that llmrouter strategies accept routing_strategy_args."""
-        import litellm_llmrouter  # noqa: F401
         from litellm.router import Router
 
         model_list = [
@@ -194,22 +226,25 @@ class TestPatchFunctions:
     """Test the patch/unpatch functions."""
 
     def test_is_patch_applied(self):
-        """Test is_patch_applied returns correct status."""
-        from litellm_llmrouter import is_patch_applied
+        """Test is_patch_applied returns correct status after explicit patch."""
+        from litellm_llmrouter import is_patch_applied, patch_litellm_router
 
-        # Patch should be applied by default
+        # Apply patch explicitly
+        patch_litellm_router()
         assert is_patch_applied() is True
 
     def test_patch_idempotent(self):
         """Test that calling patch_litellm_router multiple times is safe."""
         from litellm_llmrouter import patch_litellm_router, is_patch_applied
 
-        # Should already be applied
+        # Apply patch first time
+        result1 = patch_litellm_router()
+        assert result1 is True
         assert is_patch_applied() is True
 
         # Calling again should return True and not break anything
-        result = patch_litellm_router()
-        assert result is True
+        result2 = patch_litellm_router()
+        assert result2 is True
         assert is_patch_applied() is True
 
 

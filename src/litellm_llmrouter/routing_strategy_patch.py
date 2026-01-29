@@ -8,6 +8,7 @@ It must be imported BEFORE any Router initialization occurs.
 The patch works by:
 1. Monkey-patching the routing_strategy_init() method to accept llmrouter-* prefixed strategies
 2. Registering custom routing strategy handlers that delegate to LLMRouterStrategyFamily
+3. Integrating with RoutingPipeline for A/B testing support and telemetry
 
 This approach is necessary because LiteLLM validates routing_strategy against a fixed enum
 at runtime (see router.py lines 719-736), and we cannot extend Python enums at runtime.
@@ -27,6 +28,7 @@ Usage:
 
 import functools
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,10 @@ _patch_applied = False
 
 # Store original method for potential restoration
 _original_routing_strategy_init = None
+
+# Feature flag: Use pipeline routing (enables A/B testing)
+# Set LLMROUTER_USE_PIPELINE=false to disable
+USE_PIPELINE_ROUTING = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
 
 
 def is_llmrouter_strategy(strategy: Any) -> bool:
@@ -80,6 +86,10 @@ def create_patched_routing_strategy_init(original_method: Callable) -> Callable:
             # This will be used by the patched get_available_deployment
             self._llmrouter_strategy_instance = None
 
+            # Initialize pipeline routing if enabled
+            if USE_PIPELINE_ROUTING:
+                _initialize_pipeline_strategy(self, routing_strategy, routing_strategy_args)
+
             return
 
         # Delegate to original method for standard strategies
@@ -88,10 +98,45 @@ def create_patched_routing_strategy_init(original_method: Callable) -> Callable:
     return patched_routing_strategy_init
 
 
+def _initialize_pipeline_strategy(
+    router: Any,
+    strategy_name: str,
+    strategy_args: dict,
+) -> None:
+    """
+    Initialize pipeline routing for a router instance.
+    
+    This registers the LLMRouterStrategyFamily as the default strategy
+    in the routing registry, enabling A/B testing support.
+    """
+    try:
+        from litellm_llmrouter.strategy_registry import (
+            get_routing_registry,
+            DefaultStrategy,
+        )
+        
+        # Register the default strategy if not already registered
+        registry = get_routing_registry()
+        
+        # Use router-specific strategy name to support multiple routers
+        router_strategy_name = f"llmrouter-default-{id(router)}"
+        
+        # Check if we need to register
+        if router_strategy_name not in registry.list_strategies():
+            default_strategy = DefaultStrategy()
+            registry.register(router_strategy_name, default_strategy)
+            logger.debug(f"Registered default pipeline strategy: {router_strategy_name}")
+        
+    except ImportError as e:
+        logger.debug(f"Pipeline routing not available: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to initialize pipeline routing: {e}")
+
+
 def create_patched_get_available_deployment(original_method: Callable) -> Callable:
     """
     Create a patched version of get_available_deployment that uses LLMRouterStrategyFamily
-    for llmrouter-* strategies.
+    for llmrouter-* strategies, with pipeline routing support for A/B testing.
     """
 
     @functools.wraps(original_method)
@@ -105,6 +150,20 @@ def create_patched_get_available_deployment(original_method: Callable) -> Callab
     ):
         # Check if we're using an llmrouter strategy
         if hasattr(self, "_llmrouter_strategy") and self._llmrouter_strategy:
+            # Try pipeline routing first if enabled
+            if USE_PIPELINE_ROUTING:
+                result = _get_deployment_via_pipeline(
+                    router=self,
+                    model=model,
+                    messages=messages,
+                    input=input,
+                    specific_deployment=specific_deployment,
+                    request_kwargs=request_kwargs,
+                )
+                if result is not None:
+                    return result
+            
+            # Fallback to direct LLMRouter call
             return _get_deployment_via_llmrouter(
                 router=self,
                 model=model,
@@ -125,6 +184,65 @@ def create_patched_get_available_deployment(original_method: Callable) -> Callab
         )
 
     return patched_get_available_deployment
+
+
+def _get_deployment_via_pipeline(
+    router: Any,
+    model: str,
+    messages: Optional[List[Dict[str, str]]] = None,
+    input: Optional[Union[str, List]] = None,
+    specific_deployment: Optional[bool] = False,
+    request_kwargs: Optional[Dict] = None,
+) -> Optional[Dict]:
+    """
+    Get deployment using the routing pipeline.
+    
+    This enables A/B testing and telemetry via the strategy registry.
+    Falls back to None if pipeline is not available.
+    """
+    try:
+        from litellm_llmrouter.strategy_registry import (
+            get_routing_pipeline,
+            RoutingContext,
+        )
+        
+        # Extract request_id and user_id from request_kwargs if available
+        request_id = None
+        user_id = None
+        if request_kwargs:
+            request_id = request_kwargs.get("request_id") or request_kwargs.get("litellm_call_id")
+            user_id = request_kwargs.get("user") or request_kwargs.get("user_id")
+            # Also check metadata
+            metadata = request_kwargs.get("metadata", {})
+            if isinstance(metadata, dict):
+                request_id = request_id or metadata.get("request_id")
+                user_id = user_id or metadata.get("user_id")
+        
+        # Build routing context
+        context = RoutingContext(
+            router=router,
+            model=model,
+            messages=messages,
+            input=input,
+            specific_deployment=specific_deployment,
+            request_kwargs=request_kwargs,
+            request_id=request_id,
+            user_id=user_id,
+        )
+        
+        # Execute pipeline
+        pipeline = get_routing_pipeline()
+        result = pipeline.route(context)
+        
+        # Return deployment or None
+        return result.deployment
+        
+    except ImportError:
+        logger.debug("Pipeline routing not available, using direct LLMRouter")
+        return None
+    except Exception as e:
+        logger.warning(f"Pipeline routing failed, falling back: {e}")
+        return None
 
 
 def _get_deployment_via_llmrouter(
@@ -221,7 +339,20 @@ async def _async_get_deployment_via_llmrouter(
     request_kwargs: Optional[Dict] = None,
 ) -> Optional[Dict]:
     """Async version of _get_deployment_via_llmrouter."""
-    # For now, delegate to sync version as LLMRouter doesn't have async API
+    # Try pipeline routing first
+    if USE_PIPELINE_ROUTING:
+        result = _get_deployment_via_pipeline(
+            router=router,
+            model=model,
+            messages=messages,
+            input=input,
+            specific_deployment=specific_deployment,
+            request_kwargs=request_kwargs,
+        )
+        if result is not None:
+            return result
+    
+    # Fallback to sync version as LLMRouter doesn't have async API
     return _get_deployment_via_llmrouter(
         router=router,
         model=model,
@@ -323,7 +454,10 @@ def patch_litellm_router() -> bool:
             )
 
         _patch_applied = True
-        logger.info("LiteLLM Router patched to accept llmrouter-* strategies")
+        logger.info(
+            f"LiteLLM Router patched to accept llmrouter-* strategies "
+            f"(pipeline_routing={'enabled' if USE_PIPELINE_ROUTING else 'disabled'})"
+        )
         return True
 
     except ImportError as e:
@@ -368,6 +502,11 @@ def is_patch_applied() -> bool:
     return _patch_applied
 
 
-# Auto-apply patch on module import
-# This ensures the patch is in place before any Router is created
-patch_litellm_router()
+def is_pipeline_routing_enabled() -> bool:
+    """Check if pipeline routing is enabled."""
+    return USE_PIPELINE_ROUTING
+
+
+# NOTE: Patch is NOT applied automatically on import.
+# Call patch_litellm_router() explicitly from your application startup.
+# This ensures importing the module has no side effects.

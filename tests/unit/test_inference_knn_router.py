@@ -247,8 +247,8 @@ class TestInferenceKNNRouter:
             )
 
     def test_invalid_model_raises_error(self):
-        """Test that loading a non-sklearn model raises TypeError."""
-        from litellm_llmrouter.strategies import InferenceKNNRouter
+        """Test that loading a non-sklearn model raises ModelLoadError."""
+        from litellm_llmrouter.strategies import InferenceKNNRouter, ModelLoadError
 
         # Create a .pkl file with an invalid object (no predict method)
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
@@ -256,7 +256,7 @@ class TestInferenceKNNRouter:
             pkl_path = f.name
 
         try:
-            with pytest.raises(TypeError, match="does not have 'predict' method"):
+            with pytest.raises(ModelLoadError, match="does not have 'predict' method"):
                 InferenceKNNRouter(model_path=pkl_path)
         finally:
             os.unlink(pkl_path)

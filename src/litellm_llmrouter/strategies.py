@@ -8,6 +8,8 @@ routing strategies and LiteLLM's routing infrastructure.
 Security Notes:
 - Pickle loading is disabled by default due to RCE risk
 - Set LLMROUTER_ALLOW_PICKLE_MODELS=true to enable (only in trusted environments)
+- When pickle is enabled, use LLMROUTER_MODEL_MANIFEST_PATH for hash/signature verification
+- Set LLMROUTER_ENFORCE_SIGNED_MODELS=true to require manifest verification
 """
 
 import json
@@ -16,11 +18,33 @@ import pickle
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import tempfile
 import yaml
 from litellm._logging import verbose_proxy_logger
+
+try:
+    from opentelemetry import trace
+
+    OTEL_AVAILABLE = True
+except ImportError:
+    OTEL_AVAILABLE = False
+
+# Import model artifact verification
+from litellm_llmrouter.model_artifacts import (
+    get_artifact_verifier,
+    ModelVerificationError,
+    ActiveModelVersion,
+)
+
+# Import telemetry contracts for versioned event emission
+from litellm_llmrouter.telemetry_contracts import (
+    RouterDecisionEventBuilder,
+    RoutingOutcome,
+    ROUTER_DECISION_EVENT_NAME,
+    ROUTER_DECISION_PAYLOAD_KEY,
+)
 
 try:
     from opentelemetry import trace
@@ -81,6 +105,13 @@ ALLOW_PICKLE_MODELS = (
     os.getenv("LLMROUTER_ALLOW_PICKLE_MODELS", "false").lower() == "true"
 )
 
+# When pickle is allowed, require manifest verification by default
+# Set LLMROUTER_ENFORCE_SIGNED_MODELS=false to bypass (not recommended)
+ENFORCE_SIGNED_MODELS = (
+    os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() == "true"
+    or (ALLOW_PICKLE_MODELS and os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() != "false")
+)
+
 
 class PickleSecurityError(Exception):
     """Raised when pickle loading is attempted but not explicitly allowed."""
@@ -91,6 +122,18 @@ class PickleSecurityError(Exception):
             f"Pickle loading is disabled for security (RCE risk). "
             f"To enable pickle model loading, set LLMROUTER_ALLOW_PICKLE_MODELS=true. "
             f"Model path: {model_path}"
+        )
+
+
+class ModelLoadError(Exception):
+    """Raised when model loading fails during safe activation."""
+
+    def __init__(self, model_path: str, reason: str, correlation_id: Optional[str] = None):
+        self.model_path = model_path
+        self.reason = reason
+        self.correlation_id = correlation_id
+        super().__init__(
+            f"Model loading failed for '{model_path}': {reason}"
         )
 
 
@@ -110,6 +153,12 @@ class InferenceKNNRouter:
     Security:
     - Pickle loading requires LLMROUTER_ALLOW_PICKLE_MODELS=true
     - This protects against RCE via malicious pickle files
+    - When enabled, artifacts are verified against manifest if configured
+
+    Safe Activation:
+    - Models are loaded into a temporary instance first
+    - Only swapped to active if loading succeeds
+    - On failure, the old model remains active
 
     Attributes:
         model_path: Path to the trained .pkl model file
@@ -117,6 +166,7 @@ class InferenceKNNRouter:
         embedding_device: Device for embedding model ('cpu', 'cuda')
         knn_model: Loaded sklearn KNeighborsClassifier
         label_mapping: Optional mapping from predicted labels to LLM candidate keys
+        model_version: Active model version metadata for observability
     """
 
     def __init__(
@@ -125,6 +175,7 @@ class InferenceKNNRouter:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         embedding_device: str = "cpu",
         label_mapping: Optional[Dict[str, str]] = None,
+        correlation_id: Optional[str] = None,
     ):
         """
         Initialize inference-only KNN router.
@@ -134,21 +185,31 @@ class InferenceKNNRouter:
             embedding_model: HuggingFace model name for sentence embeddings
             embedding_device: Device for embedding model ('cpu', 'cuda', etc.)
             label_mapping: Optional dict mapping predicted labels to LLM keys
+            correlation_id: Optional correlation ID for logging
         """
         self.model_path = model_path
         self.embedding_model = embedding_model
         self.embedding_device = embedding_device
         self.label_mapping = label_mapping or {}
         self.knn_model = None
+        self.model_version: Optional[ActiveModelVersion] = None
+        self._model_lock = threading.RLock()
 
-        # Load the model
-        self._load_model()
+        # Load the model with verification
+        self._load_model(correlation_id=correlation_id)
 
-    def _load_model(self):
-        """Load the sklearn KNN model from pickle file.
+    def _load_model(self, correlation_id: Optional[str] = None):
+        """Load the sklearn KNN model from pickle file with verification.
 
-        Security: Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
-        Pickle deserialization can execute arbitrary code, so it's disabled by default.
+        Security: 
+        - Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
+        - Pickle deserialization can execute arbitrary code, so it's disabled by default.
+        - When enabled, verifies artifact against manifest if LLMROUTER_MODEL_MANIFEST_PATH is set.
+        
+        Safe Activation:
+        - Loads model into temporary variable first
+        - Only swaps to active if successful
+        - Records model version for observability
         """
         if not self.model_path:
             raise ValueError("model_path is required for InferenceKNNRouter")
@@ -161,25 +222,103 @@ class InferenceKNNRouter:
         if not path.exists():
             raise FileNotFoundError(f"KNN model file not found: {self.model_path}")
 
-        verbose_proxy_logger.info(f"Loading KNN model from: {self.model_path}")
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
 
-        with open(self.model_path, "rb") as f:
-            self.knn_model = pickle.load(f)
+        # Verify artifact against manifest if enforcement is enabled
+        verifier = get_artifact_verifier()
+        require_manifest = ENFORCE_SIGNED_MODELS
+        
+        try:
+            verifier.verify_artifact(
+                self.model_path,
+                require_manifest=require_manifest,
+                correlation_id=correlation_id,
+            )
+        except ModelVerificationError as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Model verification failed: {e}. "
+                f"Hash mismatch or manifest missing. Details: {e.details}"
+            )
+            raise
+
+        verbose_proxy_logger.info(f"{log_prefix}Loading KNN model from: {self.model_path}")
+
+        # Safe activation: load into temp variable first
+        try:
+            with open(self.model_path, "rb") as f:
+                new_model = pickle.load(f)
+        except Exception as e:
+            raise ModelLoadError(
+                self.model_path,
+                f"Pickle load failed: {e}",
+                correlation_id,
+            )
 
         # Verify it's a sklearn model with predict method
-        if not hasattr(self.knn_model, "predict"):
-            raise TypeError(
+        if not hasattr(new_model, "predict"):
+            raise ModelLoadError(
+                self.model_path,
                 f"Loaded model does not have 'predict' method. "
-                f"Expected sklearn KNeighborsClassifier, got {type(self.knn_model)}"
+                f"Expected sklearn KNeighborsClassifier, got {type(new_model)}",
+                correlation_id,
+            )
+
+        # Safe swap: only update if everything succeeded
+        with self._model_lock:
+            old_model = self.knn_model
+            self.knn_model = new_model
+            
+            # Record active version for observability
+            self.model_version = verifier.record_active_version(
+                self.model_path,
+                tags=["knn", "active"],
             )
 
         verbose_proxy_logger.info(
-            f"KNN model loaded successfully. Type: {type(self.knn_model).__name__}"
+            f"{log_prefix}KNN model loaded successfully. Type: {type(self.knn_model).__name__}, "
+            f"Version SHA256: {self.model_version.sha256[:16]}..."
         )
+        
+        # Clean up old model reference (let GC handle it)
+        del old_model
 
-    def reload_model(self):
-        """Reload the model from disk (for hot reload support)."""
-        self._load_model()
+    def reload_model(self, correlation_id: Optional[str] = None) -> bool:
+        """
+        Reload the model from disk with safe activation (for hot reload support).
+        
+        Safe Activation Pattern:
+        1. Load new model into temporary instance
+        2. Verify against manifest
+        3. Only swap to active if successful
+        4. Keep old model active on failure
+        
+        Args:
+            correlation_id: Optional correlation ID for logging
+            
+        Returns:
+            True if reload succeeded, False if failed (old model remains active)
+        """
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+        old_version = self.model_version
+        
+        try:
+            self._load_model(correlation_id=correlation_id)
+            verbose_proxy_logger.info(
+                f"{log_prefix}Model reloaded successfully. "
+                f"Old version: {old_version.sha256[:16] if old_version else 'none'}..., "
+                f"New version: {self.model_version.sha256[:16] if self.model_version else 'none'}..."
+            )
+            return True
+        except (ModelVerificationError, ModelLoadError, FileNotFoundError) as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Model reload failed, keeping old model active. Error: {e}"
+            )
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Unexpected error during model reload, keeping old model active. Error: {e}"
+            )
+            return False
 
     def route(self, query: str) -> Optional[str]:
         """
@@ -683,6 +822,9 @@ class LLMRouterStrategyFamily:
         """
         Route a query with OpenTelemetry observability.
 
+        Emits a versioned RouterDecisionEvent (routeiq.router_decision.v1)
+        as a span event for downstream MLOps consumption.
+
         Args:
             query: User query to route
             model_list: List of available models
@@ -692,6 +834,7 @@ class LLMRouterStrategyFamily:
         """
         start_time = time.time()
         selected_model = None
+        error_info = None
 
         # Create span if OpenTelemetry is available
         if OTEL_AVAILABLE:
@@ -706,17 +849,78 @@ class LLMRouterStrategyFamily:
 
                     with trace.use_span(span, end_on_exit=True):
                         # Perform routing
-                        if self.router and hasattr(self.router, "route"):
-                            selected_model = self.router.route(query)
+                        try:
+                            if self.router and hasattr(self.router, "route"):
+                                selected_model = self.router.route(query)
+                        except Exception as e:
+                            error_info = (type(e).__name__, str(e))
+                            verbose_proxy_logger.error(f"Routing error: {e}")
 
-                        # Add result to span
+                        # Calculate latency
+                        latency_ms = (time.time() - start_time) * 1000
+
+                        # Add result to span attributes
                         if selected_model:
                             span.set_attribute(
                                 "llm.routing.selected_model", selected_model
                             )
-
-                        latency_ms = (time.time() - start_time) * 1000
                         span.set_attribute("llm.routing.latency_ms", latency_ms)
+
+                        # Build versioned telemetry event
+                        event_builder = (
+                            RouterDecisionEventBuilder()
+                            .with_strategy(
+                                name=self.strategy_name,
+                                version=getattr(self, "model_version", None),
+                            )
+                            .with_input(
+                                query_length=len(query),
+                                # No PII: don't log query content
+                            )
+                            .with_candidates(
+                                [{"model_name": m, "available": True} for m in model_list]
+                            )
+                            .with_selection(
+                                selected=selected_model,
+                                reason="strategy_prediction" if selected_model else "no_prediction",
+                            )
+                            .with_timing(total_ms=latency_ms)
+                        )
+
+                        # Add trace context to event
+                        span_context = span.get_span_context()
+                        if span_context.is_valid:
+                            event_builder.with_trace_context(
+                                trace_id=format(span_context.trace_id, "032x"),
+                                span_id=format(span_context.span_id, "016x"),
+                            )
+
+                        # Set outcome based on routing result
+                        if error_info:
+                            event_builder.with_outcome(
+                                status=RoutingOutcome.ERROR,
+                                error_type=error_info[0],
+                                error_message=error_info[1],
+                            )
+                        elif selected_model:
+                            event_builder.with_outcome(status=RoutingOutcome.SUCCESS)
+                        else:
+                            event_builder.with_outcome(
+                                status=RoutingOutcome.NO_CANDIDATES
+                                if not model_list
+                                else RoutingOutcome.FAILURE
+                            )
+
+                        # Build and emit the event
+                        router_event = event_builder.build()
+
+                        # Emit as span event with JSON payload
+                        span.add_event(
+                            name=ROUTER_DECISION_EVENT_NAME,
+                            attributes={
+                                ROUTER_DECISION_PAYLOAD_KEY: router_event.to_json(),
+                            },
+                        )
 
                         # Log routing decision
                         obs_manager.log_routing_decision(
@@ -730,8 +934,11 @@ class LLMRouterStrategyFamily:
                 verbose_proxy_logger.warning(f"Observability error: {e}")
 
         # Fallback: route without observability
-        if self.router and hasattr(self.router, "route"):
-            selected_model = self.router.route(query)
+        try:
+            if self.router and hasattr(self.router, "route"):
+                selected_model = self.router.route(query)
+        except Exception as e:
+            verbose_proxy_logger.error(f"Routing error (no observability): {e}")
 
         return selected_model
 
