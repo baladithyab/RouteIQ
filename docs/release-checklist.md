@@ -31,10 +31,11 @@ uv run pytest tests/ -q --tb=short
 **Expected Results:**
 - ✅ `ruff check`: All checks passed!
 - ✅ `ruff format`: 62 files already formatted
-- ✅ Unit tests: 445+ passed (excludes flaky property tests)
+- ✅ Full test suite: 871 passed, 33 skipped, 0 failed
 
-**Known Flaky Tests:**
-- `tests/property/test_mlops_training_properties.py::TestMLOpsEvaluationMetrics::test_cost_metrics_are_valid` - Float precision edge case with Hypothesis
+**Skipped Tests:**
+- Integration tests requiring external services (22 skipped)
+- MCP parity tests for not-yet-implemented features (4 skipped): protocol proxy routes, MCP REST routes, OAuth register route
 
 ### 2. Docker Build Verification
 
@@ -318,7 +319,7 @@ After deployment, verify:
 ## Known Limitations
 
 1. **MCP Tool Invocation**: Disabled by default. Enable only after configuring SSRF allowlists.
-2. **Property Tests**: Some Hypothesis-based property tests may exhibit float precision flakiness.
+2. **MCP Protocol Proxy**: Feature routes not yet fully implemented; tests are skipped.
 3. **Helm Chart Icon**: Chart.yaml missing icon field (non-blocking INFO warning).
 
 ---
