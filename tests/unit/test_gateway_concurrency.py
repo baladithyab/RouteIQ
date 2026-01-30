@@ -80,7 +80,6 @@ class TestA2AGatewayConcurrency:
                 errors.append(f"Unregister error {idx}: {e}")
 
         with ThreadPoolExecutor(max_workers=20) as executor:
-            # Submit interleaved register/unregister operations
             futures = []
             for i in range(num_operations):
                 futures.append(executor.submit(register_agent, i))
@@ -398,6 +397,7 @@ class TestMCPGatewayConcurrency:
         def list_servers():
             try:
                 servers = gateway.list_servers()
+                # Iterate to ensure snapshot is stable
                 count = 0
                 for server in servers:
                     count += 1
@@ -927,3 +927,394 @@ class TestStressConditions:
         finally:
             reset_a2a_gateway()
             os.environ.pop("A2A_GATEWAY_ENABLED", None)
+
+
+class TestSingletonResetInterleave:
+    """
+    Test that singleton reset interleaved with get operations is safe.
+
+    These are edge-case tests for testing-only scenarios where reset
+    is called while other threads are getting instances.
+    """
+
+    def test_a2a_singleton_reset_interleave(self):
+        """
+        Test concurrent get_a2a_gateway() calls interleaved with reset.
+
+        This simulates a pathological case where reset is called
+        during heavy concurrent access. All gets should succeed,
+        though instances may differ after reset.
+        """
+        from litellm_llmrouter.a2a_gateway import get_a2a_gateway, reset_a2a_gateway
+
+        os.environ["A2A_GATEWAY_ENABLED"] = "true"
+
+        try:
+            errors = []
+            instances = []
+            resets_done = []
+
+            def get_instance(thread_id: int):
+                for _ in range(20):
+                    try:
+                        instance = get_a2a_gateway()
+                        instances.append((thread_id, id(instance)))
+                    except Exception as e:
+                        errors.append(f"Get error thread {thread_id}: {e}")
+
+            def reset_gateway(reset_id: int):
+                try:
+                    reset_a2a_gateway()
+                    resets_done.append(reset_id)
+                except Exception as e:
+                    errors.append(f"Reset error {reset_id}: {e}")
+
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                futures = []
+                # Interleave gets and resets
+                for i in range(20):
+                    futures.append(executor.submit(get_instance, i))
+                    if i % 5 == 0:
+                        futures.append(executor.submit(reset_gateway, i // 5))
+
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors.append(f"Future error: {e}")
+
+            # No exceptions should have occurred
+            assert not errors, f"Concurrency errors: {errors}"
+            # We should have captured many instances
+            assert len(instances) > 0, "No instances captured"
+
+        finally:
+            reset_a2a_gateway()
+            os.environ.pop("A2A_GATEWAY_ENABLED", None)
+
+    def test_mcp_singleton_reset_interleave(self):
+        """
+        Test concurrent get_mcp_gateway() calls interleaved with reset.
+        """
+        from litellm_llmrouter.mcp_gateway import get_mcp_gateway, reset_mcp_gateway
+
+        os.environ["MCP_GATEWAY_ENABLED"] = "true"
+        os.environ["MCP_HA_SYNC_ENABLED"] = "false"
+
+        try:
+            errors = []
+            instances = []
+            resets_done = []
+
+            def get_instance(thread_id: int):
+                for _ in range(20):
+                    try:
+                        instance = get_mcp_gateway()
+                        instances.append((thread_id, id(instance)))
+                    except Exception as e:
+                        errors.append(f"Get error thread {thread_id}: {e}")
+
+            def reset_gateway(reset_id: int):
+                try:
+                    reset_mcp_gateway()
+                    resets_done.append(reset_id)
+                except Exception as e:
+                    errors.append(f"Reset error {reset_id}: {e}")
+
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                futures = []
+                for i in range(20):
+                    futures.append(executor.submit(get_instance, i))
+                    if i % 5 == 0:
+                        futures.append(executor.submit(reset_gateway, i // 5))
+
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors.append(f"Future error: {e}")
+
+            assert not errors, f"Concurrency errors: {errors}"
+            assert len(instances) > 0, "No instances captured"
+
+        finally:
+            reset_mcp_gateway()
+            os.environ.pop("MCP_GATEWAY_ENABLED", None)
+            os.environ.pop("MCP_HA_SYNC_ENABLED", None)
+
+
+class TestAsyncConcurrency:
+    """
+    Test async operations interacting with synchronous locks.
+
+    Some gateway operations may be called from async contexts while
+    the locks are synchronous (threading.RLock). These tests verify
+    that sync locks work correctly when called from async contexts.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Reset gateways before each test."""
+        from litellm_llmrouter.a2a_gateway import reset_a2a_gateway
+        from litellm_llmrouter.mcp_gateway import reset_mcp_gateway
+
+        reset_a2a_gateway()
+        reset_mcp_gateway()
+        os.environ["A2A_GATEWAY_ENABLED"] = "true"
+        os.environ["MCP_GATEWAY_ENABLED"] = "true"
+        os.environ["MCP_HA_SYNC_ENABLED"] = "false"
+        yield
+        reset_a2a_gateway()
+        reset_mcp_gateway()
+        os.environ.pop("A2A_GATEWAY_ENABLED", None)
+        os.environ.pop("MCP_GATEWAY_ENABLED", None)
+        os.environ.pop("MCP_HA_SYNC_ENABLED", None)
+
+    @pytest.mark.asyncio
+    async def test_a2a_async_concurrent_registration(self):
+        """
+        Test concurrent agent registration from async context.
+        """
+        import asyncio
+
+        from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
+
+        gateway = get_a2a_gateway()
+        errors = []
+
+        async def register_agent(idx: int):
+            try:
+                agent = A2AAgent(
+                    agent_id=f"async-agent-{idx}",
+                    name=f"Async Agent {idx}",
+                    description=f"Async test agent {idx}",
+                    url=f"https://asyncagent{idx}.example.com",
+                    capabilities=["chat"],
+                )
+                # Call sync method from async context
+                gateway.register_agent(agent)
+            except Exception as e:
+                errors.append(f"Async register error {idx}: {e}")
+
+        # Run many concurrent registrations from async context
+        tasks = [register_agent(i) for i in range(50)]
+        await asyncio.gather(*tasks)
+
+        assert not errors, f"Async concurrency errors: {errors}"
+        # All agents should be registered (different IDs)
+        agents = gateway.list_agents()
+        assert len(agents) == 50, f"Expected 50 agents, got {len(agents)}"
+
+    @pytest.mark.asyncio
+    async def test_mcp_async_concurrent_registration(self):
+        """
+        Test concurrent server registration from async context.
+        """
+        import asyncio
+
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
+
+        gateway = get_mcp_gateway()
+        errors = []
+
+        async def register_server(idx: int):
+            try:
+                server = MCPServer(
+                    server_id=f"async-server-{idx}",
+                    name=f"Async Server {idx}",
+                    url=f"https://asyncserver{idx}.example.com",
+                    transport=MCPTransport.STREAMABLE_HTTP,
+                    tools=[f"async-tool-{idx}"],
+                )
+                gateway.register_server(server)
+            except Exception as e:
+                errors.append(f"Async register error {idx}: {e}")
+
+        tasks = [register_server(i) for i in range(50)]
+        await asyncio.gather(*tasks)
+
+        assert not errors, f"Async concurrency errors: {errors}"
+        servers = gateway.list_servers()
+        assert len(servers) == 50, f"Expected 50 servers, got {len(servers)}"
+
+    @pytest.mark.asyncio
+    async def test_a2a_mixed_sync_async_access(self):
+        """
+        Test mixed sync (via threads) and async access to A2A gateway.
+        """
+        import asyncio
+
+        from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
+
+        gateway = get_a2a_gateway()
+        errors = []
+        results = []
+
+        async def async_register(idx: int):
+            try:
+                agent = A2AAgent(
+                    agent_id=f"mixed-async-{idx}",
+                    name=f"Mixed Async Agent {idx}",
+                    description="Mixed test",
+                    url=f"https://mixedasync{idx}.example.com",
+                    capabilities=["chat"],
+                )
+                gateway.register_agent(agent)
+                results.append(("async", idx))
+            except Exception as e:
+                errors.append(f"Async error {idx}: {e}")
+
+        def sync_register(idx: int):
+            try:
+                agent = A2AAgent(
+                    agent_id=f"mixed-sync-{idx}",
+                    name=f"Mixed Sync Agent {idx}",
+                    description="Mixed test",
+                    url=f"https://mixedsync{idx}.example.com",
+                    capabilities=["chat"],
+                )
+                gateway.register_agent(agent)
+                results.append(("sync", idx))
+            except Exception as e:
+                errors.append(f"Sync error {idx}: {e}")
+
+        # Run sync operations in thread pool concurrently with async ops
+        async def run_sync_in_executor(idx: int):
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, sync_register, idx)
+
+        tasks = []
+        for i in range(25):
+            tasks.append(async_register(i))
+            tasks.append(run_sync_in_executor(i))
+
+        await asyncio.gather(*tasks)
+
+        assert not errors, f"Mixed concurrency errors: {errors}"
+        # Should have 50 agents total (25 async + 25 sync)
+        agents = gateway.list_agents()
+        assert len(agents) == 50, f"Expected 50 agents, got {len(agents)}"
+
+
+class TestConcurrentUpdate:
+    """
+    Test concurrent update operations on the same entities.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Reset gateways before each test."""
+        from litellm_llmrouter.a2a_gateway import reset_a2a_gateway
+        from litellm_llmrouter.mcp_gateway import reset_mcp_gateway
+
+        reset_a2a_gateway()
+        reset_mcp_gateway()
+        os.environ["A2A_GATEWAY_ENABLED"] = "true"
+        os.environ["MCP_GATEWAY_ENABLED"] = "true"
+        os.environ["MCP_HA_SYNC_ENABLED"] = "false"
+        yield
+        reset_a2a_gateway()
+        reset_mcp_gateway()
+        os.environ.pop("A2A_GATEWAY_ENABLED", None)
+        os.environ.pop("MCP_GATEWAY_ENABLED", None)
+        os.environ.pop("MCP_HA_SYNC_ENABLED", None)
+
+    def test_concurrent_update_same_agent(self):
+        """
+        Test concurrent updates (re-registration) of the same agent.
+
+        Updates are idempotent - the last write wins.
+        """
+        from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
+
+        gateway = get_a2a_gateway()
+        errors = []
+        versions_written = []
+
+        def update_agent(version: int):
+            try:
+                agent = A2AAgent(
+                    agent_id="update-target-agent",
+                    name=f"Updated Agent v{version}",
+                    description=f"Version {version}",
+                    url="https://update.example.com",
+                    capabilities=["chat", f"v{version}"],
+                )
+                gateway.register_agent(agent)
+                versions_written.append(version)
+            except Exception as e:
+                errors.append(f"Update error v{version}: {e}")
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(update_agent, i) for i in range(100)]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append(f"Future error: {e}")
+
+        assert not errors, f"Concurrency errors: {errors}"
+        # Exactly one agent with this ID
+        agents = gateway.list_agents()
+        assert len(agents) == 1, f"Expected 1 agent, got {len(agents)}"
+        # All 100 writes should have completed
+        assert len(versions_written) == 100
+
+    def test_concurrent_tool_definition_updates(self):
+        """
+        Test concurrent updates to tool definitions on the same server.
+        """
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPToolDefinition,
+            MCPTransport,
+            get_mcp_gateway,
+        )
+
+        gateway = get_mcp_gateway()
+
+        # Create a server to update
+        server = MCPServer(
+            server_id="tool-update-server",
+            name="Tool Update Server",
+            url="https://toolupdate.example.com",
+            transport=MCPTransport.STREAMABLE_HTTP,
+            tools=[],
+        )
+        gateway.register_server(server)
+
+        errors = []
+        successes = []
+
+        def update_tool_def(idx: int):
+            try:
+                tool_def = MCPToolDefinition(
+                    name=f"update-tool-{idx % 10}",  # 10 unique tools, updated multiple times
+                    description=f"Updated tool {idx}",
+                    input_schema={"version": idx},
+                )
+                result = gateway.register_tool_definition(
+                    "tool-update-server", tool_def
+                )
+                successes.append(result)
+            except Exception as e:
+                errors.append(f"Tool update error {idx}: {e}")
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(update_tool_def, i) for i in range(100)]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    errors.append(f"Future error: {e}")
+
+        assert not errors, f"Concurrency errors: {errors}"
+        assert all(successes), "All tool updates should succeed"
+        # Should have exactly 10 tools (unique names)
+        server = gateway.get_server("tool-update-server")
+        assert server is not None
+        assert len(server.tools) == 10, f"Expected 10 tools, got {len(server.tools)}"
