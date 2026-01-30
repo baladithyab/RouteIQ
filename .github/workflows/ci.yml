@@ -165,8 +165,9 @@ jobs:
       - name: Validate docker-compose.ha.yml
         run: docker compose -f docker-compose.ha.yml config
         env:
-          # Dummy value for CI validation only - never used in production
+          # Dummy values for CI validation only - never used in production
           LITELLM_MASTER_KEY: ci_validation_dummy_key
+          POSTGRES_PASSWORD: ci_validation_dummy_password
 
       - name: Validate MLOps compose
         run: docker compose -f examples/mlops/docker-compose.mlops.yml config
