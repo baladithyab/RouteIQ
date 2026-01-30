@@ -11,6 +11,21 @@ Plugins can:
 - Export observability data
 - Provide authentication/authorization
 
+### What Plugins Can Do (Capabilities)
+
+The plugin system is designed around specific capabilities. Plugins must declare which capabilities they require in their metadata.
+
+| Capability | Description | Stability |
+|------------|-------------|-----------|
+| `ROUTES` | Register new FastAPI routes/endpoints | Stable |
+| `MIDDLEWARE` | Add global or per-route middleware | Stable |
+| `ROUTING_STRATEGY` | Add custom ML or logic-based routing strategies | Stable |
+| `OBSERVABILITY_EXPORTER` | Export traces/metrics to custom backends | Stable |
+| `EVALUATOR` | Score/evaluate MCP and Agent interactions | Beta |
+| `TOOL_RUNTIME` | Custom execution environments for tools | Alpha |
+| `AUTH_PROVIDER` | Custom authentication logic | Alpha |
+| `STORAGE_BACKEND` | Custom storage for state/config | Alpha |
+
 ## Quick Start
 
 ### 1. Create a Plugin
@@ -429,6 +444,98 @@ export ROUTEIQ_EVALUATOR_ENABLED=true
 2. **Timeouts**: Set appropriate timeouts for external evaluation services
 3. **Error Handling**: Evaluator failures are logged but don't block the request
 4. **Resource Limits**: Be mindful of evaluation overhead on request latency
+
+## Custom Vector Database Resources
+
+Plugins can extend the gateway's RAG capabilities by providing custom vector store implementations.
+
+### Registering a Custom Vector Store
+
+Currently, the internal hook for registering a fully custom vector store backend is **experimental**. However, you can implement a plugin that provides vector search endpoints and integrates with the existing RAG system via the `vector_store` interface.
+
+**Roadmap Item**: A stable `PluginCapability.VECTOR_STORE` API is planned for Milestone D+.
+
+#### Implementation Pattern
+
+1.  **Define the Store**: Implement the `VectorStore` interface.
+2.  **Expose Endpoints**: Use `PluginCapability.ROUTES` to expose management endpoints.
+3.  **Monkey-patch (Temporary)**: Until the stable API is ready, you may need to register your store in the global registry during startup.
+
+```python
+from litellm_llmrouter.gateway.plugin_manager import GatewayPlugin, PluginMetadata, PluginCapability
+from litellm_llmrouter.gateway.vector_stores import register_vector_store
+
+class MyVectorStorePlugin(GatewayPlugin):
+    @property
+    def metadata(self) -> PluginMetadata:
+        return PluginMetadata(
+            name="my-vector-store",
+            version="0.1.0",
+            capabilities={PluginCapability.ROUTES},
+        )
+
+    async def startup(self, app, context):
+        # Register the custom backend
+        # Note: This uses an internal API that may change
+        register_vector_store("my_custom_db", MyCustomVectorStoreClass)
+        
+        context.logger.info("Registered custom vector store: my_custom_db")
+```
+
+## Overriding and Patching Built-in Behavior
+
+Plugins may need to modify or extend existing gateway functionality. It is critical to do this safely to maintain system stability and upgradeability.
+
+### Recommended Approaches
+
+1.  **Routing Strategy Plugins**: Instead of modifying the core router, register a new strategy and configure the gateway to use it.
+2.  **Middleware Hooks**: Use `PluginCapability.MIDDLEWARE` to intercept requests/responses globally.
+3.  **Additional Routes**: Add new specific routes that take precedence over generic ones (FastAPI matches specific routes first).
+
+### Discouraged: Monkey Patching
+
+**Avoid import-time monkey patching.** Modifying global state or replacing functions at import time can lead to unpredictable behavior, especially with hot-reloading and testing.
+
+**If you must patch core functionality:**
+1.  Do it inside `startup()`.
+2.  Ensure it is idempotent (safe to run multiple times).
+3.  Log a warning so operators know standard behavior is altered.
+
+```python
+# Discouraged but sometimes necessary pattern
+async def startup(self, app, context):
+    import litellm_llmrouter.some_module as target_module
+    
+    # Save original
+    self._original_func = target_module.some_function
+    
+    # Define patch
+    def patched_function(*args, **kwargs):
+        context.logger.warning("Using patched function")
+        return self._original_func(*args, **kwargs)
+        
+    # Apply patch
+    target_module.some_function = patched_function
+    
+async def shutdown(self, app, context):
+    # Restore original
+    if hasattr(self, '_original_func'):
+        import litellm_llmrouter.some_module as target_module
+        target_module.some_function = self._original_func
+```
+
+### Route Ordering
+
+FastAPI evaluates routes in order of registration.
+- **Built-in routes** are registered before plugins.
+- **Plugin routes** are registered during startup.
+
+To "override" a built-in route (e.g., `/v1/chat/completions`), you cannot simply register a new route with the same path, as the first one will always match.
+
+**Workaround**:
+1.  Use Middleware to intercept requests to the target path.
+2.  Redirect or handle the request within the middleware.
+3.  Return a response directly, bypassing the router.
 
 ## Troubleshooting
 

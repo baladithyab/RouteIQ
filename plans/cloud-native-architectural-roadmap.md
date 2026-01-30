@@ -1,15 +1,17 @@
 # Cloud-Native Architectural Roadmap
 ## Transitioning LiteLLM + LLM-Router to Production-Grade Infrastructure
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-01-26  
-**Status:** Approved for Implementation
+**Document Version:** 1.1  
+**Last Updated:** 2026-01-30  
+**Status:** Live / Iterating
 
 ---
 
 ## Executive Summary
 
 This roadmap provides a comprehensive, phased approach to transform the LiteLLM + LLM-Router combination into a robust, production-grade cloud-native system. The transformation emphasizes High Availability (HA), observability, MLOps excellence, and operational resilience while maintaining the system's core value proposition of intelligent ML-powered routing.
+
+**Update (Jan 2026):** Milestones A, B, and C (P0-P2) have been executed. See [`docs/release-checklist.md`](../docs/release-checklist.md) for release verification and [`plans/p1-remove-import-side-effects-plan.md`](p1-remove-import-side-effects-plan.md) for the architectural cleanup details. The focus now shifts to Milestone D+ (Post-MVP).
 
 ### Key Objectives
 - **Zero-downtime Operations**: Hot-reloading configurations and ML models without service interruptions
@@ -345,21 +347,85 @@ This roadmap decomposes the architectural vision into concrete, PR-sized work it
 
 ---
 
+### Milestone D+: Post-MVP Backlog
+**Goal:** Advanced enterprise features, security hardening, and extensibility.
+
+These items represent the next phase of development after the core cloud-native transition is complete.
+
+| ID | Task | Owner Mode | Dependencies |
+|----|------|------------|--------------|
+| D.1 | **Control-Plane OIDC SSO + RBAC**<br>Replace admin break-glass key with true identity management. | `code` | A.4 |
+| D.2 | **Distributed Registry State**<br>Persisted/shared-state registries for MCP/A2A for true HA. | `architect` | A.2 |
+| D.3 | **MCP Protocol Parity**<br>Complete OAuth flows and remove remaining protocol skips. | `code` | - |
+| D.4 | **Plugin Sandboxing**<br>Code signing, attestation, and isolation for plugins. | `architect` | - |
+| D.5 | **Vector Store Extension**<br>Plugin-based model for custom vector DBs + parity verification. | `code` | - |
+| D.6 | **Management UI**<br>Admin surface for rate limits, quotas, and audit logs. | `frontend-specialist` | D.1 |
+
+#### Detailed Work Items (Milestone D+)
+
+##### D.1: Control-Plane OIDC SSO + RBAC
+- **Scope**: Integrate OIDC provider (Keycloak/Auth0) for admin routes.
+- **Acceptance Criteria**:
+  - [ ] Admin endpoints require valid JWT.
+  - [ ] RBAC roles (Admin, Viewer, Editor) enforced.
+- **Validation**:
+  ```bash
+  curl -H "Authorization: Bearer $JWT" http://localhost:4000/admin/config
+  ```
+
+##### D.2: Distributed Registry State
+- **Scope**: Move MCP/A2A registry state from in-memory/local to Redis/Postgres.
+- **Acceptance Criteria**:
+  - [ ] Registry updates on one pod visible to others immediately.
+  - [ ] State survives pod restarts.
+
+##### D.3: MCP Protocol Parity
+- **Scope**: Implement full OAuth 2.0 flow for MCP tools and remove protocol compliance skips.
+- **Acceptance Criteria**:
+  - [ ] All MCP compliance tests pass without skips.
+  - [ ] OAuth-protected tools function correctly.
+
+##### D.4: Plugin Sandboxing & Provenance
+- **Scope**: Enforce signature verification for plugins and explore WASM/process isolation.
+- **Acceptance Criteria**:
+  - [ ] Unsigned plugins rejected in production mode.
+  - [ ] Plugins cannot access host filesystem outside allowed paths.
+
+##### D.5: Vector Store Extension Model
+- **Scope**: Create plugin interface for custom vector stores and verify parity across implementations.
+- **Acceptance Criteria**:
+  - [ ] Plugin can register new vector store backend.
+  - [ ] Standard test suite passes for custom backend.
+
+##### D.6: Management UI
+- **Scope**: React-based admin dashboard for system management.
+- **Acceptance Criteria**:
+  - [ ] View/edit rate limits and quotas.
+  - [ ] Searchable audit logs.
+
+---
+
 ## Tracking Table
 
 | ID | Milestone | Task | Owner | Status | PR | Risk |
 |----|-----------|------|-------|--------|----|------|
-| A.1 | A (P0) | K8s Manifests | `architect` | 🔴 Todo | - | Low |
-| A.2 | A (P0) | HA State | `code` | 🔴 Todo | - | Med |
-| A.3 | A (P0) | Basic OTel | `code` | 🔴 Todo | - | Low |
-| A.4 | A (P0) | Security Baseline | `code` | 🔴 Todo | - | Low |
-| B.1 | B (P1) | Config Sync Sidecar | `code` | 🔴 Todo | - | High |
-| B.2 | B (P1) | Routing Decision Visibility | `code` | 🔴 Todo | - | Low |
-| B.3 | B (P1) | Security Hardening | `code` | 🔴 Todo | - | Med |
-| B.4 | B (P1) | Streaming Shutdown | `architect` | 🔴 Todo | - | Med |
-| C.1 | C (P2) | MLOps Pipeline | `architect`, `Services Team` | 🔴 Todo | - | High |
-| C.2 | C (P2) | Circuit Breakers | `code` | 🔴 Todo | - | Med |
-| C.3 | C (P2) | Autoscaling | `code` | 🔴 Todo | - | Low |
+| A.1 | A (P0) | K8s Manifests | `architect` | ✅ Done | - | Low |
+| A.2 | A (P0) | HA State | `code` | ✅ Done | - | Med |
+| A.3 | A (P0) | Basic OTel | `code` | ✅ Done | - | Low |
+| A.4 | A (P0) | Security Baseline | `code` | ✅ Done | - | Low |
+| B.1 | B (P1) | Config Sync Sidecar | `code` | ✅ Done | - | High |
+| B.2 | B (P1) | Routing Decision Visibility | `code` | ✅ Done | - | Low |
+| B.3 | B (P1) | Security Hardening | `code` | ✅ Done | - | Med |
+| B.4 | B (P1) | Streaming Shutdown | `architect` | ✅ Done | - | Med |
+| C.1 | C (P2) | MLOps Pipeline | `architect`, `Services Team` | ✅ Done | - | High |
+| C.2 | C (P2) | Circuit Breakers | `code` | ✅ Done | - | Med |
+| C.3 | C (P2) | Autoscaling | `code` | ✅ Done | - | Low |
+| D.1 | D+ | OIDC SSO + RBAC | `code` | ⚪ Backlog | - | Med |
+| D.2 | D+ | Distributed Registry | `architect` | ⚪ Backlog | - | High |
+| D.3 | D+ | MCP Protocol Parity | `code` | ⚪ Backlog | - | Low |
+| D.4 | D+ | Plugin Sandboxing | `architect` | ⚪ Backlog | - | High |
+| D.5 | D+ | Vector Store Extension | `code` | ⚪ Backlog | - | Med |
+| D.6 | D+ | Management UI | `frontend-specialist` | ⚪ Backlog | - | Low |
 
 ## Appendix: Code References
 
