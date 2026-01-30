@@ -5,21 +5,31 @@ URL Security Utilities for SSRF Prevention
 This module provides URL validation utilities to prevent Server-Side Request
 Forgery (SSRF) attacks when making outbound HTTP requests to user-configured URLs.
 
-Security Focus (Fail-Closed / Secure-by-Default):
+Security Focus (Fail-Closed / Deny-by-Default):
+- Block loopback addresses (127.0.0.0/8, ::1) - ALWAYS blocked
+- Block link-local addresses (169.254.0.0/16, fe80::/10) - includes cloud metadata
 - Block private network IPs (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) by default
-- Block localhost and loopback addresses (127.0.0.0/8, ::1)
-- Block link-local addresses (169.254.0.0/16, fe80::/10)
-- Block AWS/cloud metadata endpoints (169.254.169.254)
+- Block IPv6 unique-local addresses (fc00::/7) by default
+- Reject direct IP literal hosts by default (requires hostname)
 - Allow only http:// and https:// schemes
-- Explicit allowlists for hosts/domains and CIDRs
+- Explicit allowlists for hosts/domains, CIDRs, and URL prefixes
 
 Configuration (Environment Variables):
-- LLMROUTER_ALLOW_PRIVATE_IPS: Set to "true" to allow private IPs (default: false / blocked)
-- LLMROUTER_SSRF_ALLOWLIST_HOSTS: Comma-separated list of allowed hosts/domains
+- LLMROUTER_OUTBOUND_ALLOW_PRIVATE: Set to "true" to allow private/unique-local IPs
+  (default: false / blocked). Legacy alias: LLMROUTER_ALLOW_PRIVATE_IPS
+- LLMROUTER_OUTBOUND_HOST_ALLOWLIST: Comma-separated list of allowed hosts/domains
   - Exact match (e.g., "myserver.internal")
-  - Suffix match (e.g., ".trusted.com" matches "api.trusted.com")
-- LLMROUTER_SSRF_ALLOWLIST_CIDRS: Comma-separated list of allowed IP ranges in CIDR notation
-  (e.g., "10.100.0.0/16,192.168.1.0/24")
+  - Wildcard match (e.g., "*.trusted.com" matches "api.trusted.com")
+  - Suffix match (e.g., ".trusted.com" matches "api.trusted.com") [legacy format]
+  Legacy alias: LLMROUTER_SSRF_ALLOWLIST_HOSTS
+- LLMROUTER_OUTBOUND_CIDR_ALLOWLIST: Comma-separated CIDR ranges (e.g., "10.100.0.0/16")
+  Legacy alias: LLMROUTER_SSRF_ALLOWLIST_CIDRS
+- LLMROUTER_OUTBOUND_URL_ALLOWLIST: Comma-separated URL prefixes that bypass all checks
+  (e.g., "http://internal-mcp.local:8080/,https://trusted-api.internal/")
+
+Backwards Compatibility:
+- Old env vars (LLMROUTER_ALLOW_PRIVATE_IPS, LLMROUTER_SSRF_ALLOWLIST_HOSTS,
+  LLMROUTER_SSRF_ALLOWLIST_CIDRS) remain supported and are checked if new vars are unset.
 
 Usage:
     from litellm_llmrouter.url_security import validate_outbound_url
@@ -58,11 +68,43 @@ BLOCKED_HOSTNAMES = frozenset(
         "metadata",
         "metadata.google.internal",
         "metadata.gke.internal",
+        # Azure metadata
+        "metadata.azure.com",
+        # GCP metadata
+        "computeMetadata",
     ]
 )
 
 # Allowed URL schemes
 ALLOWED_SCHEMES = frozenset(["http", "https"])
+
+# IPv6 unique-local address range (fc00::/7)
+# This covers both fd00::/8 (locally assigned) and fc00::/8 (globally assigned)
+IPV6_UNIQUE_LOCAL_NETWORK = ipaddress.ip_network("fc00::/7")
+
+
+def _get_env_with_fallback(primary: str, fallback: str, default: str = "") -> str:
+    """
+    Get environment variable with fallback to legacy name.
+
+    Args:
+        primary: Primary (new) env var name
+        fallback: Fallback (legacy) env var name
+        default: Default value if neither is set
+
+    Returns:
+        Value from primary env var, or fallback, or default
+    """
+    value = os.getenv(primary)
+    if value is not None:
+        return value
+    value = os.getenv(fallback)
+    if value is not None:
+        verbose_proxy_logger.debug(
+            f"SSRF: Using legacy env var {fallback} (prefer {primary})"
+        )
+        return value
+    return default
 
 
 @lru_cache(maxsize=1)
@@ -74,14 +116,24 @@ def _get_ssrf_config() -> dict:
     - allow_private_ips: bool (default: False - blocked)
     - allowlist_hosts: set of allowed host patterns
     - allowlist_cidrs: list of ipaddress.ip_network objects
-    """
-    # Default: private IPs are BLOCKED (secure-by-default)
-    allow_private_ips = (
-        os.getenv("LLMROUTER_ALLOW_PRIVATE_IPS", "false").lower() == "true"
-    )
+    - allowlist_urls: list of URL prefixes that bypass checks
 
-    # Parse allowlisted hosts (exact match or suffix match with leading dot)
-    allowlist_hosts_str = os.getenv("LLMROUTER_SSRF_ALLOWLIST_HOSTS", "")
+    Env vars support legacy names for backwards compatibility.
+    """
+    # Default: private IPs are BLOCKED (deny-by-default)
+    allow_private_str = _get_env_with_fallback(
+        "LLMROUTER_OUTBOUND_ALLOW_PRIVATE",
+        "LLMROUTER_ALLOW_PRIVATE_IPS",
+        "false",
+    )
+    allow_private_ips = allow_private_str.lower() == "true"
+
+    # Parse allowlisted hosts (exact match, wildcard with *, or suffix match with leading dot)
+    allowlist_hosts_str = _get_env_with_fallback(
+        "LLMROUTER_OUTBOUND_HOST_ALLOWLIST",
+        "LLMROUTER_SSRF_ALLOWLIST_HOSTS",
+        "",
+    )
     allowlist_hosts = set()
     for host in allowlist_hosts_str.split(","):
         host = host.strip().lower()
@@ -89,7 +141,11 @@ def _get_ssrf_config() -> dict:
             allowlist_hosts.add(host)
 
     # Parse allowlisted CIDRs
-    allowlist_cidrs_str = os.getenv("LLMROUTER_SSRF_ALLOWLIST_CIDRS", "")
+    allowlist_cidrs_str = _get_env_with_fallback(
+        "LLMROUTER_OUTBOUND_CIDR_ALLOWLIST",
+        "LLMROUTER_SSRF_ALLOWLIST_CIDRS",
+        "",
+    )
     allowlist_cidrs = []
     for cidr in allowlist_cidrs_str.split(","):
         cidr = cidr.strip()
@@ -102,15 +158,26 @@ def _get_ssrf_config() -> dict:
                     f"SSRF: Invalid CIDR in allowlist: {cidr} - {e}"
                 )
 
+    # Parse URL prefix allowlist (new feature - no legacy alias)
+    allowlist_urls_str = os.getenv("LLMROUTER_OUTBOUND_URL_ALLOWLIST", "")
+    allowlist_urls = []
+    for url_prefix in allowlist_urls_str.split(","):
+        url_prefix = url_prefix.strip()
+        if url_prefix:
+            # Normalize: ensure trailing slash for prefix matching
+            allowlist_urls.append(url_prefix)
+
     verbose_proxy_logger.debug(
         f"SSRF config loaded: allow_private_ips={allow_private_ips}, "
-        f"allowlist_hosts={allowlist_hosts}, allowlist_cidrs={len(allowlist_cidrs)} networks"
+        f"allowlist_hosts={allowlist_hosts}, allowlist_cidrs={len(allowlist_cidrs)} networks, "
+        f"allowlist_urls={len(allowlist_urls)} prefixes"
     )
 
     return {
         "allow_private_ips": allow_private_ips,
         "allowlist_hosts": allowlist_hosts,
         "allowlist_cidrs": allowlist_cidrs,
+        "allowlist_urls": allowlist_urls,
     }
 
 
@@ -119,13 +186,32 @@ def clear_ssrf_config_cache() -> None:
     _get_ssrf_config.cache_clear()
 
 
+def _is_url_allowlisted(url: str, config: dict) -> bool:
+    """
+    Check if a URL matches any allowlisted URL prefix.
+
+    Args:
+        url: The full URL to check
+        config: The SSRF configuration dict
+
+    Returns:
+        True if the URL starts with any allowlisted prefix, False otherwise
+    """
+    url_lower = url.lower()
+    for prefix in config.get("allowlist_urls", []):
+        if url_lower.startswith(prefix.lower()):
+            return True
+    return False
+
+
 def _is_host_allowlisted(hostname: str, config: dict) -> bool:
     """
     Check if a hostname is in the allowlist.
 
     Supports:
     - Exact match: "myserver.internal"
-    - Suffix match: ".trusted.com" matches "api.trusted.com", "internal.trusted.com"
+    - Wildcard match: "*.trusted.com" matches "api.trusted.com", "x.y.trusted.com"
+    - Suffix match (legacy): ".trusted.com" matches "api.trusted.com"
 
     Args:
         hostname: The hostname to check (case-insensitive)
@@ -141,10 +227,14 @@ def _is_host_allowlisted(hostname: str, config: dict) -> bool:
     if hostname_lower in allowlist:
         return True
 
-    # Check suffix match (patterns starting with ".")
     for pattern in allowlist:
-        if pattern.startswith("."):
-            # Suffix match: ".example.com" matches "api.example.com"
+        # Wildcard match: "*.example.com" matches "api.example.com"
+        if pattern.startswith("*."):
+            suffix = pattern[1:]  # ".example.com"
+            if hostname_lower.endswith(suffix) or hostname_lower == suffix[1:]:
+                return True
+        # Legacy suffix match: ".example.com" matches "api.example.com"
+        elif pattern.startswith("."):
             if hostname_lower.endswith(pattern) or hostname_lower == pattern[1:]:
                 return True
 
@@ -174,15 +264,32 @@ def _is_ip_allowlisted(ip_str: str, config: dict) -> bool:
     return False
 
 
+def _is_ip_literal(hostname: str) -> bool:
+    """
+    Check if a hostname is actually an IP address literal.
+
+    Args:
+        hostname: The hostname to check
+
+    Returns:
+        True if it's an IP literal, False if it's a domain name
+    """
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
 def _check_ip_address(ip_str: str, config: dict = None) -> tuple[bool, str]:
     """
     Check if an IP address should be blocked.
 
-    Order of checks:
-    1. Always block loopback (127.0.0.0/8, ::1) - ALWAYS blocked
+    Order of checks (deny-by-default):
+    1. Always block loopback (127.0.0.0/8, ::1) - NEVER allowlisted
     2. Always block link-local (169.254.0.0/16, fe80::/10) - includes cloud metadata
-    3. Check allowlist for private IPs
-    4. Block private IPs (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) unless:
+    3. Check allowlist for private IPs and IPv6 unique-local
+    4. Block private IPs (RFC1918) and IPv6 unique-local (fc00::/7) unless:
        - allow_private_ips=True, OR
        - IP is in CIDR allowlist
 
@@ -212,14 +319,34 @@ def _check_ip_address(ip_str: str, config: dict = None) -> tuple[bool, str]:
             f"link-local address {ip_str} is blocked (potential cloud metadata endpoint)",
         )
 
-    # IPv6 specific: block loopback variations - ALWAYS blocked
+    # IPv6 specific checks
     if isinstance(ip, ipaddress.IPv6Address):
+        # Block IPv4-mapped loopback/link-local - ALWAYS blocked
         if ip.ipv4_mapped:
             ipv4 = ip.ipv4_mapped
             if ipv4.is_loopback or ipv4.is_link_local:
                 return True, f"IPv4-mapped loopback/link-local {ip_str} is blocked"
 
-    # Check if IP is private
+        # Check IPv6 unique-local (fc00::/7) - blocked by default like private IPv4
+        if ip in IPV6_UNIQUE_LOCAL_NETWORK:
+            # Check CIDR allowlist first
+            if _is_ip_allowlisted(ip_str, config):
+                verbose_proxy_logger.debug(
+                    f"SSRF: IPv6 unique-local {ip_str} allowed by CIDR allowlist"
+                )
+                return False, ""
+
+            # Check global allow_private_ips setting
+            if config.get("allow_private_ips", False):
+                return False, ""
+
+            # Block unique-local IPv6
+            return (
+                True,
+                f"Access to IPv6 unique-local address {ip_str} is blocked for security reasons",
+            )
+
+    # Check if IP is private (RFC1918 for IPv4)
     if ip.is_private and not ip.is_loopback:  # loopback already caught above
         # Check CIDR allowlist first
         if _is_ip_allowlisted(ip_str, config):
@@ -291,24 +418,27 @@ def validate_outbound_url(
     This function checks URLs against SSRF attack patterns and raises
     SSRFBlockedError if the URL targets a potentially dangerous endpoint.
 
-    **SECURE-BY-DEFAULT**: Private IPs are blocked unless explicitly allowed.
+    **DENY-BY-DEFAULT**: Private IPs and IPv6 unique-local are blocked unless
+    explicitly allowed via configuration.
 
-    Blocked targets (always):
+    Blocked targets (always, cannot be overridden):
     - Non-http/https schemes (file://, ftp://, etc.)
     - Localhost and loopback addresses (127.0.0.1, ::1)
-    - Link-local addresses including cloud metadata (169.254.0.0/16)
+    - Link-local addresses including cloud metadata (169.254.0.0/16, fe80::/10)
     - Hostnames like "localhost", "metadata.google.internal"
 
     Blocked by default (can be allowed via config):
     - Private network IPs (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
-    - Configure LLMROUTER_ALLOW_PRIVATE_IPS=true to allow all private IPs
-    - Configure LLMROUTER_SSRF_ALLOWLIST_HOSTS to allow specific hosts/domains
-    - Configure LLMROUTER_SSRF_ALLOWLIST_CIDRS to allow specific IP ranges
+    - IPv6 unique-local addresses (fc00::/7)
+    - Configure LLMROUTER_OUTBOUND_ALLOW_PRIVATE=true to allow all private IPs
+    - Configure LLMROUTER_OUTBOUND_HOST_ALLOWLIST to allow specific hosts/domains
+    - Configure LLMROUTER_OUTBOUND_CIDR_ALLOWLIST to allow specific IP ranges
+    - Configure LLMROUTER_OUTBOUND_URL_ALLOWLIST to allow specific URL prefixes
 
     Args:
         url: The URL to validate
         resolve_dns: If True, resolve hostname to IP and check the IP too
-        allow_private_ips: Override env var; if True, allow RFC1918 IPs for this call
+        allow_private_ips: Override env var; if True, allow RFC1918/ULA IPs for this call
 
     Returns:
         The original URL if validation passes
@@ -322,6 +452,11 @@ def validate_outbound_url(
 
     # Load configuration
     config = _get_ssrf_config()
+
+    # Check URL allowlist first - bypasses all other checks
+    if _is_url_allowlisted(url, config):
+        verbose_proxy_logger.debug(f"SSRF: URL '{url}' allowed by URL prefix allowlist")
+        return url
 
     # Apply per-call override if provided
     if allow_private_ips is not None:
