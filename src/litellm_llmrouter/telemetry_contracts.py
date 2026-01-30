@@ -473,6 +473,12 @@ def extract_router_decision_from_span_event(
             # Unknown version
             return None
 
+        # Validate contract name matches expected pattern
+        contract_name = data.get("contract_name", "")
+        if not contract_name.startswith(CONTRACT_NAME):
+            # Wrong contract type
+            return None
+
         # Reconstruct the event
         event = RouterDecisionEvent(
             contract_version=data.get("contract_version", CONTRACT_VERSION),

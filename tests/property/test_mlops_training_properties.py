@@ -673,7 +673,8 @@ class TestMLOpsEvaluationMetrics:
 
         assert total_cost >= 0
         assert avg_cost >= 0
-        assert avg_cost <= max(costs)
+        # Use epsilon tolerance for floating-point comparison to handle rounding
+        assert avg_cost <= max(costs) + 1e-9
 
 
 class TestMLOpsPipelineIntegration:
