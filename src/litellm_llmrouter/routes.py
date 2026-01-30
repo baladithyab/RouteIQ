@@ -12,6 +12,7 @@ These routes extend the LiteLLM proxy server with:
   - POST /a2a/{agent_id}/message/stream - Streaming alias (proxies to canonical)
 - MCP (Model Context Protocol) gateway endpoints
 - MCP Parity Layer - upstream-compatible endpoint aliases
+- MCP Namespaced Routes - /mcp for built-in, /{server_prefix}/mcp for per-server
 - Hot reload and config sync endpoints
 - Kubernetes health probe endpoints (/_health/live, /_health/ready)
 
@@ -24,6 +25,7 @@ Usage:
         mcp_parity_admin_router,
         mcp_rest_router,
         mcp_proxy_router,
+        mcp_namespace_router,
         oauth_callback_router,
         RequestIDMiddleware,
     )
@@ -34,6 +36,7 @@ Usage:
     app.include_router(mcp_parity_router)  # Upstream-compatible MCP aliases
     app.include_router(mcp_parity_admin_router)  # Admin MCP parity routes
     app.include_router(mcp_rest_router)  # MCP REST API (/mcp-rest)
+    app.include_router(mcp_namespace_router)  # Namespaced /mcp routes
     # Feature-flagged:
     app.include_router(mcp_proxy_router)  # MCP protocol proxy (if enabled)
     app.include_router(oauth_callback_router)  # OAuth callback (if enabled)
@@ -65,6 +68,7 @@ from .mcp_parity import (
     mcp_parity_admin_router,
     mcp_rest_router,
     mcp_proxy_router,
+    mcp_namespace_router,
     oauth_callback_router,
     MCP_OAUTH_ENABLED,
     MCP_PROTOCOL_PROXY_ENABLED,
@@ -104,6 +108,7 @@ __all__ = [
     "mcp_parity_admin_router",
     "mcp_rest_router",
     "mcp_proxy_router",
+    "mcp_namespace_router",
     "oauth_callback_router",
     "MCP_OAUTH_ENABLED",
     "MCP_PROTOCOL_PROXY_ENABLED",

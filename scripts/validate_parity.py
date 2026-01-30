@@ -57,6 +57,8 @@ class ParityValidator:
             await self._test_chat_completions(client)
             # Management endpoints
             await self._test_management_endpoints(client)
+            # MCP parity endpoints
+            await self._test_mcp_parity_endpoints(client)
 
         return self.results
 
@@ -182,6 +184,39 @@ class ParityValidator:
             self.results.append(
                 TestResult(
                     name=f"Management: {desc}",
+                    passed=passed,
+                    status_code=resp.status_code if resp else None,
+                    response_time_ms=time_ms,
+                    error=error,
+                )
+            )
+            status = "✅" if passed else "❌"
+            code = resp.status_code if resp else "N/A"
+            print(f"  {status} {path} - {code} ({time_ms:.0f}ms)")
+
+    async def _test_mcp_parity_endpoints(self, client: httpx.AsyncClient) -> None:
+        """Test MCP parity endpoints (upstream-compatible routes)."""
+        print("\n📋 MCP Parity Endpoints")
+        endpoints = [
+            # MCP Management Endpoints
+            ("/v1/mcp/server", "GET", "List MCP servers"),
+            ("/v1/mcp/server/health", "GET", "MCP server health"),
+            ("/v1/mcp/tools", "GET", "List MCP tools"),
+            ("/v1/mcp/access_groups", "GET", "List access groups"),
+            ("/v1/mcp/registry.json", "GET", "MCP registry document"),
+            # MCP REST API
+            ("/mcp-rest/tools/list", "GET", "MCP REST tools list"),
+            # Namespaced MCP routes
+            ("/mcp", "GET", "Built-in MCP endpoint"),
+        ]
+        for path, method, desc in endpoints:
+            resp, time_ms, error = await self._request(client, method, path)
+            # Accept 200, 401, 403, 404 as valid responses
+            # 404 is valid if MCP gateway is disabled
+            passed = resp is not None and resp.status_code in [200, 401, 403, 404]
+            self.results.append(
+                TestResult(
+                    name=f"MCP Parity: {desc}",
                     passed=passed,
                     status_code=resp.status_code if resp else None,
                     response_time_ms=time_ms,

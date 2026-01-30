@@ -16,6 +16,7 @@ Management Endpoints (from mcp_management_endpoints.py):
 - GET /v1/mcp/tools → list MCP tools
 - GET /v1/mcp/access_groups → list access groups
 - GET /v1/mcp/registry.json → MCP registry document
+- POST /v1/mcp/make_public → make MCP servers public
 
 MCP REST Endpoints (from rest_endpoints.py):
 - GET /mcp-rest/tools/list → list tools with mcp_info
@@ -29,6 +30,7 @@ OAuth Endpoints (feature-flagged):
 
 Protocol Proxy (feature-flagged):
 - /mcp/{server_id}/* → proxy to registered MCP server (SSE/streamable_http)
+- /mcp → built-in MCP protocol endpoint (namespaced route)
 
 All aliases delegate to existing handlers; no logic duplication.
 """
@@ -42,7 +44,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -95,6 +97,13 @@ mcp_proxy_router = APIRouter(
     prefix="/mcp",
     tags=["mcp-proxy"],
     dependencies=[Depends(admin_api_key_auth)],
+)
+
+# Namespaced MCP protocol router - for built-in MCP server
+# This provides upstream-compatible namespaced /mcp routes
+mcp_namespace_router = APIRouter(
+    tags=["mcp-namespace"],
+    dependencies=[Depends(user_api_key_auth)],
 )
 
 # ============================================================================
@@ -152,6 +161,12 @@ class MCPToolCallRequest(BaseModel):
     arguments: dict[str, Any] | None = None
 
 
+class MakeMCPServersPublicRequest(BaseModel):
+    """Request model for making MCP servers public (matches upstream)."""
+
+    mcp_server_ids: list[str]
+
+
 # ============================================================================
 # OAuth Storage (in-memory, for demonstration)
 # ============================================================================
@@ -184,6 +199,9 @@ class OAuthToken:
 # In-memory OAuth stores (in production, use Redis or DB)
 _oauth_sessions: dict[str, OAuthSession] = {}
 _oauth_tokens: dict[str, OAuthToken] = {}
+
+# In-memory public MCP servers list (mimics upstream litellm.public_mcp_servers)
+_public_mcp_servers: list[str] = []
 
 # OAuth session TTL (5 minutes)
 OAUTH_SESSION_TTL = 300
@@ -591,86 +609,19 @@ async def get_mcp_registry(request: Request):
     return {"servers": servers}
 
 
-# ============================================================================
-# MCP REST Endpoints (/mcp-rest/*)
-# ============================================================================
-
-
-@mcp_rest_router.get("/tools/list")
-async def list_tool_rest_api(
-    request: Request,
-    server_id: str | None = Query(None, description="The server id to list tools for"),
-):
+@mcp_parity_admin_router.post("/make_public", status_code=202)
+async def make_mcp_servers_public(request: MakeMCPServersPublicRequest):
     """
-    Upstream-compatible: GET /mcp-rest/tools/list
+    Upstream-compatible: POST /v1/mcp/make_public
 
-    List all available tools with server mcp_info.
+    Make MCP servers public for AI Hub.
+    Requires admin API key authentication.
+
+    This endpoint stores the list of public MCP server IDs.
+    When GET /v1/mcp/server is called, servers in this list
+    will have mcp_info.is_public=True.
     """
-    gateway = get_mcp_gateway()
-    if not gateway.is_enabled():
-        return {
-            "tools": [],
-            "error": "mcp_gateway_disabled",
-            "message": "MCP Gateway is not enabled",
-        }
-
-    tools = []
-    try:
-        if server_id:
-            server = gateway.get_server(server_id)
-            if not server:
-                return {
-                    "tools": [],
-                    "error": "server_not_found",
-                    "message": f"Server with id {server_id} not found",
-                }
-            for tool_name in server.tools:
-                tool_info = {
-                    "name": tool_name,
-                    "description": "",
-                    "inputSchema": {},
-                    "mcp_info": server.metadata.get("mcp_info"),
-                }
-                if tool_name in server.tool_definitions:
-                    tool_def = server.tool_definitions[tool_name]
-                    tool_info["description"] = tool_def.description
-                    tool_info["inputSchema"] = tool_def.input_schema
-                tools.append(tool_info)
-        else:
-            for server in gateway.list_servers():
-                for tool_name in server.tools:
-                    tool_info = {
-                        "name": tool_name,
-                        "description": "",
-                        "inputSchema": {},
-                        "mcp_info": server.metadata.get("mcp_info"),
-                    }
-                    if tool_name in server.tool_definitions:
-                        tool_def = server.tool_definitions[tool_name]
-                        tool_info["description"] = tool_def.description
-                        tool_info["inputSchema"] = tool_def.input_schema
-                    tools.append(tool_info)
-
-        return {
-            "tools": tools,
-            "error": None,
-            "message": "Successfully retrieved tools",
-        }
-    except Exception as e:
-        return {
-            "tools": [],
-            "error": "unexpected_error",
-            "message": f"An unexpected error occurred: {str(e)}",
-        }
-
-
-@mcp_rest_router.post("/tools/call")
-async def call_tool_rest_api(request: Request):
-    """
-    Upstream-compatible: POST /mcp-rest/tools/call
-
-    REST API to call a specific MCP tool with provided arguments.
-    """
+    request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
     if not gateway.is_enabled():
         raise HTTPException(
@@ -678,70 +629,150 @@ async def call_tool_rest_api(request: Request):
             detail={
                 "error": "mcp_gateway_disabled",
                 "message": "MCP Gateway is not enabled",
+                "request_id": request_id,
             },
         )
 
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "invalid_json",
-                "message": "Request body must be valid JSON",
-            },
-        )
+    global _public_mcp_servers
 
-    server_id = data.get("server_id")
-    tool_name = data.get("name")
-    arguments = data.get("arguments", {})
+    # Validate that all server IDs exist
+    for server_id in request.mcp_server_ids:
+        server = gateway.get_server(server_id)
+        if not server:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": f"MCP Server with ID {server_id} not found"},
+            )
 
-    if not server_id:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "missing_parameter", "message": "server_id is required"},
-        )
-    if not tool_name:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "missing_parameter", "message": "name is required"},
-        )
-
-    # Verify server exists
-    server = gateway.get_server(server_id)
-    if not server:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "access_denied",
-                "message": f"Server {server_id} not found or not accessible",
-            },
-        )
-
-    if not gateway.is_tool_invocation_enabled():
-        raise HTTPException(
-            status_code=501,
-            detail={
-                "error": "tool_invocation_disabled",
-                "message": "Tool invocation is disabled. Set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true",
-            },
-        )
-
-    result = await gateway.invoke_tool(tool_name, arguments)
-    if not result.success:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "tool_invocation_failed",
-                "message": result.error or "Tool invocation failed",
-            },
-        )
+    # Update public servers list
+    _public_mcp_servers = request.mcp_server_ids
 
     return {
-        "status": "success",
-        "tool_name": result.tool_name,
-        "server_id": result.server_id,
-        "result": result.result,
+        "message": "Successfully updated public mcp servers",
+        "public_mcp_servers": _public_mcp_servers,
+    }
+
+
+# ============================================================================
+# Namespaced MCP Protocol Router
+# ============================================================================
+# Provides upstream-compatible /mcp endpoint for built-in MCP server
+# and /{server_prefix}/mcp for per-server namespaced routes.
+
+
+@mcp_namespace_router.api_route("/mcp", methods=["GET", "POST"])
+async def builtin_mcp_endpoint(request: Request):
+    """
+    Upstream-compatible: /mcp
+
+    Built-in MCP protocol endpoint (streamable HTTP).
+    This provides the default/built-in MCP server endpoint that upstream exposes.
+
+    For now, returns server information. Full MCP protocol implementation
+    would require SSE/streamable HTTP JSON-RPC handling.
+    """
+    request_id = get_request_id() or "unknown"
+    gateway = get_mcp_gateway()
+
+    if not gateway.is_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "mcp_gateway_disabled",
+                "message": "MCP Gateway is not enabled",
+                "request_id": request_id,
+            },
+        )
+
+    # Get base URL for building remote URLs
+    base_url = str(request.base_url).rstrip("/")
+
+    # Return MCP server info in standard format
+    return {
+        "name": "routeiq-mcp-server",
+        "title": "RouteIQ MCP Server",
+        "description": "MCP Server for RouteIQ Gateway",
+        "version": "1.0.0",
+        "protocol_version": "2024-11-05",
+        "capabilities": {
+            "tools": {"listChanged": True},
+            "resources": {"subscribe": False, "listChanged": True},
+        },
+        "remotes": [
+            {
+                "type": "streamable-http",
+                "url": f"{base_url}/mcp",
+            }
+        ],
+    }
+
+
+@mcp_namespace_router.api_route("/{server_prefix}/mcp", methods=["GET", "POST"])
+async def namespaced_mcp_endpoint(request: Request, server_prefix: str):
+    """
+    Upstream-compatible: /{server_prefix}/mcp
+
+    Namespaced MCP protocol endpoint for a specific server.
+    The server_prefix is matched against server_id or alias.
+
+    This provides upstream-compatible per-server namespaced routes.
+    """
+    request_id = get_request_id() or "unknown"
+    gateway = get_mcp_gateway()
+
+    if not gateway.is_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "mcp_gateway_disabled",
+                "message": "MCP Gateway is not enabled",
+                "request_id": request_id,
+            },
+        )
+
+    # Find server by prefix (could be server_id or alias)
+    server = gateway.get_server(server_prefix)
+    if not server:
+        # Try to find by alias in metadata
+        for s in gateway.list_servers():
+            if s.metadata.get("alias") == server_prefix:
+                server = s
+                break
+
+    if not server:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "server_not_found",
+                "message": f"MCP server with prefix '{server_prefix}' not found",
+                "request_id": request_id,
+            },
+        )
+
+    # Get base URL for building remote URLs
+    base_url = str(request.base_url).rstrip("/")
+
+    # Return server info in MCP format
+    return {
+        "name": server.name,
+        "title": server.name,
+        "description": server.metadata.get("description", server.name),
+        "version": "1.0.0",
+        "protocol_version": "2024-11-05",
+        "capabilities": {
+            "tools": {"listChanged": True},
+            "resources": {"subscribe": False, "listChanged": True},
+        },
+        "remotes": [
+            {
+                "type": "streamable-http",
+                "url": f"{base_url}/{server_prefix}/mcp",
+            }
+        ],
+        "server_id": server.server_id,
+        "transport": server.transport.value,
+        "tools": server.tools,
+        "resources": server.resources,
     }
 
 
@@ -976,215 +1007,6 @@ if MCP_OAUTH_ENABLED:
             raise
         except Exception as e:
             err = sanitize_error_response(e, request_id, "Token exchange failed")
-            raise HTTPException(status_code=500, detail=err)
-
-    @mcp_parity_admin_router.post("/server/oauth/{server_id}/register")
-    async def mcp_register(request: Request, server_id: str):
-        """
-        Upstream-compatible: POST /v1/mcp/server/oauth/{server_id}/register
-
-        OAuth dynamic client registration.
-        """
-        request_id = get_request_id() or "unknown"
-        gateway = get_mcp_gateway()
-        server = gateway.get_server(server_id)
-        if not server:
-            raise HTTPException(
-                status_code=404,
-                detail={"error": f"Temporary MCP server {server_id} not found"},
-            )
-
-        registration_url = server.metadata.get("registration_url")
-        if not registration_url:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "Server does not have registration_url configured"},
-            )
-
-        # Validate registration URL against SSRF
-        try:
-            validate_outbound_url(registration_url)
-        except SSRFBlockedError as e:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": f"Registration URL blocked for security: {e.reason}"},
-            )
-
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-
-        # Forward registration request to upstream
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(registration_url, json=data)
-
-                if response.status_code >= 400:
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail={
-                            "error": "registration_failed",
-                            "upstream": response.text[:500],
-                        },
-                    )
-
-                return response.json()
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail={"error": "Client registration timeout"},
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            err = sanitize_error_response(e, request_id, "Client registration failed")
-            raise HTTPException(status_code=500, detail=err)
-
-
-# ============================================================================
-# Protocol Proxy (Feature-Flagged)
-# ============================================================================
-
-
-if MCP_PROTOCOL_PROXY_ENABLED:
-
-    @mcp_proxy_router.api_route(
-        "/{server_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"]
-    )
-    async def mcp_protocol_proxy(request: Request, server_id: str, path: str):
-        """
-        MCP Protocol Proxy: /mcp/{server_id}/*
-
-        Proxies requests to registered MCP servers.
-        Feature-flagged via MCP_PROTOCOL_PROXY_ENABLED.
-
-        Enforces:
-        - SSRF allow/deny policy
-        - Strict timeouts
-        - Admin authentication
-
-        """
-        request_id = get_request_id() or "unknown"
-        gateway = get_mcp_gateway()
-
-        server = gateway.get_server(server_id)
-        if not server:
-            raise HTTPException(
-                status_code=404,
-                detail={"error": f"MCP server {server_id} not found"},
-            )
-
-        if not server.url:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "MCP server does not have a URL configured"},
-            )
-
-        # Validate target URL against SSRF
-        target_base = server.url.rstrip("/")
-        target_url = f"{target_base}/{path}"
-
-        try:
-            validate_outbound_url(target_url)
-        except SSRFBlockedError as e:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": f"Target URL blocked for security: {e.reason}"},
-            )
-
-        # Build timeout
-        timeout = httpx.Timeout(
-            connect=PROTOCOL_PROXY_CONNECT_TIMEOUT,
-            read=PROTOCOL_PROXY_READ_TIMEOUT,
-            write=PROTOCOL_PROXY_CONNECT_TIMEOUT,
-            pool=PROTOCOL_PROXY_CONNECT_TIMEOUT,
-        )
-
-        # Forward headers (excluding hop-by-hop)
-        hop_by_hop = {
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-            "host",
-        }
-        headers = {
-            k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop
-        }
-
-        # Add auth header if configured
-        if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
-            headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
-        elif server.auth_type == "api_key" and server.metadata.get("api_key"):
-            headers["X-API-Key"] = server.metadata["api_key"]
-
-        # Read request body
-        body = await request.body()
-
-        try:
-            # Check if SSE is expected
-            accept = request.headers.get("accept", "")
-            is_sse = "text/event-stream" in accept
-
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                if is_sse:
-                    # Stream SSE response
-                    async def stream_sse():
-                        async with client.stream(
-                            request.method,
-                            target_url,
-                            content=body,
-                            headers=headers,
-                            params=dict(request.query_params),
-                        ) as response:
-                            async for chunk in response.aiter_bytes():
-                                yield chunk
-
-                    return StreamingResponse(
-                        stream_sse(),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "X-Accel-Buffering": "no",
-                        },
-                    )
-                else:
-                    # Regular request
-                    response = await client.request(
-                        request.method,
-                        target_url,
-                        content=body,
-                        headers=headers,
-                        params=dict(request.query_params),
-                    )
-
-                    return JSONResponse(
-                        status_code=response.status_code,
-                        content=(
-                            response.json()
-                            if response.headers.get("content-type", "").startswith(
-                                "application/json"
-                            )
-                            else {"raw": response.text[:1000]}
-                        ),
-                    )
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail={"error": "Proxy timeout connecting to MCP server"},
-            )
-        except httpx.ConnectError:
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "Failed to connect to MCP server"},
-            )
-        except Exception as e:
-            err = sanitize_error_response(e, request_id, "Proxy request failed")
             raise HTTPException(status_code=500, detail=err)
 
 

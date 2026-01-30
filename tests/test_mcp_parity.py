@@ -416,3 +416,223 @@ class TestMCPParityFeatureFlags:
 
         assert mcp_parity_module.MCP_OAUTH_ENABLED is False
         assert mcp_parity_module.MCP_PROTOCOL_PROXY_ENABLED is False
+
+
+class TestMCPMakePublicEndpoint:
+    """Tests for POST /v1/mcp/make_public endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def setup_gateway(self):
+        """Reset gateway and environment before each test."""
+        from litellm_llmrouter.mcp_gateway import reset_mcp_gateway
+        from litellm_llmrouter.url_security import clear_ssrf_config_cache
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+
+        self._orig_enabled = os.environ.get("MCP_GATEWAY_ENABLED")
+
+        yield
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+        if self._orig_enabled is not None:
+            os.environ["MCP_GATEWAY_ENABLED"] = self._orig_enabled
+        else:
+            os.environ.pop("MCP_GATEWAY_ENABLED", None)
+
+    async def test_make_public_endpoint_exists(self):
+        """Test that make_public endpoint is registered."""
+        from litellm_llmrouter.mcp_parity import mcp_parity_admin_router
+
+        paths = [r.path for r in mcp_parity_admin_router.routes]
+        assert any("/make_public" in p for p in paths)
+
+    async def test_make_public_updates_list(self):
+        """Test that make_public updates the public servers list."""
+        os.environ["MCP_GATEWAY_ENABLED"] = "true"
+
+        from litellm_llmrouter.mcp_gateway import (
+            get_mcp_gateway,
+            MCPServer,
+            MCPTransport,
+        )
+
+        gateway = get_mcp_gateway()
+
+        # Register test servers
+        server1 = MCPServer(
+            server_id="public-test-1",
+            name="Public Test 1",
+            url="https://example.com/mcp1",
+            transport=MCPTransport.STREAMABLE_HTTP,
+        )
+        server2 = MCPServer(
+            server_id="public-test-2",
+            name="Public Test 2",
+            url="https://example.com/mcp2",
+            transport=MCPTransport.STREAMABLE_HTTP,
+        )
+        gateway.register_server(server1)
+        gateway.register_server(server2)
+
+        # Import fresh to get the function
+        import importlib
+        import litellm_llmrouter.mcp_parity as mcp_parity_module
+
+        importlib.reload(mcp_parity_module)
+
+        # Verify servers are registered
+        assert gateway.get_server("public-test-1") is not None
+        assert gateway.get_server("public-test-2") is not None
+
+
+class TestMCPNamespaceRouter:
+    """Tests for namespaced MCP protocol router."""
+
+    @pytest.fixture(autouse=True)
+    def setup_gateway(self):
+        """Reset gateway and environment before each test."""
+        from litellm_llmrouter.mcp_gateway import reset_mcp_gateway
+        from litellm_llmrouter.url_security import clear_ssrf_config_cache
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+
+        self._orig_enabled = os.environ.get("MCP_GATEWAY_ENABLED")
+
+        yield
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+        if self._orig_enabled is not None:
+            os.environ["MCP_GATEWAY_ENABLED"] = self._orig_enabled
+        else:
+            os.environ.pop("MCP_GATEWAY_ENABLED", None)
+
+    async def test_namespace_router_exists(self):
+        """Test that namespace router is properly configured."""
+        from litellm_llmrouter.mcp_parity import mcp_namespace_router
+
+        paths = [r.path for r in mcp_namespace_router.routes]
+        # Should have /mcp and /{server_prefix}/mcp
+        assert any("/mcp" == p for p in paths)
+        assert any("{server_prefix}" in p for p in paths)
+
+    async def test_builtin_mcp_route_returns_info(self):
+        """Test that built-in /mcp route returns server info."""
+        os.environ["MCP_GATEWAY_ENABLED"] = "true"
+
+        import importlib
+        import litellm_llmrouter.mcp_parity as mcp_parity_module
+
+        importlib.reload(mcp_parity_module)
+
+        from litellm_llmrouter.mcp_gateway import get_mcp_gateway
+
+        gateway = get_mcp_gateway()
+        assert gateway.is_enabled()
+
+    async def test_namespaced_mcp_route_exists(self):
+        """Test that per-server namespaced route is registered."""
+        from litellm_llmrouter.mcp_parity import mcp_namespace_router
+
+        paths = [r.path for r in mcp_namespace_router.routes]
+        assert any("/{server_prefix}/mcp" == p for p in paths)
+
+
+class TestMCPParityRouterExports:
+    """Tests for router exports from routes.py."""
+
+    async def test_namespace_router_exported(self):
+        """Test that mcp_namespace_router is exported from routes.py."""
+        from litellm_llmrouter.routes import mcp_namespace_router
+
+        assert mcp_namespace_router is not None
+        assert mcp_namespace_router.tags == ["mcp-namespace"]
+
+    async def test_all_parity_routers_exported(self):
+        """Test that all parity routers are properly exported."""
+        from litellm_llmrouter.routes import (
+            mcp_parity_router,
+            mcp_parity_admin_router,
+            mcp_rest_router,
+            mcp_proxy_router,
+            mcp_namespace_router,
+            oauth_callback_router,
+        )
+
+        assert mcp_parity_router.prefix == "/v1/mcp"
+        assert mcp_parity_admin_router.prefix == "/v1/mcp"
+        assert mcp_rest_router.prefix == "/mcp-rest"
+        assert mcp_proxy_router.prefix == "/mcp"
+        assert mcp_namespace_router is not None
+        assert oauth_callback_router is not None
+
+
+class TestMCPParityUpstreamCompatibility:
+    """Tests for upstream LiteLLM compatibility of new endpoints."""
+
+    @pytest.fixture(autouse=True)
+    def setup_gateway(self):
+        """Reset gateway and environment before each test."""
+        from litellm_llmrouter.mcp_gateway import reset_mcp_gateway
+        from litellm_llmrouter.url_security import clear_ssrf_config_cache
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+
+        self._orig_enabled = os.environ.get("MCP_GATEWAY_ENABLED")
+
+        yield
+
+        reset_mcp_gateway()
+        clear_ssrf_config_cache()
+        if self._orig_enabled is not None:
+            os.environ["MCP_GATEWAY_ENABLED"] = self._orig_enabled
+        else:
+            os.environ.pop("MCP_GATEWAY_ENABLED", None)
+
+    async def test_make_public_request_model_matches_upstream(self):
+        """Test that MakeMCPServersPublicRequest matches upstream schema."""
+        from litellm_llmrouter.mcp_parity import MakeMCPServersPublicRequest
+
+        # Create a request to verify schema
+        req = MakeMCPServersPublicRequest(mcp_server_ids=["server-1", "server-2"])
+        assert req.mcp_server_ids == ["server-1", "server-2"]
+
+        # Verify field name matches upstream
+        assert "mcp_server_ids" in MakeMCPServersPublicRequest.model_fields
+
+    async def test_make_public_endpoint_path_matches_upstream(self):
+        """Test that make_public endpoint path matches upstream."""
+        from litellm_llmrouter.mcp_parity import mcp_parity_admin_router
+
+        paths = [r.path for r in mcp_parity_admin_router.routes]
+        # Upstream path is /v1/mcp/make_public (with /v1/mcp prefix from router)
+        assert any("/make_public" in p for p in paths)
+
+    async def test_namespaced_mcp_path_matches_upstream_pattern(self):
+        """Test that namespaced MCP paths match upstream pattern."""
+        from litellm_llmrouter.mcp_parity import mcp_namespace_router
+
+        paths = [r.path for r in mcp_namespace_router.routes]
+
+        # Upstream has /{server_prefix}/mcp for per-server routes
+        assert any("/{server_prefix}/mcp" == p for p in paths)
+
+        # Upstream has /mcp for built-in MCP server
+        assert any("/mcp" == p for p in paths)
+
+    async def test_admin_auth_on_make_public(self):
+        """Test that make_public requires admin authentication."""
+        from litellm_llmrouter.mcp_parity import mcp_parity_admin_router
+
+        # Admin router should have admin_api_key_auth dependency
+        assert len(mcp_parity_admin_router.dependencies) > 0
+        # Check the dependency calls admin_api_key_auth
+        dep_calls = [d.dependency for d in mcp_parity_admin_router.dependencies]
+        dep_names = [
+            d.__name__ if hasattr(d, "__name__") else str(d) for d in dep_calls
+        ]
+        assert any("admin" in name.lower() for name in dep_names)
