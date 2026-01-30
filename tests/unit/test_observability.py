@@ -22,6 +22,12 @@ import pytest
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import (
+    ALWAYS_ON,
+    ALWAYS_OFF,
+    TraceIdRatioBased,
+    ParentBased,
+)
 
 
 # Import the module under test directly (not through __init__.py)
@@ -393,14 +399,6 @@ class TestObservabilityConfiguration:
         assert "service.namespace" in attrs
 
 
-# Import sampling classes for tests
-from opentelemetry.sdk.trace.sampling import (
-    ALWAYS_ON,
-    ALWAYS_OFF,
-    TraceIdRatioBased,
-    ParentBased,
-)
-
 # Import the _get_sampler_from_env function
 _get_sampler_from_env = observability._get_sampler_from_env
 
@@ -453,7 +451,10 @@ class TestSamplerConfiguration:
         """Test OTEL_TRACES_SAMPLER=traceidratio with invalid arg defaults to 1.0."""
         with patch.dict(
             os.environ,
-            {"OTEL_TRACES_SAMPLER": "traceidratio", "OTEL_TRACES_SAMPLER_ARG": "invalid"},
+            {
+                "OTEL_TRACES_SAMPLER": "traceidratio",
+                "OTEL_TRACES_SAMPLER_ARG": "invalid",
+            },
             clear=True,
         ):
             sampler = _get_sampler_from_env()

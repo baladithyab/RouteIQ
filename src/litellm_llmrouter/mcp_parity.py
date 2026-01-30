@@ -37,7 +37,7 @@ import hashlib
 import os
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -50,7 +50,6 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from .auth import admin_api_key_auth, get_request_id, sanitize_error_response
 from .mcp_gateway import (
     MCPServer,
-    MCPToolDefinition,
     MCPTransport,
     get_mcp_gateway,
 )
@@ -58,7 +57,9 @@ from .url_security import SSRFBlockedError, validate_outbound_url
 
 # Feature flags
 MCP_OAUTH_ENABLED = os.getenv("MCP_OAUTH_ENABLED", "false").lower() == "true"
-MCP_PROTOCOL_PROXY_ENABLED = os.getenv("MCP_PROTOCOL_PROXY_ENABLED", "false").lower() == "true"
+MCP_PROTOCOL_PROXY_ENABLED = (
+    os.getenv("MCP_PROTOCOL_PROXY_ENABLED", "false").lower() == "true"
+)
 
 # Protocol proxy timeouts
 PROTOCOL_PROXY_CONNECT_TIMEOUT = float(os.getenv("MCP_PROXY_CONNECT_TIMEOUT", "10"))
@@ -103,6 +104,7 @@ mcp_proxy_router = APIRouter(
 
 class NewMCPServerRequest(BaseModel):
     """Request model for creating/updating an MCP server (matches upstream)."""
+
     server_id: str | None = None
     server_name: str | None = None
     alias: str | None = None
@@ -127,6 +129,7 @@ class NewMCPServerRequest(BaseModel):
 
 class UpdateMCPServerRequest(BaseModel):
     """Request model for updating an MCP server (matches upstream)."""
+
     server_id: str
     server_name: str | None = None
     alias: str | None = None
@@ -143,6 +146,7 @@ class UpdateMCPServerRequest(BaseModel):
 
 class MCPToolCallRequest(BaseModel):
     """Request model for MCP tool invocation (matches upstream)."""
+
     server_id: str
     name: str
     arguments: dict[str, Any] | None = None
@@ -156,6 +160,7 @@ class MCPToolCallRequest(BaseModel):
 @dataclass
 class OAuthSession:
     """Stores OAuth session state for CSRF protection."""
+
     server_id: str
     state: str
     redirect_uri: str
@@ -167,6 +172,7 @@ class OAuthSession:
 @dataclass
 class OAuthToken:
     """Stores OAuth tokens for an MCP server."""
+
     server_id: str
     access_token: str
     token_type: str = "Bearer"
@@ -186,7 +192,9 @@ OAUTH_SESSION_TTL = 300
 def _cleanup_expired_sessions() -> None:
     """Remove expired OAuth sessions."""
     now = time.time()
-    expired = [k for k, v in _oauth_sessions.items() if now - v.created_at > OAUTH_SESSION_TTL]
+    expired = [
+        k for k, v in _oauth_sessions.items() if now - v.created_at > OAUTH_SESSION_TTL
+    ]
     for k in expired:
         del _oauth_sessions[k]
 
@@ -205,7 +213,7 @@ def _generate_state() -> str:
 async def fetch_all_mcp_servers():
     """
     Upstream-compatible: GET /v1/mcp/server
-    
+
     Returns all configured MCP servers (filtered by user access in upstream).
     Alias for GET /llmrouter/mcp/servers.
     """
@@ -224,17 +232,19 @@ async def fetch_all_mcp_servers():
     # Return list format matching upstream (list of server objects)
     servers = []
     for s in gateway.list_servers():
-        servers.append({
-            "server_id": s.server_id,
-            "server_name": s.name,
-            "alias": s.metadata.get("alias"),
-            "url": s.url,
-            "transport": s.transport.value,
-            "auth_type": s.auth_type,
-            "tools": s.tools,
-            "resources": s.resources,
-            "mcp_access_groups": s.metadata.get("access_groups", []),
-        })
+        servers.append(
+            {
+                "server_id": s.server_id,
+                "server_name": s.name,
+                "alias": s.metadata.get("alias"),
+                "url": s.url,
+                "transport": s.transport.value,
+                "auth_type": s.auth_type,
+                "tools": s.tools,
+                "resources": s.resources,
+                "mcp_access_groups": s.metadata.get("access_groups", []),
+            }
+        )
     return servers
 
 
@@ -244,7 +254,7 @@ async def health_check_servers(
 ):
     """
     Upstream-compatible: GET /v1/mcp/server/health
-    
+
     Health check for MCP servers.
     Alias for GET /v1/llmrouter/mcp/server/health.
     """
@@ -266,10 +276,12 @@ async def health_check_servers(
             health_results = []
             for sid in server_ids:
                 health = await gateway.check_server_health(sid)
-                health_results.append({
-                    "server_id": sid,
-                    "status": health.get("status", "unknown"),
-                })
+                health_results.append(
+                    {
+                        "server_id": sid,
+                        "status": health.get("status", "unknown"),
+                    }
+                )
         else:
             # Check all servers
             all_health = await gateway.check_all_servers_health()
@@ -287,11 +299,10 @@ async def health_check_servers(
 async def fetch_mcp_server(server_id: str):
     """
     Upstream-compatible: GET /v1/mcp/server/{server_id}
-    
+
     Returns info on a specific MCP server.
     Alias for GET /llmrouter/mcp/servers/{server_id}.
     """
-    request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
     server = gateway.get_server(server_id)
     if not server:
@@ -318,7 +329,7 @@ async def fetch_mcp_server(server_id: str):
 async def add_mcp_server(payload: NewMCPServerRequest):
     """
     Upstream-compatible: POST /v1/mcp/server
-    
+
     Add a new external MCP server.
     Alias for POST /llmrouter/mcp/servers (admin required).
     """
@@ -369,7 +380,7 @@ async def add_mcp_server(payload: NewMCPServerRequest):
             },
         )
         gateway.register_server(mcp_server)
-        
+
         # Return matching upstream response
         return {
             "server_id": server_id,
@@ -395,7 +406,7 @@ async def add_mcp_server(payload: NewMCPServerRequest):
 async def edit_mcp_server(payload: UpdateMCPServerRequest):
     """
     Upstream-compatible: PUT /v1/mcp/server
-    
+
     Updates an existing MCP server.
     """
     request_id = get_request_id() or "unknown"
@@ -414,7 +425,9 @@ async def edit_mcp_server(payload: UpdateMCPServerRequest):
     if not existing:
         raise HTTPException(
             status_code=404,
-            detail={"error": f"MCP Server not found, passed server_id={payload.server_id}"},
+            detail={
+                "error": f"MCP Server not found, passed server_id={payload.server_id}"
+            },
         )
 
     try:
@@ -432,8 +445,10 @@ async def edit_mcp_server(payload: UpdateMCPServerRequest):
             auth_type=payload.auth_type or existing.auth_type,
             metadata={
                 "alias": payload.alias or existing.metadata.get("alias"),
-                "description": payload.description or existing.metadata.get("description"),
-                "access_groups": payload.mcp_access_groups or existing.metadata.get("access_groups", []),
+                "description": payload.description
+                or existing.metadata.get("description"),
+                "access_groups": payload.mcp_access_groups
+                or existing.metadata.get("access_groups", []),
                 "mcp_info": payload.mcp_info or existing.metadata.get("mcp_info"),
             },
         )
@@ -462,15 +477,14 @@ async def edit_mcp_server(payload: UpdateMCPServerRequest):
 async def remove_mcp_server(server_id: str):
     """
     Upstream-compatible: DELETE /v1/mcp/server/{server_id}
-    
+
     Deletes an MCP server.
     """
-    request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
-    
+
     if gateway.unregister_server(server_id):
         return JSONResponse(status_code=202, content=None)
-    
+
     raise HTTPException(
         status_code=404,
         detail={"error": f"MCP Server not found, passed server_id={server_id}"},
@@ -481,7 +495,7 @@ async def remove_mcp_server(server_id: str):
 async def get_mcp_tools():
     """
     Upstream-compatible: GET /v1/mcp/tools
-    
+
     Get all MCP tools available for the current key.
     """
     request_id = get_request_id() or "unknown"
@@ -513,7 +527,7 @@ async def get_mcp_tools():
 async def get_mcp_access_groups():
     """
     Upstream-compatible: GET /v1/mcp/access_groups
-    
+
     Get all available MCP access groups.
     """
     request_id = get_request_id() or "unknown"
@@ -536,7 +550,7 @@ async def get_mcp_access_groups():
 async def get_mcp_registry(request: Request):
     """
     Upstream-compatible: GET /v1/mcp/registry.json
-    
+
     MCP registry endpoint for server discovery.
     """
     request_id = get_request_id() or "unknown"
@@ -552,25 +566,27 @@ async def get_mcp_registry(request: Request):
         )
 
     registry = gateway.get_registry()
-    
+
     # Transform to upstream format
     base_url = str(request.base_url).rstrip("/")
     servers = []
     for srv in registry.get("servers", []):
-        servers.append({
-            "server": {
-                "name": srv.get("name", srv.get("id")),
-                "title": srv.get("name", srv.get("id")),
-                "description": srv.get("name", ""),
-                "version": "1.0.0",
-                "remotes": [
-                    {
-                        "type": "streamable-http",
-                        "url": f"{base_url}/mcp/{srv.get('id')}/mcp",
-                    }
-                ],
+        servers.append(
+            {
+                "server": {
+                    "name": srv.get("name", srv.get("id")),
+                    "title": srv.get("name", srv.get("id")),
+                    "description": srv.get("name", ""),
+                    "version": "1.0.0",
+                    "remotes": [
+                        {
+                            "type": "streamable-http",
+                            "url": f"{base_url}/mcp/{srv.get('id')}/mcp",
+                        }
+                    ],
+                }
             }
-        })
+        )
 
     return {"servers": servers}
 
@@ -587,10 +603,9 @@ async def list_tool_rest_api(
 ):
     """
     Upstream-compatible: GET /mcp-rest/tools/list
-    
+
     List all available tools with server mcp_info.
     """
-    request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
     if not gateway.is_enabled():
         return {
@@ -653,10 +668,9 @@ async def list_tool_rest_api(
 async def call_tool_rest_api(request: Request):
     """
     Upstream-compatible: POST /mcp-rest/tools/call
-    
+
     REST API to call a specific MCP tool with provided arguments.
     """
-    request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
     if not gateway.is_enabled():
         raise HTTPException(
@@ -672,7 +686,10 @@ async def call_tool_rest_api(request: Request):
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_json", "message": "Request body must be valid JSON"},
+            detail={
+                "error": "invalid_json",
+                "message": "Request body must be valid JSON",
+            },
         )
 
     server_id = data.get("server_id")
@@ -734,16 +751,17 @@ async def call_tool_rest_api(request: Request):
 
 
 if MCP_OAUTH_ENABLED:
+
     @mcp_parity_admin_router.post("/server/oauth/session", status_code=200)
     async def add_session_mcp_server(payload: NewMCPServerRequest):
         """
         Upstream-compatible: POST /v1/mcp/server/oauth/session
-        
+
         Temporarily cache an MCP server in memory for OAuth flow (~5 minutes).
         Does not write to database.
         """
         request_id = get_request_id() or "unknown"
-        
+
         server_id = payload.server_id
         if not server_id:
             server_id = hashlib.sha256(
@@ -774,7 +792,7 @@ if MCP_OAUTH_ENABLED:
                 },
             )
             gateway.register_server(mcp_server)
-            
+
             return {
                 "server_id": server_id,
                 "server_name": mcp_server.name,
@@ -791,7 +809,9 @@ if MCP_OAUTH_ENABLED:
                 )
             raise HTTPException(status_code=400, detail={"error": error_msg})
         except Exception as e:
-            err = sanitize_error_response(e, request_id, "Failed to create OAuth session")
+            err = sanitize_error_response(
+                e, request_id, "Failed to create OAuth session"
+            )
             raise HTTPException(status_code=500, detail=err)
 
     @mcp_parity_router.get("/server/oauth/{server_id}/authorize")
@@ -808,10 +828,9 @@ if MCP_OAUTH_ENABLED:
     ):
         """
         Upstream-compatible: GET /v1/mcp/server/oauth/{server_id}/authorize
-        
+
         OAuth authorization redirect endpoint.
         """
-        request_id = get_request_id() or "unknown"
         gateway = get_mcp_gateway()
         server = gateway.get_server(server_id)
         if not server:
@@ -880,7 +899,7 @@ if MCP_OAUTH_ENABLED:
     ):
         """
         Upstream-compatible: POST /v1/mcp/server/oauth/{server_id}/token
-        
+
         OAuth token exchange endpoint.
         """
         request_id = get_request_id() or "unknown"
@@ -925,22 +944,25 @@ if MCP_OAUTH_ENABLED:
                     form_data["code_verifier"] = code_verifier
 
                 response = await client.post(token_url, data=form_data)
-                
+
                 if response.status_code >= 400:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail={"error": "token_exchange_failed", "upstream": response.text[:500]},
+                        detail={
+                            "error": "token_exchange_failed",
+                            "upstream": response.text[:500],
+                        },
                     )
 
                 token_data = response.json()
-                
+
                 # Store token for this server
                 _oauth_tokens[server_id] = OAuthToken(
                     server_id=server_id,
                     access_token=token_data.get("access_token", ""),
                     token_type=token_data.get("token_type", "Bearer"),
                     refresh_token=token_data.get("refresh_token"),
-                    expires_at=time.time() + token_data.get("expires_in", 3600) if "expires_in" in token_data else None,
+                    expires_at=time.time() + token_data.get("expires_in", 3600),
                     scope=token_data.get("scope"),
                 )
 
@@ -960,7 +982,7 @@ if MCP_OAUTH_ENABLED:
     async def mcp_register(request: Request, server_id: str):
         """
         Upstream-compatible: POST /v1/mcp/server/oauth/{server_id}/register
-        
+
         OAuth dynamic client registration.
         """
         request_id = get_request_id() or "unknown"
@@ -997,11 +1019,14 @@ if MCP_OAUTH_ENABLED:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(registration_url, json=data)
-                
+
                 if response.status_code >= 400:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail={"error": "registration_failed", "upstream": response.text[:500]},
+                        detail={
+                            "error": "registration_failed",
+                            "upstream": response.text[:500],
+                        },
                     )
 
                 return response.json()
@@ -1023,22 +1048,26 @@ if MCP_OAUTH_ENABLED:
 
 
 if MCP_PROTOCOL_PROXY_ENABLED:
-    @mcp_proxy_router.api_route("/{server_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+
+    @mcp_proxy_router.api_route(
+        "/{server_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"]
+    )
     async def mcp_protocol_proxy(request: Request, server_id: str, path: str):
         """
         MCP Protocol Proxy: /mcp/{server_id}/*
-        
+
         Proxies requests to registered MCP servers.
         Feature-flagged via MCP_PROTOCOL_PROXY_ENABLED.
-        
+
         Enforces:
         - SSRF allow/deny policy
         - Strict timeouts
         - Admin authentication
+
         """
         request_id = get_request_id() or "unknown"
         gateway = get_mcp_gateway()
-        
+
         server = gateway.get_server(server_id)
         if not server:
             raise HTTPException(
@@ -1074,11 +1103,20 @@ if MCP_PROTOCOL_PROXY_ENABLED:
 
         # Forward headers (excluding hop-by-hop)
         hop_by_hop = {
-            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-            "te", "trailers", "transfer-encoding", "upgrade", "host",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "transfer-encoding",
+            "upgrade",
+            "host",
         }
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop}
-        
+        headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop
+        }
+
         # Add auth header if configured
         if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
             headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
@@ -1110,7 +1148,10 @@ if MCP_PROTOCOL_PROXY_ENABLED:
                     return StreamingResponse(
                         stream_sse(),
                         media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
                     )
                 else:
                     # Regular request
@@ -1124,7 +1165,13 @@ if MCP_PROTOCOL_PROXY_ENABLED:
 
                     return JSONResponse(
                         status_code=response.status_code,
-                        content=response.json() if response.headers.get("content-type", "").startswith("application/json") else {"raw": response.text[:1000]},
+                        content=(
+                            response.json()
+                            if response.headers.get("content-type", "").startswith(
+                                "application/json"
+                            )
+                            else {"raw": response.text[:1000]}
+                        ),
                     )
         except httpx.TimeoutException:
             raise HTTPException(
@@ -1158,7 +1205,7 @@ async def oauth_callback(
 ):
     """
     OAuth callback endpoint.
-    
+
     This endpoint receives the authorization code from the OAuth provider
     and validates the state parameter for CSRF protection.
     """
@@ -1172,13 +1219,16 @@ async def oauth_callback(
         )
 
     _cleanup_expired_sessions()
-    
+
     # Validate state (CSRF protection)
     session = _oauth_sessions.get(state)
     if not session:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_state", "message": "Invalid or expired OAuth state"},
+            detail={
+                "error": "invalid_state",
+                "message": "Invalid or expired OAuth state",
+            },
         )
 
     # Session is valid; return info for frontend to complete token exchange

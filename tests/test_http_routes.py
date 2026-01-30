@@ -254,7 +254,7 @@ class TestConfigSyncStatusResponse:
 @pytest.fixture
 def app_with_admin_router():
     """Create a minimal FastAPI app with admin-protected routes."""
-    from fastapi import Depends, HTTPException, Request, APIRouter
+    from fastapi import APIRouter, Depends
     from litellm_llmrouter.routes import health_router
     from litellm_llmrouter.auth import admin_api_key_auth, RequestIDMiddleware
 
@@ -598,12 +598,14 @@ class TestReadinessErrorSanitization:
 
         try:
             # Set an invalid database URL that will cause connection to fail
-            os.environ["DATABASE_URL"] = "postgresql://invalid:invalid@localhost:5432/invalid"
+            os.environ["DATABASE_URL"] = (
+                "postgresql://invalid:invalid@localhost:5432/invalid"
+            )
 
             client = TestClient(app_with_health_router, raise_server_exceptions=False)
             response = client.get("/_health/ready")
 
-            # Response could be 200 (if asyncpg not installed, check is skipped) 
+            # Response could be 200 (if asyncpg not installed, check is skipped)
             # or 503 (if asyncpg installed and connection fails)
             assert response.status_code in (200, 503)
 
@@ -615,7 +617,10 @@ class TestReadinessErrorSanitization:
                     db_check = data["checks"]["database"]
                     error_msg = db_check.get("error", "")
                     # Should be generic error, not the full exception
-                    assert "connection failed" in error_msg or "connection timeout" in error_msg
+                    assert (
+                        "connection failed" in error_msg
+                        or "connection timeout" in error_msg
+                    )
                     # Should not contain stack traces or connection strings
                     assert "traceback" not in error_msg.lower()
                     assert "password" not in error_msg.lower()
@@ -733,7 +738,9 @@ class TestAdminAuthUnit:
         try:
             for disable_value in ["false", "False", "FALSE", "0", "no", "off"]:
                 os.environ["ADMIN_AUTH_ENABLED"] = disable_value
-                assert _is_admin_auth_enabled() is False, f"Failed for value: {disable_value}"
+                assert _is_admin_auth_enabled() is False, (
+                    f"Failed for value: {disable_value}"
+                )
         finally:
             for key, val in env_backup.items():
                 if val is not None:
@@ -745,7 +752,9 @@ class TestAdminAuthUnit:
         """Test that sanitize_error_response produces correct structure."""
         from litellm_llmrouter.auth import sanitize_error_response
 
-        error = Exception("Sensitive database connection string: postgres://user:pass@host")
+        error = Exception(
+            "Sensitive database connection string: postgres://user:pass@host"
+        )
         result = sanitize_error_response(error, "test-req-id", "Generic error message")
 
         assert result["error"] == "internal_error"

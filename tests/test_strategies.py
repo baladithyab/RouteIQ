@@ -153,18 +153,18 @@ class TestA2AGateway:
     def setup_ssrf_config(self):
         """Allow localhost and private IPs for these tests."""
         from litellm_llmrouter.url_security import clear_ssrf_config_cache
-        
+
         # Store original values
         orig_allow_private = os.environ.get("LLMROUTER_ALLOW_PRIVATE_IPS")
         orig_allowlist = os.environ.get("LLMROUTER_SSRF_ALLOWLIST_HOSTS")
-        
+
         # Allow localhost and private IPs for tests
         os.environ["LLMROUTER_ALLOW_PRIVATE_IPS"] = "true"
         os.environ["LLMROUTER_SSRF_ALLOWLIST_HOSTS"] = "localhost"
         clear_ssrf_config_cache()
-        
+
         yield
-        
+
         # Restore original values
         if orig_allow_private is not None:
             os.environ["LLMROUTER_ALLOW_PRIVATE_IPS"] = orig_allow_private
@@ -205,7 +205,7 @@ class TestA2AGateway:
         finally:
             del os.environ["A2A_GATEWAY_ENABLED"]
 
-    def test_a2a_discover_agents(self):
+    def test_a2a_list_agents(self):
         """Test agent discovery by capability."""
         from litellm_llmrouter.a2a_gateway import A2AGateway, A2AAgent
 
@@ -229,9 +229,13 @@ class TestA2AGateway:
             gateway.register_agent(agent1)
             gateway.register_agent(agent2)
 
-            chat_agents = gateway.discover_agents("chat")
+            chat_agents = gateway.list_agents("chat")
             assert len(chat_agents) == 1
             assert chat_agents[0].agent_id == "agent1"
+
+            code_agents = gateway.list_agents("code")
+            assert len(code_agents) == 1
+            assert code_agents[0].agent_id == "agent2"
         finally:
             del os.environ["A2A_GATEWAY_ENABLED"]
 
@@ -243,16 +247,16 @@ class TestMCPGateway:
     def setup_ssrf_config(self):
         """Allow private IPs for these tests."""
         from litellm_llmrouter.url_security import clear_ssrf_config_cache
-        
+
         # Store original values
         orig_allow_private = os.environ.get("LLMROUTER_ALLOW_PRIVATE_IPS")
-        
+
         # Allow private IPs for tests
         os.environ["LLMROUTER_ALLOW_PRIVATE_IPS"] = "true"
         clear_ssrf_config_cache()
-        
+
         yield
-        
+
         # Restore original values
         if orig_allow_private is not None:
             os.environ["LLMROUTER_ALLOW_PRIVATE_IPS"] = orig_allow_private

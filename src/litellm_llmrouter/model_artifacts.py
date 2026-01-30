@@ -13,7 +13,7 @@ Security Features:
 Usage:
     manifest_path = os.environ.get("LLMROUTER_MODEL_MANIFEST_PATH")
     verifier = ModelArtifactVerifier(manifest_path)
-    
+
     # Before loading a pickle model:
     verifier.verify_artifact("models/knn_router.pkl")  # Raises ModelVerificationError on failure
 """
@@ -54,13 +54,16 @@ except ImportError:
 class ModelVerificationError(Exception):
     """Raised when model artifact verification fails."""
 
-    def __init__(self, artifact_path: str, reason: str, details: Optional[Dict] = None):
+    def __init__(
+        self,
+        artifact_path: str,
+        reason: str,
+        details: Optional[Dict] = None,
+    ):
         self.artifact_path = artifact_path
         self.reason = reason
         self.details = details or {}
-        super().__init__(
-            f"Model verification failed for '{artifact_path}': {reason}"
-        )
+        super().__init__(f"Model verification failed for '{artifact_path}': {reason}")
 
 
 class ManifestParseError(Exception):
@@ -82,6 +85,7 @@ class SignatureVerificationError(Exception):
 
 class SignatureType(Enum):
     """Supported signature types for manifest verification."""
+
     ED25519 = "ed25519"
     HMAC_SHA256 = "hmac-sha256"
     NONE = "none"
@@ -90,6 +94,7 @@ class SignatureType(Enum):
 @dataclass
 class ArtifactEntry:
     """Represents a single artifact entry in the manifest."""
+
     path: str
     sha256: str
     description: Optional[str] = None
@@ -114,7 +119,7 @@ class ArtifactEntry:
 class ModelManifest:
     """
     Represents a model artifact manifest with hash and signature information.
-    
+
     Example manifest (JSON):
     {
         "version": "1.0",
@@ -132,6 +137,7 @@ class ModelManifest:
         ]
     }
     """
+
     version: str
     artifacts: List[ArtifactEntry]
     created_at: Optional[str] = None
@@ -146,7 +152,9 @@ class ModelManifest:
         normalized = Path(path).as_posix()
         for artifact in self.artifacts:
             artifact_normalized = Path(artifact.path).as_posix()
-            if artifact_normalized == normalized or artifact_normalized.endswith(normalized):
+            if artifact_normalized == normalized or artifact_normalized.endswith(
+                normalized
+            ):
                 return artifact
             # Also try matching the basename
             if Path(artifact.path).name == Path(path).name:
@@ -167,7 +175,9 @@ class ModelManifest:
         if self.description:
             content["description"] = self.description
         # Use sorted keys for deterministic output
-        return json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return json.dumps(content, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelManifest":
@@ -178,9 +188,7 @@ class ModelManifest:
         except ValueError:
             sig_type = SignatureType.NONE
 
-        artifacts = [
-            ArtifactEntry.from_dict(a) for a in data.get("artifacts", [])
-        ]
+        artifacts = [ArtifactEntry.from_dict(a) for a in data.get("artifacts", [])]
 
         return cls(
             version=data.get("version", "1.0"),
@@ -196,12 +204,13 @@ class ModelManifest:
 @dataclass
 class ActiveModelVersion:
     """Tracks the currently active model version for observability."""
+
     artifact_path: str
     sha256: str
     manifest_path: Optional[str]
     loaded_at: str
     tags: List[str] = field(default_factory=list)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -216,12 +225,12 @@ class ActiveModelVersion:
 class ModelArtifactVerifier:
     """
     Verifies model artifacts against a signed manifest before loading.
-    
+
     This class provides:
     - SHA256 hash verification of artifact files
     - Optional Ed25519 or HMAC-SHA256 signature verification of the manifest
     - Thread-safe manifest caching and reloading
-    
+
     Environment Variables:
         LLMROUTER_MODEL_MANIFEST_PATH: Path to the manifest file (JSON or YAML)
         LLMROUTER_ENFORCE_SIGNED_MODELS: If "true", require manifest for pickle models
@@ -240,31 +249,38 @@ class ModelArtifactVerifier:
     ):
         """
         Initialize the verifier.
-        
+
         Args:
             manifest_path: Path to manifest file, or from LLMROUTER_MODEL_MANIFEST_PATH
             public_key_b64: Base64-encoded Ed25519 public key, or from LLMROUTER_MODEL_PUBLIC_KEY_B64
-            public_key_path: Path to public key file, or from LLMROUTER_MODEL_PUBLIC_KEY_PATH
             hmac_secret: HMAC secret, or from LLMROUTER_MODEL_HMAC_SECRET
             enforce_signed: Whether to enforce manifest verification, or from LLMROUTER_ENFORCE_SIGNED_MODELS
         """
-        self.manifest_path = manifest_path or os.environ.get("LLMROUTER_MODEL_MANIFEST_PATH")
-        self.public_key_b64 = public_key_b64 or os.environ.get("LLMROUTER_MODEL_PUBLIC_KEY_B64")
-        self.public_key_path = public_key_path or os.environ.get("LLMROUTER_MODEL_PUBLIC_KEY_PATH")
+        self.manifest_path = manifest_path or os.environ.get(
+            "LLMROUTER_MODEL_MANIFEST_PATH"
+        )
+        self.public_key_b64 = public_key_b64 or os.environ.get(
+            "LLMROUTER_MODEL_PUBLIC_KEY_B64"
+        )
+        self.public_key_path = public_key_path or os.environ.get(
+            "LLMROUTER_MODEL_PUBLIC_KEY_PATH"
+        )
         self.hmac_secret = hmac_secret or os.environ.get("LLMROUTER_MODEL_HMAC_SECRET")
-        
+
         # Determine enforcement mode
         if enforce_signed is not None:
             self.enforce_signed = enforce_signed
         else:
-            env_enforce = os.environ.get("LLMROUTER_ENFORCE_SIGNED_MODELS", "false").lower()
+            env_enforce = os.environ.get(
+                "LLMROUTER_ENFORCE_SIGNED_MODELS", "false"
+            ).lower()
             self.enforce_signed = env_enforce == "true"
-        
+
         self._manifest: Optional[ModelManifest] = None
         self._manifest_lock = threading.RLock()
         self._manifest_mtime: float = 0
         self._public_key: Optional[Any] = None  # Ed25519PublicKey
-        
+
         # Track active model versions for observability
         self._active_versions: Dict[str, ActiveModelVersion] = {}
         self._versions_lock = threading.RLock()
@@ -287,7 +303,9 @@ class ModelArtifactVerifier:
             try:
                 key_data = base64.b64decode(self.public_key_b64)
             except Exception as e:
-                verbose_proxy_logger.error(f"Failed to decode public key from base64: {e}")
+                verbose_proxy_logger.error(
+                    f"Failed to decode public key from base64: {e}"
+                )
                 return None
 
         # Try file path
@@ -333,7 +351,9 @@ class ModelArtifactVerifier:
             # Load manifest
             path = Path(self.manifest_path)
             if not path.exists():
-                verbose_proxy_logger.warning(f"Manifest file not found: {self.manifest_path}")
+                verbose_proxy_logger.warning(
+                    f"Manifest file not found: {self.manifest_path}"
+                )
                 return None
 
             try:
@@ -344,8 +364,7 @@ class ModelArtifactVerifier:
                 if path.suffix.lower() in (".yaml", ".yml"):
                     if not YAML_AVAILABLE:
                         raise ManifestParseError(
-                            self.manifest_path,
-                            "YAML format requires pyyaml package"
+                            self.manifest_path, "YAML format requires pyyaml package"
                         )
                     data = yaml.safe_load(content)
                 else:
@@ -370,18 +389,20 @@ class ModelArtifactVerifier:
     def verify_manifest_signature(self, manifest: ModelManifest) -> bool:
         """
         Verify the signature on a manifest.
-        
+
         Returns True if:
         - Signature type is 'none' (no signature required)
         - Signature is valid
-        
+
         Raises SignatureVerificationError if signature is invalid.
         """
         if manifest.signature_type == SignatureType.NONE:
             return True
 
         if not manifest.signature:
-            raise SignatureVerificationError("Manifest has signature_type but no signature")
+            raise SignatureVerificationError(
+                "Manifest has signature_type but no signature"
+            )
 
         signable_content = manifest.get_signable_content()
         signature_bytes = base64.b64decode(manifest.signature)
@@ -401,10 +422,14 @@ class ModelArtifactVerifier:
 
             try:
                 public_key.verify(signature_bytes, signable_content)
-                verbose_proxy_logger.debug("Manifest Ed25519 signature verified successfully")
+                verbose_proxy_logger.debug(
+                    "Manifest Ed25519 signature verified successfully"
+                )
                 return True
             except InvalidSignature:
-                raise SignatureVerificationError("Ed25519 signature verification failed")
+                raise SignatureVerificationError(
+                    "Ed25519 signature verification failed"
+                )
 
         elif manifest.signature_type == SignatureType.HMAC_SHA256:
             if not self.hmac_secret:
@@ -413,19 +438,23 @@ class ModelArtifactVerifier:
                 )
 
             expected_sig = hmac.new(
-                self.hmac_secret.encode("utf-8"),
-                signable_content,
-                hashlib.sha256
+                self.hmac_secret.encode("utf-8"), signable_content, hashlib.sha256
             ).digest()
 
             if not hmac.compare_digest(expected_sig, signature_bytes):
-                raise SignatureVerificationError("HMAC-SHA256 signature verification failed")
+                raise SignatureVerificationError(
+                    "HMAC-SHA256 signature verification failed"
+                )
 
-            verbose_proxy_logger.debug("Manifest HMAC-SHA256 signature verified successfully")
+            verbose_proxy_logger.debug(
+                "Manifest HMAC-SHA256 signature verified successfully"
+            )
             return True
 
         else:
-            raise SignatureVerificationError(f"Unknown signature type: {manifest.signature_type}")
+            raise SignatureVerificationError(
+                f"Unknown signature type: {manifest.signature_type}"
+            )
 
     def compute_sha256(self, file_path: str) -> str:
         """Compute SHA256 hash of a file."""
@@ -443,15 +472,15 @@ class ModelArtifactVerifier:
     ) -> bool:
         """
         Verify an artifact against the manifest.
-        
+
         Args:
             artifact_path: Path to the artifact file to verify
             require_manifest: If True, raise error if no manifest entry exists
             correlation_id: Optional request/correlation ID for logging
-        
+
         Returns:
             True if verification passes
-        
+
         Raises:
             ModelVerificationError: If verification fails
             FileNotFoundError: If artifact file doesn't exist
@@ -496,10 +525,14 @@ class ModelArtifactVerifier:
                 raise ModelVerificationError(
                     artifact_path,
                     "Artifact not found in manifest",
-                    {
-                        "manifest_path": self.manifest_path,
-                        "correlation_id": correlation_id,
-                    } if correlation_id else {"manifest_path": self.manifest_path},
+                    (
+                        {
+                            "manifest_path": self.manifest_path,
+                            "correlation_id": correlation_id,
+                        }
+                        if correlation_id
+                        else {"manifest_path": self.manifest_path}
+                    ),
                 )
             verbose_proxy_logger.warning(
                 f"{log_prefix}Artifact not in manifest; skipping verification for {artifact_path}"
@@ -533,12 +566,12 @@ class ModelArtifactVerifier:
     ) -> ActiveModelVersion:
         """
         Record an artifact as the active version for observability.
-        
+
         Args:
             artifact_path: Path to the artifact
             sha256: Pre-computed hash (will be computed if not provided)
             tags: Optional tags for the version
-        
+
         Returns:
             ActiveModelVersion instance
         """
@@ -601,15 +634,15 @@ def verify_model_artifact(
 ) -> bool:
     """
     Convenience function to verify an artifact using the global verifier.
-    
+
     Args:
         artifact_path: Path to the artifact file
         require_manifest: If True, fail if no manifest entry exists
         correlation_id: Optional correlation ID for logging
-    
+
     Returns:
         True if verification passes
-    
+
     Raises:
         ModelVerificationError: If verification fails
     """
@@ -629,10 +662,10 @@ def create_manifest_signer(
 class ManifestSigner:
     """
     Utility class for creating signed manifests.
-    
+
     This is typically used by the model training/deployment pipeline,
     not by the gateway itself.
-    
+
     Example:
         signer = ManifestSigner(private_key_path="/path/to/key.pem")
         manifest = signer.create_manifest(
@@ -678,9 +711,16 @@ class ManifestSigner:
         if len(key_data) == 32:
             self._private_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_data)
         else:
-            self._private_key = serialization.load_pem_private_key(key_data, password=None)
+            self._private_key = serialization.load_pem_private_key(
+                key_data, password=None
+            )
 
         return self._private_key
+
+    def _sign_content(
+        self, signable_content: bytes, signature_type: SignatureType
+    ) -> str:
+        pass
 
     def sign_manifest(
         self,
@@ -698,9 +738,7 @@ class ManifestSigner:
             if not self.hmac_secret:
                 raise ValueError("HMAC secret required for HMAC-SHA256 signing")
             signature = hmac.new(
-                self.hmac_secret.encode("utf-8"),
-                signable_content,
-                hashlib.sha256
+                self.hmac_secret.encode("utf-8"), signable_content, hashlib.sha256
             ).digest()
         else:
             raise ValueError(f"Unsupported signature type: {signature_type}")
@@ -717,13 +755,13 @@ class ManifestSigner:
     ) -> ModelManifest:
         """
         Create a new manifest with optional signing.
-        
+
         Args:
             artifacts: List of artifact entries (dicts or ArtifactEntry objects)
             signature_type: Type of signature to apply
             version: Manifest version string
             description: Optional description
-        
+
         Returns:
             ModelManifest instance (signed if signature_type is not NONE)
         """
@@ -807,7 +845,7 @@ class ManifestSigner:
 def generate_ed25519_keypair() -> tuple[str, str]:
     """
     Generate a new Ed25519 keypair for manifest signing.
-    
+
     Returns:
         Tuple of (private_key_b64, public_key_b64)
     """

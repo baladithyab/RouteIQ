@@ -10,21 +10,16 @@ Tests cover:
 
 import asyncio
 import os
-import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, patch
 import pytest
 
 from litellm_llmrouter.leader_election import (
     LeaderElection,
     LeaseInfo,
     get_leader_election_config,
-    get_leader_election,
-    initialize_leader_election,
-    shutdown_leader_election,
-    LEADER_ELECTION_TABLE_SQL,
     DEFAULT_LEASE_SECONDS,
     DEFAULT_RENEW_INTERVAL_SECONDS,
 )
@@ -32,7 +27,8 @@ from litellm_llmrouter.leader_election import (
 
 # Check if asyncpg is available
 try:
-    import asyncpg
+    import asyncpg  # noqa: F401
+
     ASYNCPG_AVAILABLE = True
 except ImportError:
     ASYNCPG_AVAILABLE = False
@@ -434,12 +430,11 @@ class TestConcurrentLeaderElection:
         async def mock_fetch(*args, **kwargs):
             """Simulate atomic upsert behavior."""
             # Extract arguments from the call
-            query = args[0]
-            lock_name = args[1]
             holder_id = args[2]
             now = args[3]
-            expires = args[4]
+            lease_seconds = args[4]
 
+            expires_at = now + timedelta(seconds=lease_seconds)
             with lock:
                 # If no current holder or lease expired
                 if (
@@ -447,17 +442,17 @@ class TestConcurrentLeaderElection:
                     or current_holder["expires_at"] < now
                 ):
                     current_holder["holder_id"] = holder_id
-                    current_holder["expires_at"] = expires
+                    current_holder["expires_at"] = expires_at
                     return {
                         "holder_id": holder_id,
-                        "expires_at": expires,
+                        "expires_at": expires_at,
                     }
                 # If we already hold it
                 elif current_holder["holder_id"] == holder_id:
-                    current_holder["expires_at"] = expires
+                    current_holder["expires_at"] = expires_at
                     return {
                         "holder_id": holder_id,
-                        "expires_at": expires,
+                        "expires_at": expires_at,
                     }
                 # Someone else holds it
                 else:
@@ -497,23 +492,22 @@ class TestConcurrentLeaderElection:
         lock = threading.Lock()
 
         async def mock_fetch(*args, **kwargs):
-            query = args[0]
-            lock_name = args[1]
             holder_id = args[2]
             now = args[3]
-            expires = args[4]
+            lease_seconds = args[4]
 
+            expires_at = now + timedelta(seconds=lease_seconds)
             with lock:
                 if (
                     current_holder["holder_id"] is None
                     or current_holder["expires_at"] < now
                 ):
                     current_holder["holder_id"] = holder_id
-                    current_holder["expires_at"] = expires
-                    return {"holder_id": holder_id, "expires_at": expires}
+                    current_holder["expires_at"] = expires_at
+                    return {"holder_id": holder_id, "expires_at": expires_at}
                 elif current_holder["holder_id"] == holder_id:
-                    current_holder["expires_at"] = expires
-                    return {"holder_id": holder_id, "expires_at": expires}
+                    current_holder["expires_at"] = expires_at
+                    return {"holder_id": holder_id, "expires_at": expires_at}
                 else:
                     return None
 

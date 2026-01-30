@@ -18,7 +18,7 @@ import pickle
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import tempfile
 import yaml
@@ -107,9 +107,11 @@ ALLOW_PICKLE_MODELS = (
 
 # When pickle is allowed, require manifest verification by default
 # Set LLMROUTER_ENFORCE_SIGNED_MODELS=false to bypass (not recommended)
-ENFORCE_SIGNED_MODELS = (
-    os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() == "true"
-    or (ALLOW_PICKLE_MODELS and os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() != "false")
+ENFORCE_SIGNED_MODELS = os.getenv(
+    "LLMROUTER_ENFORCE_SIGNED_MODELS", ""
+).lower() == "true" or (
+    ALLOW_PICKLE_MODELS
+    and os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() != "false"
 )
 
 
@@ -128,13 +130,13 @@ class PickleSecurityError(Exception):
 class ModelLoadError(Exception):
     """Raised when model loading fails during safe activation."""
 
-    def __init__(self, model_path: str, reason: str, correlation_id: Optional[str] = None):
+    def __init__(
+        self, model_path: str, reason: str, correlation_id: Optional[str] = None
+    ):
         self.model_path = model_path
         self.reason = reason
         self.correlation_id = correlation_id
-        super().__init__(
-            f"Model loading failed for '{model_path}': {reason}"
-        )
+        super().__init__(f"Model loading failed for '{model_path}': {reason}")
 
 
 class InferenceKNNRouter:
@@ -201,11 +203,11 @@ class InferenceKNNRouter:
     def _load_model(self, correlation_id: Optional[str] = None):
         """Load the sklearn KNN model from pickle file with verification.
 
-        Security: 
+        Security:
         - Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
         - Pickle deserialization can execute arbitrary code, so it's disabled by default.
         - When enabled, verifies artifact against manifest if LLMROUTER_MODEL_MANIFEST_PATH is set.
-        
+
         Safe Activation:
         - Loads model into temporary variable first
         - Only swaps to active if successful
@@ -227,7 +229,7 @@ class InferenceKNNRouter:
         # Verify artifact against manifest if enforcement is enabled
         verifier = get_artifact_verifier()
         require_manifest = ENFORCE_SIGNED_MODELS
-        
+
         try:
             verifier.verify_artifact(
                 self.model_path,
@@ -241,7 +243,9 @@ class InferenceKNNRouter:
             )
             raise
 
-        verbose_proxy_logger.info(f"{log_prefix}Loading KNN model from: {self.model_path}")
+        verbose_proxy_logger.info(
+            f"{log_prefix}Loading KNN model from: {self.model_path}"
+        )
 
         # Safe activation: load into temp variable first
         try:
@@ -267,7 +271,7 @@ class InferenceKNNRouter:
         with self._model_lock:
             old_model = self.knn_model
             self.knn_model = new_model
-            
+
             # Record active version for observability
             self.model_version = verifier.record_active_version(
                 self.model_path,
@@ -278,29 +282,29 @@ class InferenceKNNRouter:
             f"{log_prefix}KNN model loaded successfully. Type: {type(self.knn_model).__name__}, "
             f"Version SHA256: {self.model_version.sha256[:16]}..."
         )
-        
+
         # Clean up old model reference (let GC handle it)
         del old_model
 
     def reload_model(self, correlation_id: Optional[str] = None) -> bool:
         """
         Reload the model from disk with safe activation (for hot reload support).
-        
+
         Safe Activation Pattern:
         1. Load new model into temporary instance
         2. Verify against manifest
         3. Only swap to active if successful
         4. Keep old model active on failure
-        
+
         Args:
             correlation_id: Optional correlation ID for logging
-            
+
         Returns:
             True if reload succeeded, False if failed (old model remains active)
         """
         log_prefix = f"[{correlation_id}] " if correlation_id else ""
         old_version = self.model_version
-        
+
         try:
             self._load_model(correlation_id=correlation_id)
             verbose_proxy_logger.info(
@@ -878,11 +882,18 @@ class LLMRouterStrategyFamily:
                                 # No PII: don't log query content
                             )
                             .with_candidates(
-                                [{"model_name": m, "available": True} for m in model_list]
+                                [
+                                    {"model_name": m, "available": True}
+                                    for m in model_list
+                                ]
                             )
                             .with_selection(
                                 selected=selected_model,
-                                reason="strategy_prediction" if selected_model else "no_prediction",
+                                reason=(
+                                    "strategy_prediction"
+                                    if selected_model
+                                    else "no_prediction"
+                                ),
                             )
                             .with_timing(total_ms=latency_ms)
                         )
@@ -906,9 +917,11 @@ class LLMRouterStrategyFamily:
                             event_builder.with_outcome(status=RoutingOutcome.SUCCESS)
                         else:
                             event_builder.with_outcome(
-                                status=RoutingOutcome.NO_CANDIDATES
-                                if not model_list
-                                else RoutingOutcome.FAILURE
+                                status=(
+                                    RoutingOutcome.NO_CANDIDATES
+                                    if not model_list
+                                    else RoutingOutcome.FAILURE
+                                )
                             )
 
                         # Build and emit the event

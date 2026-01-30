@@ -128,7 +128,7 @@ class A2AGateway:
     - Registering AI agents with their capabilities
     - Discovering available agents
     - Routing requests to appropriate agents
-    
+
     Thread Safety:
     All registry mutations are protected by a reentrant lock. Read operations
     return immutable snapshots to avoid stale-read issues and allow iteration
@@ -138,7 +138,7 @@ class A2AGateway:
     def __init__(self):
         # Thread safety: RLock for registry mutations (reentrant to allow nested calls)
         self._lock = threading.RLock()
-        
+
         self.agents: dict[str, A2AAgent] = {}
         self.enabled = os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true"
 
@@ -149,7 +149,7 @@ class A2AGateway:
     def register_agent(self, agent: A2AAgent) -> None:
         """
         Register an agent with the gateway.
-        
+
         Security: Agent URLs are validated against SSRF attacks before registration.
         Thread Safety: Registry mutation is protected by lock.
         """
@@ -178,7 +178,7 @@ class A2AGateway:
         # Thread-safe registry update
         with self._lock:
             self.agents[agent.agent_id] = agent
-        
+
         verbose_proxy_logger.info(
             f"A2A: Registered agent {agent.name} ({agent.agent_id})"
         )
@@ -186,7 +186,7 @@ class A2AGateway:
     def unregister_agent(self, agent_id: str) -> bool:
         """
         Unregister an agent from the gateway.
-        
+
         Thread Safety: Registry mutation is protected by lock.
         """
         with self._lock:
@@ -195,7 +195,7 @@ class A2AGateway:
                 found = True
             else:
                 found = False
-        
+
         if found:
             verbose_proxy_logger.info(f"A2A: Unregistered agent {agent_id}")
             return True
@@ -206,15 +206,10 @@ class A2AGateway:
         with self._lock:
             return self.agents.get(agent_id)
 
-    def list_agents(self) -> list[A2AAgent]:
-        """List all registered agents. Returns a snapshot copy. Thread-safe."""
-        with self._lock:
-            return list(self.agents.values())
-
     def get_agents_snapshot(self) -> MappingProxyType[str, A2AAgent]:
         """
         Get an immutable snapshot of the agents registry.
-        
+
         Returns:
             Read-only view of current agents dict.
         """
@@ -222,11 +217,11 @@ class A2AGateway:
             # Return immutable proxy to a copy to prevent mutation
             return MappingProxyType(dict(self.agents))
 
-    def discover_agents(self, capability: str | None = None) -> list[A2AAgent]:
+    def list_agents(self, capability: str | None = None) -> list[A2AAgent]:
         """Discover agents, optionally filtered by capability. Thread-safe."""
         with self._lock:
             agents_snapshot = list(self.agents.values())
-        
+
         if capability is None:
             return agents_snapshot
         return [a for a in agents_snapshot if capability in a.capabilities]
@@ -235,7 +230,7 @@ class A2AGateway:
         """Get the A2A agent card for an agent. Thread-safe."""
         with self._lock:
             agent = self.agents.get(agent_id)
-        
+
         if not agent:
             return None
 
@@ -282,7 +277,7 @@ class A2AGateway:
         # Get agent under lock
         with self._lock:
             agent = self.agents.get(agent_id)
-        
+
         if not agent:
             return JSONRPCResponse.error_response(
                 request.id, -32000, f"Agent '{agent_id}' not found"
@@ -405,7 +400,7 @@ class A2AGateway:
         # Get agent under lock
         with self._lock:
             agent = self.agents.get(agent_id)
-        
+
         if not agent:
             yield (
                 json.dumps(
@@ -525,7 +520,7 @@ _a2a_gateway_lock = threading.Lock()
 def get_a2a_gateway() -> A2AGateway:
     """
     Get the global A2A gateway instance.
-    
+
     Thread-safe: Uses double-checked locking pattern for efficient
     singleton initialization.
     """
@@ -541,7 +536,7 @@ def get_a2a_gateway() -> A2AGateway:
 def reset_a2a_gateway() -> None:
     """
     Reset the global A2A gateway instance.
-    
+
     WARNING: For testing purposes only. Not safe to call while
     requests are in flight.
     """

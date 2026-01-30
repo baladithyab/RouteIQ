@@ -10,7 +10,7 @@ These tests verify that:
 
 import os
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 
 class TestGatewayPlugin:

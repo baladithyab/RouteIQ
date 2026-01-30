@@ -168,12 +168,12 @@ class MCPGateway:
     When REDIS_HOST is set and MCP_HA_SYNC_ENABLED=true, server registrations
     are synchronized via Redis pub/sub, allowing all replicas to share the
     same registry state.
-    
+
     Thread Safety:
     All registry mutations are protected by a reentrant lock. Read operations
     return immutable snapshots to avoid stale-read issues and allow iteration
     without holding locks.
-    
+
     Tool Invocation:
     Remote tool invocation is DISABLED by default for security. To enable,
     set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true. When disabled, invoke_tool()
@@ -183,7 +183,7 @@ class MCPGateway:
     # Redis key prefix for MCP servers
     REDIS_KEY_PREFIX = "litellm:mcp:servers:"
     REDIS_PUBSUB_CHANNEL = "litellm:mcp:sync"
-    
+
     # HTTP client timeouts for tool invocation (seconds)
     TOOL_INVOCATION_CONNECT_TIMEOUT = 10.0
     TOOL_INVOCATION_READ_TIMEOUT = 30.0
@@ -192,12 +192,12 @@ class MCPGateway:
     def __init__(self):
         # Thread safety: RLock for registry mutations (reentrant to allow nested calls)
         self._lock = threading.RLock()
-        
+
         self.servers: dict[str, MCPServer] = {}
         self.enabled = os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true"
         # Map tool names to server IDs for quick lookup
         self._tool_to_server: dict[str, str] = {}
-        
+
         # Feature flag for remote tool invocation (disabled by default for security)
         self._tool_invocation_enabled = (
             os.getenv("LLMROUTER_ENABLE_MCP_TOOL_INVOCATION", "false").lower() == "true"
@@ -363,6 +363,7 @@ class MCPGateway:
         self._load_servers_from_redis()
         with self._lock:
             return len(self.servers)
+
     def is_enabled(self) -> bool:
         """Check if MCP gateway is enabled."""
         return self.enabled
@@ -471,7 +472,7 @@ class MCPGateway:
     def get_servers_snapshot(self) -> MappingProxyType[str, MCPServer]:
         """
         Get an immutable snapshot of the servers registry.
-        
+
         Returns:
             Read-only view of current servers dict.
         """
@@ -601,7 +602,7 @@ class MCPGateway:
         """
         Invoke an MCP tool.
 
-        Security: 
+        Security:
         - Remote tool invocation is DISABLED by default. Enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true.
         - Server URLs are validated against SSRF attacks before making requests.
 
@@ -615,7 +616,7 @@ class MCPGateway:
         # Check feature flag first - disabled by default for security
         if not self._tool_invocation_enabled:
             verbose_proxy_logger.warning(
-                f"MCP: Tool invocation disabled. Set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true to enable."
+                "MCP: Tool invocation disabled. Set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true to enable."
             )
             return MCPToolResult(
                 success=False,
@@ -726,7 +727,11 @@ class MCPGateway:
 
                 # Check HTTP status
                 if response.status_code >= 400:
-                    error_detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+                    error_detail = (
+                        response.text[:500]
+                        if response.text
+                        else f"HTTP {response.status_code}"
+                    )
                     verbose_proxy_logger.warning(
                         f"MCP: Tool invocation failed with HTTP {response.status_code}: {error_detail}"
                     )
@@ -894,7 +899,7 @@ class MCPGateway:
         # Get server under lock
         with self._lock:
             server = self.servers.get(server_id)
-        
+
         if not server:
             return {
                 "server_id": server_id,
@@ -967,7 +972,7 @@ class MCPGateway:
         # Get snapshot of server IDs under lock
         with self._lock:
             server_ids = list(self.servers.keys())
-        
+
         results = []
         for server_id in server_ids:
             health = await self.check_server_health(server_id)
@@ -987,7 +992,7 @@ class MCPGateway:
         servers_list = []
         with self._lock:
             servers_snapshot = list(self.servers.values())
-        
+
         for server in servers_snapshot:
             # Filter by access groups if specified
             if access_groups:
@@ -1023,7 +1028,7 @@ class MCPGateway:
         groups = set()
         with self._lock:
             servers_snapshot = list(self.servers.values())
-        
+
         for server in servers_snapshot:
             server_groups = server.metadata.get("access_groups", [])
             groups.update(server_groups)
@@ -1038,7 +1043,7 @@ _mcp_gateway_lock = threading.Lock()
 def get_mcp_gateway() -> MCPGateway:
     """
     Get the global MCP gateway instance.
-    
+
     Thread-safe: Uses double-checked locking pattern for efficient
     singleton initialization.
     """
@@ -1054,7 +1059,7 @@ def get_mcp_gateway() -> MCPGateway:
 def reset_mcp_gateway() -> None:
     """
     Reset the global MCP gateway instance.
-    
+
     WARNING: For testing purposes only. Not safe to call while
     requests are in flight.
     """

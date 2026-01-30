@@ -69,15 +69,17 @@ ALLOWED_SCHEMES = frozenset(["http", "https"])
 def _get_ssrf_config() -> dict:
     """
     Load SSRF configuration from environment variables.
-    
+
     Returns a cached configuration dict with:
     - allow_private_ips: bool (default: False - blocked)
     - allowlist_hosts: set of allowed host patterns
     - allowlist_cidrs: list of ipaddress.ip_network objects
     """
     # Default: private IPs are BLOCKED (secure-by-default)
-    allow_private_ips = os.getenv("LLMROUTER_ALLOW_PRIVATE_IPS", "false").lower() == "true"
-    
+    allow_private_ips = (
+        os.getenv("LLMROUTER_ALLOW_PRIVATE_IPS", "false").lower() == "true"
+    )
+
     # Parse allowlisted hosts (exact match or suffix match with leading dot)
     allowlist_hosts_str = os.getenv("LLMROUTER_SSRF_ALLOWLIST_HOSTS", "")
     allowlist_hosts = set()
@@ -85,7 +87,7 @@ def _get_ssrf_config() -> dict:
         host = host.strip().lower()
         if host:
             allowlist_hosts.add(host)
-    
+
     # Parse allowlisted CIDRs
     allowlist_cidrs_str = os.getenv("LLMROUTER_SSRF_ALLOWLIST_CIDRS", "")
     allowlist_cidrs = []
@@ -99,12 +101,12 @@ def _get_ssrf_config() -> dict:
                 verbose_proxy_logger.warning(
                     f"SSRF: Invalid CIDR in allowlist: {cidr} - {e}"
                 )
-    
+
     verbose_proxy_logger.debug(
         f"SSRF config loaded: allow_private_ips={allow_private_ips}, "
         f"allowlist_hosts={allowlist_hosts}, allowlist_cidrs={len(allowlist_cidrs)} networks"
     )
-    
+
     return {
         "allow_private_ips": allow_private_ips,
         "allowlist_hosts": allowlist_hosts,
@@ -120,43 +122,43 @@ def clear_ssrf_config_cache() -> None:
 def _is_host_allowlisted(hostname: str, config: dict) -> bool:
     """
     Check if a hostname is in the allowlist.
-    
+
     Supports:
     - Exact match: "myserver.internal"
     - Suffix match: ".trusted.com" matches "api.trusted.com", "internal.trusted.com"
-    
+
     Args:
         hostname: The hostname to check (case-insensitive)
         config: The SSRF configuration dict
-        
+
     Returns:
         True if the hostname is allowlisted, False otherwise
     """
     hostname_lower = hostname.lower().strip(".")
     allowlist = config.get("allowlist_hosts", set())
-    
+
     # Check exact match
     if hostname_lower in allowlist:
         return True
-    
+
     # Check suffix match (patterns starting with ".")
     for pattern in allowlist:
         if pattern.startswith("."):
             # Suffix match: ".example.com" matches "api.example.com"
             if hostname_lower.endswith(pattern) or hostname_lower == pattern[1:]:
                 return True
-    
+
     return False
 
 
 def _is_ip_allowlisted(ip_str: str, config: dict) -> bool:
     """
     Check if an IP address is in the allowlisted CIDRs.
-    
+
     Args:
         ip_str: The IP address string
         config: The SSRF configuration dict
-        
+
     Returns:
         True if the IP is in any allowlisted CIDR, False otherwise
     """
@@ -164,15 +166,15 @@ def _is_ip_allowlisted(ip_str: str, config: dict) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    
+
     for network in config.get("allowlist_cidrs", []):
         if ip in network:
             return True
-    
+
     return False
 
 
-def _is_ip_blocked(ip_str: str, config: dict | None = None) -> tuple[bool, str]:
+def _check_ip_address(ip_str: str, config: dict = None) -> tuple[bool, str]:
     """
     Check if an IP address should be blocked.
 
@@ -193,7 +195,7 @@ def _is_ip_blocked(ip_str: str, config: dict | None = None) -> tuple[bool, str]:
     """
     if config is None:
         config = _get_ssrf_config()
-    
+
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
@@ -225,21 +227,21 @@ def _is_ip_blocked(ip_str: str, config: dict | None = None) -> tuple[bool, str]:
                 f"SSRF: Private IP {ip_str} allowed by CIDR allowlist"
             )
             return False, ""
-        
+
         # Check global allow_private_ips setting
         if config.get("allow_private_ips", False):
             return False, ""
-        
+
         # Block private IP
         return (
             True,
-            f"private IP {ip_str} is blocked (configure LLMROUTER_ALLOW_PRIVATE_IPS=true or add to LLMROUTER_SSRF_ALLOWLIST_CIDRS)",
+            f"Access to private IP {ip_str} is blocked for security reasons",
         )
 
     return False, ""
 
 
-def _is_hostname_blocked(hostname: str, config: dict | None = None) -> tuple[bool, str]:
+def _check_hostname(hostname: str, config: dict = None) -> tuple[bool, str]:
     """
     Check if a hostname should be blocked.
 
@@ -252,7 +254,7 @@ def _is_hostname_blocked(hostname: str, config: dict | None = None) -> tuple[boo
     """
     if config is None:
         config = _get_ssrf_config()
-    
+
     hostname_lower = hostname.lower().strip(".")
 
     # Check if hostname is in allowlist first
@@ -320,7 +322,7 @@ def validate_outbound_url(
 
     # Load configuration
     config = _get_ssrf_config()
-    
+
     # Apply per-call override if provided
     if allow_private_ips is not None:
         config = dict(config)  # Create a copy to avoid modifying cached config
@@ -345,13 +347,13 @@ def validate_outbound_url(
         raise ValueError("URL must have a hostname")
 
     # Check blocked hostnames (considers allowlist)
-    blocked, reason = _is_hostname_blocked(hostname, config)
+    blocked, reason = _check_hostname(hostname, config)
     if blocked:
         verbose_proxy_logger.warning(f"SSRF: Blocked URL due to hostname: {url}")
         raise SSRFBlockedError(url, reason)
 
     # Check if hostname is an IP address directly
-    blocked, reason = _is_ip_blocked(hostname, config)
+    blocked, reason = _check_ip_address(hostname, config)
     if blocked:
         verbose_proxy_logger.warning(f"SSRF: Blocked URL due to IP address: {url}")
         raise SSRFBlockedError(url, reason)
@@ -365,7 +367,7 @@ def validate_outbound_url(
             )
             for family, type_, proto, canonname, sockaddr in addr_info:
                 ip_str = sockaddr[0]
-                blocked, reason = _is_ip_blocked(ip_str, config)
+                blocked, reason = _check_ip_address(ip_str, config)
                 if blocked:
                     verbose_proxy_logger.warning(
                         f"SSRF: Blocked URL due to resolved IP {ip_str}: {url}"

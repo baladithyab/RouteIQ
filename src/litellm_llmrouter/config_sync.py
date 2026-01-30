@@ -46,9 +46,7 @@ class ConfigSyncManager:
         self._sync_thread: threading.Thread | None = None
         self._reload_count = 0
         self._last_sync_time: float | None = None
-        self._skipped_sync_count = (
-            0  # Track skipped syncs (non-leader)
-        )
+        self._skipped_sync_count = 0  # Track skipped syncs (non-leader)
 
         # S3 config
         self.s3_bucket = os.getenv("CONFIG_S3_BUCKET")
@@ -84,13 +82,9 @@ class ConfigSyncManager:
 
             if self._leader_election_enabled:
                 self._leader_election = get_leader_election()
-                verbose_proxy_logger.info(
-                    "Config sync: Leader election enabled"
-                )
+                verbose_proxy_logger.info("Config sync: Leader election enabled")
             else:
-                verbose_proxy_logger.debug(
-                    "Config sync: Leader election disabled"
-                )
+                verbose_proxy_logger.debug("Config sync: Leader election disabled")
 
         except ImportError as e:
             verbose_proxy_logger.warning(
@@ -212,7 +206,10 @@ class ConfigSyncManager:
 
                     # Check S3 for updates using ETag
                     if self.s3_sync_enabled:
-                        if self._download_from_s3_if_changed() and self.hot_reload_enabled:
+                        if (
+                            self._download_from_s3_if_changed()
+                            and self.hot_reload_enabled
+                        ):
                             verbose_proxy_logger.info(
                                 "Config changed, triggering reload..."
                             )
@@ -256,9 +253,7 @@ class ConfigSyncManager:
             try:
                 loop = asyncio.new_event_loop()
                 try:
-                    loop.run_until_complete(
-                        self._leader_election.ensure_table_exists()
-                    )
+                    loop.run_until_complete(self._leader_election.ensure_table_exists())
                     loop.run_until_complete(self._leader_election.try_acquire())
                 finally:
                     loop.close()
@@ -305,21 +300,25 @@ class ConfigSyncManager:
             "enabled": self.sync_enabled,
             "hot_reload_enabled": self.hot_reload_enabled,
             "sync_interval_seconds": self.sync_interval,
-            "s3": {
-                "enabled": self.s3_sync_enabled,
-                "bucket": self.s3_bucket,
-                "key": self.s3_key,
-                "last_etag": self._last_s3_etag,
-            }
-            if self.s3_sync_enabled
-            else None,
-            "gcs": {
-                "enabled": self.gcs_sync_enabled,
-                "bucket": self.gcs_bucket,
-                "key": self.gcs_key,
-            }
-            if self.gcs_sync_enabled
-            else None,
+            "s3": (
+                {
+                    "enabled": self.s3_sync_enabled,
+                    "bucket": self.s3_bucket,
+                    "key": self.s3_key,
+                    "last_etag": self._last_s3_etag,
+                }
+                if self.s3_sync_enabled
+                else None
+            ),
+            "gcs": (
+                {
+                    "enabled": self.gcs_sync_enabled,
+                    "bucket": self.gcs_bucket,
+                    "key": self.gcs_key,
+                }
+                if self.gcs_sync_enabled
+                else None
+            ),
             "local_config_path": str(self.local_config_path),
             "local_config_hash": self._compute_file_hash(self.local_config_path),
             "reload_count": self._reload_count,

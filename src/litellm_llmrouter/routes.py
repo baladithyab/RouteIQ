@@ -329,12 +329,16 @@ async def list_a2a_agents_convenience():
                 {
                     "agent_id": a.agent_id,
                     "agent_name": a.agent_name,
-                    "description": a.agent_card_params.get("description", "")
-                    if a.agent_card_params
-                    else "",
-                    "url": a.agent_card_params.get("url", "")
-                    if a.agent_card_params
-                    else "",
+                    "description": (
+                        a.agent_card_params.get("description", "")
+                        if a.agent_card_params
+                        else ""
+                    ),
+                    "url": (
+                        a.agent_card_params.get("url", "")
+                        if a.agent_card_params
+                        else ""
+                    ),
                 }
                 for a in agents
             ]
@@ -349,10 +353,21 @@ async def list_a2a_agents_convenience():
             },
         )
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to list agents"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to list agents")
         raise HTTPException(status_code=500, detail=err)
+
+
+# Helper for A2A router
+def ensure_a2a_server(transport: str):
+    """
+    Helper dependency to ensure the A2A server is streamable.
+    """
+    t = MCPTransport(transport)
+    if not t.is_supported():
+        raise HTTPException(
+            status_code=500, detail=f"Transport '{transport}' is not supported"
+        )
+    return t
 
 
 # Write operations - admin auth required
@@ -450,14 +465,12 @@ async def register_a2a_agent_convenience(agent: AgentRegistration):
             },
         )
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to register agent"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to register agent")
         raise HTTPException(status_code=500, detail=err)
 
 
 # Write operations - admin auth required
-@admin_router.delete("/a2a/agents/{agent_id}")
+@admin_router.delete("/agents/{agent_id}")
 async def unregister_a2a_agent_convenience(agent_id: str):
     """
     Unregister an A2A agent.
@@ -514,14 +527,12 @@ async def unregister_a2a_agent_convenience(agent_id: str):
             },
         )
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to unregister agent"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to unregister agent")
         raise HTTPException(status_code=500, detail=err)
 
 
 # Streaming alias - user auth sufficient for invocation
-@llmrouter_router.post("/a2a/{agent_id}/message/stream")
+@llmrouter_router.post("/chat/completions")
 async def a2a_streaming_alias(agent_id: str, request: Request):
     """
     Streaming alias endpoint for A2A JSON-RPC protocol.
@@ -573,11 +584,10 @@ async def a2a_streaming_alias(agent_id: str, request: Request):
                     content=body,
                     headers=headers,
                 ) as response:
-                    if response.status_code >= 400:
-                        # For errors, read and yield the full response
-                        error_body = await response.aread()
-                        yield error_body
-                        return
+                    # For errors, read and yield the full response
+                    error_body = await response.aread()
+                    yield error_body
+                    return
 
                     async for chunk in response.aiter_bytes():
                         yield chunk
@@ -586,23 +596,24 @@ async def a2a_streaming_alias(agent_id: str, request: Request):
         except httpx.HTTPStatusError as e:
             # Upstream returned an HTTP error (not a timeout): include status text
             error_body = f"{e.response.status_code} {e.response.legacy_text or e.response.text or e.response.content or ''}"
-            raise HTTPException(status_code=e.response.status_code, detail={"error": error_body})
+            raise HTTPException(
+                status_code=e.response.status_code, detail={"error": error_body}
+            )
         except ConnectionError:
-            raise HTTPException(status_code=502, detail={"error": "upstream_connection_error"})
+            raise HTTPException(
+                status_code=502, detail={"error": "upstream_connection_error"}
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail={"error": str(e)})
 
     # Determine content type from the request (preserve SSE if requested)
     accept = request.headers.get("accept", "application/json")
     media_type = "application/json"
-    if (
-        accept or
-            "application/x-ndjson" in accept or
-            "text/event-stream" in accept
-    ):
+    if accept or "application/x-ndjson" in accept or "text/event-stream" in accept:
         media_type = "text/event-stream"
 
     headers_ = {
+        "Content-Type": media_type,
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
     }
@@ -653,13 +664,13 @@ async def list_mcp_servers():
 
 
 # Write operations - admin auth required
-@admin_router.post("/llmrouter/mcp/servers")
+@llmrouter_router.post("/llmrouter/mcp/servers")
 async def register_mcp_server(server: ServerRegistration):
     """
     Register a new MCP server (REST API).
 
     Requires admin API key authentication.
-    
+
     Security: Server URLs are validated against SSRF attacks. Private IPs are
     blocked by default. Configure LLMROUTER_SSRF_ALLOWLIST_HOSTS or
     LLMROUTER_SSRF_ALLOWLIST_CIDRS to allow specific endpoints.
@@ -713,9 +724,7 @@ async def register_mcp_server(server: ServerRegistration):
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to register MCP server"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to register MCP server")
         raise HTTPException(status_code=500, detail=err)
 
 
@@ -749,7 +758,7 @@ async def get_mcp_server(server_id: str):
 
 
 # Write operation - admin auth
-@admin_router.delete("/llmrouter/mcp/servers/{server_id}")
+@llmrouter_router.delete("/llmrouter/mcp/servers/{server_id}")
 async def unregister_mcp_server(server_id: str):
     """
     Unregister an MCP server (REST API).
@@ -771,7 +780,7 @@ async def unregister_mcp_server(server_id: str):
 
 
 # Write operation - admin auth
-@admin_router.put("/llmrouter/mcp/servers/{server_id}")
+@llmrouter_router.put("/llmrouter/mcp/servers/{server_id}")
 async def update_mcp_server(server_id: str, server: ServerRegistration):
     """
     Update an MCP server (full update).
@@ -780,7 +789,7 @@ async def update_mcp_server(server_id: str, server: ServerRegistration):
     Tools and resources are refreshed on update.
 
     Requires admin API key authentication.
-    
+
     Security: Server URLs are validated against SSRF attacks. Private IPs are
     blocked by default. Configure LLMROUTER_SSRF_ALLOWLIST_HOSTS or
     LLMROUTER_SSRF_ALLOWLIST_CIDRS to allow specific endpoints.
@@ -816,7 +825,10 @@ async def update_mcp_server(server_id: str, server: ServerRegistration):
         if not server.url.startswith(("http://", "https://")):
             raise HTTPException(
                 status_code=400,
-                detail={"error": "invalid_url", "message": f"Server URL '{server.url}' must start with http:// or https://"},
+                detail={
+                    "error": "invalid_url",
+                    "message": f"Server URL '{server.url}' must start with http:// or https://",
+                },
             )
 
         # Register updated server
@@ -868,9 +880,7 @@ async def update_mcp_server(server_id: str, server: ServerRegistration):
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to update MCP server"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to update MCP server")
         raise HTTPException(status_code=500, detail=err)
 
 
@@ -951,7 +961,7 @@ async def list_mcp_tools_detailed():
 
 
 # Tool invocation - admin auth (modifies state on external MCP servers)
-@admin_router.post("/llmrouter/mcp/tools/call")
+@llmrouter_router.post("/llmrouter/mcp/tools/call")
 async def call_mcp_tool(request: MCPToolCall):
     """
     Invoke an MCP tool by name.
@@ -976,7 +986,7 @@ async def call_mcp_tool(request: MCPToolCall):
         }
     }
     ```
-    
+
     Response (when enabled and successful):
     ```json
     {
@@ -986,11 +996,11 @@ async def call_mcp_tool(request: MCPToolCall):
         "result": {...}
     }
     ```
-    
+
     Response (when disabled - 501):
     ```json
     {
-        "error": "tool_invocation_disabled",
+        "error": "not_implemented",
         "message": "Remote tool invocation is disabled. Enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true",
         "request_id": "..."
     }
@@ -1065,9 +1075,7 @@ async def call_mcp_tool(request: MCPToolCall):
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to invoke MCP tool"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to invoke MCP tool")
         raise HTTPException(status_code=500, detail=err)
 
 
@@ -1109,7 +1117,7 @@ async def get_mcp_tool(tool_name: str):
 
 
 # Tool registration - admin auth
-@admin_router.post("/llmrouter/mcp/servers/{server_id}/tools")
+@llmrouter_router.post("/llmrouter/mcp/servers/{server_id}/tools")
 async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
     """
     Register a tool definition for an MCP server.
@@ -1151,7 +1159,11 @@ async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
         )
 
         if gateway.register_tool_definition(server_id, tool_def):
-            return {"status": "registered", "tool_name": tool.name, "server_id": server_id}
+            return {
+                "status": "registered",
+                "tool_name": tool.name,
+                "server_id": server_id,
+            }
         else:
             raise HTTPException(
                 status_code=400,
@@ -1164,9 +1176,7 @@ async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to register MCP tool"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to register MCP tool")
         raise HTTPException(status_code=500, detail=err)
 
 
@@ -1319,32 +1329,31 @@ async def list_mcp_access_groups():
 # Hot Reload and Config Sync Endpoints
 # =============================================================================
 
+
 # Config reload - admin auth required
-@admin_router.post("/router/reload")
-async def reload_router(request: ReloadRequest | None = None):
+@llmrouter_router.post("/llmrouter/reload")
+async def reload_config(request: ReloadRequest | None = None):
     """
-    Reload routing strategy/strategies.
+    Trigger a config reload, optionally syncing from remote.
 
     Requires admin API key authentication.
     """
     request_id = get_request_id() or "unknown"
     try:
-        manager = get_hot_reload_manager()
-        strategy = request.strategy if request else None
-        result = manager.reload_router(strategy)
+        manager = get_sync_manager()
+        force_sync = request.force_sync if request else False
+        result = manager.reload_config(force_sync=force_sync)
         return result
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to reload router"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to reload config")
         raise HTTPException(status_code=500, detail=err)
 
 
 # Config reload - admin auth required
-@admin_router.post("/config/reload")
-async def reload_config(request: ReloadRequest | None = None):
+@llmrouter_router.post("/config/reload")
+async def reload_config_2(request: ReloadRequest | None = None):
     """
     Trigger a config reload, optionally syncing from remote.
 
@@ -1359,9 +1368,7 @@ async def reload_config(request: ReloadRequest | None = None):
     except HTTPException:
         raise
     except Exception as e:
-        err = sanitize_error_response(
-            e, request_id, "Failed to reload config"
-        )
+        err = sanitize_error_response(e, request_id, "Failed to reload config")
         raise HTTPException(status_code=500, detail=err)
 
 

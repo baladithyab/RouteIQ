@@ -39,8 +39,10 @@ class TestImportBehavior:
 
         # The old code had "patch_litellm_router()" as a bare call at module level
         # The new code has a comment explaining it's NOT auto-applied
-        assert "Patch is NOT applied automatically on import" in source or \
-               "NOTE: Patch is NOT applied automatically on import" in source
+        assert (
+            "Patch is NOT applied automatically on import" in source
+            or "NOTE: Patch is NOT applied automatically on import" in source
+        )
 
     def test_patch_is_explicit_and_idempotent(self):
         """Test that patch_litellm_router() is explicit and idempotent."""
@@ -65,6 +67,7 @@ class TestRoutingStrategyPatch:
     def apply_patch(self):
         """Ensure patch is applied before each test."""
         from litellm_llmrouter import patch_litellm_router
+
         patch_litellm_router()
 
     def test_llmrouter_knn_strategy_accepted(self):

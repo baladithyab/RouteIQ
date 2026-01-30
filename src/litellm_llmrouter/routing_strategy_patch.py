@@ -88,7 +88,9 @@ def create_patched_routing_strategy_init(original_method: Callable) -> Callable:
 
             # Initialize pipeline routing if enabled
             if USE_PIPELINE_ROUTING:
-                _initialize_pipeline_strategy(self, routing_strategy, routing_strategy_args)
+                _initialize_pipeline_strategy(
+                    self, routing_strategy, routing_strategy_args
+                )
 
             return
 
@@ -105,7 +107,7 @@ def _initialize_pipeline_strategy(
 ) -> None:
     """
     Initialize pipeline routing for a router instance.
-    
+
     This registers the LLMRouterStrategyFamily as the default strategy
     in the routing registry, enabling A/B testing support.
     """
@@ -114,19 +116,21 @@ def _initialize_pipeline_strategy(
             get_routing_registry,
             DefaultStrategy,
         )
-        
+
         # Register the default strategy if not already registered
         registry = get_routing_registry()
-        
+
         # Use router-specific strategy name to support multiple routers
         router_strategy_name = f"llmrouter-default-{id(router)}"
-        
+
         # Check if we need to register
         if router_strategy_name not in registry.list_strategies():
             default_strategy = DefaultStrategy()
             registry.register(router_strategy_name, default_strategy)
-            logger.debug(f"Registered default pipeline strategy: {router_strategy_name}")
-        
+            logger.debug(
+                f"Registered default pipeline strategy: {router_strategy_name}"
+            )
+
     except ImportError as e:
         logger.debug(f"Pipeline routing not available: {e}")
     except Exception as e:
@@ -162,7 +166,7 @@ def create_patched_get_available_deployment(original_method: Callable) -> Callab
                 )
                 if result is not None:
                     return result
-            
+
             # Fallback to direct LLMRouter call
             return _get_deployment_via_llmrouter(
                 router=self,
@@ -196,7 +200,7 @@ def _get_deployment_via_pipeline(
 ) -> Optional[Dict]:
     """
     Get deployment using the routing pipeline.
-    
+
     This enables A/B testing and telemetry via the strategy registry.
     Falls back to None if pipeline is not available.
     """
@@ -205,38 +209,38 @@ def _get_deployment_via_pipeline(
             get_routing_pipeline,
             RoutingContext,
         )
-        
+
         # Extract request_id and user_id from request_kwargs if available
         request_id = None
         user_id = None
         if request_kwargs:
-            request_id = request_kwargs.get("request_id") or request_kwargs.get("litellm_call_id")
+            request_id = request_kwargs.get("request_id") or request_kwargs.get(
+                "litellm_call_id"
+            )
             user_id = request_kwargs.get("user") or request_kwargs.get("user_id")
             # Also check metadata
             metadata = request_kwargs.get("metadata", {})
             if isinstance(metadata, dict):
                 request_id = request_id or metadata.get("request_id")
                 user_id = user_id or metadata.get("user_id")
-        
+
         # Build routing context
         context = RoutingContext(
             router=router,
             model=model,
             messages=messages,
-            input=input,
-            specific_deployment=specific_deployment,
             request_kwargs=request_kwargs,
             request_id=request_id,
             user_id=user_id,
         )
-        
+
         # Execute pipeline
         pipeline = get_routing_pipeline()
         result = pipeline.route(context)
-        
+
         # Return deployment or None
         return result.deployment
-        
+
     except ImportError:
         logger.debug("Pipeline routing not available, using direct LLMRouter")
         return None
@@ -351,7 +355,7 @@ async def _async_get_deployment_via_llmrouter(
         )
         if result is not None:
             return result
-    
+
     # Fallback to sync version as LLMRouter doesn't have async API
     return _get_deployment_via_llmrouter(
         router=router,

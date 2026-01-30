@@ -9,7 +9,6 @@ These tests verify:
 """
 
 import json
-import pytest
 
 from litellm_llmrouter.telemetry_contracts import (
     CONTRACT_VERSION,
@@ -21,8 +20,6 @@ from litellm_llmrouter.telemetry_contracts import (
     RouterDecisionInput,
     CandidateDeployment,
     RoutingTimings,
-    RoutingOutcomeData,
-    FallbackInfo,
     RouterDecisionEvent,
     RouterDecisionEventBuilder,
     extract_router_decision_from_span_event,
@@ -178,7 +175,6 @@ class TestRouterDecisionEvent:
         )
         json_str = event.to_json()
         assert isinstance(json_str, str)
-        
         # Parse back and verify
         data = json.loads(json_str)
         assert data["strategy_name"] == "llmrouter-knn"
@@ -239,7 +235,6 @@ class TestRouterDecisionEventBuilder:
             {"model_name": "claude-3", "provider": "anthropic", "score": 0.82},
         ]
         event = RouterDecisionEventBuilder().with_candidates(candidates).build()
-        
         assert len(event.candidate_deployments) == 2
         assert event.candidate_deployments[0].model_name == "gpt-4"
         assert event.candidate_deployments[0].score == 0.95
@@ -338,16 +333,17 @@ class TestRouterDecisionEventBuilder:
             .with_strategy("llmrouter-knn", version="1.0.0")
             .with_trace_context(trace_id="abc123", span_id="def456")
             .with_input(query_length=150, user_id="user-123")
-            .with_candidates([
-                {"model_name": "gpt-4", "score": 0.95},
-                {"model_name": "claude-3", "score": 0.82},
-            ])
+            .with_candidates(
+                [
+                    {"model_name": "gpt-4", "score": 0.95},
+                    {"model_name": "claude-3", "score": 0.82},
+                ]
+            )
             .with_selection(selected="gpt-4", reason="highest_score")
             .with_timing(total_ms=15.5, strategy_ms=10.2)
             .with_outcome(status=RoutingOutcome.SUCCESS)
             .build()
         )
-        
         # Verify all fields are set correctly
         assert event.strategy_name == "llmrouter-knn"
         assert event.trace_id == "abc123"
@@ -368,20 +364,22 @@ class TestExtractRouterDecision:
             RouterDecisionEventBuilder()
             .with_strategy("llmrouter-knn", version="1.0.0")
             .with_input(query_length=150)
-            .with_candidates([
-                {"model_name": "gpt-4", "score": 0.95},
-            ])
+            .with_candidates(
+                [
+                    {"model_name": "gpt-4", "score": 0.95},
+                ]
+            )
             .with_selection(selected="gpt-4")
             .with_timing(total_ms=15.5)
             .with_outcome(status=RoutingOutcome.SUCCESS)
             .build()
         )
-        
+
         # Simulate span event attributes
         attributes = {
             ROUTER_DECISION_PAYLOAD_KEY: original.to_json(),
         }
-        
+
         # Extract and verify
         extracted = extract_router_decision_from_span_event(attributes)
         assert extracted is not None
@@ -407,53 +405,57 @@ class TestExtractRouterDecision:
     def test_extract_wrong_contract(self):
         """Return None for wrong contract name."""
         attributes = {
-            ROUTER_DECISION_PAYLOAD_KEY: json.dumps({
-                "contract_name": "other.contract.v1",
-                "strategy_name": "test",
-            }),
+            ROUTER_DECISION_PAYLOAD_KEY: json.dumps(
+                {
+                    "contract_name": "other.contract.v1",
+                    "strategy_name": "test",
+                }
+            ),
         }
         extracted = extract_router_decision_from_span_event(attributes)
         assert extracted is None
 
-    def test_extract_preserves_nested_objects(self):
-        """Verify nested objects are properly reconstructed."""
+    def test_extract_full_event(self):
+        """Test extracting a fully populated event."""
         original = (
             RouterDecisionEventBuilder()
             .with_strategy("llmrouter-knn")
-            .with_candidates([
-                {"model_name": "gpt-4", "provider": "openai", "score": 0.95},
-                {"model_name": "claude-3", "provider": "anthropic", "score": 0.82},
-            ])
+            .with_candidates(
+                [
+                    {"model_name": "gpt-4", "provider": "openai", "score": 0.95},
+                    {"model_name": "claude-3", "provider": "anthropic", "score": 0.82},
+                ]
+            )
             .with_timing(total_ms=15.5, strategy_ms=10.2)
             .with_outcome(
                 status=RoutingOutcome.ERROR,
                 error_type="TestError",
-                error_message="Test message",
+                error_message="Something went wrong",
             )
             .with_fallback(triggered=True, original_model="gpt-4", reason="error")
             .build()
         )
-        
+
         attributes = {
             ROUTER_DECISION_PAYLOAD_KEY: original.to_json(),
         }
-        
+
         extracted = extract_router_decision_from_span_event(attributes)
         assert extracted is not None
-        
+
         # Check candidates
         assert len(extracted.candidate_deployments) == 2
         assert extracted.candidate_deployments[0].model_name == "gpt-4"
         assert extracted.candidate_deployments[0].provider == "openai"
-        
+
         # Check timings
         assert extracted.timings.total_ms == 15.5
         assert extracted.timings.strategy_ms == 10.2
-        
+
         # Check outcome
         assert extracted.outcome.status == RoutingOutcome.ERROR
         assert extracted.outcome.error_type == "TestError"
-        
+
         # Check fallback
         assert extracted.fallback.fallback_triggered is True
         assert extracted.fallback.original_model == "gpt-4"
@@ -472,11 +474,7 @@ class TestPIISafety:
 
     def test_builder_only_accepts_query_length(self):
         """Verify builder only accepts query_length, not content."""
-        event = (
-            RouterDecisionEventBuilder()
-            .with_input(query_length=150)
-            .build()
-        )
+        event = RouterDecisionEventBuilder().with_input(query_length=150).build()
         assert event.input.query_length == 150
         # The input dataclass doesn't have a field for query content
         data = event.to_dict()

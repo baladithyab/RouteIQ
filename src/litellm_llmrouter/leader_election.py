@@ -19,7 +19,6 @@ Design Principles:
 import asyncio
 import os
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -229,21 +228,15 @@ class LeaderElection:
             conn = await asyncpg.connect(self._db_url)
             try:
                 await conn.execute(LEADER_ELECTION_TABLE_SQL)
-                verbose_proxy_logger.debug(
-                    "Leader election: Table created/verified"
-                )
+                verbose_proxy_logger.debug("Leader election: Table created/verified")
                 return True
             finally:
                 await conn.close()
         except ImportError:
-            verbose_proxy_logger.warning(
-                "Leader election: asyncpg not installed"
-            )
+            verbose_proxy_logger.warning("Leader election: asyncpg not installed")
             return False
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"Leader election: Error creating table: {e}"
-            )
+            verbose_proxy_logger.error(f"Leader election: Error creating table: {e}")
             return False
 
     async def try_acquire(self) -> bool:
@@ -267,9 +260,7 @@ class LeaderElection:
             conn = await asyncpg.connect(self._db_url)
             try:
                 now = datetime.now(timezone.utc)
-                expires_at = now.replace(
-                    second=now.second + self.lease_seconds
-                )
+                expires_at = now.replace(second=now.second + self.lease_seconds)
 
                 # Atomic upsert that only succeeds if:
                 # 1. No lock exists (INSERT)
@@ -336,9 +327,7 @@ class LeaderElection:
 
         except Exception as e:
             self._last_renewal_error = str(e)
-            verbose_proxy_logger.error(
-                f"Leader election: Error acquiring lease: {e}"
-            )
+            verbose_proxy_logger.error(f"Leader election: Error acquiring lease: {e}")
             # On error, don't change leadership status (favour stability)
             return self._is_leader
 
@@ -400,9 +389,7 @@ class LeaderElection:
                 await conn.close()
 
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"Leader election: Error releasing lease: {e}"
-            )
+            verbose_proxy_logger.error(f"Leader election: Error releasing lease: {e}")
             return False
 
     async def get_current_leader(self) -> LeaseInfo | None:
@@ -453,9 +440,7 @@ class LeaderElection:
                 await conn.close()
 
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"Leader election: Error getting leader: {e}"
-            )
+            verbose_proxy_logger.error(f"Leader election: Error getting leader: {e}")
             return None
 
     def _renew_loop(self):
@@ -475,9 +460,7 @@ class LeaderElection:
                     loop.close()
 
             except Exception as e:
-                verbose_proxy_logger.error(
-                    f"Leader election: Renewal error: {e}"
-                )
+                verbose_proxy_logger.error(f"Leader election: Renewal error: {e}")
 
             # Wait for next renewal interval
             self._stop_event.wait(self.renew_interval_seconds)
@@ -515,9 +498,9 @@ class LeaderElection:
             "lock_name": self.lock_name,
             "lease_seconds": self.lease_seconds,
             "renew_interval_seconds": self.renew_interval_seconds,
-            "lease_expires_at": self._lease_expires_at.isoformat()
-            if self._lease_expires_at
-            else None,
+            "lease_expires_at": (
+                self._lease_expires_at.isoformat() if self._lease_expires_at else None
+            ),
             "database_configured": self.database_configured,
             "last_renewal_error": self._last_renewal_error,
             "renewal_thread_alive": self._renew_thread is not None
@@ -566,9 +549,7 @@ async def initialize_leader_election() -> LeaderElection | None:
     """
     election = get_leader_election()
     if election is None:
-        verbose_proxy_logger.info(
-            "Leader election: Disabled (single instance mode)"
-        )
+        verbose_proxy_logger.info("Leader election: Disabled (single instance mode)")
         return None
 
     # Ensure table exists

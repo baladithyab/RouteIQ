@@ -1,18 +1,4 @@
-"""
-Concurrency Tests for A2A and MCP Gateways
-============================================
-
-Tests thread safety of:
-1. Singleton initialization (get_a2a_gateway, get_mcp_gateway)
-2. Registry mutations (register/unregister operations)
-3. Read operations returning consistent snapshots
-4. No race conditions under concurrent access
-
-Uses ThreadPoolExecutor to simulate high-concurrency FastAPI/uvicorn environment.
-"""
-
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import MappingProxyType
 
@@ -38,7 +24,7 @@ class TestA2AGatewayConcurrency:
     def test_singleton_concurrent_initialization(self):
         """
         Test that concurrent calls to get_a2a_gateway() return the same instance.
-        
+
         Simulates multiple requests hitting the gateway simultaneously at startup.
         """
         from litellm_llmrouter.a2a_gateway import get_a2a_gateway, reset_a2a_gateway
@@ -58,14 +44,14 @@ class TestA2AGatewayConcurrency:
 
         # All instances should be the same object
         first_instance = instances[0]
-        assert all(
-            inst is first_instance for inst in instances
-        ), "Singleton violated: different instances returned"
+        assert all(inst is first_instance for inst in instances), (
+            "Singleton violated: different instances returned"
+        )
 
     def test_concurrent_register_unregister(self):
         """
         Test concurrent register and unregister operations don't cause race conditions.
-        
+
         This hammers the registry with simultaneous add/remove operations.
         """
         from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
@@ -113,7 +99,7 @@ class TestA2AGatewayConcurrency:
     def test_concurrent_list_while_mutating(self):
         """
         Test that list_agents returns consistent snapshots while mutations occur.
-        
+
         Verifies no RuntimeError from dictionary changed during iteration.
         """
         from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
@@ -166,7 +152,7 @@ class TestA2AGatewayConcurrency:
 
     def test_concurrent_discover_agents(self):
         """
-        Test concurrent discover_agents with capability filtering.
+        Test concurrent list_agents with capability filtering.
         """
         from litellm_llmrouter.a2a_gateway import A2AAgent, get_a2a_gateway
 
@@ -194,7 +180,7 @@ class TestA2AGatewayConcurrency:
 
         def discover(capability: str):
             try:
-                agents = gateway.discover_agents(capability=capability)
+                agents = gateway.list_agents(capability=capability)
                 results.append((capability, len(agents)))
             except Exception as e:
                 errors.append(f"Discover error: {e}")
@@ -328,15 +314,19 @@ class TestMCPGatewayConcurrency:
                 instances.append(future.result())
 
         first_instance = instances[0]
-        assert all(
-            inst is first_instance for inst in instances
-        ), "Singleton violated: different instances returned"
+        assert all(inst is first_instance for inst in instances), (
+            "Singleton violated: different instances returned"
+        )
 
     def test_concurrent_register_unregister(self):
         """
         Test concurrent register and unregister operations don't cause race conditions.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
         num_operations = 100
@@ -381,7 +371,11 @@ class TestMCPGatewayConcurrency:
         """
         Test that list_servers returns consistent snapshots while mutations occur.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
         num_iterations = 50
@@ -432,11 +426,15 @@ class TestMCPGatewayConcurrency:
         """
         Test concurrent list_tools calls with concurrent mutations.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
 
-        # Pre-register some servers
+        # Pre-register some servers with tools
         for i in range(20):
             server = MCPServer(
                 server_id=f"tools-server-{i}",
@@ -506,7 +504,10 @@ class TestMCPGatewayConcurrency:
             tool_def = MCPToolDefinition(
                 name=f"lookup-tool-{i}",
                 description=f"Tool {i} for lookup test",
-                input_schema={"type": "object", "properties": {"arg": {"type": "string"}}},
+                input_schema={
+                    "type": "object",
+                    "properties": {"arg": {"type": "string"}},
+                },
             )
             gateway.register_tool_definition(f"lookup-server-{i}", tool_def)
 
@@ -547,7 +548,11 @@ class TestMCPGatewayConcurrency:
         """
         Test that get_servers_snapshot returns an immutable MappingProxyType.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
 
@@ -622,7 +627,11 @@ class TestMCPGatewayConcurrency:
         """
         Test concurrent get_registry calls with access group filtering.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
 
@@ -640,7 +649,9 @@ class TestMCPGatewayConcurrency:
                 url=f"https://registryserver{i}.example.com",
                 transport=MCPTransport.STREAMABLE_HTTP,
                 tools=[f"registry-tool-{i}"],
-                metadata={"access_groups": access_groups_sets[i % len(access_groups_sets)]},
+                metadata={
+                    "access_groups": access_groups_sets[i % len(access_groups_sets)]
+                },
             )
             gateway.register_server(server)
 
@@ -676,7 +687,11 @@ class TestMCPGatewayConcurrency:
         """
         Test concurrent list_access_groups calls.
         """
-        from litellm_llmrouter.mcp_gateway import MCPServer, MCPTransport, get_mcp_gateway
+        from litellm_llmrouter.mcp_gateway import (
+            MCPServer,
+            MCPTransport,
+            get_mcp_gateway,
+        )
 
         gateway = get_mcp_gateway()
 
@@ -719,7 +734,7 @@ class TestMCPGatewayConcurrency:
 class TestConcurrentSingletonReset:
     """
     Test that singleton reset is safe but warns about concurrent usage.
-    
+
     These tests verify the reset functions work correctly for testing purposes.
     """
 
@@ -770,7 +785,7 @@ class TestStressConditions:
     def test_high_contention_a2a_register_same_agent(self):
         """
         Test multiple threads registering the same agent ID concurrently.
-        
+
         The last write should win, but no exceptions should occur.
         """
         from litellm_llmrouter.a2a_gateway import (

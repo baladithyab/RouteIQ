@@ -8,7 +8,9 @@ These tests verify that:
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch
+
+# Mark all tests in this module as asyncio
+pytestmark = pytest.mark.asyncio
 
 
 class TestStandaloneApp:

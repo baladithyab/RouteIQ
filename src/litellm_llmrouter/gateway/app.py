@@ -19,16 +19,12 @@ Usage standalone (without LiteLLM):
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, AsyncGenerator
+from typing import AsyncGenerator
 
 from fastapi import FastAPI
 
 from ..routing_strategy_patch import is_patch_applied, patch_litellm_router
-
-if TYPE_CHECKING:
-    from litellm.proxy.proxy_server import ProxyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +107,9 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     # Admin parity endpoints (write operations)
     if include_admin:
         app.include_router(mcp_parity_admin_router, prefix="")
-        logger.debug("Registered mcp_parity_admin_router (upstream-compatible /v1/mcp/* admin)")
+        logger.debug(
+            "Registered mcp_parity_admin_router (upstream-compatible /v1/mcp/* admin)"
+        )
 
     # MCP REST API (/mcp-rest/*) - upstream-compatible
     app.include_router(mcp_rest_router, prefix="")

@@ -188,9 +188,7 @@ class PluginManager:
 
             # Verify it's a GatewayPlugin subclass
             if not issubclass(plugin_class, GatewayPlugin):
-                logger.error(
-                    f"Plugin {plugin_path} is not a GatewayPlugin subclass"
-                )
+                logger.error(f"Plugin {plugin_path} is not a GatewayPlugin subclass")
                 return None
 
             # Instantiate
