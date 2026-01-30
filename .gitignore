@@ -96,3 +96,8 @@ temp/
 
 # Lefthook local installation
 .lefthook-local/
+
+# Ruff scratch outputs
+.ruff_check*.txt
+.ruff_format_check*.txt
+.ruff_format_diff*.txt
