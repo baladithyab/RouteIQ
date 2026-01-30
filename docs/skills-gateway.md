@@ -87,6 +87,114 @@ model_list:
       api_key: os.environ/TEAM_B_KEY
 ```
 
+## Skills Discovery
+
+You can discover the available skills using the following endpoints:
+
+| Method | Endpoint | Description |
+|-------|---------|-------------|
+| `GET` | /skills/{namespace}/index.json | Gets the available skills in a single namespace, respecting the cache size and mutual exclusivity rules. |
+| `GET` | /skills/{namespace}__all.json | Gets a flat list of all skills in a single namespace across all available functions and classes. |
+| `GET` | /_skill/discovery.json | Gets the available functions and classes across all loaded Python say modules as a JSON array, along with their namespaces and paths. |
+
+The JSON responses for these endpoints are of the format:
+
+     {
+       "namespace": "<namespace>",
+       "name": "<function name>",
+       "docstring": "<Optional: function docstring>",
+       "args": [
+         {
+           "name": "<arg name>",
+           "type": "<arg type>"
+         },
+         ...
+       ],
+       "returns": "<return type>"
+     }
+
+Where `<namespace>` is the module path, `<function name>` is the name of the function, and any relative imports are * referenced, e.g., `routeiq.say.compose.*`. The endpoints align with litellm's invocation patterns—so for example, `routeiq.say.compose.transform_text.*`:
+​​​​​- `routeiq.say.compose.transform_text.TextTransformer.transform` * `POST /v1/skills/TextTransformer/transform`
+​​​​​- `routeiq.say.compose.transform_text.TextTransformer`
+
+**Note:**
+* The Skill Discovery endpoints retrieve available functions from registered skills via `highly_authenticated_client.function_list_client.get_skills_names_by_module_path`.
+* The cache size on `say_module` has a default value of 20 in Moat Mode.
+
+## Well-Known Skills Index (Plugin)
+
+RouteIQ provides an optional plugin for publishing a discoverable skills index at the well-known path `/.well-known/skills/`. This follows the progressive disclosure pattern for skill catalogs.
+
+### Enabling the Plugin
+
+Add the plugin to your `LLMROUTER_PLUGINS` environment variable:
+
+```bash
+export LLMROUTER_PLUGINS=litellm_llmrouter.gateway.plugins.skills_discovery.SkillsDiscoveryPlugin
+```
+
+### Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ROUTEIQ_SKILLS_DIR` | Directory containing skill definitions | `./skills` or `./docs/skills` |
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/.well-known/skills/index.json` | List all available skills with metadata |
+| `GET` | `/.well-known/skills/{skill}/SKILL.md` | Get the markdown body for a skill |
+| `GET` | `/.well-known/skills/{skill}/{path}` | Get any file from a skill directory |
+
+### Skill Directory Structure
+
+Each skill is a subdirectory in the skills directory:
+
+```
+skills/
+├── my-skill/
+│   ├── SKILL.md          # Required: skill description
+│   ├── helper.py         # Optional: implementation files
+│   └── data/
+│       └── config.json   # Optional: nested files
+└── another-skill/
+    └── SKILL.md
+```
+
+### Skill Naming Constraints
+
+Skill directory names must follow these rules:
+- Lowercase letters, digits, and hyphens only
+- Must start with a letter
+- 1-64 characters in length
+
+Examples: `my-skill`, `code-analyzer`, `data-processor-v2`
+
+### Index Response Format
+
+```json
+{
+  "skills": [
+    {
+      "name": "my-skill",
+      "description": "First paragraph from SKILL.md",
+      "files": ["SKILL.md", "helper.py", "data/config.json"]
+    }
+  ]
+}
+```
+
+### Security
+
+- **Path Traversal Protection**: All file access is validated to prevent directory traversal attacks.
+- **Read-Only**: The plugin only publishes skills; it does not execute them.
+- **Opt-In**: The plugin is disabled by default and must be explicitly enabled.
+
+### Caching
+
+The skills index is cached in memory and refreshes automatically when the skills directory is modified. The cache checks for changes every 5 seconds.
+
 ## See Also
 
 - [MCP Gateway](mcp-gateway.md) - For standard Model Context Protocol support
