@@ -48,6 +48,9 @@ ATTR_MCP_SUCCESS = "mcp.success"
 ATTR_MCP_ERROR = "mcp.error"
 ATTR_MCP_DURATION_MS = "mcp.duration_ms"
 ATTR_MCP_RESULT_TYPE = "mcp.result.type"
+ATTR_MCP_HTTP_STATUS = "mcp.http.status_code"
+ATTR_MCP_INVOCATION_URL = "mcp.invocation.url"
+ATTR_MCP_INVOCATION_DISABLED = "mcp.invocation.disabled"
 
 
 def get_tracer() -> Any:
@@ -283,11 +286,18 @@ def instrument_mcp_gateway() -> bool:
             with trace_tool_call(
                 tracer, tool_name, server_id, server_name, transport
             ) as span:
+                # Check if invocation is disabled and record it
+                if not gateway.is_tool_invocation_enabled():
+                    add_invocation_disabled_attribute(span, True)
+
                 result = await original_invoke_tool(tool_name, arguments)
                 if span and hasattr(span, "set_attribute"):
                     span.set_attribute(ATTR_MCP_SUCCESS, result.success)
                     if result.error:
                         span.set_attribute(ATTR_MCP_ERROR, result.error)
+                        # Check for specific error patterns to add categorized attributes
+                        if "tool_invocation_disabled" in result.error:
+                            add_invocation_disabled_attribute(span, True)
                 return result
 
         gateway.invoke_tool = traced_invoke_tool
@@ -338,3 +348,38 @@ def is_tracing_enabled() -> bool:
     if os.getenv("MCP_TRACING_ENABLED", "true").lower() != "true":
         return False
     return get_tracer() is not None
+
+
+def add_invocation_events(
+    span: Any, invocation_url: str | None, http_status_code: int | None
+) -> None:
+    """
+    Add invocation-specific events to the span.
+
+    Args:
+        span: The OpenTelemetry span instance
+        invocation_url: The URL of the invocation request, if available
+        http_status_code: The HTTP status code of the invocation response, if available
+    """
+    try:
+        if invocation_url is not None:
+            span.set_attribute(ATTR_MCP_INVOCATION_URL, invocation_url)
+        if http_status_code is not None:
+            span.set_attribute(ATTR_MCP_HTTP_STATUS, http_status_code)
+    except Exception:
+        pass
+
+
+def add_invocation_disabled_attribute(span: Any, disabled: bool) -> None:
+    """
+    Add a disabled attribute to the span.
+
+    Args:
+        span: The OpenTelemetry span instance
+        disabled: Whether the invocation was disabled
+    """
+    try:
+        if span and hasattr(span, "set_attribute"):
+            span.set_attribute(ATTR_MCP_INVOCATION_DISABLED, bool(disabled))
+    except Exception:
+        pass
