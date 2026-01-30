@@ -729,3 +729,585 @@ class TestEnvironmentVariables:
 
             verifier = ModelArtifactVerifier()
             assert verifier.public_key_b64 == test_key
+
+
+class TestModelActivationManager:
+    """Test staged model activation with rollback support."""
+
+    @pytest.fixture
+    def temp_state_file(self):
+        """Create a temporary activation state file path."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            state_path = f.name
+        # Delete so the manager can create it
+        os.unlink(state_path)
+        yield state_path
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+    @pytest.fixture
+    def valid_model_file(self):
+        """Create a valid pickle model with predict method."""
+        mock_model = MockModel(prediction="gpt-4")
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump(mock_model, f)
+            model_path = f.name
+
+        yield model_path
+        os.unlink(model_path)
+
+    @pytest.fixture
+    def second_valid_model_file(self):
+        """Create a second valid pickle model."""
+        mock_model = MockModel(prediction="claude-3")
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump(mock_model, f)
+            model_path = f.name
+
+        yield model_path
+        os.unlink(model_path)
+
+    @pytest.fixture
+    def manifest_for_model(self, valid_model_file):
+        """Create a manifest for the valid model."""
+        sha256_hash = hashlib.sha256()
+        with open(valid_model_file, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256_hash.update(chunk)
+        model_hash = sha256_hash.hexdigest()
+
+        manifest = {
+            "version": "1.0",
+            "signature_type": "none",
+            "artifacts": [
+                {
+                    "path": valid_model_file,
+                    "sha256": model_hash,
+                    "tags": ["test"],
+                }
+            ],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(manifest, f)
+            manifest_path = f.name
+
+        yield manifest_path, model_hash
+        os.unlink(manifest_path)
+
+    def test_stage_model_success(
+        self, temp_state_file, valid_model_file, manifest_for_model
+    ):
+        """Test successfully staging a model for activation."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+        )
+
+        manifest_path, expected_hash = manifest_for_model
+
+        verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            verifier=verifier,
+            strict_pickle_mode=False,
+        )
+
+        # Stage the model
+        staged = manager.stage_model(valid_model_file, correlation_id="test-stage")
+
+        assert staged["path"] == valid_model_file
+        assert staged["sha256"] == expected_hash
+        assert staged["verified"] is True
+        assert staged["status"] == "staged"
+
+        # Check state file was created
+        state = manager.get_activation_state()
+        assert state.staged is not None
+        assert state.staged["path"] == valid_model_file
+
+        # Staged model should be accessible
+        assert manager.get_staged_model() is not None
+        assert hasattr(manager.get_staged_model(), "predict")
+
+    def test_promote_staged_model(
+        self, temp_state_file, valid_model_file, manifest_for_model
+    ):
+        """Test promoting a staged model to active."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+        )
+
+        manifest_path, _ = manifest_for_model
+
+        verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            verifier=verifier,
+            strict_pickle_mode=False,
+        )
+
+        # Stage and promote
+        manager.stage_model(valid_model_file)
+        active = manager.promote_staged_model(correlation_id="test-promote")
+
+        assert active["path"] == valid_model_file
+        assert active["status"] == "active"
+
+        # Staged should be cleared
+        state = manager.get_activation_state()
+        assert state.staged is None
+        assert state.active is not None
+        assert state.active["path"] == valid_model_file
+
+    def test_rollback_model(
+        self, temp_state_file, valid_model_file, second_valid_model_file
+    ):
+        """Test rolling back to the previous model."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+            ManifestSigner,
+        )
+
+        # Create manifest for both models
+        signer = ManifestSigner()
+
+        artifacts = []
+        for model_path in [valid_model_file, second_valid_model_file]:
+            entry = signer.create_artifact_entry(model_path)
+            artifacts.append(
+                {
+                    "path": entry.path,
+                    "sha256": entry.sha256,
+                }
+            )
+
+        manifest = signer.create_manifest(artifacts=artifacts)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            signer.save_manifest(manifest, f.name)
+            manifest_path = f.name
+
+        try:
+            verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+            manager = ModelActivationManager(
+                state_path=temp_state_file,
+                verifier=verifier,
+                strict_pickle_mode=False,
+            )
+
+            # Stage and promote first model
+            manager.stage_model(valid_model_file)
+            manager.promote_staged_model()
+
+            # Stage and promote second model
+            manager.stage_model(second_valid_model_file)
+            manager.promote_staged_model()
+
+            # Now we have: active=second, previous=first
+            state = manager.get_activation_state()
+            assert state.active["path"] == second_valid_model_file
+            assert state.previous["path"] == valid_model_file
+
+            # Rollback
+            restored = manager.rollback_model(correlation_id="test-rollback")
+
+            assert restored["path"] == valid_model_file
+
+            # Check state
+            state = manager.get_activation_state()
+            assert state.active["path"] == valid_model_file
+            assert state.previous is None  # Previous cleared after rollback
+            assert state.staged is not None  # Failed model moved to staged
+            assert state.staged["path"] == second_valid_model_file
+        finally:
+            os.unlink(manifest_path)
+
+    def test_promote_without_staged_raises(self, temp_state_file):
+        """Test that promoting without a staged model raises error."""
+        from litellm_llmrouter.model_artifacts import ModelActivationManager
+
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            strict_pickle_mode=False,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            manager.promote_staged_model()
+
+        assert "No model is staged" in str(exc_info.value)
+
+    def test_rollback_without_previous_raises(
+        self, temp_state_file, valid_model_file, manifest_for_model
+    ):
+        """Test that rollback without a previous model raises error."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+        )
+
+        manifest_path, _ = manifest_for_model
+
+        verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            verifier=verifier,
+            strict_pickle_mode=False,
+        )
+
+        # Stage and promote first model (no previous yet)
+        manager.stage_model(valid_model_file)
+        manager.promote_staged_model()
+
+        with pytest.raises(ValueError) as exc_info:
+            manager.rollback_model()
+
+        assert "No previous model version" in str(exc_info.value)
+
+    def test_stage_model_file_not_found(self, temp_state_file):
+        """Test staging a non-existent model file."""
+        from litellm_llmrouter.model_artifacts import ModelActivationManager
+
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            strict_pickle_mode=False,
+        )
+
+        with pytest.raises(FileNotFoundError):
+            manager.stage_model("/nonexistent/path/model.pkl")
+
+    def test_stage_invalid_model_no_predict(self, temp_state_file):
+        """Test staging a model without predict method fails."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            StagedModelVerificationError,
+        )
+
+        # Create invalid model (no predict method)
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump({"not": "a model"}, f)
+            invalid_model_path = f.name
+
+        try:
+            manager = ModelActivationManager(
+                state_path=temp_state_file,
+                strict_pickle_mode=False,
+            )
+
+            with pytest.raises(StagedModelVerificationError) as exc_info:
+                manager.stage_model(invalid_model_path)
+
+            assert "does not have 'predict' method" in str(exc_info.value)
+        finally:
+            os.unlink(invalid_model_path)
+
+    def test_clear_staged(self, temp_state_file, valid_model_file, manifest_for_model):
+        """Test clearing staged model without promoting."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+        )
+
+        manifest_path, _ = manifest_for_model
+
+        verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            verifier=verifier,
+            strict_pickle_mode=False,
+        )
+
+        # Stage a model
+        manager.stage_model(valid_model_file)
+        assert manager.get_staged_model() is not None
+
+        # Clear it
+        manager.clear_staged()
+
+        assert manager.get_staged_model() is None
+        state = manager.get_activation_state()
+        assert state.staged is None
+
+
+class TestStrictPickleMode:
+    """Test strict pickle mode requiring signature verification."""
+
+    @pytest.fixture
+    def temp_state_file(self):
+        """Create a temporary activation state file path."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            state_path = f.name
+        os.unlink(state_path)
+        yield state_path
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+    @pytest.fixture
+    def valid_model_file(self):
+        """Create a valid pickle model."""
+        mock_model = MockModel(prediction="gpt-4")
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump(mock_model, f)
+            model_path = f.name
+
+        yield model_path
+        os.unlink(model_path)
+
+    def test_strict_mode_no_manifest_fails(self, temp_state_file, valid_model_file):
+        """Test that strict mode fails without a manifest."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            PickleSignatureRequiredError,
+        )
+
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            strict_pickle_mode=True,
+        )
+
+        with pytest.raises(PickleSignatureRequiredError) as exc_info:
+            manager.stage_model(valid_model_file)
+
+        assert "PICKLE_SIGNATURE_REQUIRED" in str(exc_info.value)
+        assert "signed manifest" in str(exc_info.value)
+
+    def test_strict_mode_unsigned_manifest_fails(
+        self, temp_state_file, valid_model_file
+    ):
+        """Test that strict mode fails with unsigned manifest."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+            ManifestSigner,
+            PickleSignatureRequiredError,
+            SignatureType,
+        )
+
+        # Create unsigned manifest
+        signer = ManifestSigner()
+        entry = signer.create_artifact_entry(valid_model_file)
+        manifest = signer.create_manifest(
+            artifacts=[{"path": entry.path, "sha256": entry.sha256}],
+            signature_type=SignatureType.NONE,  # Unsigned
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            signer.save_manifest(manifest, f.name)
+            manifest_path = f.name
+
+        try:
+            verifier = ModelArtifactVerifier(manifest_path=manifest_path)
+            manager = ModelActivationManager(
+                state_path=temp_state_file,
+                verifier=verifier,
+                strict_pickle_mode=True,
+            )
+
+            with pytest.raises(PickleSignatureRequiredError):
+                manager.stage_model(valid_model_file)
+        finally:
+            os.unlink(manifest_path)
+
+    @pytest.mark.skipif(
+        not CRYPTOGRAPHY_AVAILABLE,
+        reason="cryptography package not available",
+    )
+    def test_strict_mode_signed_manifest_succeeds(
+        self, temp_state_file, valid_model_file
+    ):
+        """Test that strict mode succeeds with properly signed manifest."""
+        from litellm_llmrouter.model_artifacts import (
+            ModelActivationManager,
+            ModelArtifactVerifier,
+            ManifestSigner,
+            SignatureType,
+            generate_ed25519_keypair,
+        )
+
+        # Generate keypair
+        private_key_b64, public_key_b64 = generate_ed25519_keypair()
+
+        # Create signed manifest
+        signer = ManifestSigner(private_key_b64=private_key_b64)
+        entry = signer.create_artifact_entry(valid_model_file)
+        manifest = signer.create_manifest(
+            artifacts=[{"path": entry.path, "sha256": entry.sha256}],
+            signature_type=SignatureType.ED25519,
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            signer.save_manifest(manifest, f.name)
+            manifest_path = f.name
+
+        try:
+            verifier = ModelArtifactVerifier(
+                manifest_path=manifest_path,
+                public_key_b64=public_key_b64,
+            )
+            manager = ModelActivationManager(
+                state_path=temp_state_file,
+                verifier=verifier,
+                strict_pickle_mode=True,
+            )
+
+            # Should succeed with signed manifest
+            staged = manager.stage_model(valid_model_file)
+            assert staged["verified"] is True
+            assert staged["signature_verified"] is True
+        finally:
+            os.unlink(manifest_path)
+
+    def test_allowlist_bypasses_strict_mode(self, temp_state_file, valid_model_file):
+        """Test that allowlisted hashes bypass strict mode signature requirement."""
+        from litellm_llmrouter.model_artifacts import ModelActivationManager
+
+        # Compute hash of model
+        sha256_hash = hashlib.sha256()
+        with open(valid_model_file, "rb") as f:
+            sha256_hash.update(f.read())
+        model_hash = sha256_hash.hexdigest()
+
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            strict_pickle_mode=True,
+            pickle_allowlist=[model_hash],  # Allowlist this hash
+        )
+
+        # Should succeed despite strict mode because hash is allowlisted
+        staged = manager.stage_model(valid_model_file)
+        assert staged["sha256"] == model_hash
+        assert staged["verified"] is True
+
+    def test_non_strict_mode_allows_unsigned(self, temp_state_file, valid_model_file):
+        """Test that non-strict mode allows unsigned models."""
+        from litellm_llmrouter.model_artifacts import ModelActivationManager
+
+        manager = ModelActivationManager(
+            state_path=temp_state_file,
+            strict_pickle_mode=False,  # Not strict
+        )
+
+        # Should succeed without manifest
+        staged = manager.stage_model(valid_model_file)
+        assert staged["path"] == valid_model_file
+
+
+class TestActivationStateHelperFunctions:
+    """Test convenience functions for staged activation."""
+
+    @pytest.fixture
+    def temp_state_file(self):
+        """Create temporary state file."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            state_path = f.name
+        os.unlink(state_path)
+        yield state_path
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+    @pytest.fixture
+    def valid_model_file(self):
+        """Create a valid pickle model."""
+        mock_model = MockModel(prediction="test-model")
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump(mock_model, f)
+            model_path = f.name
+
+        yield model_path
+        os.unlink(model_path)
+
+    def test_convenience_functions(self, temp_state_file, valid_model_file):
+        """Test stage_model, promote_staged_model convenience functions."""
+        from litellm_llmrouter.model_artifacts import ModelActivationManager
+
+        # Manually set up the manager with our temp state file
+        import litellm_llmrouter.model_artifacts as artifacts_module
+
+        original_manager = artifacts_module._global_activation_manager
+
+        try:
+            # Create a fresh manager
+            manager = ModelActivationManager(
+                state_path=temp_state_file,
+                strict_pickle_mode=False,
+            )
+            artifacts_module._global_activation_manager = manager
+
+            # Now test the convenience functions
+            from litellm_llmrouter.model_artifacts import stage_model
+
+            staged = stage_model(valid_model_file, correlation_id="test")
+            assert staged["path"] == valid_model_file
+
+            from litellm_llmrouter.model_artifacts import promote_staged_model
+
+            active = promote_staged_model(correlation_id="test")
+            assert active["path"] == valid_model_file
+        finally:
+            artifacts_module._global_activation_manager = original_manager
+
+
+class TestInferenceKNNRouterStrictMode:
+    """Test InferenceKNNRouter with strict pickle mode."""
+
+    @pytest.fixture
+    def valid_model_file(self):
+        """Create a valid pickle model."""
+        mock_model = MockModel(prediction="gpt-4")
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            pickle.dump(mock_model, f)
+            model_path = f.name
+
+        yield model_path
+        os.unlink(model_path)
+
+    def test_strict_mode_blocks_unsigned_pickle(self, valid_model_file):
+        """Test that strict pickle mode blocks unsigned models in InferenceKNNRouter."""
+        from litellm_llmrouter.strategies import InferenceKNNRouter
+        from litellm_llmrouter.model_artifacts import PickleSignatureRequiredError
+
+        with (
+            patch("litellm_llmrouter.strategies.ALLOW_PICKLE_MODELS", True),
+            patch("litellm_llmrouter.strategies.STRICT_PICKLE_MODE", True),
+            patch("litellm_llmrouter.strategies.PICKLE_ALLOWLIST", set()),
+        ):
+            with pytest.raises(PickleSignatureRequiredError) as exc_info:
+                InferenceKNNRouter(
+                    model_path=valid_model_file,
+                    embedding_model="test-model",
+                )
+
+            assert "PICKLE_SIGNATURE_REQUIRED" in str(exc_info.value)
+
+    def test_allowlist_allows_loading(self, valid_model_file):
+        """Test that allowlisted hashes allow loading in strict mode."""
+        from litellm_llmrouter.strategies import InferenceKNNRouter
+
+        # Compute hash
+        sha256_hash = hashlib.sha256()
+        with open(valid_model_file, "rb") as f:
+            sha256_hash.update(f.read())
+        model_hash = sha256_hash.hexdigest()
+
+        with (
+            patch("litellm_llmrouter.strategies.ALLOW_PICKLE_MODELS", True),
+            patch("litellm_llmrouter.strategies.STRICT_PICKLE_MODE", True),
+            patch("litellm_llmrouter.strategies.PICKLE_ALLOWLIST", {model_hash}),
+            patch("litellm_llmrouter.strategies.ENFORCE_SIGNED_MODELS", False),
+        ):
+            # Should succeed with allowlisted hash
+            router = InferenceKNNRouter(
+                model_path=valid_model_file,
+                embedding_model="test-model",
+            )
+
+            assert router.knn_model is not None
+            assert router.model_version is not None
+            assert router.model_version.sha256 == model_hash

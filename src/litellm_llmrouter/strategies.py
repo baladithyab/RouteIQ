@@ -36,6 +36,9 @@ from litellm_llmrouter.model_artifacts import (
     get_artifact_verifier,
     ModelVerificationError,
     ActiveModelVersion,
+    PickleSignatureRequiredError,
+    SignatureVerificationError,
+    SignatureType,
 )
 
 # Import telemetry contracts for versioned event emission
@@ -112,6 +115,21 @@ ENFORCE_SIGNED_MODELS = os.getenv(
 ).lower() == "true" or (
     ALLOW_PICKLE_MODELS
     and os.getenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower() != "false"
+)
+
+# Strict pickle mode: require signature verification for all pickle files
+# When true, pickle files must have a valid signature in the manifest
+# Set LLMROUTER_STRICT_PICKLE_MODE=true to enable (recommended for production)
+STRICT_PICKLE_MODE = (
+    os.getenv("LLMROUTER_STRICT_PICKLE_MODE", "false").lower() == "true"
+)
+
+# Pickle allowlist: SHA256 hashes of pickle files that bypass signature requirement
+# Comma-separated list of hex-encoded SHA256 hashes
+PICKLE_ALLOWLIST = set(
+    h.strip()
+    for h in os.getenv("LLMROUTER_PICKLE_ALLOWLIST", "").split(",")
+    if h.strip()
 )
 
 
@@ -207,6 +225,7 @@ class InferenceKNNRouter:
         - Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
         - Pickle deserialization can execute arbitrary code, so it's disabled by default.
         - When enabled, verifies artifact against manifest if LLMROUTER_MODEL_MANIFEST_PATH is set.
+        - In strict mode (LLMROUTER_STRICT_PICKLE_MODE=true), requires signed manifest.
 
         Safe Activation:
         - Loads model into temporary variable first
@@ -229,6 +248,41 @@ class InferenceKNNRouter:
         # Verify artifact against manifest if enforcement is enabled
         verifier = get_artifact_verifier()
         require_manifest = ENFORCE_SIGNED_MODELS
+
+        # Compute hash first for allowlist check and verification
+        computed_hash = verifier.compute_sha256(self.model_path)
+
+        # Check if hash is in allowlist (bypasses signature requirement)
+        is_allowlisted = computed_hash in PICKLE_ALLOWLIST
+        if is_allowlisted:
+            verbose_proxy_logger.info(
+                f"{log_prefix}Model in pickle allowlist: {self.model_path} "
+                f"(sha256={computed_hash[:16]}...)"
+            )
+
+        # Strict pickle mode check
+        if STRICT_PICKLE_MODE and not is_allowlisted:
+            # Must have a signed manifest
+            manifest = verifier._load_manifest()
+            if manifest is None:
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            # Verify manifest has a signature
+            if manifest.signature_type == SignatureType.NONE:
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            # Verify signature is valid
+            try:
+                verifier.verify_manifest_signature(manifest)
+            except SignatureVerificationError as e:
+                verbose_proxy_logger.error(
+                    f"{log_prefix}STRICT_PICKLE_MODE: Signature verification failed: {e}"
+                )
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            verbose_proxy_logger.info(
+                f"{log_prefix}STRICT_PICKLE_MODE: Manifest signature verified for {self.model_path}"
+            )
 
         try:
             verifier.verify_artifact(
@@ -275,6 +329,7 @@ class InferenceKNNRouter:
             # Record active version for observability
             self.model_version = verifier.record_active_version(
                 self.model_path,
+                sha256=computed_hash,
                 tags=["knn", "active"],
             )
 
