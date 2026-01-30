@@ -6,14 +6,14 @@ This document tracks the feature parity of RouteIQ Gateway compared to standard 
 
 | Feature Area | Status | Notes |
 |--------------|--------|-------|
-| **Core Routing** | ✅ Available | ML-based routing (KNN, SVM), simple shuffle, least-busy. |
-| **A2A (Agent-to-Agent)** | ✅ Available | Full support for A2A protocol, agent registration, and invocation. |
-| **MCP (Model Context Protocol)** | ✅ Available | Server registration, tool discovery, and invocation (flag-gated). |
-| **Skills Gateway** | ✅ Available | Support for Anthropic Computer Use, Bash, and Text Editor skills. |
-| **Vector Stores** | ⚠️ Partial | Inherits OpenAI-compatible endpoints. Deep external DB integration (Pinecone, Qdrant) is planned. |
-| **Observability** | ✅ Available | OpenTelemetry (OTel) tracing, metrics, and logging. Jaeger integration. |
-| **Security** | ✅ Available | SSRF protection (deny-by-default), Admin Auth, Role-based access. |
-| **High Availability** | ✅ Available | Redis-backed state sync, multi-replica support, load balancing. |
+| **Core Routing** | 🟢 **Stable** | ML-based routing (KNN, SVM), simple shuffle, least-busy. |
+| **A2A (Agent-to-Agent)** | 🟡 **Beta** | Full support for A2A protocol, agent registration, and invocation. |
+| **MCP (Model Context Protocol)** | 🟡 **Beta** | Server registration, tool discovery, and invocation (flag-gated). |
+| **Skills Gateway** | 🟡 **Beta** | Support for Anthropic Computer Use, Bash, and Text Editor skills. |
+| **Vector Stores** | 🔴 **Experimental** | Inherits OpenAI-compatible endpoints. Deep external DB integration (Pinecone, Qdrant) is planned. |
+| **Observability** | 🟢 **Stable** | OpenTelemetry (OTel) tracing, metrics, and logging. Jaeger integration. |
+| **Security** | 🟢 **Stable** | SSRF protection (deny-by-default), Admin Auth, Role-based access. |
+| **High Availability** | 🟢 **Stable** | Redis-backed state sync, multi-replica support, load balancing. |
 
 ## Roadmap
 
@@ -23,8 +23,8 @@ Our roadmap is prioritized into P0 (Critical), P1 (High), and P2 (Medium) items.
 
 - [x] **Unified Docker Container**: Single image for LiteLLM + LLMRouter.
 - [x] **ML Routing Strategies**: KNN and SVM implementations.
-- [ ] **Hot-Reload Config Sync**: Dynamic updates without restart.
-- [ ] **Routing Decision Visibility**: Full OTel instrumentation for *why* a model was chosen.
+- [x] **Hot-Reload Config Sync**: Dynamic updates without restart.
+- [x] **Routing Decision Visibility**: Full OTel instrumentation for *why* a model was chosen.
 
 ### P1: Enterprise Hardening (Q2 2026)
 

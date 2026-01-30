@@ -16,17 +16,28 @@ cd RouteIQ
 
 ## 2. Configure Environment
 
-Create a `.env` file or set environment variables directly.
+Start by copying the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` to set your keys.
+
+**Required Environment Variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `LITELLM_MASTER_KEY` | **Critical**. The admin master key for the gateway. Generate a strong random string. |
+| `OPENAI_API_KEY` | (Optional) If using OpenAI models. |
+| `ANTHROPIC_API_KEY` | (Optional) If using Anthropic models. |
 
 **Security Note:** You **must** generate a secure `LITELLM_MASTER_KEY`.
 
 ```bash
 # Generate a secure master key
 export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
-
-# Set your LLM provider keys
-export OPENAI_API_KEY=sk-...
-export ANTHROPIC_API_KEY=sk-...
+# Update your .env file with this key
 ```
 
 ## 3. Start the Gateway
@@ -85,6 +96,6 @@ The default setup mounts `./config/config.yaml` to the container. You can modify
 
 ## Next Steps
 
-- [High Availability Setup](quickstart-ha-compose.md)
-- [Observability Setup](quickstart-otel-compose.md)
-- [Configuration Guide](configuration.md)
+- **Need reliability?** Switch to the [High Availability Setup](quickstart-ha-compose.md).
+- **Need visibility?** Add the [Observability Stack](quickstart-otel-compose.md).
+- **Configuration:** See the [Configuration Guide](configuration.md).

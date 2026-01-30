@@ -18,16 +18,28 @@ This setup includes:
 
 ## 1. Configure Secrets
 
-Set the required secrets in your environment:
+Start by copying the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+Set the required secrets in your `.env` file:
+
+**Required Environment Variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `LITELLM_MASTER_KEY` | **Critical**. Admin master key. |
+| `POSTGRES_PASSWORD` | Password for the PostgreSQL database. |
+| `DATABASE_URL` | Connection string (e.g., `postgresql://user:pass@db:5432/routeiq`). |
+| `REDIS_HOST` | Hostname for Redis (e.g., `redis`). |
 
 ```bash
 # Generate secure keys
 export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 export POSTGRES_PASSWORD=$(openssl rand -hex 16)
-
-# Provider Keys
-export OPENAI_API_KEY=sk-...
-export ANTHROPIC_API_KEY=sk-...
+# Update your .env file with these keys
 ```
 
 ## 2. Start the HA Cluster
@@ -80,5 +92,6 @@ docker-compose -f docker-compose.ha.yml up -d
 
 ## Next Steps
 
-- [Observability Setup](quickstart-otel-compose.md)
-- [Security Guide](security.md)
+- **Need visibility?** Add the [Observability Stack](quickstart-otel-compose.md).
+- **Security:** Review the [Security Guide](security.md).
+- **Back to Basics:** [Simple Docker Compose](quickstart-docker-compose.md).

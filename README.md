@@ -24,13 +24,13 @@ RouteIQ Gateway unifies multiple AI interaction patterns under a single endpoint
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **LLM Proxy** | ✅ Available | Standard OpenAI-compatible chat/completions. |
-| **A2A (Agent-to-Agent)** | ✅ Available | Protocol for multi-agent orchestration. |
-| **MCP Gateway** | ✅ Available | Connect LLMs to external tools via Model Context Protocol. |
-| **Skills** | ✅ Available | Anthropic Computer Use, Bash, and Text Editor skills. |
-| **Vector Stores** | ⚠️ Partial | Inherited OpenAI endpoints; deep external DB integration planned. |
-| **Observability** | ✅ Available | OpenTelemetry tracing, metrics, and logging. |
-| **Security** | ✅ Available | SSRF protection, Admin Auth, Role-based access. |
+| **LLM Proxy** | 🟢 **Stable** | Standard OpenAI-compatible chat/completions. |
+| **Observability** | 🟢 **Stable** | OpenTelemetry tracing, metrics, and logging. |
+| **Security** | 🟢 **Stable** | SSRF protection, Admin Auth, Role-based access. |
+| **A2A (Agent-to-Agent)** | 🟡 **Beta** | Protocol for multi-agent orchestration. |
+| **MCP Gateway** | 🟡 **Beta** | Connect LLMs to external tools via Model Context Protocol. <br> *Note: Tool invocation is disabled by default.* |
+| **Skills** | 🟡 **Beta** | Anthropic Computer Use, Bash, and Text Editor skills. |
+| **Vector Stores** | 🔴 **Experimental** | Inherited OpenAI endpoints; deep external DB integration planned. |
 
 See [Feature Parity & Roadmap](docs/parity-roadmap.md) for details.
 
@@ -50,6 +50,14 @@ The gateway operates as the central nervous system for your AI infrastructure, o
 
 ## Quick Start
 
+### Choose Your Deployment Mode
+
+| Goal | Recommended Setup |
+|------|-------------------|
+| **"I just want to try it out."** | [**Basic Docker Compose**](docs/quickstart-docker-compose.md) <br> *Simple, single container, local config.* |
+| **"I need production reliability."** | [**High Availability (HA)**](docs/quickstart-ha-compose.md) <br> *Multi-replica, Redis/Postgres backed, Nginx load balancing.* |
+| **"I need to debug or optimize."** | [**Observability Stack**](docs/quickstart-otel-compose.md) <br> *Includes Jaeger for full trace visualization.* |
+
 ### 1. Docker Compose (Basic)
 
 Ideal for local development.
@@ -58,6 +66,7 @@ Ideal for local development.
 # Clone and start
 git clone https://github.com/baladithyab/litellm-llm-router.git
 cd litellm-llm-router
+cp .env.example .env
 docker-compose up -d
 ```
 
@@ -94,6 +103,17 @@ RouteIQ Gateway is designed for cloud-native deployment:
   - `/_health/live`: Liveness probe
   - `/_health/ready`: Readiness probe
 - **Config Management**: Supports loading configuration from local files, S3, or environment variables.
+
+## Production Checklist
+
+Before going to production, ensure you have addressed the following:
+
+- [ ] **Security**: Generate a strong `LITELLM_MASTER_KEY` and rotate it regularly.
+- [ ] **Persistence**: Use external PostgreSQL and Redis instances for state and caching (don't use containers for data in prod).
+- [ ] **TLS/SSL**: Terminate SSL at your load balancer (Nginx, AWS ALB, or K8s Ingress).
+- [ ] **Observability**: Configure an OTel collector to capture traces and metrics.
+- [ ] **MCP Security**: If using MCP, explicitly enable tool invocation via `LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true` only if trusted.
+- [ ] **Resource Limits**: Set appropriate CPU/Memory requests and limits in Kubernetes.
 
 ## Security
 

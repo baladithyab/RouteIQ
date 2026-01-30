@@ -14,7 +14,14 @@ This guide sets up RouteIQ Gateway with a full OpenTelemetry (OTel) stack using 
 
 ## 1. Start the Stack
 
-Use the `docker-compose.otel.yml` file:
+First, ensure your environment is configured:
+
+```bash
+cp .env.example .env
+# Edit .env to set LITELLM_MASTER_KEY and provider keys
+```
+
+Then start the observability stack using the `docker-compose.otel.yml` file:
 
 ```bash
 docker-compose -f docker-compose.otel.yml up -d
@@ -80,5 +87,6 @@ Point the gateway to your OTel collector (e.g., Jaeger, Honeycomb, Datadog).
 
 ## Next Steps
 
-- [MLOps Training Pipeline](mlops-training.md)
-- [Observability Guide](observability.md)
+- **Production Setup:** [High Availability Guide](quickstart-ha-compose.md).
+- **MLOps:** [MLOps Training Pipeline](mlops-training.md).
+- **Deep Dive:** [Observability Guide](observability.md).
