@@ -5,6 +5,14 @@ Gateway Application Factory (Composition Root)
 This module provides the FastAPI application factory for the LLMRouter gateway.
 It explicitly configures all middleware, routers, and patches in a single place.
 
+Load Order:
+1. Apply LiteLLM router patch (if enabled)
+2. Get/create FastAPI app
+3. Add middleware
+4. Load and register plugins (deterministically before routes)
+5. Register built-in routes
+6. Set up plugin lifecycle hooks
+
 Usage with LiteLLM proxy (in-process):
     from litellm_llmrouter.gateway import create_app
 
@@ -131,8 +139,12 @@ async def _run_plugin_startup(app: FastAPI) -> None:
 
     Args:
         app: The FastAPI application instance
+
+    Raises:
+        PluginDependencyError: If plugin dependencies cannot be resolved
+        Exception: If any plugin with failure_mode=abort fails during startup
     """
-    from .plugin_manager import get_plugin_manager
+    from .plugin_manager import get_plugin_manager, PluginDependencyError
 
     manager = get_plugin_manager()
 
@@ -142,7 +154,15 @@ async def _run_plugin_startup(app: FastAPI) -> None:
         if loaded:
             logger.info(f"Loaded {loaded} plugins from configuration")
 
-    await manager.startup(app)
+    try:
+        await manager.startup(app)
+    except PluginDependencyError as e:
+        logger.error(f"Plugin dependency error: {e}")
+        raise
+    except Exception as e:
+        # Re-raise if it's a startup abort
+        logger.error(f"Plugin startup error: {e}")
+        raise
 
 
 async def _run_plugin_shutdown(app: FastAPI) -> None:
@@ -158,6 +178,40 @@ async def _run_plugin_shutdown(app: FastAPI) -> None:
     await manager.shutdown(app)
 
 
+def _load_plugins_before_routes() -> int:
+    """
+    Load plugins synchronously before routes are registered.
+
+    This ensures plugins are discovered and validated BEFORE routes
+    are finalized, allowing plugin route registration to work correctly.
+
+    Returns:
+        Number of plugins loaded
+    """
+    from .plugin_manager import get_plugin_manager
+
+    manager = get_plugin_manager()
+
+    # Only load if not already loaded
+    if manager.plugins:
+        logger.debug(f"Plugins already loaded: {len(manager.plugins)}")
+        return len(manager.plugins)
+
+    loaded = manager.load_from_config()
+    if loaded:
+        logger.info(f"Pre-loaded {loaded} plugins (startup hooks will run later)")
+
+        # Log plugin order for debugging
+        for i, plugin in enumerate(manager.plugins, 1):
+            meta = plugin.metadata
+            logger.debug(
+                f"  [{i}] {plugin.name} "
+                f"(priority={meta.priority}, capabilities={[c.value for c in meta.capabilities]})"
+            )
+
+    return loaded
+
+
 def create_app(
     *,
     apply_patch: bool = True,
@@ -171,8 +225,9 @@ def create_app(
     1. Applies the LiteLLM router patch (explicit, idempotent)
     2. Gets the LiteLLM proxy's FastAPI app
     3. Adds RequestID middleware
-    4. Registers LLMRouter routes (health, llmrouter, admin)
-    5. Optionally runs plugin startup hooks
+    4. Loads plugins (discovery + validation, before routes)
+    5. Registers LLMRouter routes (health, llmrouter, admin)
+    6. Sets up plugin lifecycle hooks (startup runs later)
 
     This is the preferred method for in-process LiteLLM proxy usage.
 
@@ -194,10 +249,18 @@ def create_app(
     # Step 3: Add middleware
     _configure_middleware(app)
 
-    # Step 4: Register routes
+    # Step 4: Load plugins BEFORE routes (for deterministic ordering)
+    if enable_plugins:
+        try:
+            _load_plugins_before_routes()
+        except Exception as e:
+            logger.error(f"Failed to load plugins: {e}")
+            # Continue without plugins if loading fails
+
+    # Step 5: Register routes
     _register_routes(app, include_admin=include_admin_routes)
 
-    # Step 5: Set up plugin lifecycle if enabled
+    # Step 6: Set up plugin lifecycle if enabled
     if enable_plugins:
         # Store original lifespan if any
         original_lifespan = getattr(app.router, "lifespan_context", None)
@@ -254,6 +317,12 @@ def create_standalone_app(
     Returns:
         A new standalone FastAPI application instance
     """
+    # Load plugins BEFORE creating app (for deterministic ordering)
+    if enable_plugins:
+        try:
+            _load_plugins_before_routes()
+        except Exception as e:
+            logger.error(f"Failed to load plugins: {e}")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
