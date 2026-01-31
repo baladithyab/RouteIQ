@@ -38,10 +38,11 @@ permissions: {}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Docker/OCI requires lowercase image names
+  IMAGE_NAME: baladithyab/routeiq
   TEST_PORT: 4010
   # Registry cache references (per-arch for better cache isolation)
-  CACHE_REPO: ghcr.io/${{ github.repository }}
+  CACHE_REPO: ghcr.io/baladithyab/routeiq
 
 jobs:
   # =============================================================================
