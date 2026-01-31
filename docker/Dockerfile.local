@@ -56,11 +56,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml uv.lock /app/
 COPY src/ /app/src/
 
-# Install dependencies using uv sync --frozen
-# --frozen: Fail if lockfile is out of sync with pyproject.toml (ensures reproducibility)
-# All OTEL packages are included via the 'otel' extra in the lockfile
+# Install dependencies using uv pip install --system
+# --system: Install to system Python (not a venv) so packages are available at runtime
+# All OTEL packages are included via the 'otel' extra, callbacks extra includes backoff
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra db --extra otel
+    uv pip install --system -e ".[db,otel,callbacks]"
 
 # Note: Prisma client is generated at runtime in entrypoint.sh
 # This allows the container to work with different database configurations
