@@ -251,21 +251,59 @@ uv run pytest tests/unit/test_file.py --pdb
 uv run pytest tests/unit/test_file.py::test_function -v
 ```
 
-## WORKFLOW FOR CODE DEFENDER BLOCKS
+## PUSHING CHANGES (CODE DEFENDER / rr)
 
-If `git push` is blocked by Code Defender:
+Local `git push` may be blocked by Code Defender. When this happens, use the `rr`
+(Road Runner) tool to push from a remote machine with unrestricted access.
 
-1. **Preferred**: Request repo approval (one-time):
-   ```bash
-   git-defender --request-repo --url https://github.com/baladithyab/RouteIQ.git --reason 3
-   ```
+### Available rr Push Tasks
 
-2. **Alternative**: Use `rr` to push from a remote machine:
-   ```bash
-   rr push  # Syncs code and pushes from remote
-   ```
+| Task | Command | Description |
+|------|---------|-------------|
+| Normal push | `rr push` | Sync code and push to GitHub |
+| Force push | `rr push-force` | Sync code and force push (`--force-with-lease`) |
 
-See [`docs/rr-workflow.md`](docs/rr-workflow.md) for detailed `rr` setup.
+### Complete Workflow
+
+**1. Push via rr:**
+
+```bash
+# Normal push
+rr push
+
+# Or force push (use sparingly)
+rr push-force
+```
+
+**2. Sync local repo after rr push (REQUIRED):**
+
+After any rr-based push, your local repo is behind `origin/main`. You **must**
+sync your local repo:
+
+```bash
+# After normal push:
+git pull
+
+# After force push (requires clean working tree):
+git fetch origin
+git reset --hard origin/main
+```
+
+> ⚠️ **Force-push safety**: Before running `git reset --hard`, ensure your working
+> tree is clean (`git status`). Any uncommitted changes will be lost.
+
+### Request Repo Approval (Alternative)
+
+For a one-time permanent fix, request Code Defender approval:
+
+```bash
+git-defender --request-repo --url https://github.com/baladithyab/RouteIQ.git --reason 3
+```
+
+After approval, local `git push` will work normally.
+
+See [`.rr.yaml`](.rr.yaml) for all available tasks and
+[`docs/rr-workflow.md`](docs/rr-workflow.md) for detailed setup instructions.
 
 ## DOCUMENTATION
 
