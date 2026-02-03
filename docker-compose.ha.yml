@@ -16,6 +16,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-litellm}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm_password}
       POSTGRES_DB: ${POSTGRES_DB:-litellm}
+    ports:
+      - "5432:5432"  # Exposed for HA integration tests (leader election queries)
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -81,6 +83,10 @@ services:
       - LLMROUTER_MODELS_PATH=/app/models
       - LLMROUTER_HOT_RELOAD=true
       - LLMROUTER_RELOAD_INTERVAL=300
+      # HA Mode - Leader Election
+      - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
+      - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-30}
+      - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-10}
       # Gateway Features (A2A, MCP)
       - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
       - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
@@ -144,6 +150,10 @@ services:
       - LLMROUTER_MODELS_PATH=/app/models
       - LLMROUTER_HOT_RELOAD=true
       - LLMROUTER_RELOAD_INTERVAL=300
+      # HA Mode - Leader Election
+      - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
+      - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-30}
+      - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-10}
       # Gateway Features (A2A, MCP) - same as gateway-1 for HA consistency
       - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
       - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
