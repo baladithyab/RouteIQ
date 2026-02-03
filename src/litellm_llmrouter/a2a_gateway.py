@@ -21,6 +21,11 @@ Streaming Modes:
 - A2A_RAW_STREAMING_ENABLED=false (default): Line-buffered streaming using aiter_lines()
   for backward compatibility. This is the rollback-safe default.
 
+HTTP Client Pooling:
+- Uses shared HTTP client pool by default (HTTP_CLIENT_POOLING_ENABLED=true)
+- Falls back to per-request clients when pooling is disabled
+- See http_client_pool.py for configuration and lifecycle
+
 See: https://google.github.io/A2A/
 """
 
@@ -34,6 +39,9 @@ from typing import Any, AsyncIterator
 import httpx
 
 from litellm._logging import verbose_proxy_logger
+
+# Import shared HTTP client pool
+from .http_client_pool import get_client_for_request
 
 # Import SSRF protection utilities
 try:
@@ -363,7 +371,7 @@ class A2AGateway:
             headers = {"Content-Type": "application/json"}
             headers = inject_trace_headers(headers)
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with get_client_for_request(timeout=60.0) as client:
                 response = await client.post(
                     agent.url,
                     json=request.to_dict(),
@@ -533,7 +541,7 @@ class A2AGateway:
             headers = {"Content-Type": "application/json"}
             headers = inject_trace_headers(headers)
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with get_client_for_request(timeout=120.0) as client:
                 async with client.stream(
                     "POST",
                     agent.url,
@@ -681,7 +689,7 @@ class A2AGateway:
             headers = {"Content-Type": "application/json"}
             headers = inject_trace_headers(headers)
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with get_client_for_request(timeout=120.0) as client:
                 async with client.stream(
                     "POST",
                     agent.url,

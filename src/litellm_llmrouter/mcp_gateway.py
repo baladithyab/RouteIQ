@@ -17,6 +17,11 @@ Security Notes:
 - See url_security.py for details on blocked targets
 - Remote tool invocation is disabled by default (enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true)
 
+HTTP Client Pooling:
+- Uses shared HTTP client pool by default (HTTP_CLIENT_POOLING_ENABLED=true)
+- Falls back to per-request clients when pooling is disabled
+- See http_client_pool.py for configuration and lifecycle
+
 See: https://modelcontextprotocol.io/
 """
 
@@ -45,6 +50,8 @@ except ImportError:
         """No-op fallback when url_security module is not available."""
         return url
 
+# Import shared HTTP client pool
+from .http_client_pool import get_client_for_request
 
 # Redis for HA sync (optional)
 try:
@@ -718,11 +725,12 @@ class MCPGateway:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with get_client_for_request(timeout=timeout) as client:
                 response = await client.post(
                     invocation_url,
                     json=request_payload,
                     headers=headers,
+                    timeout=timeout,  # Override timeout for this specific request
                 )
 
                 # Check HTTP status

@@ -32,6 +32,11 @@ Protocol Proxy (feature-flagged):
 - /mcp/{server_id}/* → proxy to registered MCP server (SSE/streamable_http)
 - /mcp → built-in MCP protocol endpoint (namespaced route)
 
+HTTP Client Pooling:
+- Uses shared HTTP client pool by default (HTTP_CLIENT_POOLING_ENABLED=true)
+- Falls back to per-request clients when pooling is disabled
+- See http_client_pool.py for configuration and lifecycle
+
 All aliases delegate to existing handlers; no logic duplication.
 """
 
@@ -56,6 +61,7 @@ from .mcp_gateway import (
     get_mcp_gateway,
 )
 from .url_security import SSRFBlockedError, validate_outbound_url
+from .http_client_pool import get_client_for_request
 
 # Feature flags
 MCP_OAUTH_ENABLED = os.getenv("MCP_OAUTH_ENABLED", "false").lower() == "true"
@@ -960,7 +966,7 @@ if MCP_OAUTH_ENABLED:
 
         # Forward token request to upstream
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with get_client_for_request(timeout=30.0) as client:
                 form_data = {
                     "grant_type": grant_type,
                     "client_id": client_id,
