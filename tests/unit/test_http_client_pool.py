@@ -199,10 +199,10 @@ class TestHttpClientPoolingDisabled:
         reset_client_instantiation_count()
 
         # Store original value
-        original = os.environ.get("HTTP_CLIENT_POOLING_ENABLED")
+        original = os.environ.get("ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED")
 
         # Disable pooling
-        os.environ["HTTP_CLIENT_POOLING_ENABLED"] = "false"
+        os.environ["ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED"] = "false"
 
         # Need to reimport to pick up new env var
         import importlib
@@ -214,9 +214,9 @@ class TestHttpClientPoolingDisabled:
 
         # Restore
         if original is not None:
-            os.environ["HTTP_CLIENT_POOLING_ENABLED"] = original
+            os.environ["ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED"] = original
         else:
-            os.environ.pop("HTTP_CLIENT_POOLING_ENABLED", None)
+            os.environ.pop("ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED", None)
 
         # Reload again to restore
         importlib.reload(pool_module)
@@ -229,10 +229,10 @@ class TestHttpClientPoolingDisabled:
         from litellm_llmrouter.http_client_pool import (
             startup_http_client_pool,
             is_pool_initialized,
-            HTTP_CLIENT_POOLING_ENABLED,
+            ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED,
         )
 
-        assert not HTTP_CLIENT_POOLING_ENABLED
+        assert not ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED
 
         await startup_http_client_pool()
         assert not is_pool_initialized()
@@ -242,10 +242,10 @@ class TestHttpClientPoolingDisabled:
         """Verify get_http_client raises when pooling is disabled."""
         from litellm_llmrouter.http_client_pool import (
             get_http_client,
-            HTTP_CLIENT_POOLING_ENABLED,
+            ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED,
         )
 
-        assert not HTTP_CLIENT_POOLING_ENABLED
+        assert not ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED
 
         with pytest.raises(RuntimeError, match="pooling is disabled"):
             get_http_client()
@@ -256,10 +256,10 @@ class TestHttpClientPoolingDisabled:
         from litellm_llmrouter.http_client_pool import (
             get_client_for_request,
             get_client_instantiation_count,
-            HTTP_CLIENT_POOLING_ENABLED,
+            ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED,
         )
 
-        assert not HTTP_CLIENT_POOLING_ENABLED
+        assert not ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED
 
         # Each call should create a new client
         clients = []

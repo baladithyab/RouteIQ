@@ -9,7 +9,7 @@ proper connection pooling.
 Features:
 - Singleton AsyncClient with configurable limits
 - Proper lifecycle management (startup/shutdown hooks)
-- Feature flag for rollback safety (HTTP_CLIENT_POOLING_ENABLED)
+- Feature flag for rollback safety (ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED)
 - Instrumentation hooks for tracking instantiation counts
 
 Usage:
@@ -27,7 +27,7 @@ Lifecycle:
     await shutdown_http_client_pool()
 
 Rollback Safety:
-    Set HTTP_CLIENT_POOLING_ENABLED=false to disable pooling and
+    Set ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED to false to disable pooling and
     fall back to per-request client creation. Default is 'true'.
 
 See: https://www.python-httpx.org/advanced/clients/#client-instances
@@ -47,15 +47,15 @@ logger = logging.getLogger(__name__)
 # Feature Flag
 # =============================================================================
 
-# HTTP_CLIENT_POOLING_ENABLED: When true (default), uses shared pooled client.
+# ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED: When true (default), uses shared pooled client.
 # When false, falls back to per-request client creation for rollback safety.
 #
 # Rollback Safety: Default is True to enable pooling. Set to "false" to disable
 # and fall back to per-request clients if issues are detected.
 #
-# Toggle: Set environment variable HTTP_CLIENT_POOLING_ENABLED=false to disable.
-HTTP_CLIENT_POOLING_ENABLED = (
-    os.getenv("HTTP_CLIENT_POOLING_ENABLED", "true").lower() == "true"
+# Toggle: Set environment variable ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED=false to disable.
+ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED = (
+    os.getenv("ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED", "true").lower() == "true"
 )
 
 # =============================================================================
@@ -167,13 +167,13 @@ async def startup_http_client_pool() -> None:
     Should be called during application startup. Safe to call multiple times
     (idempotent).
 
-    This function is a no-op if HTTP_CLIENT_POOLING_ENABLED=false.
+    This function is a no-op if ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED=false.
     """
     global _http_client
 
-    if not HTTP_CLIENT_POOLING_ENABLED:
+    if not ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED:
         logger.info(
-            "HTTP client pool: pooling DISABLED (HTTP_CLIENT_POOLING_ENABLED=false)"
+            "HTTP client pool: pooling DISABLED (ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED=false)"
         )
         return
 
@@ -215,7 +215,7 @@ def get_http_client() -> httpx.AsyncClient:
     """
     Get the shared HTTP client for outbound requests.
 
-    Returns the pooled client if HTTP_CLIENT_POOLING_ENABLED=true and
+    Returns the pooled client if ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED=true and
     the pool has been initialized. Otherwise, raises RuntimeError.
 
     For fallback scenarios (pooling disabled or not initialized),
@@ -227,7 +227,7 @@ def get_http_client() -> httpx.AsyncClient:
     Raises:
         RuntimeError: If pooling is disabled or client not initialized.
     """
-    if not HTTP_CLIENT_POOLING_ENABLED:
+    if not ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED:
         raise RuntimeError(
             "HTTP client pooling is disabled. "
             "Use create_fallback_client() for per-request clients."
@@ -249,7 +249,7 @@ def is_pooling_enabled() -> bool:
     Returns:
         True if pooling is enabled and client is initialized.
     """
-    return HTTP_CLIENT_POOLING_ENABLED and _http_client is not None
+    return ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED and _http_client is not None
 
 
 def is_pool_initialized() -> bool:
@@ -270,7 +270,7 @@ async def create_fallback_client(
     """
     Create a per-request fallback client (for rollback safety).
 
-    Use this when HTTP_CLIENT_POOLING_ENABLED=false or when you need
+    Use this when ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED=false or when you need
     specific client configuration that differs from the pool defaults.
 
     This is the original behavior before pooling was introduced.
@@ -332,7 +332,7 @@ async def get_client_for_request(
             return
 
     # Fallback to per-request client
-    if HTTP_CLIENT_POOLING_ENABLED and not is_pool_initialized():
+    if ROUTEIQ_HTTP_CLIENT_POOLING_ENABLED and not is_pool_initialized():
         logger.warning(
             "HTTP client pool not initialized; falling back to per-request client. "
             "Ensure startup_http_client_pool() is called during app startup."
