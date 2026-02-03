@@ -1,22 +1,73 @@
 #!/usr/bin/env bash
 #
 # Gate 6: MCP Gateway End-to-End Validation
-# Black-box testing via curl against HA stack at http://localhost:8080
+# Black-box testing via curl against HA stack or local-test environment
 #
 # NOTE: LLMRouter MCP REST endpoints use /llmrouter/mcp/* prefix
 # to avoid conflicts with LiteLLM's native /mcp (JSON-RPC/SSE) endpoint.
 #
+# Environment Variables (all optional, with sensible defaults):
+#   LB_URL          - Load balancer or single gateway URL (default: http://localhost:8080 for HA, http://localhost:4010 for local-test)
+#   REPLICA1_URL    - First replica URL for HA mode (default: http://localhost:4000)
+#   REPLICA2_URL    - Second replica URL for HA mode (default: http://localhost:4001)
+#   MASTER_KEY      - Master API key for user-level auth (default: sk-master-key-change-me)
+#   ADMIN_API_KEY   - Admin API key for control-plane auth (default: uses MASTER_KEY)
+#   MCP_STUB_URL    - MCP stub server URL as seen by containers (default: http://mcp-stub-server:9100/mcp)
+#   MCP_STUB_LOCAL_URL - MCP stub server URL for local testing (default: http://localhost:9100/mcp)
+#   HA_MODE         - Set to "true" for HA testing (3 URLs), "false" for single-node (default: auto-detect)
+#
+# Usage Examples:
+#   # HA mode (default):
+#   ./scripts/validate_mcp_gateway_curl.sh
+#
+#   # Local-test mode (single node on port 4010):
+#   LB_URL=http://localhost:4010 MASTER_KEY=sk-test-master-key ADMIN_API_KEY=sk-test-admin-key HA_MODE=false ./scripts/validate_mcp_gateway_curl.sh
+#
+#   # Custom HA configuration:
+#   LB_URL=http://lb.example.com:8080 REPLICA1_URL=http://node1:4000 REPLICA2_URL=http://node2:4000 MASTER_KEY=sk-prod-key ./scripts/validate_mcp_gateway_curl.sh
+#
 
 set -euo pipefail
 
-# Configuration
-LB_URL="http://localhost:8080"
-REPLICA1_URL="http://localhost:4000"
-REPLICA2_URL="http://localhost:4001"
+# Configuration with environment variable overrides
+# Auto-detect HA_MODE based on whether REPLICA1_URL is set or LB_URL contains non-HA port
+_detect_ha_mode() {
+    if [[ -n "${HA_MODE:-}" ]]; then
+        [[ "${HA_MODE}" == "true" ]] && echo "true" || echo "false"
+    elif [[ -n "${REPLICA1_URL:-}" ]] || [[ -n "${REPLICA2_URL:-}" ]]; then
+        echo "true"
+    elif [[ "${LB_URL:-}" == *":4010"* ]]; then
+        echo "false"
+    else
+        echo "true"  # Default to HA mode
+    fi
+}
+
+HA_MODE=$(_detect_ha_mode)
+
+# URL defaults depend on mode
+if [[ "$HA_MODE" == "true" ]]; then
+    LB_URL="${LB_URL:-http://localhost:8080}"
+    REPLICA1_URL="${REPLICA1_URL:-http://localhost:4000}"
+    REPLICA2_URL="${REPLICA2_URL:-http://localhost:4001}"
+else
+    LB_URL="${LB_URL:-http://localhost:4010}"
+    REPLICA1_URL="${LB_URL}"  # In single-node mode, all URLs point to the same place
+    REPLICA2_URL="${LB_URL}"
+fi
+
+# Authentication keys
+MASTER_KEY="${MASTER_KEY:-sk-master-key-change-me}"
+ADMIN_API_KEY="${ADMIN_API_KEY:-${MASTER_KEY}}"
+
 # MCP stub server URL as seen by containers (service name in Docker network)
 STUB_CONTAINER_URL="${MCP_STUB_URL:-http://mcp-stub-server:9100/mcp}"
 STUB_LOCAL_URL="${MCP_STUB_LOCAL_URL:-http://localhost:9100/mcp}"
-AUTH_HEADER="Authorization: Bearer sk-master-key-change-me"
+
+# Auth headers - use Bearer token that also works as admin key
+AUTH_HEADER="Authorization: Bearer ${MASTER_KEY}"
+# X-Admin-API-Key header for explicit admin auth (preferred for control plane operations)
+ADMIN_HEADER="X-Admin-API-Key: ${ADMIN_API_KEY}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,6 +100,7 @@ log_warn() {
 }
 
 # Test helper that expects JSON response
+# For POST/DELETE methods, also sends X-Admin-API-Key header for control-plane auth
 test_json_endpoint() {
     local name="$1"
     local method="$2"
@@ -59,18 +111,22 @@ test_json_endpoint() {
     log_info "Testing: $name"
     echo "  curl -sS -X $method '$url'"
 
+    # Build common headers
+    local headers=(-H "$AUTH_HEADER" -H "Content-Type: application/json" -H "Accept: application/json")
+    
+    # Add admin header for mutating operations (POST, PUT, DELETE)
+    if [[ "$method" == "POST" || "$method" == "PUT" || "$method" == "DELETE" || "$method" == "PATCH" ]]; then
+        headers+=(-H "$ADMIN_HEADER")
+    fi
+
     if [ -n "$payload" ]; then
         response=$(curl -sS -w "\n%{http_code}" -X "$method" \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
+            "${headers[@]}" \
             -d "$payload" \
             "$url" 2>&1 || echo "CURL_ERROR")
     else
         response=$(curl -sS -w "\n%{http_code}" -X "$method" \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
+            "${headers[@]}" \
             "$url" 2>&1 || echo "CURL_ERROR")
     fi
 
@@ -80,9 +136,10 @@ test_json_endpoint() {
         return 1
     fi
 
-    # Extract status code (last line)
+    # Extract status code (last line) and body (all but last line)
+    # Using portable approach that works on both GNU and BSD (macOS)
     status_code=$(echo "$response" | tail -n 1)
-    body=$(echo "$response" | head -n -1)
+    body=$(echo "$response" | sed '$d')
 
     echo "  Status: $status_code"
     echo "  Body: $body"
@@ -101,9 +158,14 @@ main() {
     echo "=========================================="
     echo "  MCP Gateway E2E Validation (Gate 6)"
     echo "=========================================="
-    echo "Load Balancer: $LB_URL"
-    echo "Replica 1:     $REPLICA1_URL"
-    echo "Replica 2:     $REPLICA2_URL"
+    echo "Mode:          ${HA_MODE} (HA_MODE=${HA_MODE})"
+    echo "Gateway URL:   $LB_URL"
+    if [[ "$HA_MODE" == "true" ]]; then
+        echo "Replica 1:     $REPLICA1_URL"
+        echo "Replica 2:     $REPLICA2_URL"
+    fi
+    echo "Master Key:    ${MASTER_KEY:0:8}..."
+    echo "Admin Key:     ${ADMIN_API_KEY:0:8}..."
     echo "Stub (container): $STUB_CONTAINER_URL"
     echo "Stub (local):     $STUB_LOCAL_URL"
     echo ""
@@ -124,7 +186,7 @@ main() {
         "200" || true
 
     test_json_endpoint \
-        "GET /llmrouter/mcp/servers (LB)" \
+        "GET /llmrouter/mcp/servers (gateway)" \
         "GET" \
         "$LB_URL/llmrouter/mcp/servers" \
         "" \
@@ -135,12 +197,17 @@ main() {
     # ==========================================
     echo -e "\n${BLUE}=== 2. Verify Stub MCP Server ===${NC}\n"
 
-    test_json_endpoint \
-        "GET stub /mcp/tools (local)" \
-        "GET" \
-        "$STUB_LOCAL_URL/tools" \
-        "" \
-        "200" || true
+    # Note: This test is optional - stub server may not be running in local-test
+    if curl -sS --connect-timeout 2 "$STUB_LOCAL_URL/tools" > /dev/null 2>&1; then
+        test_json_endpoint \
+            "GET stub /mcp/tools (local)" \
+            "GET" \
+            "$STUB_LOCAL_URL/tools" \
+            "" \
+            "200" || true
+    else
+        log_warn "Stub MCP server not reachable at $STUB_LOCAL_URL - skipping stub tests"
+    fi
 
     # ==========================================
     # 3. Register Stub Server
@@ -168,20 +235,24 @@ main() {
     # Wait for propagation
     sleep 2
 
-    # Verify registration on replicas (via REST, not SSE)
-    test_json_endpoint \
-        "GET /llmrouter/mcp/servers (replica1)" \
-        "GET" \
-        "$REPLICA1_URL/llmrouter/mcp/servers" \
-        "" \
-        "200" || true
+    # Verify registration on replicas (HA mode only)
+    if [[ "$HA_MODE" == "true" ]]; then
+        test_json_endpoint \
+            "GET /llmrouter/mcp/servers (replica1)" \
+            "GET" \
+            "$REPLICA1_URL/llmrouter/mcp/servers" \
+            "" \
+            "200" || true
 
-    test_json_endpoint \
-        "GET /llmrouter/mcp/servers (replica2)" \
-        "GET" \
-        "$REPLICA2_URL/llmrouter/mcp/servers" \
-        "" \
-        "200" || true
+        test_json_endpoint \
+            "GET /llmrouter/mcp/servers (replica2)" \
+            "GET" \
+            "$REPLICA2_URL/llmrouter/mcp/servers" \
+            "" \
+            "200" || true
+    else
+        log_info "Skipping replica verification (single-node mode)"
+    fi
 
     # ==========================================
     # 4. Tools/Resources Aggregation
@@ -241,22 +312,33 @@ main() {
     # ==========================================
     echo -e "\n${BLUE}=== 6. HA Sync Verification ===${NC}\n"
 
-    log_info "Verifying server registered via LB is visible on both replicas..."
+    if [[ "$HA_MODE" == "true" ]]; then
+        log_info "Verifying server registered via LB is visible on both replicas..."
 
-    # Check that both replicas see the server
-    test_json_endpoint \
-        "GET /llmrouter/mcp/servers/stub-mcp-1 (replica1)" \
-        "GET" \
-        "$REPLICA1_URL/llmrouter/mcp/servers/stub-mcp-1" \
-        "" \
-        "200" || true
+        # Check that both replicas see the server
+        test_json_endpoint \
+            "GET /llmrouter/mcp/servers/stub-mcp-1 (replica1)" \
+            "GET" \
+            "$REPLICA1_URL/llmrouter/mcp/servers/stub-mcp-1" \
+            "" \
+            "200" || true
 
-    test_json_endpoint \
-        "GET /llmrouter/mcp/servers/stub-mcp-1 (replica2)" \
-        "GET" \
-        "$REPLICA2_URL/llmrouter/mcp/servers/stub-mcp-1" \
-        "" \
-        "200" || true
+        test_json_endpoint \
+            "GET /llmrouter/mcp/servers/stub-mcp-1 (replica2)" \
+            "GET" \
+            "$REPLICA2_URL/llmrouter/mcp/servers/stub-mcp-1" \
+            "" \
+            "200" || true
+    else
+        log_info "Skipping HA sync verification (single-node mode)"
+        # In single-node mode, just verify the server is registered on the gateway
+        test_json_endpoint \
+            "GET /llmrouter/mcp/servers/stub-mcp-1 (gateway)" \
+            "GET" \
+            "$LB_URL/llmrouter/mcp/servers/stub-mcp-1" \
+            "" \
+            "200" || true
+    fi
 
     # ==========================================
     # 7. Performance Sanity Check

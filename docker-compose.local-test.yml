@@ -186,6 +186,10 @@ services:
       # Core settings
       - LITELLM_CONFIG_PATH=/app/config/config.local-test.yaml
       - LITELLM_MASTER_KEY=sk-test-master-key
+      # Admin API key for control-plane authentication (MCP, A2A, hot-reload management)
+      # Using the same key as master for simplicity in local testing
+      - ADMIN_API_KEY=sk-test-admin-key
+      - ADMIN_API_KEYS=sk-test-admin-key,sk-test-master-key
       # Enable database for full feature testing
       - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
       - REDIS_HOST=redis
@@ -197,6 +201,7 @@ services:
       # Gateway Features - ALL ENABLED for testing
       - A2A_GATEWAY_ENABLED=true
       - MCP_GATEWAY_ENABLED=true
+      - LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true
       - STORE_MODEL_IN_DB=true
       # LLMRouter Settings
       - LLMROUTER_MODELS_PATH=/app/models
