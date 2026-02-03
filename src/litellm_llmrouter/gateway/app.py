@@ -12,7 +12,8 @@ Load Order:
 4. Load and register plugins (deterministically before routes)
 5. Register built-in routes
 6. Set up plugin lifecycle hooks
-7. Set up graceful shutdown hooks
+7. Set up HTTP client pool lifecycle hooks
+8. Set up graceful shutdown hooks
 
 Usage with LiteLLM proxy (in-process):
     from litellm_llmrouter.gateway import create_app
@@ -38,6 +39,10 @@ from ..resilience import (
     add_backpressure_middleware,
     get_drain_manager,
     graceful_shutdown,
+)
+from ..http_client_pool import (
+    startup_http_client_pool,
+    shutdown_http_client_pool,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,6 +195,26 @@ async def _run_plugin_shutdown(app: FastAPI) -> None:
     await manager.shutdown(app)
 
 
+async def _startup_http_client_pool() -> None:
+    """
+    Initialize the shared HTTP client pool.
+
+    This is called during application startup to create the shared
+    httpx.AsyncClient for outbound requests.
+    """
+    await startup_http_client_pool()
+
+
+async def _shutdown_http_client_pool() -> None:
+    """
+    Shutdown the shared HTTP client pool.
+
+    This is called during application shutdown to properly close
+    all connections and cleanup resources.
+    """
+    await shutdown_http_client_pool()
+
+
 def _load_plugins_before_routes() -> int:
     """
     Load plugins synchronously before routes are registered.
@@ -241,7 +266,8 @@ def create_app(
     4. Loads plugins (discovery + validation, before routes)
     5. Registers LLMRouter routes (health, llmrouter, admin)
     6. Sets up plugin lifecycle hooks (startup runs later)
-    7. Adds backpressure middleware and drain manager (if enabled)
+    7. Sets up HTTP client pool lifecycle hooks
+    8. Adds backpressure middleware and drain manager (if enabled)
 
     This is the preferred method for in-process LiteLLM proxy usage.
 
@@ -303,7 +329,16 @@ def create_app(
         app.state.llmrouter_plugin_startup = lambda: _run_plugin_startup(app)
         app.state.llmrouter_plugin_shutdown = lambda: _run_plugin_shutdown(app)
 
-    # Step 7: Add backpressure middleware (wraps ASGI app)
+    # Step 7: Set up HTTP client pool lifecycle hooks
+    # These are called explicitly by startup.py for proper ordering
+    def http_pool_setup(app: FastAPI) -> None:
+        app.state.llmrouter_http_pool_startup = _startup_http_client_pool
+        app.state.llmrouter_http_pool_shutdown = _shutdown_http_client_pool
+        logger.debug("HTTP client pool lifecycle hooks attached")
+
+    app.state.http_pool_setup = http_pool_setup
+
+    # Step 8: Add backpressure middleware (wraps ASGI app)
     if enable_resilience:
         add_backpressure_middleware(app)
         # Store graceful shutdown function for external use
@@ -351,6 +386,9 @@ def create_standalone_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         """Lifespan context manager for standalone app."""
+        # Initialize HTTP client pool
+        await _startup_http_client_pool()
+        
         if enable_plugins:
             await _run_plugin_startup(app)
         try:
@@ -363,6 +401,8 @@ def create_standalone_app(
                 await drain_manager.wait_for_drain()
             if enable_plugins:
                 await _run_plugin_shutdown(app)
+            # Shutdown HTTP client pool
+            await _shutdown_http_client_pool()
 
     app = FastAPI(
         title=title,

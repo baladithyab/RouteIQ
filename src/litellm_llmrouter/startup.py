@@ -218,6 +218,17 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         # No event loop in current thread
         asyncio.run(init_litellm())
 
+    # Initialize HTTP client pool BEFORE plugins (they may use it)
+    async def run_http_pool_startup():
+        if hasattr(app.state, "llmrouter_http_pool_startup"):
+            await app.state.llmrouter_http_pool_startup()
+            print("✅ HTTP client pool initialized")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(run_http_pool_startup())
+    except RuntimeError:
+        asyncio.run(run_http_pool_startup())
+
     # Initialize A2A tracing AFTER LiteLLM initialization
     init_a2a_tracing_if_enabled(app)
 
