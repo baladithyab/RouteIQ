@@ -18,11 +18,11 @@ Usage:
     GATEWAY_URL=http://localhost:8080 uv run python scripts/validate_mcp_sse.py
 
     # With authentication:
-    GATEWAY_URL=http://localhost:4010 API_KEY=sk-test-master-key uv run python scripts/validate_mcp_sse.py
+    GATEWAY_URL=http://localhost:4010 API_KEY=local-dev-master-key uv run python scripts/validate_mcp_sse.py
 
 Environment Variables:
     GATEWAY_URL     - Gateway URL (default: http://localhost:4010)
-    API_KEY         - API key for authentication (default: sk-test-master-key)
+    API_KEY         - API key for authentication (default: local-dev-master-key)
     SSE_TIMEOUT     - Timeout for SSE connection in seconds (default: 10)
     VERBOSE         - Set to "true" for detailed output
 
@@ -43,7 +43,7 @@ import httpx
 
 # Configuration
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:4010")
-API_KEY = os.getenv("API_KEY", "sk-test-master-key")
+API_KEY = os.getenv("API_KEY", "local-dev-master-key")
 SSE_TIMEOUT = float(os.getenv("SSE_TIMEOUT", "10"))
 VERBOSE = os.getenv("VERBOSE", "false").lower() == "true"
 

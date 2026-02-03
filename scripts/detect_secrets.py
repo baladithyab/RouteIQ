@@ -75,17 +75,17 @@ ALLOWLISTED_SECRETS = {
     # Test bearer tokens
     "Bearer test_token_12345",
     "Bearer token-please-use-me",
-    "Bearer sk-invalid-key-12345",  # Used in e2e tests
-    "Bearer sk-invalid-user-key-12345",  # Used in integration tests
+    "Bearer invalid-key-12345",  # Used in e2e tests
+    "Bearer invalid-user-key-12345",  # Used in integration tests
     "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",  # Example JWT header (test value)
     "test_token_12345",
     "token-please-use-me",
-    "sk-invalid-key-12345",
-    "sk-invalid-user-key-12345",
+    "invalid-key-12345",
+    "invalid-user-key-12345",
     # Example API keys (obviously fake patterns)
     "AKIAIOSFODNN7EXAMPLE",  # AWS example key
-    "sk-test-fake-key-12345",
-    "sk-proj-fake-key-for-testing",
+    "test-fake-key-12345",
+    "proj-fake-key-for-testing",
 }
 
 # File patterns to ignore

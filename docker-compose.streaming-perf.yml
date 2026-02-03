@@ -64,9 +64,9 @@ services:
     environment:
       # Core settings - minimal config for streaming test
       - LITELLM_CONFIG_PATH=/app/config/config.streaming-perf.yaml
-      - LITELLM_MASTER_KEY=sk-streaming-perf-key
-      - ADMIN_API_KEY=sk-streaming-perf-admin
-      - ADMIN_API_KEYS=sk-streaming-perf-admin
+      - LITELLM_MASTER_KEY=local-dev-streaming-perf-key
+      - ADMIN_API_KEY=local-dev-streaming-perf-admin
+      - ADMIN_API_KEYS=local-dev-streaming-perf-admin
       # Enable A2A and raw streaming
       - A2A_GATEWAY_ENABLED=true
       - A2A_RAW_STREAMING_ENABLED=true
@@ -78,7 +78,7 @@ services:
       - LLMROUTER_HOT_RELOAD=false
     command: ["--config", "/app/config/config.streaming-perf.yaml", "--port", "4000"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer sk-streaming-perf-key", "http://localhost:4000/health"]
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer local-dev-streaming-perf-key", "http://localhost:4000/health"]
       interval: 5s
       timeout: 5s
       retries: 10

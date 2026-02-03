@@ -31,7 +31,7 @@ import requests
 LB_URL = "http://localhost:8080"
 REPLICA_1_URL = "http://localhost:4000"
 REPLICA_2_URL = "http://localhost:4001"
-MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-master-key-change-me")
+MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "local-dev-master-key")
 
 
 @dataclass
@@ -114,7 +114,7 @@ class SecurityTester:
         try:
             response = requests.get(
                 f"{self.lb_url}/key/info",
-                headers={"Authorization": "Bearer sk-invalid-key-12345"},
+                headers={"Authorization": "Bearer invalid-key-12345"},
                 timeout=10,
             )
             if response.status_code in [401, 403]:

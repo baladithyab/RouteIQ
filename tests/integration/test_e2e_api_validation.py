@@ -15,7 +15,7 @@ Usage:
     
 Environment Variables:
     GATEWAY_URL: Gateway base URL (default: http://localhost:4010)
-    ADMIN_KEY: Admin API key (default: sk-test-master-key)
+    ADMIN_KEY: Admin API key (default: local-dev-master-key)
 """
 
 import os
@@ -26,7 +26,7 @@ import time
 
 # Configuration
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:4010")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "sk-test-master-key")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "local-dev-master-key")
 REQUEST_TIMEOUT = 5  # seconds
 
 
@@ -41,7 +41,7 @@ class TestAuthZBoundary:
     @pytest.fixture
     def invalid_headers(self) -> Dict[str, str]:
         """Invalid API key headers (should be rejected)."""
-        return {"Authorization": "Bearer sk-invalid-user-key-12345"}
+        return {"Authorization": "Bearer invalid-user-key-12345"}
 
     def test_router_reload_with_invalid_key(self, invalid_headers):
         """

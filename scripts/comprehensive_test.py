@@ -29,7 +29,8 @@ import httpx
 
 # Configuration
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4010")
-LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "sk-test-master-key")
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "local-dev-master-key")
+MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "local-dev-master-key")
 JAEGER_URL = os.getenv("JAEGER_URL", "http://localhost:16686")
 MLFLOW_URL = os.getenv("MLFLOW_URL", "http://localhost:5050")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")

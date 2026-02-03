@@ -185,11 +185,11 @@ services:
     environment:
       # Core settings
       - LITELLM_CONFIG_PATH=/app/config/config.local-test.yaml
-      - LITELLM_MASTER_KEY=sk-test-master-key
+      - LITELLM_MASTER_KEY=local-dev-master-key
       # Admin API key for control-plane authentication (MCP, A2A, hot-reload management)
       # Using the same key as master for simplicity in local testing
-      - ADMIN_API_KEY=sk-test-admin-key
-      - ADMIN_API_KEYS=sk-test-admin-key,sk-test-master-key
+      - ADMIN_API_KEY=local-dev-admin-key
+      - ADMIN_API_KEYS=local-dev-admin-key,local-dev-master-key
       # Enable database for full feature testing
       - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
       # Run database migrations on startup (safe for single-node local testing)
@@ -230,7 +230,7 @@ services:
       - "host.docker.internal:host-gateway"
     command: ["--config", "/app/config/config.local-test.yaml", "--port", "4000"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer sk-test-master-key", "http://localhost:4000/health"]
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer local-dev-master-key", "http://localhost:4000/health"]
       interval: 10s
       timeout: 5s
       retries: 5

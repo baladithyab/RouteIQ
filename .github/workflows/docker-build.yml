@@ -195,7 +195,7 @@ jobs:
                 api_base: http://localhost:8080
 
           general_settings:
-            master_key: sk-test-ci-key
+            master_key: local-dev-ci-key
 
           litellm_settings:
             drop_params: true
@@ -229,7 +229,7 @@ jobs:
 
           echo ""
           echo "=== Models Endpoint ==="
-          curl -s -H "Authorization: Bearer sk-test-ci-key" \
+          curl -s -H "Authorization: Bearer local-dev-ci-key" \
             http://localhost:${{ env.TEST_PORT }}/v1/models | jq . || true
 
           echo ""

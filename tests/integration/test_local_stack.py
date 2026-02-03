@@ -19,7 +19,7 @@ import requests
 
 # Test configuration
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:4010")
-MASTER_KEY = os.getenv("MASTER_KEY", "sk-test-master-key")
+MASTER_KEY = os.getenv("MASTER_KEY", "local-dev-master-key")
 JAEGER_URL = os.getenv("JAEGER_URL", "http://localhost:16686")
 MLFLOW_URL = os.getenv("MLFLOW_URL", "http://localhost:5050")
 MINIO_URL = os.getenv("MINIO_URL", "http://localhost:9000")

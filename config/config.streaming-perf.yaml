@@ -6,7 +6,7 @@
 # =============================================================================
 
 general_settings:
-  master_key: "sk-streaming-perf-key"
+  master_key: "local-dev-streaming-perf-key"
   alerting: []
   enable_telemetry: false
 

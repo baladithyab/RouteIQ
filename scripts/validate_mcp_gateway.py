@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 DEFAULT_LB_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:8080")
-DEFAULT_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-master-key-change-me")
+DEFAULT_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "local-dev-master-key")
 DEFAULT_REPLICA_URLS = ["http://localhost:4000", "http://localhost:4001"]
 # MCP stub server URL as seen by containers (service name in Docker network)
 DEFAULT_STUB_URL = os.getenv("MCP_STUB_URL", "http://mcp-stub-server:9100/mcp")

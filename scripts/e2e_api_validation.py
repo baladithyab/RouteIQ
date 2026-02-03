@@ -10,7 +10,7 @@ Usage:
     
 Environment Variables:
     GATEWAY_URL: Gateway base URL (default: http://localhost:4010)
-    ADMIN_KEY: Admin API key (default: sk-test-master-key)
+    ADMIN_KEY: Admin API key (default: local-dev-master-key)
 """
 
 import os
@@ -97,7 +97,7 @@ class E2EValidator:
         try:
             response = requests.post(
                 f"{self.gateway_url}/router/reload",
-                headers={"Authorization": "Bearer sk-invalid-key-12345"},
+                headers={"Authorization": "Bearer invalid-key-12345"},
                 timeout=self.timeout
             )
             passed = response.status_code in [401, 403]
@@ -378,7 +378,7 @@ class E2EValidator:
 def main():
     """Main entry point."""
     gateway_url = os.getenv("GATEWAY_URL", "http://localhost:4010")
-    admin_key = os.getenv("ADMIN_KEY", "sk-test-master-key")
+    admin_key = os.getenv("ADMIN_KEY", "local-dev-master-key")
     
     validator = E2EValidator(gateway_url, admin_key)
     

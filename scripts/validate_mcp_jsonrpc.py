@@ -19,12 +19,13 @@ Usage:
     GATEWAY_URL=http://localhost:8080 python scripts/validate_mcp_jsonrpc.py
 
     # With authentication:
-    GATEWAY_URL=http://localhost:4010 API_KEY=sk-test-master-key python scripts/validate_mcp_jsonrpc.py
+    GATEWAY_URL=http://localhost:4010 API_KEY=local-dev-master-key \\
+    LITELLM_MASTER_KEY=local-dev-master-key python scripts/validate_mcp_jsonrpc.py
 
 Environment Variables:
     GATEWAY_URL     - Gateway URL (default: http://localhost:4010)
-    API_KEY         - API key for authentication (default: sk-test-master-key)
-    ADMIN_API_KEY   - Admin API key for tool invocation (default: uses API_KEY)
+    API_KEY         - API key for authentication (default: local-dev-master-key)
+    LITELLM_MASTER_KEY    - Admin API key for tool invocation (default: local-dev-master-key)
     STUB_SERVER_ID  - Server ID for stub server (default: stub-mcp-1)
     STUB_URL        - Stub server URL as seen by gateway (default: http://mcp-stub-server:9100/mcp)
     VERBOSE         - Set to "true" for detailed output
@@ -44,7 +45,8 @@ import httpx
 
 # Configuration
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:4010")
-API_KEY = os.getenv("API_KEY", "sk-test-master-key")
+API_KEY = os.getenv("API_KEY", "local-dev-master-key")
+MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "local-dev-master-key")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", API_KEY)
 STUB_SERVER_ID = os.getenv("STUB_SERVER_ID", "stub-mcp-1")
 STUB_URL = os.getenv("STUB_URL", "http://mcp-stub-server:9100/mcp")

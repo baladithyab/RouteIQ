@@ -63,7 +63,7 @@ TOTAL_STREAM_DURATION_MS = MARKER_COUNT * INTERVAL_MS  # Expected ~2000ms for 20
 # URLs for compose services
 STUB_URL = "http://localhost:9200"
 GATEWAY_URL = "http://localhost:4020"
-MASTER_KEY = "sk-streaming-perf-key"
+MASTER_KEY = "local-dev-streaming-perf-key"
 
 # Compose file path
 COMPOSE_FILE = "docker-compose.streaming-perf.yml"

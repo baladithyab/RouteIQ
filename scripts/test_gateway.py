@@ -10,7 +10,7 @@ from typing import Any
 import requests
 
 BASE_URL = "http://localhost:4000"
-MASTER_KEY = "sk-test-master-key"
+MASTER_KEY = "local-dev-master-key"
 
 
 def request(

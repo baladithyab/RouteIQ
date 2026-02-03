@@ -39,7 +39,7 @@ from sentence_transformers import SentenceTransformer
 # Configuration
 # =============================================================================
 LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4010")
-LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "sk-test-master-key")
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "local-dev-master-key")
 JAEGER_URL = os.getenv("JAEGER_URL", "http://localhost:16686")
 MLFLOW_URL = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5050")
 MINIO_URL = os.getenv("MINIO_URL", "http://localhost:9000")

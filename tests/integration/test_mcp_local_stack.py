@@ -16,8 +16,8 @@ Usage:
 
 Environment Variables:
     GATEWAY_URL: Override gateway URL (default: http://localhost:4010)
-    MASTER_KEY: Override master key (default: sk-test-master-key)
-    ADMIN_API_KEY: Override admin key (default: sk-test-admin-key)
+    MASTER_KEY: Override master key (default: local-dev-master-key)
+    ADMIN_API_KEY: Override admin key (default: local-dev-admin-key)
     MCP_STUB_URL: Override MCP stub server URL (default: http://localhost:9100)
     MCP_DOCKER_STARTUP_TIMEOUT: Override startup timeout in seconds (default: 120)
     MCP_SKIP_DOCKER_LIFECYCLE: Set to "true" to skip docker compose up/down
@@ -46,8 +46,8 @@ if TYPE_CHECKING:
 
 # Gateway configuration
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:4010")
-MASTER_KEY = os.getenv("MASTER_KEY", "sk-test-master-key")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "sk-test-admin-key")
+MASTER_KEY = os.getenv("MASTER_KEY", "local-dev-master-key")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "local-dev-admin-key")
 
 # MCP stub server configuration (the container URL for gateway to reach it)
 MCP_STUB_CONTAINER_URL = os.getenv(
