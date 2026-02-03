@@ -1,6 +1,6 @@
 """
-Resilience Primitives: Backpressure and Drain Mode
-====================================================
+Resilience Primitives: Backpressure, Drain Mode, and Circuit Breakers
+======================================================================
 
 This module provides gateway-level resilience primitives for the LLMRouter gateway:
 
@@ -15,30 +15,63 @@ This module provides gateway-level resilience primitives for the LLMRouter gatew
    - Exposes draining flag for readiness checks
    - Waits for in-flight requests during shutdown
 
+3. **CircuitBreaker**: Implements the circuit breaker pattern for external dependencies
+   - States: CLOSED (normal), OPEN (failing fast), HALF_OPEN (testing recovery)
+   - Tracks failure rate and opens circuit when threshold exceeded
+   - Automatic recovery testing after timeout
+
+4. **CircuitBreakerManager**: Manages circuit breakers for DB, Redis, etc.
+   - Provides named breakers for different services
+   - Exposes degraded mode status for health checks
+   - Supports graceful degradation (cached reads when writes fail)
+
 Configuration via environment variables (disabled by default for non-breaking behavior):
 - ROUTEIQ_MAX_CONCURRENT_REQUESTS: Max concurrent requests (0 = disabled)
 - ROUTEIQ_DRAIN_TIMEOUT_SECONDS: Max time to wait for drain (default: 30)
+- ROUTEIQ_CB_FAILURE_THRESHOLD: Failures before circuit opens (default: 5)
+- ROUTEIQ_CB_SUCCESS_THRESHOLD: Successes before circuit closes (default: 2)
+- ROUTEIQ_CB_TIMEOUT_SECONDS: Time before half-open test (default: 30)
+- ROUTEIQ_CB_WINDOW_SECONDS: Failure tracking window (default: 60)
 
 Usage:
     from litellm_llmrouter.resilience import (
         BackpressureMiddleware,
         DrainManager,
         get_drain_manager,
+        CircuitBreaker,
+        CircuitBreakerManager,
+        get_circuit_breaker_manager,
+        CircuitBreakerOpenError,
     )
 
     # In app factory:
     drain_manager = get_drain_manager()
     drain_manager.attach(app)
 
+    # Circuit breaker for database calls:
+    cb_manager = get_circuit_breaker_manager()
+    try:
+        async with cb_manager.get_breaker("database").execute():
+            await db.execute("SELECT 1")
+    except CircuitBreakerOpenError:
+        # Fail fast - use cached data or return error
+        pass
+
     # Middleware is added by calling add_backpressure_middleware(app)
     # It wraps the ASGI app to track concurrency
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
+import time
+from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import Any, AsyncIterator, Callable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -54,6 +87,12 @@ DEFAULT_EXCLUDED_PATHS = frozenset({
     "/health/readiness",
     "/health",
 })
+
+# Circuit Breaker defaults
+DEFAULT_CB_FAILURE_THRESHOLD = 5  # Number of failures before circuit opens
+DEFAULT_CB_SUCCESS_THRESHOLD = 2  # Number of successes in half-open before closing
+DEFAULT_CB_TIMEOUT_SECONDS = 30.0  # Time before attempting recovery (half-open)
+DEFAULT_CB_WINDOW_SECONDS = 60.0  # Sliding window for failure tracking
 
 
 @dataclass
@@ -485,3 +524,458 @@ async def graceful_shutdown(app: Any, timeout: float | None = None) -> bool:
 
     await drain_manager.start_drain()
     return await drain_manager.wait_for_drain()
+
+
+# =============================================================================
+# Circuit Breaker Implementation
+# =============================================================================
+
+
+class CircuitBreakerState(Enum):
+    """Circuit breaker states."""
+
+    CLOSED = "closed"  # Normal operation - requests pass through
+    OPEN = "open"  # Failing fast - all requests immediately fail
+    HALF_OPEN = "half_open"  # Testing recovery - limited requests pass through
+
+
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open and request is rejected."""
+
+    def __init__(self, breaker_name: str, time_until_retry: float):
+        self.breaker_name = breaker_name
+        self.time_until_retry = time_until_retry
+        super().__init__(
+            f"Circuit breaker '{breaker_name}' is open. "
+            f"Retry in {time_until_retry:.1f}s"
+        )
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for a circuit breaker."""
+
+    failure_threshold: int = DEFAULT_CB_FAILURE_THRESHOLD
+    success_threshold: int = DEFAULT_CB_SUCCESS_THRESHOLD
+    timeout_seconds: float = DEFAULT_CB_TIMEOUT_SECONDS
+    window_seconds: float = DEFAULT_CB_WINDOW_SECONDS
+
+    @classmethod
+    def from_env(cls, prefix: str = "") -> "CircuitBreakerConfig":
+        """Load configuration from environment variables."""
+        env_prefix = f"ROUTEIQ_CB_{prefix.upper()}_" if prefix else "ROUTEIQ_CB_"
+
+        def get_int(key: str, default: int) -> int:
+            try:
+                return int(os.getenv(f"{env_prefix}{key}", os.getenv(f"ROUTEIQ_CB_{key}", str(default))))
+            except ValueError:
+                return default
+
+        def get_float(key: str, default: float) -> float:
+            try:
+                return float(os.getenv(f"{env_prefix}{key}", os.getenv(f"ROUTEIQ_CB_{key}", str(default))))
+            except ValueError:
+                return default
+
+        return cls(
+            failure_threshold=get_int("FAILURE_THRESHOLD", DEFAULT_CB_FAILURE_THRESHOLD),
+            success_threshold=get_int("SUCCESS_THRESHOLD", DEFAULT_CB_SUCCESS_THRESHOLD),
+            timeout_seconds=get_float("TIMEOUT_SECONDS", DEFAULT_CB_TIMEOUT_SECONDS),
+            window_seconds=get_float("WINDOW_SECONDS", DEFAULT_CB_WINDOW_SECONDS),
+        )
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker for protecting external service calls.
+
+    States:
+    - CLOSED: Normal operation. Failures are tracked in a sliding window.
+              When failure_threshold is reached, transitions to OPEN.
+    - OPEN: All calls immediately fail with CircuitBreakerOpenError.
+            After timeout_seconds, transitions to HALF_OPEN.
+    - HALF_OPEN: A limited number of calls are allowed through.
+                 If success_threshold is reached, transitions to CLOSED.
+                 If any call fails, transitions back to OPEN.
+
+    Usage:
+        breaker = CircuitBreaker("database")
+
+        try:
+            async with breaker.execute():
+                await db.execute("SELECT 1")
+        except CircuitBreakerOpenError:
+            # Handle fast failure
+            pass
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: CircuitBreakerConfig | None = None,
+    ):
+        self.name = name
+        self._config = config or CircuitBreakerConfig.from_env(name)
+        self._state = CircuitBreakerState.CLOSED
+        self._failures: deque[float] = deque()  # Timestamps of failures
+        self._success_count = 0  # Successes in half-open state
+        self._opened_at: float | None = None  # When circuit opened
+        self._lock = asyncio.Lock()
+        self._last_failure_error: str | None = None
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        """Get current circuit state (checking for timeout transition)."""
+        if self._state == CircuitBreakerState.OPEN:
+            # Check if timeout has passed -> transition to half-open
+            if self._opened_at and time.monotonic() - self._opened_at >= self._config.timeout_seconds:
+                return CircuitBreakerState.HALF_OPEN
+        return self._state
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is open (failing fast)."""
+        return self.state == CircuitBreakerState.OPEN
+
+    @property
+    def is_closed(self) -> bool:
+        """Check if circuit is closed (normal operation)."""
+        return self.state == CircuitBreakerState.CLOSED
+
+    @property
+    def is_half_open(self) -> bool:
+        """Check if circuit is half-open (testing recovery)."""
+        return self.state == CircuitBreakerState.HALF_OPEN
+
+    @property
+    def time_until_retry(self) -> float:
+        """Seconds until retry is allowed (0 if not open)."""
+        if self._state != CircuitBreakerState.OPEN or not self._opened_at:
+            return 0.0
+        elapsed = time.monotonic() - self._opened_at
+        remaining = self._config.timeout_seconds - elapsed
+        return max(0.0, remaining)
+
+    @property
+    def failure_count(self) -> int:
+        """Current failure count in sliding window."""
+        self._cleanup_old_failures()
+        return len(self._failures)
+
+    @property
+    def last_failure_error(self) -> str | None:
+        """Last error message that caused a failure."""
+        return self._last_failure_error
+
+    def _cleanup_old_failures(self) -> None:
+        """Remove failures outside the sliding window."""
+        cutoff = time.monotonic() - self._config.window_seconds
+        while self._failures and self._failures[0] < cutoff:
+            self._failures.popleft()
+
+    async def _transition_to(self, new_state: CircuitBreakerState) -> None:
+        """Transition to a new state."""
+        old_state = self._state
+        self._state = new_state
+
+        if new_state == CircuitBreakerState.OPEN:
+            self._opened_at = time.monotonic()
+            self._success_count = 0
+            logger.warning(
+                f"Circuit breaker '{self.name}' OPENED after {self.failure_count} failures. "
+                f"Will retry in {self._config.timeout_seconds}s"
+            )
+        elif new_state == CircuitBreakerState.HALF_OPEN:
+            self._success_count = 0
+            logger.info(
+                f"Circuit breaker '{self.name}' now HALF_OPEN, testing recovery"
+            )
+        elif new_state == CircuitBreakerState.CLOSED:
+            self._failures.clear()
+            self._opened_at = None
+            self._success_count = 0
+            self._last_failure_error = None
+            if old_state != CircuitBreakerState.CLOSED:
+                logger.info(f"Circuit breaker '{self.name}' CLOSED, service recovered")
+
+    async def record_success(self) -> None:
+        """Record a successful call."""
+        async with self._lock:
+            current_state = self.state  # Triggers timeout check
+
+            if current_state == CircuitBreakerState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self._config.success_threshold:
+                    await self._transition_to(CircuitBreakerState.CLOSED)
+            # In CLOSED state, successes are not specifically tracked
+
+    async def record_failure(self, error: str | None = None) -> None:
+        """Record a failed call."""
+        async with self._lock:
+            self._last_failure_error = error
+            current_state = self.state  # Triggers timeout check
+
+            if current_state == CircuitBreakerState.HALF_OPEN:
+                # Any failure in half-open immediately opens the circuit
+                await self._transition_to(CircuitBreakerState.OPEN)
+            elif current_state == CircuitBreakerState.CLOSED:
+                # Track failure in sliding window
+                self._cleanup_old_failures()
+                self._failures.append(time.monotonic())
+
+                if len(self._failures) >= self._config.failure_threshold:
+                    await self._transition_to(CircuitBreakerState.OPEN)
+
+    async def allow_request(self) -> bool:
+        """
+        Check if a request should be allowed.
+
+        Returns:
+            True if request can proceed, False if circuit is open
+        """
+        async with self._lock:
+            current_state = self.state
+
+            if current_state == CircuitBreakerState.CLOSED:
+                return True
+            elif current_state == CircuitBreakerState.HALF_OPEN:
+                # In half-open, allow limited requests
+                return True
+            else:  # OPEN
+                return False
+
+    @asynccontextmanager
+    async def execute(self) -> AsyncIterator[None]:
+        """
+        Context manager for executing code with circuit breaker protection.
+
+        Raises:
+            CircuitBreakerOpenError: If circuit is open
+        """
+        async with self._lock:
+            current_state = self.state
+
+            if current_state == CircuitBreakerState.OPEN:
+                raise CircuitBreakerOpenError(self.name, self.time_until_retry)
+
+            # Transition to half-open if timeout passed (handled by state property)
+            if self._state == CircuitBreakerState.OPEN and current_state == CircuitBreakerState.HALF_OPEN:
+                await self._transition_to(CircuitBreakerState.HALF_OPEN)
+
+        try:
+            yield
+            await self.record_success()
+        except CircuitBreakerOpenError:
+            # Re-raise circuit breaker errors without recording as failure
+            raise
+        except Exception as e:
+            await self.record_failure(str(e))
+            raise
+
+    async def force_open(self) -> None:
+        """Manually open the circuit (for testing or manual intervention)."""
+        async with self._lock:
+            await self._transition_to(CircuitBreakerState.OPEN)
+
+    async def force_closed(self) -> None:
+        """Manually close the circuit (for testing or manual intervention)."""
+        async with self._lock:
+            await self._transition_to(CircuitBreakerState.CLOSED)
+
+    async def reset(self) -> None:
+        """Reset the circuit breaker to initial state."""
+        async with self._lock:
+            self._state = CircuitBreakerState.CLOSED
+            self._failures.clear()
+            self._success_count = 0
+            self._opened_at = None
+            self._last_failure_error = None
+
+    def get_status(self) -> dict[str, Any]:
+        """Get current circuit breaker status."""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "success_count": self._success_count,
+            "time_until_retry": round(self.time_until_retry, 1),
+            "last_failure_error": self._last_failure_error,
+            "config": {
+                "failure_threshold": self._config.failure_threshold,
+                "success_threshold": self._config.success_threshold,
+                "timeout_seconds": self._config.timeout_seconds,
+                "window_seconds": self._config.window_seconds,
+            },
+        }
+
+
+# =============================================================================
+# Circuit Breaker Manager and Degraded Mode
+# =============================================================================
+
+
+@dataclass
+class DegradedComponent:
+    """Information about a degraded component."""
+
+    name: str
+    is_degraded: bool
+    reason: str | None = None
+    since: float | None = None  # Timestamp when degradation started
+
+
+class CircuitBreakerManager:
+    """
+    Manages circuit breakers for multiple services and tracks degraded mode.
+
+    Provides named circuit breakers for:
+    - database: PostgreSQL connections
+    - redis: Redis cache connections
+    - leader_election: Leader election operations
+
+    Exposes aggregated degraded mode status for health checks.
+    """
+
+    # Standard breaker names
+    DATABASE = "database"
+    REDIS = "redis"
+    LEADER_ELECTION = "leader_election"
+
+    def __init__(self):
+        self._breakers: dict[str, CircuitBreaker] = {}
+        self._lock = asyncio.Lock()
+
+    def get_breaker(self, name: str) -> CircuitBreaker:
+        """
+        Get or create a circuit breaker by name.
+
+        Args:
+            name: Name of the circuit breaker (e.g., "database", "redis")
+
+        Returns:
+            CircuitBreaker instance
+        """
+        if name not in self._breakers:
+            self._breakers[name] = CircuitBreaker(
+                name=name,
+                config=CircuitBreakerConfig.from_env(name),
+            )
+        return self._breakers[name]
+
+    @property
+    def database(self) -> CircuitBreaker:
+        """Get the database circuit breaker."""
+        return self.get_breaker(self.DATABASE)
+
+    @property
+    def redis(self) -> CircuitBreaker:
+        """Get the Redis circuit breaker."""
+        return self.get_breaker(self.REDIS)
+
+    @property
+    def leader_election(self) -> CircuitBreaker:
+        """Get the leader election circuit breaker."""
+        return self.get_breaker(self.LEADER_ELECTION)
+
+    def is_degraded(self) -> bool:
+        """Check if any circuit breaker is open (system is degraded)."""
+        return any(breaker.is_open for breaker in self._breakers.values())
+
+    def get_degraded_components(self) -> list[DegradedComponent]:
+        """Get list of degraded components."""
+        components = []
+        for name, breaker in self._breakers.items():
+            if breaker.is_open:
+                components.append(
+                    DegradedComponent(
+                        name=name,
+                        is_degraded=True,
+                        reason=breaker.last_failure_error,
+                        since=breaker._opened_at,
+                    )
+                )
+        return components
+
+    def get_status(self) -> dict[str, Any]:
+        """Get aggregated status for all circuit breakers."""
+        breakers_status = {
+            name: breaker.get_status()
+            for name, breaker in self._breakers.items()
+        }
+
+        degraded_names = [
+            name for name, breaker in self._breakers.items()
+            if breaker.is_open
+        ]
+
+        return {
+            "is_degraded": self.is_degraded(),
+            "degraded_components": degraded_names,
+            "breakers": breakers_status,
+        }
+
+    async def reset_all(self) -> None:
+        """Reset all circuit breakers."""
+        for breaker in self._breakers.values():
+            await breaker.reset()
+
+
+# Global singleton for the circuit breaker manager
+_circuit_breaker_manager: CircuitBreakerManager | None = None
+
+
+def get_circuit_breaker_manager() -> CircuitBreakerManager:
+    """Get or create the global circuit breaker manager singleton."""
+    global _circuit_breaker_manager
+    if _circuit_breaker_manager is None:
+        _circuit_breaker_manager = CircuitBreakerManager()
+    return _circuit_breaker_manager
+
+
+def reset_circuit_breaker_manager() -> None:
+    """Reset the global circuit breaker manager (for testing)."""
+    global _circuit_breaker_manager
+    _circuit_breaker_manager = None
+
+
+# =============================================================================
+# Wrapped Database Operations with Circuit Breaker
+# =============================================================================
+
+
+async def execute_with_circuit_breaker(
+    breaker: CircuitBreaker,
+    operation: Callable[..., Any],
+    *args: Any,
+    fallback: Callable[[], Any] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Execute an async operation with circuit breaker protection.
+
+    Args:
+        breaker: The circuit breaker to use
+        operation: The async callable to execute
+        *args: Arguments to pass to the operation
+        fallback: Optional fallback callable if circuit is open
+        **kwargs: Keyword arguments to pass to the operation
+
+    Returns:
+        Result of the operation or fallback
+
+    Raises:
+        CircuitBreakerOpenError: If circuit is open and no fallback provided
+    """
+    try:
+        async with breaker.execute():
+            return await operation(*args, **kwargs)
+    except CircuitBreakerOpenError:
+        if fallback is not None:
+            logger.debug(
+                f"Circuit breaker '{breaker.name}' open, using fallback"
+            )
+            result = fallback()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        raise

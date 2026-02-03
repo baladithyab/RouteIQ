@@ -61,7 +61,7 @@ from .mcp_gateway import MCPServer, MCPTransport, MCPToolDefinition, get_mcp_gat
 from .hot_reload import get_hot_reload_manager
 from .config_sync import get_sync_manager
 from .url_security import validate_outbound_url, validate_outbound_url_async, SSRFBlockedError
-from .resilience import get_drain_manager
+from .resilience import get_drain_manager, get_circuit_breaker_manager, CircuitBreakerOpenError
 
 # Import MCP parity layer routers and feature flags
 from .mcp_parity import (
@@ -228,6 +228,7 @@ async def readiness_probe():
     If a dependency is not configured, it's not checked (still returns ready).
     If a dependency is configured but unreachable, returns 503.
     If the server is draining (graceful shutdown), returns 503.
+    If any circuit breaker is open, returns 200 but with degraded status.
 
     Returns:
         200 OK if all configured dependencies are healthy and not draining
@@ -236,6 +237,7 @@ async def readiness_probe():
     request_id = get_request_id() or "unknown"
     checks = {}
     is_ready = True
+    is_degraded = False
 
     # Check drain status first (highest priority)
     drain_manager = get_drain_manager()
@@ -251,63 +253,117 @@ async def readiness_probe():
             "active_requests": drain_manager.active_requests,
         }
 
+    # Check circuit breakers - degraded mode detection
+    cb_manager = get_circuit_breaker_manager()
+    cb_status = cb_manager.get_status()
+    if cb_status["is_degraded"]:
+        is_degraded = True
+        checks["circuit_breakers"] = {
+            "status": "degraded",
+            "open_breakers": cb_status["degraded_components"],
+            "breakers": {
+                name: {
+                    "state": info["state"],
+                    "failure_count": info["failure_count"],
+                    "time_until_retry": info["time_until_retry"],
+                }
+                for name, info in cb_status["breakers"].items()
+            },
+        }
+    else:
+        checks["circuit_breakers"] = {
+            "status": "healthy",
+            "breakers": {
+                name: {"state": info["state"]}
+                for name, info in cb_status["breakers"].items()
+            } if cb_status["breakers"] else {},
+        }
+
     # Check database if configured
     db_url = os.getenv("DATABASE_URL")
     if db_url:
-        try:
-            # Import here to avoid circular imports and optional dependency
-            import asyncpg
-
-            # Use short timeout for health check
-            conn = await asyncio.wait_for(
-                asyncpg.connect(db_url, timeout=2.0),
-                timeout=2.0,
-            )
-            await asyncio.wait_for(conn.execute("SELECT 1"), timeout=1.0)
-            await conn.close()
-            checks["database"] = {"status": "healthy"}
-        except asyncio.TimeoutError:
-            checks["database"] = {"status": "unhealthy", "error": "connection timeout"}
-            is_ready = False
-        except ImportError:
-            # asyncpg not installed, try basic connectivity via litellm
+        db_breaker = cb_manager.database
+        # If circuit breaker is open, skip the actual check
+        if db_breaker.is_open:
             checks["database"] = {
-                "status": "skipped",
-                "reason": "asyncpg not installed",
+                "status": "degraded",
+                "circuit_breaker": "open",
+                "time_until_retry": round(db_breaker.time_until_retry, 1),
             }
-        except Exception:
-            # Sanitize: don't leak exception details in health check response
-            checks["database"] = {"status": "unhealthy", "error": "connection failed"}
-            is_ready = False
+            # Degraded is not a readiness failure - service can still work with cache
+            is_degraded = True
+        else:
+            try:
+                # Import here to avoid circular imports and optional dependency
+                import asyncpg
+
+                # Use short timeout for health check
+                conn = await asyncio.wait_for(
+                    asyncpg.connect(db_url, timeout=2.0),
+                    timeout=2.0,
+                )
+                await asyncio.wait_for(conn.execute("SELECT 1"), timeout=1.0)
+                await conn.close()
+                checks["database"] = {"status": "healthy"}
+                # Record success in circuit breaker
+                await db_breaker.record_success()
+            except asyncio.TimeoutError:
+                await db_breaker.record_failure("connection timeout")
+                checks["database"] = {"status": "unhealthy", "error": "connection timeout"}
+                is_ready = False
+            except ImportError:
+                # asyncpg not installed, try basic connectivity via litellm
+                checks["database"] = {
+                    "status": "skipped",
+                    "reason": "asyncpg not installed",
+                }
+            except Exception as e:
+                await db_breaker.record_failure(str(e))
+                # Sanitize: don't leak exception details in health check response
+                checks["database"] = {"status": "unhealthy", "error": "connection failed"}
+                is_ready = False
 
     # Check Redis if configured
     redis_host = os.getenv("REDIS_HOST")
     if redis_host:
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
-        try:
-            import redis.asyncio as aioredis
-
-            r = aioredis.Redis(
-                host=redis_host,
-                port=redis_port,
-                socket_connect_timeout=2.0,
-                socket_timeout=2.0,
-            )
-            await asyncio.wait_for(r.ping(), timeout=2.0)
-            await r.aclose()
-            checks["redis"] = {"status": "healthy"}
-        except asyncio.TimeoutError:
-            checks["redis"] = {"status": "unhealthy", "error": "connection timeout"}
-            is_ready = False
-        except ImportError:
+        redis_breaker = cb_manager.redis
+        # If circuit breaker is open, skip the actual check
+        if redis_breaker.is_open:
             checks["redis"] = {
-                "status": "skipped",
-                "reason": "redis package not installed",
+                "status": "degraded",
+                "circuit_breaker": "open",
+                "time_until_retry": round(redis_breaker.time_until_retry, 1),
             }
-        except Exception:
-            # Sanitize: don't leak exception details in health check response
-            checks["redis"] = {"status": "unhealthy", "error": "connection failed"}
-            is_ready = False
+            is_degraded = True
+        else:
+            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            try:
+                import redis.asyncio as aioredis
+
+                r = aioredis.Redis(
+                    host=redis_host,
+                    port=redis_port,
+                    socket_connect_timeout=2.0,
+                    socket_timeout=2.0,
+                )
+                await asyncio.wait_for(r.ping(), timeout=2.0)
+                await r.aclose()
+                checks["redis"] = {"status": "healthy"}
+                await redis_breaker.record_success()
+            except asyncio.TimeoutError:
+                await redis_breaker.record_failure("connection timeout")
+                checks["redis"] = {"status": "unhealthy", "error": "connection timeout"}
+                is_ready = False
+            except ImportError:
+                checks["redis"] = {
+                    "status": "skipped",
+                    "reason": "redis package not installed",
+                }
+            except Exception as e:
+                await redis_breaker.record_failure(str(e))
+                # Sanitize: don't leak exception details in health check response
+                checks["redis"] = {"status": "unhealthy", "error": "connection failed"}
+                is_ready = False
 
     # Check MCP gateway health if enabled
     if os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true":
@@ -326,9 +382,18 @@ async def readiness_probe():
             # MCP gateway failure is non-fatal for readiness
             # is_ready = False
 
+    # Determine overall status
+    if is_degraded and is_ready:
+        status = "degraded"
+    elif is_ready:
+        status = "ready"
+    else:
+        status = "not_ready"
+
     response = {
-        "status": "ready" if is_ready else "not_ready",
+        "status": status,
         "service": "litellm-llmrouter",
+        "is_degraded": is_degraded,
         "checks": checks,
         "request_id": request_id,
     }

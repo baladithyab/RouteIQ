@@ -32,8 +32,10 @@ def pytest_collection_modifyitems(config, items):
     gateway_available = is_port_open("localhost", gateway_port)
 
     # Tests that manage their own compose stack (should not be auto-skipped)
+    # Also includes tests that don't require external services
     self_managed_tests = {
         "test_streaming_perf_gate",  # TG10.5 - manages its own compose stack
+        "test_resilience",  # TG2.3 - circuit breaker tests (no external deps)
     }
 
     if not gateway_available:
