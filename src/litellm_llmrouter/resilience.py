@@ -38,10 +38,8 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from time import monotonic
-from typing import Any, Callable, Set
+from typing import Any
 
-from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)

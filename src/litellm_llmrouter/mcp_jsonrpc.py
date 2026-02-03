@@ -41,11 +41,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
-from .auth import admin_api_key_auth, get_request_id
+from .auth import get_request_id
 from .mcp_gateway import get_mcp_gateway, MCPToolResult
 
 # Protocol version (MCP spec version we implement)
