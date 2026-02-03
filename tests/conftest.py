@@ -37,6 +37,7 @@ def pytest_collection_modifyitems(config, items):
         "test_streaming_perf_gate",  # TG10.5 - manages its own compose stack
         "test_resilience",  # TG2.3 - circuit breaker tests (no external deps)
         "test_quota_enforcement",  # TG3.1 - manages its own compose stack
+        "test_rbac_enforcement",  # TG3.2 - uses in-process TestClient (no external deps)
     }
 
     if not gateway_available:

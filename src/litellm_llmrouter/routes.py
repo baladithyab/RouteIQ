@@ -57,6 +57,14 @@ from .auth import (
     sanitize_error_response,
     RequestIDMiddleware,
 )
+from .rbac import (
+    requires_permission,
+    PERMISSION_MCP_SERVER_WRITE,
+    PERMISSION_MCP_TOOL_WRITE,
+    PERMISSION_MCP_TOOL_CALL,
+    PERMISSION_SYSTEM_CONFIG_RELOAD,
+    PERMISSION_A2A_AGENT_WRITE,
+)
 from .mcp_gateway import MCPServer, MCPTransport, MCPToolDefinition, get_mcp_gateway
 from .hot_reload import get_hot_reload_manager
 from .config_sync import get_sync_manager
@@ -478,9 +486,12 @@ def ensure_a2a_server(transport: str):
     return t
 
 
-# Write operations - admin auth required
+# Write operations - admin auth required + RBAC
 @admin_router.post("/a2a/agents")
-async def register_a2a_agent_convenience(agent: AgentRegistration):
+async def register_a2a_agent_convenience(
+    agent: AgentRegistration,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_A2A_AGENT_WRITE)),
+):
     """
     Register a new A2A agent.
 
@@ -491,7 +502,7 @@ async def register_a2a_agent_convenience(agent: AgentRegistration):
     lost on restart. For HA consistency, use POST /v1/agents which persists
     to the database.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with a2a.agent.write permission.
 
     Security: URLs are validated against SSRF attacks.
     """
@@ -578,9 +589,12 @@ async def register_a2a_agent_convenience(agent: AgentRegistration):
         raise HTTPException(status_code=500, detail=err)
 
 
-# Write operations - admin auth required
+# Write operations - admin auth required + RBAC
 @admin_router.delete("/agents/{agent_id}")
-async def unregister_a2a_agent_convenience(agent_id: str):
+async def unregister_a2a_agent_convenience(
+    agent_id: str,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_A2A_AGENT_WRITE)),
+):
     """
     Unregister an A2A agent.
 
@@ -590,7 +604,7 @@ async def unregister_a2a_agent_convenience(agent_id: str):
     Note: This only removes from in-memory registry. DB-backed agents will
     be re-loaded on restart. Use DELETE /v1/agents/{agent_id} for permanent deletion.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with a2a.agent.write permission.
     """
     request_id = get_request_id() or "unknown"
     try:
@@ -678,13 +692,16 @@ async def list_mcp_servers():
     }
 
 
-# Write operations - admin auth required
+# Write operations - admin auth required + RBAC
 @admin_router.post("/llmrouter/mcp/servers")
-async def register_mcp_server(server: ServerRegistration):
+async def register_mcp_server(
+    server: ServerRegistration,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_MCP_SERVER_WRITE)),
+):
     """
     Register a new MCP server (REST API).
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with mcp.server.write permission.
 
     Security: Server URLs are validated against SSRF attacks. Private IPs are
     blocked by default. Configure LLMROUTER_SSRF_ALLOWLIST_HOSTS or
@@ -772,13 +789,16 @@ async def get_mcp_server(server_id: str):
     }
 
 
-# Write operation - admin auth
+# Write operation - admin auth + RBAC
 @admin_router.delete("/llmrouter/mcp/servers/{server_id}")
-async def unregister_mcp_server(server_id: str):
+async def unregister_mcp_server(
+    server_id: str,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_MCP_SERVER_WRITE)),
+):
     """
     Unregister an MCP server (REST API).
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with mcp.server.write permission.
     """
     request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
@@ -794,16 +814,20 @@ async def unregister_mcp_server(server_id: str):
     )
 
 
-# Write operation - admin auth
+# Write operation - admin auth + RBAC
 @admin_router.put("/llmrouter/mcp/servers/{server_id}")
-async def update_mcp_server(server_id: str, server: ServerRegistration):
+async def update_mcp_server(
+    server_id: str,
+    server: ServerRegistration,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_MCP_SERVER_WRITE)),
+):
     """
     Update an MCP server (full update).
 
     Replaces all server fields with the provided values.
     Tools and resources are refreshed on update.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with mcp.server.write permission.
 
     Security: Server URLs are validated against SSRF attacks. Private IPs are
     blocked by default. Configure LLMROUTER_SSRF_ALLOWLIST_HOSTS or
@@ -975,9 +999,12 @@ async def list_mcp_tools_detailed():
     return {"tools": tools, "count": len(tools)}
 
 
-# Tool invocation - admin auth (modifies state on external MCP servers)
+# Tool invocation - admin auth + RBAC (modifies state on external MCP servers)
 @admin_router.post("/llmrouter/mcp/tools/call")
-async def call_mcp_tool(request: MCPToolCall):
+async def call_mcp_tool(
+    request: MCPToolCall,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_MCP_TOOL_CALL)),
+):
     """
     Invoke an MCP tool by name.
 
@@ -1131,16 +1158,20 @@ async def get_mcp_tool(tool_name: str):
     }
 
 
-# Tool registration - admin auth
+# Tool registration - admin auth + RBAC
 @admin_router.post("/llmrouter/mcp/servers/{server_id}/tools")
-async def register_mcp_tool(server_id: str, tool: MCPToolRegister):
+async def register_mcp_tool(
+    server_id: str,
+    tool: MCPToolRegister,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_MCP_TOOL_WRITE)),
+):
     """
     Register a tool definition for an MCP server.
 
     This allows adding detailed tool definitions with input schemas
     to an existing server registration.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with mcp.tool.write permission.
     """
     request_id = get_request_id() or "unknown"
     gateway = get_mcp_gateway()
@@ -1345,13 +1376,16 @@ async def list_mcp_access_groups():
 # =============================================================================
 
 
-# Config reload - admin auth required
+# Config reload - admin auth required + RBAC
 @admin_router.post("/llmrouter/reload")
-async def reload_config(request: ReloadRequest | None = None):
+async def reload_config(
+    request: ReloadRequest | None = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
     """
     Trigger a config reload, optionally syncing from remote.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with system.config.reload permission.
     """
     request_id = get_request_id() or "unknown"
     try:
@@ -1366,13 +1400,16 @@ async def reload_config(request: ReloadRequest | None = None):
         raise HTTPException(status_code=500, detail=err)
 
 
-# Config reload - admin auth required
+# Config reload - admin auth required + RBAC
 @admin_router.post("/config/reload")
-async def reload_config_2(request: ReloadRequest | None = None):
+async def reload_config_2(
+    request: ReloadRequest | None = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
     """
     Trigger a config reload, optionally syncing from remote.
 
-    Requires admin API key authentication.
+    Requires admin API key authentication or user with system.config.reload permission.
     """
     request_id = get_request_id() or "unknown"
     try:
