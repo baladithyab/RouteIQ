@@ -1,0 +1,22 @@
+# =============================================================================
+# Streaming Perf Gate Configuration
+# =============================================================================
+# Minimal LiteLLM config for streaming performance testing.
+# No real LLM models - just A2A gateway for streaming passthrough.
+# =============================================================================
+
+general_settings:
+  master_key: "sk-streaming-perf-key"
+  alerting: []
+  enable_telemetry: false
+
+model_list:
+  # Dummy model - not actually used in streaming tests
+  - model_name: fake-model
+    litellm_params:
+      model: fake
+      api_key: not-used
+
+litellm_settings:
+  json_logs: true
+  drop_params: true

@@ -31,6 +31,11 @@ def pytest_collection_modifyitems(config, items):
     # Try to detect if the gateway is running
     gateway_available = is_port_open("localhost", gateway_port)
 
+    # Tests that manage their own compose stack (should not be auto-skipped)
+    self_managed_tests = {
+        "test_streaming_perf_gate",  # TG10.5 - manages its own compose stack
+    }
+
     if not gateway_available:
         skip_integration = pytest.mark.skip(
             reason="Integration tests skipped: Local Docker stack not running. "
@@ -41,7 +46,13 @@ def pytest_collection_modifyitems(config, items):
             # Check for /integration/ or \integration\ in the path
             fspath_str = str(item.fspath)
             if "/integration/" in fspath_str or "\\integration\\" in fspath_str:
-                item.add_marker(skip_integration)
+                # Don't skip tests that manage their own compose stack
+                parent_name = getattr(item.parent, "name", "") if item.parent else ""
+                if parent_name not in self_managed_tests and item.name not in self_managed_tests:
+                    # Check module name as well
+                    module_name = item.fspath.purebasename if hasattr(item.fspath, 'purebasename') else ""
+                    if module_name not in self_managed_tests:
+                        item.add_marker(skip_integration)
 
     if in_ci and not gateway_available:
         # In CI, we expect integration tests to be skipped

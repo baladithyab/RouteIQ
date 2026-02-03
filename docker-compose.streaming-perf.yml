@@ -1,0 +1,91 @@
+# =============================================================================
+# Streaming Performance Gate - Docker Compose
+# =============================================================================
+# Minimal compose file for TG10.5 streaming TTFB and cadence validation.
+#
+# Usage:
+#   finch compose -f docker-compose.streaming-perf.yml up -d --build
+#   uv run pytest tests/integration/test_streaming_perf_gate.py -v
+#   finch compose -f docker-compose.streaming-perf.yml down -v
+#
+# This setup includes:
+#   - streaming-stub: Deterministic streaming server (markers at fixed intervals)
+#   - gateway: LiteLLM + LLMRouter proxy (passthrough to streaming-stub)
+#
+# The gateway is configured without real LLM credentials - it only proxies
+# streaming requests to the stub server for deterministic testing.
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # Streaming Stub Server - Deterministic streaming endpoint
+  # ==========================================================================
+  streaming-stub:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.local
+    container_name: streaming-perf-stub
+    ports:
+      - "9200:9200"
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      - STREAMING_STUB_PORT=9200
+      - STREAMING_STUB_MARKER_COUNT=20
+      - STREAMING_STUB_INTERVAL_MS=100
+    # Override entrypoint to run the streaming stub server
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: ["python", "/app/scripts/streaming_stub_server.py"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - streaming-perf-network
+
+  # ==========================================================================
+  # LiteLLM + LLMRouter Gateway (minimal config for streaming passthrough)
+  # ==========================================================================
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.local
+    container_name: streaming-perf-gateway
+    depends_on:
+      streaming-stub:
+        condition: service_healthy
+    ports:
+      - "4020:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    environment:
+      # Core settings - minimal config for streaming test
+      - LITELLM_CONFIG_PATH=/app/config/config.streaming-perf.yaml
+      - LITELLM_MASTER_KEY=sk-streaming-perf-key
+      - ADMIN_API_KEY=sk-streaming-perf-admin
+      - ADMIN_API_KEYS=sk-streaming-perf-admin
+      # Enable A2A and raw streaming
+      - A2A_GATEWAY_ENABLED=true
+      - A2A_RAW_STREAMING_ENABLED=true
+      # Allow outbound to private IPs (Docker network)
+      - LLMROUTER_OUTBOUND_ALLOW_PRIVATE=true
+      # Disable features not needed for streaming test
+      - MCP_GATEWAY_ENABLED=false
+      - CONFIG_SYNC_ENABLED=false
+      - LLMROUTER_HOT_RELOAD=false
+    command: ["--config", "/app/config/config.streaming-perf.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer sk-streaming-perf-key", "http://localhost:4000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - streaming-perf-network
+
+networks:
+  streaming-perf-network:
+    driver: bridge
