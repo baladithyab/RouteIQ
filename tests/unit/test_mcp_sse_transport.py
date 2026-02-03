@@ -608,3 +608,342 @@ class TestFeatureFlagEnvironment:
         """Legacy mode is off by default."""
         from litellm_llmrouter.mcp_sse_transport import MCP_SSE_LEGACY_MODE
         assert MCP_SSE_LEGACY_MODE is False
+
+
+# ============================================================================
+# Legacy SSE Messages Endpoint Tests
+# ============================================================================
+
+
+class TestLegacyMessagesEndpoint:
+    """Test POST /mcp/messages endpoint for legacy SSE transport."""
+
+    def test_messages_endpoint_requires_session_id(self, client, mock_gateway):
+        """POST /mcp/messages requires sessionId query parameter."""
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp/messages",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                },
+            )
+            # FastAPI returns 422 for missing required query param
+            assert response.status_code == 422
+
+    def test_messages_endpoint_invalid_session(self, client, mock_gateway):
+        """POST /mcp/messages returns 404 for invalid session."""
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp/messages?sessionId=invalid-session-id",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                },
+            )
+            assert response.status_code == 404
+
+            data = response.json()
+            assert data["detail"]["error"] == "session_not_found"
+
+
+# ============================================================================
+# Session Isolation Tests
+# ============================================================================
+
+
+class TestSessionIsolation:
+    """Test session isolation and async queue behavior."""
+
+    @pytest.mark.asyncio
+    async def test_session_queue_creation(self):
+        """SSESession creates async queue on demand."""
+        from litellm_llmrouter.mcp_sse_transport import SSESession
+
+        session = SSESession(session_id="test-queue-session")
+
+        # Queue should not exist yet
+        assert session._response_queue is None
+
+        # Get queue (creates it)
+        queue = await session.get_queue()
+        assert queue is not None
+        assert session._response_queue is not None
+
+        # Second call returns same queue
+        queue2 = await session.get_queue()
+        assert queue2 is queue
+
+    @pytest.mark.asyncio
+    async def test_session_send_response(self):
+        """SSESession.send_response puts message in queue."""
+        from litellm_llmrouter.mcp_sse_transport import SSESession
+
+        session = SSESession(session_id="test-send-session")
+
+        test_response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"test": "data"},
+        }
+
+        await session.send_response(test_response)
+
+        queue = await session.get_queue()
+        assert not queue.empty()
+
+        received = await queue.get()
+        assert received == test_response
+
+    @pytest.mark.asyncio
+    async def test_session_expiration(self):
+        """SSESession.is_expired checks against timeout."""
+        import time
+        from litellm_llmrouter.mcp_sse_transport import SSESession, MCP_SSE_SESSION_TIMEOUT
+
+        session = SSESession(session_id="test-expire-session")
+
+        # Fresh session should not be expired
+        assert not session.is_expired()
+
+        # Set last_activity to past timeout
+        session.last_activity = time.time() - MCP_SSE_SESSION_TIMEOUT - 1
+        assert session.is_expired()
+
+    @pytest.mark.asyncio
+    async def test_session_touch_updates_activity(self):
+        """SSESession.touch updates last_activity timestamp."""
+        import time
+        from litellm_llmrouter.mcp_sse_transport import SSESession
+
+        session = SSESession(session_id="test-touch-session")
+        original_activity = session.last_activity
+
+        # Small delay
+        time.sleep(0.01)
+
+        session.touch()
+        assert session.last_activity > original_activity
+
+    @pytest.mark.asyncio
+    async def test_get_session_returns_active(self):
+        """get_session returns active, non-expired sessions."""
+        from litellm_llmrouter.mcp_sse_transport import (
+            SSESession,
+            _sse_sessions,
+            get_session,
+            _sessions_lock,
+        )
+
+        session_id = "test-get-session-123"
+        session = SSESession(session_id=session_id)
+
+        # Register manually
+        async with _sessions_lock:
+            _sse_sessions[session_id] = session
+
+        try:
+            result = await get_session(session_id)
+            assert result is session
+
+            # Non-existent session
+            result = await get_session("nonexistent")
+            assert result is None
+
+            # Inactive session
+            session.is_active = False
+            result = await get_session(session_id)
+            assert result is None
+
+        finally:
+            # Cleanup
+            async with _sessions_lock:
+                if session_id in _sse_sessions:
+                    del _sse_sessions[session_id]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_sessions(self):
+        """cleanup_expired_sessions removes expired and inactive sessions."""
+        import time
+        from litellm_llmrouter.mcp_sse_transport import (
+            SSESession,
+            _sse_sessions,
+            cleanup_expired_sessions,
+            MCP_SSE_SESSION_TIMEOUT,
+            _sessions_lock,
+        )
+
+        # Create sessions
+        active_session = SSESession(session_id="active-session")
+        inactive_session = SSESession(session_id="inactive-session")
+        inactive_session.is_active = False
+
+        expired_session = SSESession(session_id="expired-session")
+        expired_session.last_activity = time.time() - MCP_SSE_SESSION_TIMEOUT - 10
+
+        async with _sessions_lock:
+            _sse_sessions["active-session"] = active_session
+            _sse_sessions["inactive-session"] = inactive_session
+            _sse_sessions["expired-session"] = expired_session
+
+        try:
+            removed = await cleanup_expired_sessions()
+            # Should remove inactive and expired
+            assert removed >= 2
+
+            # Active session should remain
+            assert "active-session" in _sse_sessions
+            # Others should be gone
+            assert "inactive-session" not in _sse_sessions
+            assert "expired-session" not in _sse_sessions
+
+        finally:
+            # Cleanup
+            async with _sessions_lock:
+                if "active-session" in _sse_sessions:
+                    del _sse_sessions["active-session"]
+
+
+# ============================================================================
+# JSON-RPC Method Dispatch Tests
+# ============================================================================
+
+
+class TestJSONRPCDispatch:
+    """Test JSON-RPC method dispatching via SSE transport."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_initialize(self, mock_gateway):
+        """_dispatch_jsonrpc_method handles initialize."""
+        from litellm_llmrouter.mcp_sse_transport import (
+            _dispatch_jsonrpc_method,
+            SSESession,
+        )
+
+        session = SSESession(session_id="dispatch-init-session")
+
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            result = await _dispatch_jsonrpc_method(
+                method="initialize",
+                request_id=1,
+                params={"protocolVersion": "2024-11-05"},
+                session=session,
+            )
+
+            assert result["jsonrpc"] == "2.0"
+            assert result["id"] == 1
+            assert "result" in result
+            assert result["result"]["protocolVersion"] == "2024-11-05"
+            assert session.is_initialized is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_tools_list(self, mock_gateway):
+        """_dispatch_jsonrpc_method handles tools/list."""
+        from litellm_llmrouter.mcp_sse_transport import (
+            _dispatch_jsonrpc_method,
+            SSESession,
+        )
+
+        # Mock server with tools
+        mock_server = MagicMock()
+        mock_server.server_id = "test-server"
+        mock_server.name = "Test Server"
+        mock_server.tools = ["tool1", "tool2"]
+        mock_server.tool_definitions = {}
+        mock_gateway.list_servers.return_value = [mock_server]
+
+        session = SSESession(session_id="dispatch-tools-session")
+
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            result = await _dispatch_jsonrpc_method(
+                method="tools/list",
+                request_id=2,
+                params=None,
+                session=session,
+            )
+
+            assert result["jsonrpc"] == "2.0"
+            assert result["id"] == 2
+            assert "result" in result
+            assert "tools" in result["result"]
+            assert len(result["result"]["tools"]) == 2
+            # Tools should be namespaced
+            tool_names = [t["name"] for t in result["result"]["tools"]]
+            assert "test-server.tool1" in tool_names
+            assert "test-server.tool2" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_dispatch_unknown_method(self, mock_gateway):
+        """_dispatch_jsonrpc_method returns error for unknown method."""
+        from litellm_llmrouter.mcp_sse_transport import (
+            _dispatch_jsonrpc_method,
+            SSESession,
+        )
+
+        session = SSESession(session_id="dispatch-unknown-session")
+
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            result = await _dispatch_jsonrpc_method(
+                method="nonexistent/method",
+                request_id=3,
+                params=None,
+                session=session,
+            )
+
+            assert result["jsonrpc"] == "2.0"
+            assert result["id"] == 3
+            assert "error" in result
+            assert result["error"]["code"] == -32601  # Method not found
+
+
+# ============================================================================
+# Transport Info Tests
+# ============================================================================
+
+
+class TestTransportInfoEndpoint:
+    """Test GET /mcp/transport with new SSE fields."""
+
+    def test_transport_info_includes_session_timeout(self, client, mock_gateway):
+        """GET /mcp/transport includes session_timeout in config."""
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.get("/mcp/transport")
+            assert response.status_code == 200
+
+            data = response.json()
+            config = data["config"]
+            assert "session_timeout" in config
+
+    def test_transport_info_includes_messages_endpoint(self, client, mock_gateway):
+        """GET /mcp/transport shows /mcp/messages endpoint."""
+        with patch(
+            "litellm_llmrouter.mcp_sse_transport.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.get("/mcp/transport")
+            assert response.status_code == 200
+
+            data = response.json()
+            sse_info = data["transports"]["sse"]
+            assert sse_info["messages_endpoint"] == "/mcp/messages"
+            assert sse_info["legacy_messages_endpoint"] == "/mcp/sse/messages"

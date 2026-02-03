@@ -83,7 +83,10 @@ from .mcp_sse_transport import (
     mcp_sse_router,
     MCP_SSE_TRANSPORT_ENABLED,
     MCP_SSE_LEGACY_MODE,
+    MCP_SSE_SESSION_TIMEOUT,
     get_transport_mode,
+    get_session,
+    cleanup_expired_sessions,
 )
 
 # Health router - unauthenticated endpoints for Kubernetes probes
@@ -130,7 +133,10 @@ __all__ = [
     "mcp_sse_router",
     "MCP_SSE_TRANSPORT_ENABLED",
     "MCP_SSE_LEGACY_MODE",
+    "MCP_SSE_SESSION_TIMEOUT",
     "get_transport_mode",
+    "get_session",
+    "cleanup_expired_sessions",
 ]
 
 
