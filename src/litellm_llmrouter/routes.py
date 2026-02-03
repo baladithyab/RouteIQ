@@ -74,6 +74,9 @@ from .mcp_parity import (
     MCP_PROTOCOL_PROXY_ENABLED,
 )
 
+# Import MCP native JSON-RPC router
+from .mcp_jsonrpc import mcp_jsonrpc_router
+
 # Health router - unauthenticated endpoints for Kubernetes probes
 # These MUST remain accessible without credentials for K8s liveness/readiness
 health_router = APIRouter(tags=["health"])
@@ -112,6 +115,8 @@ __all__ = [
     "oauth_callback_router",
     "MCP_OAUTH_ENABLED",
     "MCP_PROTOCOL_PROXY_ENABLED",
+    # MCP Native JSON-RPC
+    "mcp_jsonrpc_router",
 ]
 
 

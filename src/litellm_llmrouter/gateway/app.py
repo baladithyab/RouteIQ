@@ -90,6 +90,7 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         mcp_rest_router,
         mcp_proxy_router,
         oauth_callback_router,
+        mcp_jsonrpc_router,
         MCP_OAUTH_ENABLED,
         MCP_PROTOCOL_PROXY_ENABLED,
     )
@@ -122,6 +123,11 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     # MCP REST API (/mcp-rest/*) - upstream-compatible
     app.include_router(mcp_rest_router, prefix="")
     logger.debug("Registered mcp_rest_router (upstream-compatible /mcp-rest/*)")
+
+    # MCP Native JSON-RPC surface (/mcp) - for Claude Desktop / IDE MCP clients
+    # This provides native MCP protocol (JSON-RPC 2.0 over HTTP)
+    app.include_router(mcp_jsonrpc_router, prefix="")
+    logger.debug("Registered mcp_jsonrpc_router (native MCP JSON-RPC at /mcp)")
 
     # Feature-flagged routers
     if MCP_PROTOCOL_PROXY_ENABLED and include_admin:
