@@ -61,7 +61,7 @@ This roadmap provides a comprehensive, phased approach to transform the LiteLLM 
 **Identified Gaps** (per [`docs/litellm-cloud-native-enhancements.md`](../docs/litellm-cloud-native-enhancements.md)):
 - ❌ **Config Sync**: No standardized mechanism for multi-replica config distribution
 - ❌ **Graceful Shutdown**: Active LLM streams terminated on SIGTERM
-- ❌ **MLOps Pipeline**: Manual training/deployment workflow
+- ❌ **MLOps Automation**: Fully automated training/deployment workflow (currently script-driven)
 - ❌ **Observability**: Missing routing decision visibility and SLO dashboards
 - ❌ **State Management**: No distributed locks for model downloads
 - ❌ **Persistence**: S3/object storage integration not standardized
@@ -289,7 +289,7 @@ This roadmap decomposes the architectural vision into concrete, PR-sized work it
 | B.2 | B (P1) | Routing Decision Visibility | `code` | ✅ Done | - | Low |
 | B.3 | B (P1) | Security Hardening | `code` | ✅ Done | - | Med |
 | B.4 | B (P1) | Streaming Shutdown | `architect` | ✅ Done | - | Med |
-| C.1 | C (P2) | MLOps Pipeline | `architect`, `Services Team` | ✅ Done | - | High |
+| C.1 | C (P2) | MLOps Tooling (Scripts) | `architect`, `Services Team` | ✅ Done | - | High |
 | C.2 | C (P2) | Circuit Breakers | `code` | ✅ Done | - | Med |
 | C.3 | C (P2) | Autoscaling | `code` | ✅ Done | - | Low |
 | D.1 | D+ | OIDC SSO + RBAC | `code` | ⚪ Backlog | - | Med |

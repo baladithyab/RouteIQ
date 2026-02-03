@@ -1,9 +1,9 @@
 # RouteIQ Gateway
-Cloud-native General AI Gateway (powered by LiteLLM) with pluggable routing intelligence + closed-loop MLOps
+Cloud-native General AI Gateway (powered by LiteLLM) with pluggable routing intelligence + scripted MLOps pipeline
 
 <div align="center">
 
-  **A cloud-grade AI gateway with pluggable routing and end-to-end MLOps**
+  **A cloud-grade AI gateway with pluggable routing and end-to-end MLOps tooling**
 
   [![Docker Build](https://github.com/baladithyab/litellm-llm-router/actions/workflows/docker-build.yml/badge.svg)](https://github.com/baladithyab/litellm-llm-router/actions/workflows/docker-build.yml)
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -11,11 +11,11 @@ Cloud-native General AI Gateway (powered by LiteLLM) with pluggable routing inte
 
 ## Overview
 
-**RouteIQ Gateway** is a production-grade, cloud-native **General AI Gateway** that extends the capabilities of the upstream [LiteLLM Proxy](https://github.com/BerriAI/litellm). It serves as a unified control plane for all AI interactions—LLMs, Agents, Tools (MCP), and Skills—while adding a layer of **pluggable routing intelligence** and a **closed-loop MLOps workflow**.
+**RouteIQ Gateway** is a production-grade, cloud-native **General AI Gateway** that extends the capabilities of the upstream [LiteLLM Proxy](https://github.com/BerriAI/litellm). It serves as a unified control plane for all AI interactions—LLMs, Agents, Tools (MCP), and Skills—while adding a layer of **pluggable routing intelligence** and a **scripted MLOps pipeline**.
 
 While LiteLLM provides the core proxy and protocol translation, RouteIQ Gateway adds:
 - **Intelligent Routing**: Pluggable strategies (KNN, MLP, etc.) that learn from your traffic.
-- **Closed-Loop MLOps**: A complete loop to collect telemetry, train routing models, register them, and roll them out without downtime.
+- **MLOps Pipeline**: A complete set of scripts and tools to collect telemetry, train routing models, and roll them out (CI/CD driven).
 - **Enterprise Hardening**: Enhanced security, observability, and deployment patterns for cloud-native environments.
 
 ## Gateway Surfaces
@@ -45,7 +45,7 @@ The gateway operates as the central nervous system for your AI infrastructure, o
 
 1.  **Route**: Incoming requests are analyzed by the **Routing Intelligence Layer** (inside the Data Plane) and routed to the best model using the active strategy.
 2.  **Observe**: Execution data (latency, cost, feedback) is captured via OpenTelemetry.
-3.  **Learn**: The MLOps pipeline uses this data to train improved routing models.
+3.  **Learn**: The MLOps pipeline (external scripts/CI) uses this data to train improved routing models.
 4.  **Update**: New models are hot-reloaded into the gateway without restarting.
 
 ## Quick Start

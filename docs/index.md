@@ -5,6 +5,7 @@ Welcome to the documentation for **RouteIQ Gateway**, the cloud-native General A
 ## Getting Started
 
 - [Introduction](index.md)
+- [Project State & Gaps](project-state.md)
 - [Quickstart: Docker Compose](quickstart-docker-compose.md)
 - [Tutorial: High Availability](tutorials/ha-quickstart.md)
 - [Tutorial: Observability](tutorials/observability-quickstart.md)

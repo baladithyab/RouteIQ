@@ -2,6 +2,8 @@
 
 This guide covers training, evaluating, and deploying custom LLMRouter routing models.
 
+> **Note:** The MLOps workflow in RouteIQ is currently **script-driven**. Training and deployment are triggered via external scripts or CI/CD pipelines, not by a background job running inside the gateway itself.
+
 ## Quick Start
 
 ```bash

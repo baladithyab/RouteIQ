@@ -23,6 +23,7 @@ Our roadmap is prioritized into P0 (Critical), P1 (High), and P2 (Medium) items.
 
 - [x] **Unified Docker Container**: Single image for LiteLLM + LLMRouter.
 - [x] **ML Routing Strategies**: KNN and SVM implementations.
+- [x] **MLOps Tooling**: Scripts for training and deploying models (manual/CI trigger).
 - [x] **Hot-Reload Config Sync**: Dynamic updates without restart.
 - [x] **Routing Decision Visibility**: Full OTel instrumentation for *why* a model was chosen.
 
