@@ -15,6 +15,12 @@ Thread Safety:
 - Registry mutations are protected by a reentrant lock
 - Read operations return snapshots to avoid stale-read issues
 
+Streaming Modes:
+- A2A_RAW_STREAMING_ENABLED=true: True raw streaming passthrough using aiter_bytes()
+  for minimal TTFB and proper chunk cadence. Does not wait for newline boundaries.
+- A2A_RAW_STREAMING_ENABLED=false (default): Line-buffered streaming using aiter_lines()
+  for backward compatibility. This is the rollback-safe default.
+
 See: https://google.github.io/A2A/
 """
 
@@ -54,6 +60,28 @@ except ImportError:
     def inject_trace_headers(headers: dict[str, str]) -> dict[str, str]:
         """No-op fallback when tracing module is not available."""
         return headers
+
+
+# =============================================================================
+# Feature Flags for Streaming Behavior
+# =============================================================================
+
+# A2A_RAW_STREAMING_ENABLED: When true, uses raw byte streaming (aiter_bytes)
+# for true passthrough semantics. When false (default), uses line-buffered
+# streaming (aiter_lines) for backward compatibility.
+#
+# Rollback Safety: Default is False to minimize blast radius. Set to "true"
+# to enable raw streaming passthrough after validation in staging.
+#
+# Toggle: Set environment variable A2A_RAW_STREAMING_ENABLED=true to enable.
+A2A_RAW_STREAMING_ENABLED = (
+    os.getenv("A2A_RAW_STREAMING_ENABLED", "false").lower() == "true"
+)
+
+# Default chunk size for raw streaming (8KB balances latency vs overhead)
+A2A_RAW_STREAMING_CHUNK_SIZE = int(
+    os.getenv("A2A_RAW_STREAMING_CHUNK_SIZE", "8192")
+)
 
 
 @dataclass
@@ -133,6 +161,11 @@ class A2AGateway:
     All registry mutations are protected by a reentrant lock. Read operations
     return immutable snapshots to avoid stale-read issues and allow iteration
     without holding locks.
+
+    Streaming Modes:
+    - Raw streaming (A2A_RAW_STREAMING_ENABLED=true): True passthrough using
+      aiter_bytes() for minimal TTFB and chunk cadence preservation.
+    - Line-buffered (default): Uses aiter_lines() for backward compatibility.
     """
 
     def __init__(self):
@@ -376,8 +409,194 @@ class A2AGateway:
         """
         Stream response from an agent using Server-Sent Events.
 
+        This method dispatches to either raw streaming (aiter_bytes) or
+        line-buffered streaming (aiter_lines) based on the A2A_RAW_STREAMING_ENABLED
+        feature flag.
+
         Security: Agent URLs are validated against SSRF attacks before making requests.
         Thread Safety: Agent lookup is protected by lock.
+
+        Streaming Modes:
+        - A2A_RAW_STREAMING_ENABLED=true: Raw byte streaming for true passthrough.
+          Emits chunks as they arrive without waiting for newline boundaries.
+        - A2A_RAW_STREAMING_ENABLED=false (default): Line-buffered streaming for
+          backward compatibility. Waits for complete lines before yielding.
+
+        Args:
+            agent_id: The ID of the agent to invoke
+            request: The JSON-RPC 2.0 request with method 'message/stream'
+
+        Yields:
+            Response chunks (bytes decoded as UTF-8 for raw mode, lines for buffered mode)
+        """
+        if A2A_RAW_STREAMING_ENABLED:
+            async for chunk in self._stream_agent_response_raw(agent_id, request):
+                yield chunk
+        else:
+            async for chunk in self._stream_agent_response_buffered(agent_id, request):
+                yield chunk
+
+    async def _stream_agent_response_raw(
+        self, agent_id: str, request: JSONRPCRequest
+    ) -> AsyncIterator[str]:
+        """
+        True raw streaming passthrough using aiter_bytes().
+
+        This implementation:
+        - Does NOT wait for newline boundaries (true passthrough)
+        - Preserves upstream chunk cadence as much as possible
+        - Respects backpressure (async iteration)
+        - Supports cancellation (no full buffering)
+
+        Args:
+            agent_id: The ID of the agent to invoke
+            request: The JSON-RPC 2.0 request with method 'message/stream'
+
+        Yields:
+            Raw bytes decoded as UTF-8 strings, preserving original chunk boundaries
+        """
+        if not self.enabled:
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, "A2A Gateway is not enabled"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+
+        # Get agent under lock
+        with self._lock:
+            agent = self.agents.get(agent_id)
+
+        if not agent:
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent '{agent_id}' not found"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+
+        if not agent.url:
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent '{agent_id}' has no URL configured"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+
+        # Security: Validate URL against SSRF attacks (outside lock)
+        try:
+            validate_outbound_url(agent.url)
+        except SSRFBlockedError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: SSRF blocked for agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id,
+                        -32000,
+                        f"Agent URL blocked for security reasons: {e.reason}",
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+        except ValueError as e:
+            verbose_proxy_logger.warning(
+                f"A2A: Invalid URL for agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Agent URL is invalid: {str(e)}"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+            return
+
+        verbose_proxy_logger.info(
+            f"A2A: Raw streaming from agent '{agent_id}' (chunk_size={A2A_RAW_STREAMING_CHUNK_SIZE})"
+        )
+
+        try:
+            # Inject W3C trace context headers for distributed tracing
+            headers = {"Content-Type": "application/json"}
+            headers = inject_trace_headers(headers)
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream(
+                    "POST",
+                    agent.url,
+                    json=request.to_dict(),
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+
+                    # True raw streaming: yield bytes as they arrive
+                    # without waiting for newline boundaries
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=A2A_RAW_STREAMING_CHUNK_SIZE
+                    ):
+                        if chunk:
+                            # Decode bytes to string for consistency with API contract
+                            # Note: This preserves chunk boundaries but decodes to UTF-8
+                            yield chunk.decode("utf-8", errors="replace")
+
+        except httpx.TimeoutException:
+            verbose_proxy_logger.error(
+                f"A2A: Timeout streaming from agent '{agent_id}'"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"Timeout streaming from agent '{agent_id}'"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+        except httpx.HTTPStatusError as e:
+            verbose_proxy_logger.error(
+                f"A2A: HTTP error streaming from agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32000, f"HTTP error: {e.response.status_code}"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+        except Exception as e:
+            verbose_proxy_logger.exception(
+                f"A2A: Error streaming from agent '{agent_id}': {e}"
+            )
+            yield (
+                json.dumps(
+                    JSONRPCResponse.error_response(
+                        request.id, -32603, f"Streaming error: {str(e)}"
+                    ).to_dict()
+                )
+                + "\n"
+            )
+
+    async def _stream_agent_response_buffered(
+        self, agent_id: str, request: JSONRPCRequest
+    ) -> AsyncIterator[str]:
+        """
+        Line-buffered streaming using aiter_lines() - the original implementation.
+
+        This is the backward-compatible implementation that waits for complete
+        lines (newline boundaries) before yielding. Preserved for rollback safety.
 
         Args:
             agent_id: The ID of the agent to invoke
@@ -543,3 +762,18 @@ def reset_a2a_gateway() -> None:
     global _a2a_gateway
     with _a2a_gateway_lock:
         _a2a_gateway = None
+
+
+def is_raw_streaming_enabled() -> bool:
+    """
+    Check if raw streaming passthrough is enabled.
+
+    Returns:
+        True if A2A_RAW_STREAMING_ENABLED environment variable is set to "true".
+
+    Usage:
+        from litellm_llmrouter.a2a_gateway import is_raw_streaming_enabled
+        if is_raw_streaming_enabled():
+            print("Raw streaming mode active")
+    """
+    return A2A_RAW_STREAMING_ENABLED
