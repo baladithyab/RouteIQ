@@ -60,7 +60,7 @@ from .mcp_gateway import (
     MCPTransport,
     get_mcp_gateway,
 )
-from .url_security import SSRFBlockedError, validate_outbound_url
+from .url_security import SSRFBlockedError, validate_outbound_url, validate_outbound_url_async
 from .http_client_pool import get_client_for_request
 
 # Feature flags
@@ -884,8 +884,9 @@ if MCP_OAUTH_ENABLED:
             )
 
         # Validate authorization URL against SSRF
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(authorization_url)
+            await validate_outbound_url_async(authorization_url)
         except SSRFBlockedError as e:
             raise HTTPException(
                 status_code=400,
@@ -956,8 +957,9 @@ if MCP_OAUTH_ENABLED:
             )
 
         # Validate token URL against SSRF
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(token_url)
+            await validate_outbound_url_async(token_url)
         except SSRFBlockedError as e:
             raise HTTPException(
                 status_code=400,

@@ -39,7 +39,7 @@ from litellm._logging import verbose_proxy_logger
 
 # Import SSRF protection utilities
 try:
-    from .url_security import validate_outbound_url, SSRFBlockedError
+    from .url_security import validate_outbound_url, validate_outbound_url_async, SSRFBlockedError
 
     SSRF_PROTECTION_AVAILABLE = True
 except ImportError:
@@ -47,6 +47,10 @@ except ImportError:
     SSRFBlockedError = Exception  # Fallback type
 
     def validate_outbound_url(url: str, **kwargs) -> str:
+        """No-op fallback when url_security module is not available."""
+        return url
+
+    async def validate_outbound_url_async(url: str, **kwargs) -> str:
         """No-op fallback when url_security module is not available."""
         return url
 
@@ -649,8 +653,9 @@ class MCPGateway:
             )
 
         # Security: Validate URL against SSRF attacks before making outbound call
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(server.url)
+            await validate_outbound_url_async(server.url)
         except SSRFBlockedError as e:
             verbose_proxy_logger.warning(
                 f"MCP: SSRF blocked for server '{server.server_id}' when invoking tool '{tool_name}': {e}"
@@ -721,7 +726,6 @@ class MCPGateway:
             connect=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
             read=self.TOOL_INVOCATION_READ_TIMEOUT,
             write=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
-            pool=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
         )
 
         try:
@@ -918,12 +922,13 @@ class MCPGateway:
         start_time = time.time()
 
         # Security: Validate URL against SSRF attacks (outside lock)
+        # Use async version to avoid blocking the event loop
         if server.url:
             try:
-                validate_outbound_url(server.url)
+                await validate_outbound_url_async(server.url)
             except SSRFBlockedError as e:
                 verbose_proxy_logger.warning(
-                    f"MCP: SSRF blocked for health check of server '{server_id}': {e}"
+                    f"MCP: SSRF blocked for server '{server_id}': {e}"
                 )
                 return {
                     "server_id": server_id,

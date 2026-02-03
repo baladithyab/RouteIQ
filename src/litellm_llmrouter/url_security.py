@@ -29,6 +29,8 @@ Configuration (Environment Variables):
 - LLMROUTER_SSRF_USE_SYNC_DNS: Set to "true" to use synchronous (blocking) DNS resolution.
   (default: false = non-blocking async DNS). Use as rollback if async DNS causes issues.
 - LLMROUTER_SSRF_DNS_TIMEOUT: Timeout in seconds for async DNS resolution (default: 5.0)
+- LLMROUTER_SSRF_DNS_CACHE_TTL: TTL in seconds for DNS cache entries (default: 60)
+- LLMROUTER_SSRF_DNS_CACHE_SIZE: Maximum number of DNS cache entries (default: 1000)
 
 Backwards Compatibility:
 - Old env vars (LLMROUTER_ALLOW_PRIVATE_IPS, LLMROUTER_SSRF_ALLOWLIST_HOSTS,
@@ -48,7 +50,10 @@ import asyncio
 import ipaddress
 import os
 import socket
+import threading
+import time
 from functools import lru_cache
+from typing import Any
 from urllib.parse import urlparse
 
 from litellm._logging import verbose_proxy_logger
@@ -92,6 +97,126 @@ IPV6_UNIQUE_LOCAL_NETWORK = ipaddress.ip_network("fc00::/7")
 # Default DNS resolution timeout (seconds)
 DEFAULT_DNS_TIMEOUT = 5.0
 
+# DNS cache configuration defaults
+DEFAULT_DNS_CACHE_TTL = 60  # seconds
+DEFAULT_DNS_CACHE_SIZE = 1000  # max entries
+
+
+# =============================================================================
+# DNS Cache Implementation (Thread-Safe TTL Cache)
+# =============================================================================
+
+
+class DNSCacheEntry:
+    """A cached DNS resolution result with TTL."""
+
+    __slots__ = ("addresses", "expires_at")
+
+    def __init__(self, addresses: list[tuple[int, int, int, str, tuple]], ttl: float):
+        self.addresses = addresses
+        self.expires_at = time.monotonic() + ttl
+
+    def is_expired(self) -> bool:
+        return time.monotonic() > self.expires_at
+
+
+class DNSCache:
+    """
+    Thread-safe TTL cache for DNS resolution results.
+
+    Uses a simple dict with periodic cleanup to avoid memory leaks.
+    Thread safety is achieved via a threading.Lock.
+    """
+
+    def __init__(self, max_size: int = DEFAULT_DNS_CACHE_SIZE, ttl: float = DEFAULT_DNS_CACHE_TTL):
+        self._cache: dict[str, DNSCacheEntry] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+        self._ttl = ttl
+        self._cleanup_threshold = max_size // 10  # Cleanup when 10% over capacity
+
+    def get(self, key: str) -> list[tuple[int, int, int, str, tuple]] | None:
+        """Get cached DNS result if not expired."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if entry.is_expired():
+                del self._cache[key]
+                return None
+            return entry.addresses
+
+    def set(self, key: str, addresses: list[tuple[int, int, int, str, tuple]]) -> None:
+        """Cache DNS result with TTL."""
+        with self._lock:
+            # Cleanup if over capacity
+            if len(self._cache) >= self._max_size + self._cleanup_threshold:
+                self._cleanup_expired_locked()
+
+            self._cache[key] = DNSCacheEntry(addresses, self._ttl)
+
+    def _cleanup_expired_locked(self) -> None:
+        """Remove expired entries. Must be called with lock held."""
+        expired_keys = [k for k, v in self._cache.items() if v.is_expired()]
+        for k in expired_keys:
+            del self._cache[k]
+
+        # If still over capacity, remove oldest entries (LRU-ish)
+        if len(self._cache) >= self._max_size:
+            # Sort by expiry time and remove oldest
+            sorted_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k].expires_at)
+            excess = len(self._cache) - self._max_size + self._cleanup_threshold
+            for k in sorted_keys[:excess]:
+                del self._cache[k]
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+
+    def stats(self) -> dict[str, Any]:
+        """Return cache statistics."""
+        with self._lock:
+            expired_count = sum(1 for v in self._cache.values() if v.is_expired())
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "ttl": self._ttl,
+                "expired_pending_cleanup": expired_count,
+            }
+
+
+# Global DNS cache instance (lazy initialized via _get_dns_cache)
+_dns_cache: DNSCache | None = None
+_dns_cache_lock = threading.Lock()
+
+
+def _get_dns_cache() -> DNSCache:
+    """Get or create the global DNS cache instance."""
+    global _dns_cache
+    if _dns_cache is None:
+        with _dns_cache_lock:
+            if _dns_cache is None:
+                config = _get_ssrf_config()
+                _dns_cache = DNSCache(
+                    max_size=config.get("dns_cache_size", DEFAULT_DNS_CACHE_SIZE),
+                    ttl=config.get("dns_cache_ttl", DEFAULT_DNS_CACHE_TTL),
+                )
+    return _dns_cache
+
+
+def clear_dns_cache() -> None:
+    """Clear the DNS resolution cache. Useful for testing."""
+    global _dns_cache
+    if _dns_cache is not None:
+        _dns_cache.clear()
+
+
+def get_dns_cache_stats() -> dict[str, Any]:
+    """Get DNS cache statistics."""
+    cache = _get_dns_cache()
+    return cache.stats()
+
 
 def _get_env_with_fallback(primary: str, fallback: str, default: str = "") -> str:
     """
@@ -129,6 +254,8 @@ def _get_ssrf_config() -> dict:
     - allowlist_urls: list of URL prefixes that bypass checks
     - use_sync_dns: bool (default: False - use async DNS)
     - dns_timeout: float (default: 5.0 seconds)
+    - dns_cache_ttl: float (default: 60 seconds)
+    - dns_cache_size: int (default: 1000 entries)
 
     Env vars support legacy names for backwards compatibility.
     """
@@ -192,11 +319,30 @@ def _get_ssrf_config() -> dict:
     except ValueError:
         dns_timeout = DEFAULT_DNS_TIMEOUT
 
+    # DNS cache TTL
+    dns_cache_ttl_str = os.getenv("LLMROUTER_SSRF_DNS_CACHE_TTL", str(DEFAULT_DNS_CACHE_TTL))
+    try:
+        dns_cache_ttl = float(dns_cache_ttl_str)
+        if dns_cache_ttl <= 0:
+            dns_cache_ttl = DEFAULT_DNS_CACHE_TTL
+    except ValueError:
+        dns_cache_ttl = DEFAULT_DNS_CACHE_TTL
+
+    # DNS cache size
+    dns_cache_size_str = os.getenv("LLMROUTER_SSRF_DNS_CACHE_SIZE", str(DEFAULT_DNS_CACHE_SIZE))
+    try:
+        dns_cache_size = int(dns_cache_size_str)
+        if dns_cache_size <= 0:
+            dns_cache_size = DEFAULT_DNS_CACHE_SIZE
+    except ValueError:
+        dns_cache_size = DEFAULT_DNS_CACHE_SIZE
+
     verbose_proxy_logger.debug(
         f"SSRF config loaded: allow_private_ips={allow_private_ips}, "
         f"allowlist_hosts={allowlist_hosts}, allowlist_cidrs={len(allowlist_cidrs)} networks, "
         f"allowlist_urls={len(allowlist_urls)} prefixes, "
-        f"use_sync_dns={use_sync_dns}, dns_timeout={dns_timeout}s"
+        f"use_sync_dns={use_sync_dns}, dns_timeout={dns_timeout}s, "
+        f"dns_cache_ttl={dns_cache_ttl}s, dns_cache_size={dns_cache_size}"
     )
 
     return {
@@ -206,12 +352,18 @@ def _get_ssrf_config() -> dict:
         "allowlist_urls": allowlist_urls,
         "use_sync_dns": use_sync_dns,
         "dns_timeout": dns_timeout,
+        "dns_cache_ttl": dns_cache_ttl,
+        "dns_cache_size": dns_cache_size,
     }
 
 
 def clear_ssrf_config_cache() -> None:
     """Clear the cached SSRF configuration. Useful for testing."""
     _get_ssrf_config.cache_clear()
+    # Also reset DNS cache when config changes
+    global _dns_cache
+    with _dns_cache_lock:
+        _dns_cache = None
 
 
 def _is_url_allowlisted(url: str, config: dict) -> bool:
@@ -588,6 +740,7 @@ async def _resolve_dns_async(
     Resolve DNS asynchronously without blocking the event loop.
 
     Uses asyncio.get_running_loop().getaddrinfo() for non-blocking resolution.
+    Results are cached with TTL to avoid repeated resolution under load.
 
     Args:
         hostname: Hostname to resolve
@@ -601,11 +754,26 @@ async def _resolve_dns_async(
         asyncio.TimeoutError: If resolution exceeds timeout
         socket.gaierror: If DNS resolution fails
     """
+    # Check cache first
+    cache_key = f"{hostname}:{port}"
+    cache = _get_dns_cache()
+    cached_result = cache.get(cache_key)
+    if cached_result is not None:
+        verbose_proxy_logger.debug(f"SSRF: DNS cache hit for {hostname}:{port}")
+        return cached_result
+
+    # Perform async DNS resolution
     loop = asyncio.get_running_loop()
-    return await asyncio.wait_for(
+    result = await asyncio.wait_for(
         loop.getaddrinfo(hostname, port, family=0, type=socket.SOCK_STREAM),
         timeout=timeout,
     )
+
+    # Cache the result
+    cache.set(cache_key, result)
+    verbose_proxy_logger.debug(f"SSRF: DNS resolved and cached for {hostname}:{port}")
+
+    return result
 
 
 async def validate_outbound_url_async(

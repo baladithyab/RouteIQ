@@ -60,7 +60,7 @@ from .auth import (
 from .mcp_gateway import MCPServer, MCPTransport, MCPToolDefinition, get_mcp_gateway
 from .hot_reload import get_hot_reload_manager
 from .config_sync import get_sync_manager
-from .url_security import validate_outbound_url, SSRFBlockedError
+from .url_security import validate_outbound_url, validate_outbound_url_async, SSRFBlockedError
 from .resilience import get_drain_manager
 
 # Import MCP parity layer routers and feature flags
@@ -427,9 +427,10 @@ async def register_a2a_agent_convenience(agent: AgentRegistration):
     request_id = get_request_id() or "unknown"
 
     # Security: Validate URL against SSRF attacks before registration
+    # Use async version to avoid blocking the event loop
     if agent.url:
         try:
-            validate_outbound_url(agent.url, resolve_dns=False)
+            await validate_outbound_url_async(agent.url, resolve_dns=False)
         except SSRFBlockedError as e:
             raise HTTPException(
                 status_code=400,

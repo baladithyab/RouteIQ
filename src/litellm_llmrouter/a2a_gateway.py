@@ -45,7 +45,7 @@ from .http_client_pool import get_client_for_request
 
 # Import SSRF protection utilities
 try:
-    from .url_security import validate_outbound_url, SSRFBlockedError
+    from .url_security import validate_outbound_url, validate_outbound_url_async, SSRFBlockedError
 
     SSRF_PROTECTION_AVAILABLE = True
 except ImportError:
@@ -53,6 +53,10 @@ except ImportError:
     SSRFBlockedError = Exception  # Fallback type
 
     def validate_outbound_url(url: str, **kwargs) -> str:
+        """No-op fallback when url_security module is not available."""
+        return url
+
+    async def validate_outbound_url_async(url: str, **kwargs) -> str:
         """No-op fallback when url_security module is not available."""
         return url
 
@@ -330,8 +334,9 @@ class A2AGateway:
             )
 
         # Security: Validate URL against SSRF attacks (outside lock)
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(agent.url)
+            await validate_outbound_url_async(agent.url)
         except SSRFBlockedError as e:
             verbose_proxy_logger.warning(
                 f"A2A: SSRF blocked for agent '{agent_id}': {e}"
@@ -501,8 +506,9 @@ class A2AGateway:
             return
 
         # Security: Validate URL against SSRF attacks (outside lock)
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(agent.url)
+            await validate_outbound_url_async(agent.url)
         except SSRFBlockedError as e:
             verbose_proxy_logger.warning(
                 f"A2A: SSRF blocked for agent '{agent_id}': {e}"
@@ -651,8 +657,9 @@ class A2AGateway:
             return
 
         # Security: Validate URL against SSRF attacks (outside lock)
+        # Use async version to avoid blocking the event loop
         try:
-            validate_outbound_url(agent.url)
+            await validate_outbound_url_async(agent.url)
         except SSRFBlockedError as e:
             verbose_proxy_logger.warning(
                 f"A2A: SSRF blocked for agent '{agent_id}': {e}"
