@@ -1,0 +1,227 @@
+# =============================================================================
+# TG6.1 Load/Soak Gate Workflow
+# =============================================================================
+#
+# This workflow runs deterministic load/soak tests against the streaming-perf
+# stack to validate latency (TTFB p95/p99) and error rate thresholds.
+#
+# Triggers:
+#   - Nightly schedule: Full soak test (5 min, higher concurrency)
+#   - Pull requests: Quick load test (30s, lower concurrency)
+#   - Manual dispatch: Configurable mode
+#
+# Thresholds:
+#   - TTFB p95: 500ms (default)
+#   - TTFB p99: 1000ms (default)
+#   - Error rate: 1% (default)
+#
+# Requirements:
+#   - Uses ubuntu-latest with Docker for compose
+#   - No external credentials needed (deterministic stub stack)
+# =============================================================================
+
+name: Load/Soak Gate
+
+on:
+  # Nightly schedule for soak testing (2 AM UTC)
+  schedule:
+    - cron: '0 2 * * *'
+
+  # PR gate (optional - shorter load test)
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'docker-compose.streaming-perf.yml'
+      - 'scripts/run_load_gate.py'
+      - 'scripts/streaming_stub_server.py'
+      - 'config/config.streaming-perf.yaml'
+      - '.github/workflows/load-gate.yml'
+
+  # Manual trigger with configurable mode
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Test mode: load (quick) or soak (extended)'
+        required: true
+        default: 'load'
+        type: choice
+        options:
+          - load
+          - soak
+      ttfb_p95_ms:
+        description: 'TTFB p95 threshold (ms)'
+        required: false
+        default: '500'
+      ttfb_p99_ms:
+        description: 'TTFB p99 threshold (ms)'
+        required: false
+        default: '1000'
+      error_rate_pct:
+        description: 'Max error rate (%)'
+        required: false
+        default: '1.0'
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Detect changes (for PR runs only)
+  # ===========================================================================
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      should_run: ${{ steps.filter.outputs.perf }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3
+        id: filter
+        with:
+          filters: |
+            perf:
+              - 'src/**'
+              - 'tests/**'
+              - 'docker-compose.streaming-perf.yml'
+              - 'scripts/run_load_gate.py'
+              - 'scripts/streaming_stub_server.py'
+              - 'config/config.streaming-perf.yaml'
+              - '.github/workflows/load-gate.yml'
+
+  # ===========================================================================
+  # Load Gate (PR - quick 30s test)
+  # ===========================================================================
+  load-gate-pr:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' &&
+      (needs.changes.outputs.should_run == 'true' || needs.changes.outputs.should_run == null)
+    needs: [changes]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          # Ensure httpx is available
+          uv pip install --python .venv/bin/python httpx
+
+      - name: Run load gate (quick)
+        id: load_gate
+        run: |
+          .venv/bin/python scripts/run_load_gate.py \
+            --mode load \
+            --json-output load-gate-report.json
+        env:
+          CI: "true"
+
+      - name: Upload load gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: load-gate-report-pr
+          path: load-gate-report.json
+          retention-days: 7
+
+  # ===========================================================================
+  # Soak Gate (Nightly - extended 5 min test)
+  # ===========================================================================
+  soak-gate-nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          uv pip install --python .venv/bin/python httpx
+
+      - name: Run soak gate (extended)
+        id: soak_gate
+        run: |
+          .venv/bin/python scripts/run_load_gate.py \
+            --mode soak \
+            --json-output soak-gate-report.json
+        env:
+          CI: "true"
+
+      - name: Upload soak gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: soak-gate-report-nightly
+          path: soak-gate-report.json
+          retention-days: 30
+
+  # ===========================================================================
+  # Manual Gate (workflow_dispatch - configurable)
+  # ===========================================================================
+  load-gate-manual:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          uv pip install --python .venv/bin/python httpx
+
+      - name: Run load gate (manual)
+        id: load_gate
+        run: |
+          .venv/bin/python scripts/run_load_gate.py \
+            --mode "${{ inputs.mode }}" \
+            --ttfb-p95-ms "${{ inputs.ttfb_p95_ms }}" \
+            --ttfb-p99-ms "${{ inputs.ttfb_p99_ms }}" \
+            --error-rate-pct "${{ inputs.error_rate_pct }}" \
+            --json-output load-gate-report.json
+        env:
+          CI: "true"
+
+      - name: Upload load gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: load-gate-report-manual-${{ inputs.mode }}
+          path: load-gate-report.json
+          retention-days: 30
