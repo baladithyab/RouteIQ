@@ -58,6 +58,9 @@ from litellm_llmrouter.telemetry_contracts import (
     RouterDecisionEventBuilder,
 )
 
+# Import TG4.1 router decision span attributes helper
+from litellm_llmrouter.observability import set_router_decision_attributes
+
 logger = logging.getLogger(__name__)
 
 # Configuration environment variables
@@ -1306,23 +1309,6 @@ class RoutingPipeline:
                     reason=result.fallback_reason,
                 )
 
-            # Set outcome
-            if result.error and not result.deployment:
-                builder.with_outcome(
-                    status=RoutingOutcome.ERROR,
-                    error_message=result.error,
-                )
-            elif result.deployment:
-                builder.with_outcome(
-                    status=(
-                        RoutingOutcome.FALLBACK
-                        if result.is_fallback
-                        else RoutingOutcome.SUCCESS
-                    ),
-                )
-            else:
-                builder.with_outcome(status=RoutingOutcome.NO_CANDIDATES)
-
             # Add trace context
             span_context = span.get_span_context()
             if span_context.is_valid:
@@ -1340,6 +1326,41 @@ class RoutingPipeline:
                     span.set_attribute("routing.experiment", ab.experiment_id)
                 if ab.variant:
                     span.set_attribute("routing.variant", ab.variant)
+
+            # TG4.1: Set router decision span attributes for observability
+            selected_model = (
+                result.deployment.get("litellm_params", {}).get("model")
+                if result.deployment
+                else None
+            )
+
+            # Determine outcome for TG4.1 attributes
+            if result.error and not result.deployment:
+                outcome = RoutingOutcome.ERROR.value
+                reason = f"strategy_error: {result.error}"
+            elif result.deployment and result.is_fallback:
+                outcome = RoutingOutcome.FALLBACK.value
+                reason = result.fallback_reason or "primary_failed"
+            elif result.deployment:
+                outcome = RoutingOutcome.SUCCESS.value
+                reason = "ab_test" if ab_weights else "active_strategy"
+            else:
+                outcome = RoutingOutcome.NO_CANDIDATES.value
+                reason = "no_candidates_available"
+
+            set_router_decision_attributes(
+                span,
+                strategy=result.strategy_name,
+                model_selected=selected_model,
+                candidates_evaluated=len(candidates),
+                outcome=outcome,
+                reason=reason,
+                latency_ms=result.latency_ms,
+                error_type=type(Exception(result.error)).__name__ if result.error else None,
+                error_message=result.error if result.error else None,
+                strategy_version=ab.version if ab else None,
+                fallback_triggered=result.is_fallback,
+            )
 
             # Emit event
             event = builder.build()

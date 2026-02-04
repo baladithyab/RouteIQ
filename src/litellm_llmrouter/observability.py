@@ -43,6 +43,134 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 
 logger = logging.getLogger(__name__)
 
+# ==============================================================================
+# TG4.1: Router Decision Span Attributes
+# ==============================================================================
+# These span attribute keys align with the TG4.1 acceptance criteria for
+# routing decision visibility in traces.
+#
+# Span Attribute Naming Convention:
+# - Use 'router.' prefix for all routing-related attributes
+# - Use snake_case for attribute names
+# ==============================================================================
+
+ROUTER_STRATEGY_ATTR = "router.strategy"
+"""Strategy name used for routing (e.g., 'knn', 'mlp', 'random')."""
+
+ROUTER_MODEL_SELECTED_ATTR = "router.model_selected"
+"""Model/deployment that was selected by the router."""
+
+ROUTER_SCORE_ATTR = "router.score"
+"""Routing score for ML-based strategies (e.g., confidence score)."""
+
+ROUTER_CANDIDATES_EVALUATED_ATTR = "router.candidates_evaluated"
+"""Number of candidate models evaluated during routing."""
+
+ROUTER_DECISION_OUTCOME_ATTR = "router.decision_outcome"
+"""Outcome of the routing decision (success, failure, error, fallback, no_candidates)."""
+
+ROUTER_DECISION_REASON_ATTR = "router.decision_reason"
+"""Human-readable reason for the routing decision."""
+
+ROUTER_LATENCY_MS_ATTR = "router.latency_ms"
+"""Routing decision latency in milliseconds."""
+
+ROUTER_ERROR_TYPE_ATTR = "router.error_type"
+"""Error type if routing failed (exception class name)."""
+
+ROUTER_ERROR_MESSAGE_ATTR = "router.error_message"
+"""Error message if routing failed."""
+
+ROUTER_VERSION_ATTR = "router.strategy_version"
+"""Version of the routing strategy/model (e.g., model SHA256 prefix)."""
+
+ROUTER_FALLBACK_TRIGGERED_ATTR = "router.fallback_triggered"
+"""Whether fallback to another model was triggered."""
+
+
+def set_router_decision_attributes(
+    span: trace.Span,
+    *,
+    strategy: Optional[str] = None,
+    model_selected: Optional[str] = None,
+    score: Optional[float] = None,
+    candidates_evaluated: Optional[int] = None,
+    outcome: Optional[str] = None,
+    reason: Optional[str] = None,
+    latency_ms: Optional[float] = None,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    fallback_triggered: Optional[bool] = None,
+) -> None:
+    """
+    Set TG4.1 router decision span attributes on the given span.
+
+    This function provides a centralized way to emit routing decision
+    telemetry as first-class span attributes, enabling analysis of routing
+    decisions in tracing backends (Jaeger, Tempo, etc.).
+
+    Args:
+        span: The OpenTelemetry span to add attributes to
+        strategy: Routing strategy name (e.g., 'knn', 'mlp', 'random')
+        model_selected: Model/deployment that was selected
+        score: Routing score for ML-based strategies
+        candidates_evaluated: Number of candidates evaluated
+        outcome: Routing outcome (success, failure, error, fallback, no_candidates)
+        reason: Human-readable reason for the decision
+        latency_ms: Routing decision latency in milliseconds
+        error_type: Error type if routing failed
+        error_message: Error message if routing failed
+        strategy_version: Version of the routing strategy/model
+        fallback_triggered: Whether fallback was triggered
+
+    Example:
+        with tracer.start_as_current_span("routing.decision") as span:
+            # ... perform routing ...
+            set_router_decision_attributes(
+                span,
+                strategy="knn",
+                model_selected="gpt-4",
+                candidates_evaluated=5,
+                outcome="success",
+            )
+    """
+    if not span or not span.is_recording():
+        return
+
+    if strategy is not None:
+        span.set_attribute(ROUTER_STRATEGY_ATTR, strategy)
+
+    if model_selected is not None:
+        span.set_attribute(ROUTER_MODEL_SELECTED_ATTR, model_selected)
+
+    if score is not None:
+        span.set_attribute(ROUTER_SCORE_ATTR, score)
+
+    if candidates_evaluated is not None:
+        span.set_attribute(ROUTER_CANDIDATES_EVALUATED_ATTR, candidates_evaluated)
+
+    if outcome is not None:
+        span.set_attribute(ROUTER_DECISION_OUTCOME_ATTR, outcome)
+
+    if reason is not None:
+        span.set_attribute(ROUTER_DECISION_REASON_ATTR, reason)
+
+    if latency_ms is not None:
+        span.set_attribute(ROUTER_LATENCY_MS_ATTR, latency_ms)
+
+    if error_type is not None:
+        span.set_attribute(ROUTER_ERROR_TYPE_ATTR, error_type)
+
+    if error_message is not None:
+        span.set_attribute(ROUTER_ERROR_MESSAGE_ATTR, error_message)
+
+    if strategy_version is not None:
+        span.set_attribute(ROUTER_VERSION_ATTR, strategy_version)
+
+    if fallback_triggered is not None:
+        span.set_attribute(ROUTER_FALLBACK_TRIGGERED_ATTR, fallback_triggered)
+
 
 def _is_sdk_tracer_provider(provider: Any) -> bool:
     """

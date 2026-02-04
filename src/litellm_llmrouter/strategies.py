@@ -24,13 +24,6 @@ import tempfile
 import yaml
 from litellm._logging import verbose_proxy_logger
 
-try:
-    from opentelemetry import trace
-
-    OTEL_AVAILABLE = True
-except ImportError:
-    OTEL_AVAILABLE = False
-
 # Import model artifact verification
 from litellm_llmrouter.model_artifacts import (
     get_artifact_verifier,
@@ -48,6 +41,9 @@ from litellm_llmrouter.telemetry_contracts import (
     ROUTER_DECISION_EVENT_NAME,
     ROUTER_DECISION_PAYLOAD_KEY,
 )
+
+# Import TG4.1 router decision span attributes helper
+from litellm_llmrouter.observability import set_router_decision_attributes
 
 try:
     from opentelemetry import trace
@@ -918,12 +914,52 @@ class LLMRouterStrategyFamily:
                         # Calculate latency
                         latency_ms = (time.time() - start_time) * 1000
 
-                        # Add result to span attributes
-                        if selected_model:
-                            span.set_attribute(
-                                "llm.routing.selected_model", selected_model
+                        # Determine outcome and reason for TG4.1 span attributes
+                        if error_info:
+                            outcome = RoutingOutcome.ERROR.value
+                            reason = f"strategy_error: {error_info[0]}"
+                        elif selected_model:
+                            outcome = RoutingOutcome.SUCCESS.value
+                            reason = "strategy_prediction"
+                        else:
+                            outcome = (
+                                RoutingOutcome.NO_CANDIDATES.value
+                                if not model_list
+                                else RoutingOutcome.FAILURE.value
                             )
-                        span.set_attribute("llm.routing.latency_ms", latency_ms)
+                            reason = (
+                                "no_candidates_available"
+                                if not model_list
+                                else "no_prediction"
+                            )
+
+                        # Get strategy version from router if available
+                        strategy_version = None
+                        if (
+                            self.router
+                            and hasattr(self.router, "model_version")
+                            and self.router.model_version
+                        ):
+                            strategy_version = (
+                                self.router.model_version.sha256[:16]
+                                if hasattr(self.router.model_version, "sha256")
+                                else str(self.router.model_version)
+                            )
+
+                        # Set TG4.1 router decision span attributes
+                        set_router_decision_attributes(
+                            span,
+                            strategy=self.strategy_name,
+                            model_selected=selected_model,
+                            candidates_evaluated=len(model_list),
+                            outcome=outcome,
+                            reason=reason,
+                            latency_ms=latency_ms,
+                            error_type=error_info[0] if error_info else None,
+                            error_message=error_info[1] if error_info else None,
+                            strategy_version=strategy_version,
+                            fallback_triggered=False,
+                        )
 
                         # Build versioned telemetry event
                         event_builder = (
