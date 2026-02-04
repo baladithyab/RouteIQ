@@ -243,15 +243,8 @@ class ConfigSyncManager:
 
     def start(self):
         """Start the background sync thread."""
-        if not self.sync_enabled or (
-            not self.s3_sync_enabled and not self.gcs_sync_enabled
-        ):
-            verbose_proxy_logger.info(
-                "Config sync disabled or no remote config configured"
-            )
-            return
-
-        # Start leader election renewal if enabled
+        # Always initialize leader election if enabled, even if remote sync is disabled
+        # This ensures HA mode works for other features beyond config sync
         if self._leader_election_enabled and self._leader_election is not None:
             # Initialize leader election table and try initial acquisition
             import asyncio
@@ -263,6 +256,10 @@ class ConfigSyncManager:
                     loop.run_until_complete(self._leader_election.try_acquire())
                 finally:
                     loop.close()
+                verbose_proxy_logger.info(
+                    f"Config sync: Leader election initialized "
+                    f"(is_leader={self._leader_election.is_leader})"
+                )
             except Exception as e:
                 verbose_proxy_logger.warning(
                     f"Config sync: Leader election init error: {e}"
@@ -272,6 +269,14 @@ class ConfigSyncManager:
             self._leader_election.start_renewal(
                 on_leadership_change=self._on_leadership_change
             )
+
+        if not self.sync_enabled or (
+            not self.s3_sync_enabled and not self.gcs_sync_enabled
+        ):
+            verbose_proxy_logger.info(
+                "Config sync disabled or no remote config configured"
+            )
+            return
 
         self._sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
         self._sync_thread.start()

@@ -37,6 +37,7 @@ on:
     paths:
       - 'src/**'
       - 'docker-compose.ha.yml'
+      - 'docker-compose.ha-test.yml'
       - 'config/nginx.conf'
       - 'docker/Dockerfile'
       - 'scripts/run_ha_gate.py'
@@ -76,6 +77,7 @@ jobs:
             ha:
               - 'src/**'
               - 'docker-compose.ha.yml'
+              - 'docker-compose.ha-test.yml'
               - 'config/nginx.conf'
               - 'docker/Dockerfile'
               - 'scripts/run_ha_gate.py'

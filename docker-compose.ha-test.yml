@@ -1,0 +1,192 @@
+# LiteLLM + LLMRouter - High Availability Test Setup
+# This is a test variant of docker-compose.ha.yml with default credentials
+# for CI/CD testing. DO NOT USE IN PRODUCTION.
+#
+# This file provides safe defaults for automated testing without requiring
+# environment variables to be pre-configured.
+
+services:
+  # ==========================================================================
+  # PostgreSQL - Persistent storage for LiteLLM
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: litellm-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm_test_password}
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-litellm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # Redis - Caching and distributed state
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: litellm-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # LiteLLM + LLMRouter Gateway (Primary)
+  # ==========================================================================
+  litellm-gateway-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: litellm-gateway-1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.yaml
+      # TEST ONLY: Safe defaults for CI testing
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-ha-gate-test-key-not-for-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_test_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # LLM Provider API Keys (not needed for HA testing)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AZURE_API_KEY=${AZURE_API_KEY:-}
+      # LLMRouter Settings
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=true
+      - LLMROUTER_RELOAD_INTERVAL=300
+      # HA Mode - Leader Election (required for HA testing)
+      - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
+      - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-15}
+      - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-5}
+      # Gateway Features
+      - A2A_GATEWAY_ENABLED=false
+      - MCP_GATEWAY_ENABLED=false
+      - STORE_MODEL_IN_DB=true
+      # Config Sync & Hot Reload
+      - CONFIG_HOT_RELOAD=true
+      - CONFIG_SYNC_ENABLED=true
+      - CONFIG_SYNC_INTERVAL=60
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # LiteLLM + LLMRouter Gateway (Replica for HA)
+  # ==========================================================================
+  litellm-gateway-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: litellm-gateway-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4001:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.yaml
+      # TEST ONLY: Safe defaults for CI testing
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-ha-gate-test-key-not-for-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_test_password}@postgres:5432/${POSTGRES_DB:-litellm}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # LLM Provider API Keys (not needed for HA testing)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AZURE_API_KEY=${AZURE_API_KEY:-}
+      # LLMRouter Settings
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=true
+      - LLMROUTER_RELOAD_INTERVAL=300
+      # HA Mode - Leader Election (required for HA testing)
+      - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
+      - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-15}
+      - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-5}
+      # Gateway Features
+      - A2A_GATEWAY_ENABLED=false
+      - MCP_GATEWAY_ENABLED=false
+      - STORE_MODEL_IN_DB=true
+      # Config Sync & Hot Reload
+      - CONFIG_HOT_RELOAD=true
+      - CONFIG_SYNC_ENABLED=true
+      - CONFIG_SYNC_INTERVAL=60
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+  # ==========================================================================
+  # Nginx Load Balancer
+  # ==========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: litellm-nginx
+    depends_on:
+      - litellm-gateway-1
+      - litellm-gateway-2
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    networks:
+      - litellm-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  litellm-network:
+    driver: bridge

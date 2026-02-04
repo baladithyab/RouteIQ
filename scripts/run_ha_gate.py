@@ -69,7 +69,7 @@ import httpx
 # =============================================================================
 
 # Default settings
-DEFAULT_COMPOSE_FILE = "docker-compose.ha.yml"
+DEFAULT_COMPOSE_FILE = "docker-compose.ha-test.yml"
 DEFAULT_FAILOVER_TIMEOUT = 90  # seconds
 DEFAULT_STARTUP_TIMEOUT = 180  # seconds
 DEFAULT_READINESS_POLL_INTERVAL = 5  # seconds
@@ -82,7 +82,7 @@ GATEWAY_2_URL = os.getenv("HA_GATEWAY_2_URL", "http://localhost:4001")
 POSTGRES_HOST = os.getenv("HA_POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("HA_POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "litellm")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "litellm_password")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "litellm_test_password")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "litellm")
 
 # Container names from docker-compose.ha.yml
@@ -188,11 +188,11 @@ def run_compose(
         check=check,
         env={
             **os.environ,
-            # Provide required env vars for HA compose
+            # Provide required env vars for HA compose (matching docker-compose.ha-test.yml defaults)
             "LITELLM_MASTER_KEY": os.getenv(
                 "LITELLM_MASTER_KEY", "ha-gate-test-key-not-for-production"
             ),
-            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+            "POSTGRES_PASSWORD": os.getenv("POSTGRES_PASSWORD", "litellm_test_password"),
             "LLMROUTER_HA_MODE": "leader_election",
             "LLMROUTER_CONFIG_SYNC_LEASE_SECONDS": "15",  # Faster for testing
             "LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS": "5",
