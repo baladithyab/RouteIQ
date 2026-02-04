@@ -1,0 +1,230 @@
+# =============================================================================
+# TG6.2 HA Gate Workflow
+# =============================================================================
+#
+# This workflow validates the High Availability (HA) behavior of the RouteIQ
+# gateway stack by testing leader election and failover scenarios.
+#
+# Test Scenarios:
+#   1. Boot HA stack (docker-compose.ha.yml)
+#   2. Wait for readiness
+#   3. Determine current leader from PostgreSQL
+#   4. Verify no split-brain (exactly 1 leader)
+#   5. Kill the leader container
+#   6. Assert new leader elected within timeout
+#   7. Verify service remains available via nginx
+#
+# Triggers:
+#   - Nightly schedule (3 AM UTC)
+#   - Pull requests (when HA-related files change)
+#   - Manual dispatch
+#
+# Requirements:
+#   - Docker Compose for HA stack
+#   - No external credentials needed (uses health endpoints only)
+# =============================================================================
+
+name: HA Gate
+
+on:
+  # Nightly schedule (3 AM UTC)
+  schedule:
+    - cron: '0 3 * * *'
+
+  # PR gate (when HA-related files change)
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'docker-compose.ha.yml'
+      - 'config/nginx.conf'
+      - 'docker/Dockerfile'
+      - 'scripts/run_ha_gate.py'
+      - '.github/workflows/ha-gate.yml'
+      - 'src/litellm_llmrouter/leader_election.py'
+      - 'src/litellm_llmrouter/config_sync.py'
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      failover_timeout:
+        description: 'Max seconds to wait for failover'
+        required: false
+        default: '90'
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Detect changes (for PR runs only)
+  # ===========================================================================
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      should_run: ${{ steps.filter.outputs.ha }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3
+        id: filter
+        with:
+          filters: |
+            ha:
+              - 'src/**'
+              - 'docker-compose.ha.yml'
+              - 'config/nginx.conf'
+              - 'docker/Dockerfile'
+              - 'scripts/run_ha_gate.py'
+              - '.github/workflows/ha-gate.yml'
+              - 'src/litellm_llmrouter/leader_election.py'
+              - 'src/litellm_llmrouter/config_sync.py'
+
+  # ===========================================================================
+  # HA Gate (PR - quick test)
+  # ===========================================================================
+  ha-gate-pr:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' &&
+      (needs.changes.outputs.should_run == 'true' || needs.changes.outputs.should_run == null)
+    needs: [changes]
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          # Ensure required packages are available
+          uv pip install --python .venv/bin/python httpx asyncpg
+
+      - name: Run HA gate
+        id: ha_gate
+        run: |
+          .venv/bin/python scripts/run_ha_gate.py \
+            --timeout 90 \
+            --json-output ha-gate-report.json
+        env:
+          CI: "true"
+          # No real credentials needed - uses health endpoints only
+          LITELLM_MASTER_KEY: ci-ha-gate-test-key
+
+      - name: Upload HA gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: ha-gate-report-pr
+          path: ha-gate-report.json
+          retention-days: 7
+
+  # ===========================================================================
+  # HA Gate (Nightly - extended test)
+  # ===========================================================================
+  ha-gate-nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          uv pip install --python .venv/bin/python httpx asyncpg
+
+      - name: Run HA gate (extended)
+        id: ha_gate
+        run: |
+          .venv/bin/python scripts/run_ha_gate.py \
+            --timeout 120 \
+            --json-output ha-gate-report.json
+        env:
+          CI: "true"
+          LITELLM_MASTER_KEY: ci-ha-gate-test-key
+
+      - name: Upload HA gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: ha-gate-report-nightly
+          path: ha-gate-report.json
+          retention-days: 30
+
+  # ===========================================================================
+  # HA Gate (Manual - configurable)
+  # ===========================================================================
+  ha-gate-manual:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@f06b870e0a91d23284a3013acc55e6f88ab4b904  # v7
+        with:
+          version: "0.9.26"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --extra dev
+          uv pip install --python .venv/bin/python httpx asyncpg
+
+      - name: Run HA gate (manual)
+        id: ha_gate
+        run: |
+          .venv/bin/python scripts/run_ha_gate.py \
+            --timeout "${{ inputs.failover_timeout }}" \
+            --json-output ha-gate-report.json
+        env:
+          CI: "true"
+          LITELLM_MASTER_KEY: ci-ha-gate-test-key
+
+      - name: Upload HA gate report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: ha-gate-report-manual
+          path: ha-gate-report.json
+          retention-days: 30
