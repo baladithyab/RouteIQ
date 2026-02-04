@@ -1,0 +1,90 @@
+# LiteLLM + LLMRouter - OTel E2E Test Configuration
+# Purpose: Minimal config for deterministic OTel E2E testing (TG4.2)
+#
+# Key features:
+# - Uses 'simple-shuffle' routing strategy (no ML model required)
+# - Mock API keys (requests will fail, but traces will be emitted)
+# - Minimal services to reduce startup time
+# - OTEL enabled with traces to Jaeger
+# - Router decision callback enabled for TG4.1 attributes
+#
+# This config is used by docker-compose.otel.yml for TG4.2 E2E validation.
+
+# =============================================================================
+# Model List - Mock Models (no real API calls)
+# These model definitions trigger the routing pipeline without external deps
+# Multiple deployments with same model_name triggers router selection
+# =============================================================================
+model_list:
+  # Deployment 1
+  - model_name: test-model
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: sk-mock-key-deployment-1
+    model_info:
+      id: test-model-deployment-1
+      mode: chat
+      description: "Test deployment 1 for routing"
+
+  # Deployment 2
+  - model_name: test-model
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: sk-mock-key-deployment-2
+    model_info:
+      id: test-model-deployment-2
+      mode: chat
+      description: "Test deployment 2 for routing"
+
+  # Deployment 3
+  - model_name: test-model
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: sk-mock-key-deployment-3
+    model_info:
+      id: test-model-deployment-3
+      mode: chat
+      description: "Test deployment 3 for routing"
+
+# =============================================================================
+# Router Settings - Simple Strategy (No ML Model)
+# =============================================================================
+router_settings:
+  # 'simple-shuffle' is a built-in LiteLLM strategy that doesn't require external deps
+  # The RouterDecisionCallback will emit TG4.1 attributes for this strategy
+  routing_strategy: simple-shuffle
+  
+  # Enable routing to trigger router decision paths
+  num_retries: 1
+  retry_after: 1
+  timeout: 30
+  cache_responses: false
+
+# =============================================================================
+# General Settings
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # No database for simplicity in E2E tests
+  store_model_in_db: false
+
+# =============================================================================
+# LiteLLM Settings - OTEL Enabled
+# =============================================================================
+litellm_settings:
+  cache: false
+  set_verbose: true
+  drop_params: true
+  # OpenTelemetry callbacks for tracing
+  success_callback: ["otel"]
+  failure_callback: ["otel"]
+
+# =============================================================================
+# Observability Settings - Jaeger
+# =============================================================================
+environment_variables:
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_SERVICE_NAME: "litellm-gateway"
+  OTEL_TRACES_EXPORTER: "otlp"
+  # Sample all traces for testing
+  OTEL_TRACES_SAMPLER: "always_on"

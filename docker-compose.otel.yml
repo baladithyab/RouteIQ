@@ -1,5 +1,5 @@
 # LiteLLM + LLMRouter with Jaeger Tracing
-# OTEL setup for local development and MLOps testing
+# OTEL setup for local development and E2E testing (TG4.2)
 #
 # Usage:
 #   docker-compose -f docker-compose.otel.yml up -d
@@ -8,8 +8,8 @@
 #   - LiteLLM Gateway: http://localhost:4001
 #   - Jaeger UI:       http://localhost:16686
 #
-# Test MLOps Pipeline:
-#   ./scripts/test_mlops_pipeline.sh
+# TG4.2 E2E Test:
+#   uv run pytest tests/integration/test_otel_e2e.py -v -s
 
 services:
   litellm-gateway-otel:
@@ -20,14 +20,12 @@ services:
     ports:
       - "4001:4000"
     volumes:
-      - ./config/config.local-test.yaml:/app/config/config.yaml:ro
-      - ./models:/app/models:ro
+      # Use OTel test config (simple-shuffle strategy, no ML model required)
+      - ./config/config.otel-test.yaml:/app/config/config.yaml:ro
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-dev-key}
-      # API Keys (optional - uses mock responses if not set)
+      # API Keys (mock - requests will fail but traces will be emitted)
       - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-mock-key}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-sk-mock-key}
-      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
       # OpenTelemetry Configuration
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
@@ -35,12 +33,13 @@ services:
       - OTEL_TRACES_EXPORTER=otlp
       - OTEL_METRICS_EXPORTER=none
       - OTEL_LOGS_EXPORTER=none
-      # Redis (optional)
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      # Sample all traces for E2E testing
+      - OTEL_TRACES_SAMPLER=always_on
+      # Enable router decision callback for TG4.1 attributes
+      - LLMROUTER_ROUTER_CALLBACK_ENABLED=true
+      - LLMROUTER_ROUTER_CALLBACK_STRATEGY=simple-shuffle
     depends_on:
       - jaeger
-      - redis
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
       interval: 30s
@@ -61,15 +60,6 @@ services:
     environment:
       - COLLECTOR_OTLP_ENABLED=true
       - LOG_LEVEL=info
-    restart: unless-stopped
-    networks:
-      - otel-network
-
-  redis:
-    image: redis:7-alpine
-    container_name: litellm-redis-otel
-    ports:
-      - "6380:6379"
     restart: unless-stopped
     networks:
       - otel-network

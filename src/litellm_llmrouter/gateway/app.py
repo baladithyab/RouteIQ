@@ -78,10 +78,15 @@ def _configure_middleware(app: FastAPI) -> None:
         app: The FastAPI application instance
     """
     from ..auth import RequestIDMiddleware
+    from ..router_decision_callback import register_router_decision_middleware
 
     # Request ID middleware - should be outermost for correlation
     app.add_middleware(RequestIDMiddleware)
     logger.debug("Added RequestIDMiddleware")
+    
+    # Router decision telemetry middleware - emits TG4.1 router.* span attributes
+    if register_router_decision_middleware(app):
+        logger.debug("Added RouterDecisionMiddleware")
 
 
 def _register_routes(app: FastAPI, include_admin: bool = True) -> None:

@@ -37,6 +37,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 logger = logging.getLogger(__name__)
 
 
+def register_router_decision_callback():
+    """
+    Register the router decision callback for TG4.1 telemetry.
+    
+    This ensures that router decision span attributes (router.strategy, etc.)
+    are emitted for all routing decisions, regardless of which LiteLLM
+    routing strategy is used.
+    """
+    if os.getenv("LLMROUTER_ROUTER_CALLBACK_ENABLED", "true").lower() != "true":
+        return None
+    
+    try:
+        from litellm_llmrouter.router_decision_callback import (
+            register_router_decision_callback as do_register,
+        )
+        
+        callback = do_register()
+        if callback:
+            print("✅ Router decision callback registered (TG4.1 telemetry)")
+        return callback
+    except ImportError as e:
+        logger.debug(f"Could not register router decision callback: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to register router decision callback: {e}")
+        return None
+
+
 def register_strategies():
     """Register LLMRouter strategies with LiteLLM."""
     try:
@@ -358,6 +386,9 @@ Examples:
 
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()
+
+    # Register router decision callback for TG4.1 telemetry
+    register_router_decision_callback()
 
     init_mcp_tracing_if_enabled()
 
