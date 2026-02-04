@@ -21,7 +21,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Callable
 
 from litellm._logging import verbose_proxy_logger
@@ -285,11 +285,12 @@ class LeaderElection:
 
         try:
             import asyncpg
+            from datetime import timedelta
 
             conn = await asyncpg.connect(self._db_url)
             try:
                 now = datetime.now(timezone.utc)
-                expires_at = now.replace(second=now.second + self.lease_seconds)
+                expires_at = now + timedelta(seconds=self.lease_seconds)
 
                 # Atomic upsert that only succeeds if:
                 # 1. No lock exists (INSERT)
