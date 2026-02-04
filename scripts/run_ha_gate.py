@@ -143,7 +143,7 @@ class HAGateResult:
 
 
 def get_compose_command() -> list[str]:
-    """Get the appropriate compose command (docker compose or docker-compose)."""
+    """Get the appropriate compose command (docker compose, docker-compose, or finch compose)."""
     # Prefer 'docker compose' (V2)
     if shutil.which("docker"):
         result = subprocess.run(
@@ -158,7 +158,17 @@ def get_compose_command() -> list[str]:
     if shutil.which("docker-compose"):
         return ["docker-compose"]
 
-    raise RuntimeError("Neither 'docker compose' nor 'docker-compose' found")
+    # Support finch (Docker-compatible runtime on macOS)
+    if shutil.which("finch"):
+        result = subprocess.run(
+            ["finch", "compose", "version"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return ["finch", "compose"]
+
+    raise RuntimeError("Neither 'docker compose', 'docker-compose', nor 'finch compose' found")
 
 
 def run_compose(
@@ -193,7 +203,9 @@ def run_compose(
 def start_stack(compose_file: str) -> None:
     """Start the HA stack."""
     print("\n📦 Starting HA stack...")
-    run_compose(compose_file, "up", "-d", "--build", "--wait")
+    # Note: We don't use --wait because finch compose doesn't support it
+    # Instead, we rely on our own wait_for_stack_ready() function
+    run_compose(compose_file, "up", "-d", "--build")
 
 
 def stop_stack(compose_file: str) -> None:
