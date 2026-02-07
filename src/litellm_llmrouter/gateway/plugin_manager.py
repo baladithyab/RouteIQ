@@ -187,6 +187,11 @@ class GatewayPlugin(ABC):
     Plugins must implement startup() and shutdown() hooks.
     Both methods receive the FastAPI application instance and a PluginContext.
 
+    Optional hooks:
+    - on_request(request): Called before each request is processed
+    - on_response(request, response): Called after each response is generated
+    - health_check(): Called during readiness checks to report plugin health
+
     Legacy Compatibility:
     - Plugins that don't override `metadata` get safe defaults
     - Plugins using the old startup(app) signature still work
@@ -244,6 +249,18 @@ class GatewayPlugin(ABC):
             context: Plugin context with settings, logger, validators (optional for backwards compat)
         """
         pass
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        Optional health check hook called during readiness probes.
+
+        Override to report plugin-specific health status.
+
+        Returns:
+            Dict with at least {"status": "ok"|"degraded"|"unhealthy"}
+            and any additional health metadata.
+        """
+        return {"status": "ok"}
 
 
 class NoOpPlugin(GatewayPlugin):
@@ -585,11 +602,55 @@ class PluginManager:
                 "Could not import validate_outbound_url, plugins won't have URL validation"
             )
 
+        # Populate settings from environment for plugin consumption
+        settings = self._collect_plugin_settings()
+
         return PluginContext(
-            settings={},  # TODO: populate with relevant settings
+            settings=settings,
             logger=logger,
             validate_outbound_url=url_validator,
         )
+
+    def _collect_plugin_settings(self) -> dict[str, Any]:
+        """
+        Collect gateway settings relevant to plugins.
+
+        Returns a read-only snapshot of environment-driven configuration
+        that plugins may need during startup/shutdown.
+        """
+        settings: dict[str, Any] = {}
+
+        # Gateway feature flags
+        settings["mcp_gateway_enabled"] = os.getenv(
+            "MCP_GATEWAY_ENABLED", "false"
+        ).lower() == "true"
+        settings["a2a_gateway_enabled"] = os.getenv(
+            "A2A_GATEWAY_ENABLED", "false"
+        ).lower() == "true"
+        settings["otel_enabled"] = os.getenv(
+            "OTEL_ENABLED", "true"
+        ).lower() != "false"
+        settings["policy_engine_enabled"] = os.getenv(
+            "POLICY_ENGINE_ENABLED", "false"
+        ).lower() == "true"
+
+        # Config paths
+        settings["config_path"] = os.getenv("LITELLM_CONFIG_PATH", "")
+        settings["policy_config_path"] = os.getenv("POLICY_CONFIG_PATH", "")
+
+        # Service info
+        settings["service_name"] = os.getenv(
+            "OTEL_SERVICE_NAME", "litellm-gateway"
+        )
+
+        # Plugin-specific settings (prefixed with ROUTEIQ_PLUGIN_)
+        for key, value in os.environ.items():
+            if key.startswith("ROUTEIQ_PLUGIN_"):
+                # Strip prefix and lowercase for plugin consumption
+                setting_key = key[len("ROUTEIQ_PLUGIN_"):].lower()
+                settings[setting_key] = value
+
+        return settings
 
     def _get_failure_mode(self, plugin: GatewayPlugin) -> FailureMode:
         """Get the effective failure mode for a plugin."""
@@ -720,6 +781,29 @@ class PluginManager:
     def is_started(self) -> bool:
         """Return whether startup() has been called."""
         return self._started
+
+    async def health_checks(self) -> dict[str, dict[str, Any]]:
+        """
+        Run health checks on all active plugins.
+
+        Returns:
+            Dict mapping plugin name to health status dict.
+            Each status contains at least {"status": "ok"|"degraded"|"unhealthy"}.
+        """
+        results: dict[str, dict[str, Any]] = {}
+
+        for plugin in self._plugins:
+            if plugin.name in self._quarantined:
+                results[plugin.name] = {"status": "quarantined"}
+                continue
+
+            try:
+                results[plugin.name] = await plugin.health_check()
+            except Exception as e:
+                logger.warning(f"Plugin {plugin.name} health check failed: {e}")
+                results[plugin.name] = {"status": "unhealthy", "error": str(e)}
+
+        return results
 
 
 def get_plugin_manager() -> PluginManager:

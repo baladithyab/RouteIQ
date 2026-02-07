@@ -457,12 +457,12 @@ class TestConcurrentLeaderElection:
 
         async def mock_fetch(*args, **kwargs):
             """Simulate atomic upsert behavior."""
-            # Extract arguments from the call
+            # Extract arguments from the fetchrow call:
+            # fetchrow(query, lock_name, holder_id, now, expires_at)
             holder_id = args[2]
             now = args[3]
-            lease_seconds = args[4]
+            expires_at = args[4]
 
-            expires_at = now + timedelta(seconds=lease_seconds)
             with lock:
                 # If no current holder or lease expired
                 if (
@@ -520,11 +520,11 @@ class TestConcurrentLeaderElection:
         lock = threading.Lock()
 
         async def mock_fetch(*args, **kwargs):
+            # fetchrow(query, lock_name, holder_id, now, expires_at)
             holder_id = args[2]
             now = args[3]
-            lease_seconds = args[4]
+            expires_at = args[4]
 
-            expires_at = now + timedelta(seconds=lease_seconds)
             with lock:
                 if (
                     current_holder["holder_id"] is None
