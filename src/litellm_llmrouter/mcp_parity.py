@@ -60,7 +60,7 @@ from .mcp_gateway import (
     MCPTransport,
     get_mcp_gateway,
 )
-from .url_security import SSRFBlockedError, validate_outbound_url, validate_outbound_url_async
+from .url_security import SSRFBlockedError, validate_outbound_url_async
 from .http_client_pool import get_client_for_request
 
 # Feature flags

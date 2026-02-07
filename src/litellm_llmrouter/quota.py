@@ -54,7 +54,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import HTTPException, Request
 
@@ -439,7 +439,7 @@ class QuotaRepository:
         key = self._bucket_key(subject, metric, window)
 
         try:
-            redis = await self._get_redis()
+            await self._get_redis()
 
             # Use float script for spend, int script for everything else
             if metric == QuotaMetric.SPEND_USD:

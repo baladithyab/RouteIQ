@@ -44,7 +44,7 @@ from ..http_client_pool import (
     startup_http_client_pool,
     shutdown_http_client_pool,
 )
-from ..policy_engine import add_policy_middleware, get_policy_engine
+from ..policy_engine import add_policy_middleware
 
 logger = logging.getLogger(__name__)
 

@@ -29,10 +29,9 @@ Design:
 """
 
 import logging
-import os
 from typing import Any
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import HTTPException, Request
 
 from .auth import (
     ADMIN_API_KEY_HEADER,
@@ -165,7 +164,7 @@ def has_permission(user_permissions: frozenset[str], required: str) -> bool:
 
     # Namespace wildcard (e.g., "mcp.*" grants "mcp.server.write")
     required_lower = required.lower()
-    required_parts = required_lower.split(".")
+    required_lower.split(".")
     for perm in user_permissions:
         if perm.endswith(".*"):
             prefix = perm[:-2]  # Remove ".*"

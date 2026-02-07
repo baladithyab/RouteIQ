@@ -55,7 +55,7 @@ from enum import Enum
 from typing import Any
 
 import yaml
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .auth import get_request_id
 
@@ -612,7 +612,7 @@ class PolicyMiddleware:
             return
         
         path = scope.get("path", "")
-        method = scope.get("method", "GET")
+        scope.get("method", "GET")
         
         # Skip if policy engine is disabled
         if not self._engine.is_enabled:
@@ -731,7 +731,7 @@ class PolicyMiddleware:
     async def _audit_denial(self, decision: PolicyDecision) -> None:
         """Log policy denial to audit log."""
         try:
-            from .audit import audit_denied, AuditAction
+            from .audit import audit_denied
             
             # Create a new audit action for policy denials
             # We'll use a custom action string

@@ -21,7 +21,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Callable
 
 from litellm._logging import verbose_proxy_logger

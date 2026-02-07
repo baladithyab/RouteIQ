@@ -67,8 +67,6 @@ from .rbac import (
 )
 from .audit import (
     audit_log,
-    audit_success,
-    audit_error,
     AuditAction,
     AuditOutcome,
     AuditWriteError,
@@ -76,8 +74,8 @@ from .audit import (
 from .mcp_gateway import MCPServer, MCPTransport, MCPToolDefinition, get_mcp_gateway
 from .hot_reload import get_hot_reload_manager
 from .config_sync import get_sync_manager
-from .url_security import validate_outbound_url, validate_outbound_url_async, SSRFBlockedError
-from .resilience import get_drain_manager, get_circuit_breaker_manager, CircuitBreakerOpenError
+from .url_security import validate_outbound_url_async, SSRFBlockedError
+from .resilience import get_drain_manager, get_circuit_breaker_manager
 
 # Import MCP parity layer routers and feature flags
 from .mcp_parity import (
@@ -456,7 +454,7 @@ async def _handle_audit_write(
             outcome_reason=outcome_reason,
             actor_info=rbac_info,
         )
-    except AuditWriteError as e:
+    except AuditWriteError:
         # Fail-closed: reject the request with 503
         raise HTTPException(
             status_code=503,

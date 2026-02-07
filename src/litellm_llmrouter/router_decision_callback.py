@@ -27,8 +27,7 @@ Environment Variables:
 import json
 import logging
 import os
-import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 from opentelemetry import trace
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -254,7 +253,7 @@ class RouterDecisionCallback:
         
         # Extract metadata from kwargs
         metadata = kwargs.get("metadata", {}) or {}
-        litellm_params = kwargs.get("litellm_params", {}) or {}
+        kwargs.get("litellm_params", {}) or {}
         
         # Determine number of candidates (if available from router)
         # LiteLLM's router may include this in metadata
