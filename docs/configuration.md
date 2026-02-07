@@ -59,16 +59,33 @@ router_settings:
 
 | Strategy | Description |
 |----------|-------------|
+| **LiteLLM Built-in** | |
 | `simple-shuffle` | Random selection (LiteLLM default) |
 | `least-busy` | Route to least busy deployment |
 | `latency-based-routing` | Optimize for latency |
 | `cost-based-routing` | Optimize for cost |
-| `llmrouter-knn` | K-Nearest Neighbors routing |
-| `llmrouter-svm` | Support Vector Machine routing |
-| `llmrouter-mlp` | Multi-Layer Perceptron routing |
-| `llmrouter-mf` | Matrix Factorization routing |
-| `llmrouter-hybrid` | Hybrid probabilistic routing |
-| `llmrouter-custom` | Your custom trained model |
+| `usage-based-routing` | Route based on token usage |
+| **LLMRouter Single-Round** | |
+| `llmrouter-knn` | K-Nearest Neighbors (embedding similarity) |
+| `llmrouter-svm` | Support Vector Machine |
+| `llmrouter-mlp` | Multi-Layer Perceptron neural network |
+| `llmrouter-mf` | Matrix Factorization |
+| `llmrouter-elo` | Elo Rating based |
+| `llmrouter-routerdc` | Dual Contrastive learning (BERT-based) |
+| `llmrouter-hybrid` | Probabilistic hybrid |
+| `llmrouter-causallm` | Transformer-based (GPT-2) |
+| `llmrouter-graph` | Graph neural network |
+| `llmrouter-automix` | Automatic model mixing |
+| **LLMRouter Multi-Round** | |
+| `llmrouter-r1` | Pre-trained multi-turn router (requires vLLM) |
+| `llmrouter-knn-multiround` | KNN agentic router |
+| `llmrouter-llm-multiround` | LLM agentic router |
+| **LLMRouter Personalized** | |
+| `llmrouter-gmt` | Graph-based personalized router |
+| **LLMRouter Baseline** | |
+| `llmrouter-smallest` | Always picks smallest model |
+| `llmrouter-largest` | Always picks largest model |
+| `llmrouter-custom` | User-defined custom router |
 
 ### General Settings
 

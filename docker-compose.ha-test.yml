@@ -95,7 +95,7 @@ services:
       - CONFIG_SYNC_ENABLED=true
       - CONFIG_SYNC_INTERVAL=60
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -152,7 +152,7 @@ services:
       - CONFIG_SYNC_ENABLED=true
       - CONFIG_SYNC_INTERVAL=60
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 10s
       timeout: 5s
       retries: 6

@@ -157,10 +157,10 @@ Authorization: Bearer <master_key>
 ## Python SDK Usage
 
 ```python
-from litellm_llmrouter import get_a2a_gateway, A2AAgent
+from litellm_llmrouter.a2a_gateway import A2AGateway, A2AAgent
 
-# Get gateway instance
-gateway = get_a2a_gateway()
+# Instantiate gateway
+gateway = A2AGateway()
 
 # Register an agent
 agent = A2AAgent(
@@ -172,8 +172,9 @@ agent = A2AAgent(
 )
 gateway.register_agent(agent)
 
-# Discover agents
-code_agents = gateway.discover_agents("code")
+# Discover agents by capability
+snapshot = gateway.get_agents_snapshot()
+code_agents = [a for a in snapshot.values() if "code" in a.capabilities]
 for agent in code_agents:
     print(f"Found agent: {agent.name}")
 

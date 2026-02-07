@@ -59,6 +59,7 @@ Configuration (Environment Variables):
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import os
@@ -718,6 +719,10 @@ class PluginManager:
         # Create context
         self._context = self._create_context()
 
+        startup_timeout = float(
+            os.getenv("ROUTEIQ_PLUGIN_STARTUP_TIMEOUT", "30")
+        )
+
         for plugin in sorted_plugins:
             if plugin.name in self._quarantined:
                 logger.debug(f"Skipping quarantined plugin: {plugin.name}")
@@ -728,8 +733,16 @@ class PluginManager:
                     f"Starting plugin: {plugin.name} "
                     f"(priority={plugin.metadata.priority})"
                 )
-                await plugin.startup(app, self._context)
+                await asyncio.wait_for(
+                    plugin.startup(app, self._context),
+                    timeout=startup_timeout,
+                )
                 logger.info(f"Plugin started: {plugin.name}")
+            except asyncio.TimeoutError:
+                error = TimeoutError(
+                    f"Plugin {plugin.name} startup timed out after {startup_timeout}s"
+                )
+                self._handle_failure(plugin, "startup", error)
             except Exception as e:
                 self._handle_failure(plugin, "startup", e)
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -297,24 +298,28 @@ def add_evaluation_attributes(
         logger.debug(f"Failed to add evaluation attributes to span: {e}")
 
 
-# Global evaluator registry
+# Global evaluator registry (protected by lock for thread safety)
 _evaluator_plugins: list[EvaluatorPlugin] = []
+_evaluator_lock = threading.Lock()
 
 
 def register_evaluator(plugin: EvaluatorPlugin) -> None:
     """Register an evaluator plugin for hook invocation."""
-    _evaluator_plugins.append(plugin)
+    with _evaluator_lock:
+        _evaluator_plugins.append(plugin)
     logger.info(f"Registered evaluator plugin: {plugin.name}")
 
 
 def get_evaluator_plugins() -> list[EvaluatorPlugin]:
     """Get all registered evaluator plugins."""
-    return list(_evaluator_plugins)
+    with _evaluator_lock:
+        return list(_evaluator_plugins)
 
 
 def clear_evaluator_plugins() -> None:
     """Clear all registered evaluator plugins. Primarily for testing."""
-    _evaluator_plugins.clear()
+    with _evaluator_lock:
+        _evaluator_plugins.clear()
 
 
 def is_evaluator_enabled() -> bool:
@@ -335,8 +340,9 @@ async def run_mcp_evaluators(context: MCPInvocationContext) -> list[EvaluationRe
     if not is_evaluator_enabled():
         return []
 
+    plugins = get_evaluator_plugins()
     results: list[EvaluationResult] = []
-    for plugin in _evaluator_plugins:
+    for plugin in plugins:
         start_time = time.perf_counter()
         try:
             result = await plugin.evaluate_mcp_result(context)
@@ -370,8 +376,9 @@ async def run_a2a_evaluators(context: A2AInvocationContext) -> list[EvaluationRe
     if not is_evaluator_enabled():
         return []
 
+    plugins = get_evaluator_plugins()
     results: list[EvaluationResult] = []
-    for plugin in _evaluator_plugins:
+    for plugin in plugins:
         start_time = time.perf_counter()
         try:
             result = await plugin.evaluate_a2a_result(context)

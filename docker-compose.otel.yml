@@ -41,7 +41,7 @@ services:
     depends_on:
       - jaeger
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -210,7 +210,7 @@ Authorization: Bearer sk-master-key
 ### Get Agent Card
 
 ```http
-GET /a2/a/agents/{agent_id}/card
+GET /a2a/agents/{agent_id}/card
 ```
 
 ### Unregister Agent

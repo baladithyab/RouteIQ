@@ -28,6 +28,7 @@ Docker Usage:
 
 import logging
 import os
+import signal
 import sys
 
 # Ensure src is in path
@@ -278,6 +279,32 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     print(
         "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
     )
+
+    # Register SIGTERM handler to trigger graceful drain before uvicorn shuts down.
+    # Without this, uvicorn's default SIGTERM handler stops accepting connections
+    # but doesn't notify the DrainManager, so readiness probes don't go unhealthy
+    # and in-flight requests may be dropped without waiting.
+    _original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_handler(signum, frame):
+        """Trigger DrainManager drain on SIGTERM, then delegate to uvicorn."""
+        logger.info("SIGTERM received, starting graceful drain...")
+        if hasattr(app.state, "graceful_shutdown"):
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(app.state.graceful_shutdown())
+            except RuntimeError:
+                asyncio.run(app.state.graceful_shutdown())
+        # Delegate to uvicorn's original signal handler
+        if callable(_original_sigterm):
+            _original_sigterm(signum, frame)
+        elif _original_sigterm == signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # Configure uvicorn
     uvicorn_config = {
