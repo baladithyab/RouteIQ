@@ -33,6 +33,8 @@ services:
       POSTGRES_USER: litellm
       POSTGRES_PASSWORD: testpassword
       POSTGRES_DB: litellm
+    ports:
+      - "5432:5432"
     volumes:
       - test_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -52,6 +54,8 @@ services:
     image: redis:7-alpine
     container_name: litellm-test-redis
     command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
     volumes:
       - test_redis_data:/data
     healthcheck:
@@ -190,16 +194,17 @@ services:
       # Using the same key as master for simplicity in local testing
       - ADMIN_API_KEY=local-dev-admin-key
       - ADMIN_API_KEYS=local-dev-admin-key,local-dev-master-key
-      # Enable database for full feature testing
+      # Database (prisma db push done separately; prisma migrate deploy hangs in Finch)
       - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
-      # Run database migrations on startup (safe for single-node local testing)
-      - LITELLM_RUN_DB_MIGRATIONS=true
+      # - LITELLM_RUN_DB_MIGRATIONS=true  # Not needed - tables created via prisma db push
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      # AWS Bedrock - Use EC2 instance metadata service (IMDSv2)
-      # Container needs network access to host's metadata service
-      - AWS_DEFAULT_REGION=us-east-1
-      - AWS_EC2_METADATA_DISABLED=false
+      # AWS Bedrock credentials (passed from host environment)
+      # Export creds before running: eval $(aws --profile baladita+Bedrock-Admin configure export-credentials --format env)
+      - AWS_DEFAULT_REGION=us-west-2
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
       # Gateway Features - ALL ENABLED for testing
       - A2A_GATEWAY_ENABLED=true
       - MCP_GATEWAY_ENABLED=true

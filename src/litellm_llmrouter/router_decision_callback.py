@@ -350,6 +350,24 @@ class RouterDecisionCallback:
         """Async version of log_failure_event."""
         pass
 
+    async def async_post_call_success_hook(
+        self,
+        data: Dict[str, Any],
+        user_api_key_dict: Any,
+        response: Any,
+    ) -> None:
+        """Called after successful API call. Required by LiteLLM callback interface."""
+        pass
+
+    async def async_post_call_failure_hook(
+        self,
+        request_data: Dict[str, Any],
+        original_exception: Exception,
+        user_api_key_dict: Any,
+    ) -> None:
+        """Called after failed API call. Required by LiteLLM callback interface."""
+        pass
+
 
 def register_router_decision_callback() -> Optional[RouterDecisionCallback]:
     """

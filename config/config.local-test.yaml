@@ -1,90 +1,157 @@
 # LiteLLM + LLMRouter - Local Test Configuration
 # Tests all features: A2A, MCP, Routing Strategies, Hot Reload
-# Uses AWS Bedrock models (Claude 4.5 family + Nova 2 family)
+# Uses AWS Bedrock models via Cross-Region Inference Profiles (us-west-2)
 
 # =============================================================================
 # Model List - AWS Bedrock Models (IAM Profile auth)
-# Uses Cross-Region Inference Profiles for Claude models
+# All chat models use cross-region inference profiles (us.* or global.*)
+# for automatic failover across us-east-1, us-east-2, us-west-2
 # =============================================================================
 model_list:
   # ---------------------------------------------------------------------------
-  # Claude 4.5 Family (Anthropic via Bedrock - Cross-Region Inference)
-  # Uses us. prefix for cross-region inference profiles
+  # Claude 4.5 (Anthropic via Bedrock - Global Inference Profile)
   # ---------------------------------------------------------------------------
-  - model_name: claude-4.5-sonnet
-    litellm_params:
-      model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
-      aws_region_name: us-east-1
-    model_info:
-      id: claude-4.5-sonnet
-      mode: chat
-      description: "Claude 4.5 Sonnet - Latest and most capable Sonnet model"
-
   - model_name: claude-4.5-opus
     litellm_params:
-      model: bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0
-      aws_region_name: us-east-1
+      model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
+      aws_region_name: us-west-2
     model_info:
       id: claude-4.5-opus
       mode: chat
-      description: "Claude 4.5 Opus - Highest capability for complex tasks"
+      description: "Claude Opus 4.5 - Highest capability, global inference profile"
 
-  - model_name: claude-4.5-haiku
-    litellm_params:
-      model: bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
-      aws_region_name: us-east-1
-    model_info:
-      id: claude-4.5-haiku
-      mode: chat
-      description: "Claude 4.5 Haiku - Fast and cost-effective"
-
-  # Claude 4 Sonnet (previous generation - cross-region)
+  # ---------------------------------------------------------------------------
+  # Claude 4 Family (Anthropic via Bedrock - Cross-Region Inference)
+  # us.* profiles span us-east-1, us-east-2, us-west-2
+  # global.* profiles span all available regions
+  # ---------------------------------------------------------------------------
   - model_name: claude-4-sonnet
     litellm_params:
-      model: bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0
-      aws_region_name: us-east-1
+      model: bedrock/global.anthropic.claude-sonnet-4-20250514-v1:0
+      aws_region_name: us-west-2
     model_info:
       id: claude-4-sonnet
       mode: chat
-      description: "Claude 4 Sonnet - Balanced performance"
+      description: "Claude Sonnet 4 - Balanced performance, global inference"
+
+  - model_name: claude-4-opus
+    litellm_params:
+      model: bedrock/us.anthropic.claude-opus-4-20250514-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: claude-4-opus
+      mode: chat
+      description: "Claude Opus 4 - High capability (us-east-1/2, us-west-2)"
 
   # ---------------------------------------------------------------------------
-  # Amazon Nova Family (on-demand available)
+  # Claude 3.x Family (Anthropic via Bedrock - Cross-Region Inference)
   # ---------------------------------------------------------------------------
+  - model_name: claude-3.7-sonnet
+    litellm_params:
+      model: bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: claude-3.7-sonnet
+      mode: chat
+      description: "Claude 3.7 Sonnet - Extended thinking (us-east-1/2, us-west-2)"
+
+  - model_name: claude-3.5-sonnet
+    litellm_params:
+      model: bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-west-2
+    model_info:
+      id: claude-3.5-sonnet
+      mode: chat
+      description: "Claude 3.5 Sonnet v2 (us-east-1/2, us-west-2)"
+
+  - model_name: claude-3.5-haiku
+    litellm_params:
+      model: bedrock/us.anthropic.claude-3-5-haiku-20241022-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: claude-3.5-haiku
+      mode: chat
+      description: "Claude 3.5 Haiku - Fast and cost-effective (us-east-1/2, us-west-2)"
+
+  # ---------------------------------------------------------------------------
+  # Amazon Nova Family (Cross-Region Inference Profiles)
+  # ---------------------------------------------------------------------------
+  - model_name: nova-premier
+    litellm_params:
+      model: bedrock/us.amazon.nova-premier-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: nova-premier
+      mode: chat
+      description: "Nova Premier - Most capable Nova model (us-east-1/2, us-west-2)"
+
   - model_name: nova-pro
     litellm_params:
-      model: bedrock/amazon.nova-pro-v1:0
-      aws_region_name: us-east-1
+      model: bedrock/us.amazon.nova-pro-v1:0
+      aws_region_name: us-west-2
     model_info:
       id: nova-pro
       mode: chat
-      description: "Nova Pro - Highly capable multimodal model"
-
-  - model_name: nova-lite
-    litellm_params:
-      model: bedrock/amazon.nova-lite-v1:0
-      aws_region_name: us-east-1
-    model_info:
-      id: nova-lite
-      mode: chat
-      description: "Nova Lite - Fast multimodal processing"
+      description: "Nova Pro - Highly capable multimodal (us-east-1/2, us-west-2)"
 
   - model_name: nova-micro
     litellm_params:
-      model: bedrock/amazon.nova-micro-v1:0
-      aws_region_name: us-east-1
+      model: bedrock/us.amazon.nova-micro-v1:0
+      aws_region_name: us-west-2
     model_info:
       id: nova-micro
       mode: chat
-      description: "Nova Micro - Ultra-fast text-only model"
+      description: "Nova Micro - Ultra-fast text-only (us-east-1/2, us-west-2)"
+
+  - model_name: nova-2-lite
+    litellm_params:
+      model: bedrock/us.amazon.nova-2-lite-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: nova-2-lite
+      mode: chat
+      description: "Nova 2 Lite - Fast multimodal (us-east-1/2, us-west-2)"
 
   # ---------------------------------------------------------------------------
-  # Embedding Models
+  # Meta Llama 4 Family (Cross-Region Inference Profiles)
+  # ---------------------------------------------------------------------------
+  - model_name: llama-4-maverick
+    litellm_params:
+      model: bedrock/us.meta.llama4-maverick-17b-instruct-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: llama-4-maverick
+      mode: chat
+      description: "Llama 4 Maverick 17B (us-east-1/2, us-west-2)"
+
+  - model_name: llama-4-scout
+    litellm_params:
+      model: bedrock/us.meta.llama4-scout-17b-instruct-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: llama-4-scout
+      mode: chat
+      description: "Llama 4 Scout 17B (us-east-1/2, us-west-2)"
+
+  # ---------------------------------------------------------------------------
+  # DeepSeek (Cross-Region Inference Profile)
+  # ---------------------------------------------------------------------------
+  - model_name: deepseek-r1
+    litellm_params:
+      model: bedrock/us.deepseek.r1-v1:0
+      aws_region_name: us-west-2
+    model_info:
+      id: deepseek-r1
+      mode: chat
+      description: "DeepSeek-R1 - Reasoning model (us-east-1/2, us-west-2)"
+
+  # ---------------------------------------------------------------------------
+  # Embedding Models (on-demand, us-west-2 region-local)
   # ---------------------------------------------------------------------------
   - model_name: titan-embed-text-v2
     litellm_params:
       model: bedrock/amazon.titan-embed-text-v2:0
-      aws_region_name: us-east-1
+      aws_region_name: us-west-2
     model_info:
       id: titan-embed-text-v2
       mode: embedding
@@ -92,29 +159,20 @@ model_list:
 
   - model_name: titan-embed-image-v1
     litellm_params:
-      model: bedrock/amazon.titan-embed-image-v1:0
-      aws_region_name: us-east-1
+      model: bedrock/amazon.titan-embed-image-v1
+      aws_region_name: us-west-2
     model_info:
       id: titan-embed-image-v1
       mode: embedding
       description: "Titan Multimodal Embeddings - Text and image embeddings"
 
   # ---------------------------------------------------------------------------
-  # Image Generation Models
+  # Image Generation Models (on-demand, us-west-2 region-local)
   # ---------------------------------------------------------------------------
-  - model_name: nova-canvas
-    litellm_params:
-      model: bedrock/amazon.nova-canvas-v1:0
-      aws_region_name: us-east-1
-    model_info:
-      id: nova-canvas
-      mode: image_generation
-      description: "Nova Canvas - High quality image generation"
-
   - model_name: titan-image-generator
     litellm_params:
       model: bedrock/amazon.titan-image-generator-v2:0
-      aws_region_name: us-east-1
+      aws_region_name: us-west-2
     model_info:
       id: titan-image-generator
       mode: image_generation
@@ -124,28 +182,18 @@ model_list:
 # Router Settings - Test Multiple Strategies
 # =============================================================================
 router_settings:
-  # Use LLMRouter KNN strategy for trained model-based routing
-  routing_strategy: llmrouter-knn
+  # Use simple-shuffle for local testing (no trained model needed)
+  # Switch to llmrouter-knn when trained model is available in /app/models/
+  routing_strategy: simple-shuffle
 
-  # LLMRouter strategy arguments
-  routing_strategy_args:
-    # Path to the trained KNN router model (.pkl file or directory containing .pkl)
-    # Must be a FILE not a directory for proper mtime-based hot reload
-    model_path: /app/models/knn_router.pkl
-    # Path to LLM candidates JSON (model metadata for routing decisions)
-    llm_data_path: /app/config/llm_candidates.json
-    # Enable hot reload: gateway watches model_path for changes
-    hot_reload: true
-    # Reload interval in seconds (check for model updates every 10s for demo)
-    reload_interval: 10
-    # Embedding model for runtime inference (must match training pipeline)
-    # Default: sentence-transformers/all-MiniLM-L6-v2
-    embedding_model: sentence-transformers/all-MiniLM-L6-v2
-    # Device for embedding model ('cpu' or 'cuda')
-    embedding_device: cpu
-    # Optional: mapping from predicted labels to LLM candidate keys
-    # label_mapping:
-    #   model-label-1: claude-4.5-sonnet
+  # LLMRouter strategy arguments (for when llmrouter-knn is enabled)
+  # routing_strategy_args:
+  #   model_path: /app/models/knn_router.pkl
+  #   llm_data_path: /app/config/llm_candidates.json
+  #   hot_reload: true
+  #   reload_interval: 10
+  #   embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  #   embedding_device: cpu
     #   model-label-2: nova-pro
 
   num_retries: 2
