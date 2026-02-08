@@ -520,7 +520,10 @@ DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
         "quality_threshold": 0.7,
         "cost_weight": 0.7,
         "inner_strategy": None,
+        "inner_strategy_name": None,
         "max_cost_per_1k_tokens": None,
+        "cost_refresh_interval": 3600,
+        "enable_circuit_breaker_filtering": True,
     },
 }
 
@@ -1065,19 +1068,32 @@ class CostAwareRoutingStrategy(RoutingStrategy):
     """
     Selects the cheapest model that meets a quality threshold.
 
+    Enhanced with:
+    - Inner strategy delegation for quality prediction (configurable)
+    - Cost-quality Pareto frontier computation
+    - Cached cost database with configurable refresh interval
+    - Provider fallback when circuit breaker is open
+
     Algorithm:
-    1. For each candidate deployment, look up model cost from litellm.model_cost
-    2. Optionally predict quality score using an inner/delegate strategy
-    3. Filter candidates meeting the quality threshold
-    4. Select cheapest from filtered set (using combined score)
-    5. If no candidates meet threshold, fall back to best-quality selection
+    1. Filter out providers with open circuit breakers
+    2. For each candidate deployment, look up model cost from cached cost DB
+    3. Optionally predict quality score using an inner/delegate strategy
+    4. Compute Pareto frontier of cost-quality trade-offs
+    5. Filter candidates meeting the quality threshold
+    6. Select cheapest from filtered set (using combined score)
+    7. If no candidates meet threshold, fall back to best-quality selection
 
     Configuration:
         quality_threshold: Minimum acceptable quality score (0.0-1.0, default 0.7)
         cost_weight: How much to weight cost vs quality (0.0=quality only,
                      1.0=cost only, default 0.7)
-        inner_strategy: Name of inner strategy for quality prediction (optional)
+        quality_weight: Inverse weight of cost_weight (auto-derived, default 0.3)
+        inner_strategy: Inner strategy instance for quality prediction (optional)
+        inner_strategy_name: Name of inner strategy for lazy resolution (optional)
         max_cost_per_1k_tokens: Hard cap on per-request cost (optional)
+        cost_refresh_interval: Seconds between cost DB refreshes (default 3600)
+        enable_circuit_breaker_filtering: Enable provider fallback on CB open
+            (default True)
     """
 
     def __init__(
@@ -1086,11 +1102,31 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         cost_weight: float = 0.7,
         inner_strategy: Optional[RoutingStrategy] = None,
         max_cost_per_1k_tokens: Optional[float] = None,
+        *,
+        inner_strategy_name: Optional[str] = None,
+        quality_weight: Optional[float] = None,
+        cost_refresh_interval: int = 3600,
+        enable_circuit_breaker_filtering: bool = True,
+        **kwargs: Any,
     ):
         self._quality_threshold = max(0.0, min(1.0, quality_threshold))
         self._cost_weight = max(0.0, min(1.0, cost_weight))
+        # quality_weight defaults to (1 - cost_weight) unless explicitly given
+        if quality_weight is not None:
+            self._quality_weight = max(0.0, min(1.0, quality_weight))
+        else:
+            self._quality_weight = 1.0 - self._cost_weight
         self._inner_strategy = inner_strategy
+        self._inner_strategy_name = inner_strategy_name
         self._max_cost_per_1k_tokens = max_cost_per_1k_tokens
+
+        # Cost database cache
+        self._cost_db: Dict[str, float] = {}
+        self._cost_refresh_interval = max(0, cost_refresh_interval)
+        self._last_cost_refresh: float = 0.0
+
+        # Provider fallback
+        self._enable_circuit_breaker_filtering = enable_circuit_breaker_filtering
 
     @property
     def name(self) -> str:
@@ -1098,13 +1134,71 @@ class CostAwareRoutingStrategy(RoutingStrategy):
 
     @property
     def version(self) -> Optional[str]:
-        return "1.0.0"
+        return "2.0.0"
+
+    # ------------------------------------------------------------------
+    # Inner strategy delegation
+    # ------------------------------------------------------------------
+
+    def _resolve_inner_strategy(self) -> Optional[RoutingStrategy]:
+        """Lazily resolve the inner strategy by name from the registry.
+
+        If an inner strategy instance is already set, returns it directly.
+        Otherwise, looks up ``inner_strategy_name`` in the routing registry.
+
+        Returns:
+            The inner strategy instance, or None if not configured/found.
+        """
+        if self._inner_strategy is not None:
+            return self._inner_strategy
+
+        if self._inner_strategy_name:
+            try:
+                from litellm_llmrouter.strategy_registry import get_routing_registry
+
+                registry = get_routing_registry()
+                resolved = registry.get(self._inner_strategy_name)
+                if resolved is not None:
+                    self._inner_strategy = resolved
+                    return resolved
+            except Exception:
+                pass
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Cost database
+    # ------------------------------------------------------------------
+
+    def _refresh_cost_db(self) -> None:
+        """Refresh cost data from provider pricing.
+
+        Uses ``litellm.model_cost`` as the source of truth.  The cost DB
+        is cached for ``cost_refresh_interval`` seconds to avoid excessive
+        lookups.
+        """
+        now = time.time()
+        if now - self._last_cost_refresh < self._cost_refresh_interval:
+            return
+        try:
+            import litellm
+
+            if hasattr(litellm, "model_cost") and litellm.model_cost:
+                for model, info in litellm.model_cost.items():
+                    if isinstance(info, dict):
+                        input_cost = info.get("input_cost_per_token", 0) or 0
+                        output_cost = info.get("output_cost_per_token", 0) or 0
+                        self._cost_db[model] = input_cost + output_cost
+            self._last_cost_refresh = now
+        except Exception:
+            pass
 
     def _get_model_cost(self, model: str) -> float:
         """Get average cost per 1K tokens for a model.
 
-        Looks up input and output cost from litellm.model_cost and returns
-        the average. Returns inf for unknown models so they sort last.
+        First checks the cached cost DB (refreshing if stale), then
+        falls back to a direct ``litellm.model_cost`` lookup.  Returns
+        ``inf`` for unknown models so they sort last.
 
         Args:
             model: Model identifier (e.g., 'gpt-4', 'claude-3-opus')
@@ -1112,6 +1206,15 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         Returns:
             Average cost per 1K tokens in USD
         """
+        # Try cached cost DB first
+        self._refresh_cost_db()
+        if model in self._cost_db:
+            # _cost_db stores raw per-token cost (input+output)
+            raw = self._cost_db[model]
+            per_1k = raw * 1000 / 2  # Average of input+output, per 1K
+            return per_1k if per_1k > 0 else float("inf")
+
+        # Fallback: direct litellm lookup
         try:
             import litellm
 
@@ -1123,6 +1226,10 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         except Exception:
             return float("inf")
 
+    # ------------------------------------------------------------------
+    # Quality prediction
+    # ------------------------------------------------------------------
+
     def _predict_quality(
         self,
         context: RoutingContext,
@@ -1130,10 +1237,10 @@ class CostAwareRoutingStrategy(RoutingStrategy):
     ) -> float:
         """Predict quality score for a deployment.
 
-        If an inner strategy is configured, delegates to it and returns
-        1.0 if it selects this deployment, 0.5 otherwise.
-        Without an inner strategy, returns 1.0 for all candidates
-        (effectively making this a pure cost optimizer).
+        If an inner strategy is configured (either directly or via name),
+        delegates to it and returns 1.0 if it selects this deployment,
+        0.5 otherwise.  Without an inner strategy, returns 1.0 for all
+        candidates (effectively making this a pure cost optimizer).
 
         Args:
             context: Routing context with request details
@@ -1142,11 +1249,12 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         Returns:
             Quality score between 0.0 and 1.0
         """
-        if self._inner_strategy is None:
+        inner = self._resolve_inner_strategy()
+        if inner is None:
             return 1.0
 
         try:
-            selected = self._inner_strategy.select_deployment(context)
+            selected = inner.select_deployment(context)
             if selected is None:
                 return 0.5
             selected_model = selected.get("litellm_params", {}).get("model", "")
@@ -1154,6 +1262,10 @@ class CostAwareRoutingStrategy(RoutingStrategy):
             return 1.0 if selected_model == candidate_model else 0.5
         except Exception:
             return 0.5
+
+    # ------------------------------------------------------------------
+    # Candidate filtering
+    # ------------------------------------------------------------------
 
     def _get_candidates(self, context: RoutingContext) -> List[Dict]:
         """Get candidate deployments from the router.
@@ -1167,6 +1279,97 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         router = context.router
         healthy = getattr(router, "healthy_deployments", router.model_list)
         return [dep for dep in healthy if dep.get("model_name") == context.model]
+
+    def _get_available_candidates(self, candidates: List[Dict]) -> List[Dict]:
+        """Filter out candidates whose provider circuit breaker is open.
+
+        When ``enable_circuit_breaker_filtering`` is True, providers with
+        an open circuit breaker are excluded.  If all candidates are
+        excluded, falls back to the full list (no worse than not filtering).
+
+        Args:
+            candidates: List of candidate deployments
+
+        Returns:
+            Filtered list of available candidates
+        """
+        if not self._enable_circuit_breaker_filtering:
+            return candidates
+
+        try:
+            from litellm_llmrouter.resilience import get_circuit_breaker_manager
+
+            cb_manager = get_circuit_breaker_manager()
+            available: List[Dict] = []
+            for candidate in candidates:
+                provider = candidate.get("litellm_params", {}).get(
+                    "custom_llm_provider", ""
+                )
+                if provider:
+                    breaker = cb_manager.get_breaker(provider)
+                    if not breaker.is_open:
+                        available.append(candidate)
+                else:
+                    # No provider info -- include by default
+                    available.append(candidate)
+            # Fallback to all if every provider is down
+            return available if available else candidates
+        except Exception:
+            return candidates
+
+    # ------------------------------------------------------------------
+    # Pareto frontier
+    # ------------------------------------------------------------------
+
+    def _compute_pareto_optimal(
+        self,
+        candidates: List[Dict],
+        quality_scores: Dict[str, float],
+    ) -> List[Dict]:
+        """Filter candidates to the cost-quality Pareto frontier.
+
+        A candidate is *dominated* if another candidate is both cheaper
+        **and** higher quality.  Candidates that are not dominated form
+        the Pareto frontier.
+
+        Args:
+            candidates: List of candidate deployments
+            quality_scores: Mapping of model name -> quality score
+
+        Returns:
+            List of non-dominated candidates (Pareto optimal set)
+        """
+        if len(candidates) <= 1:
+            return candidates
+
+        # Build (candidate, cost, quality) tuples
+        scored: List[Tuple[Dict, float, float]] = []
+        for dep in candidates:
+            model = dep.get("litellm_params", {}).get("model", "")
+            cost = self._get_model_cost(model)
+            quality = quality_scores.get(model, 0.5)
+            scored.append((dep, cost, quality))
+
+        pareto: List[Dict] = []
+        for i, (dep_i, cost_i, qual_i) in enumerate(scored):
+            dominated = False
+            for j, (dep_j, cost_j, qual_j) in enumerate(scored):
+                if i == j:
+                    continue
+                # j dominates i if j is cheaper (or equal) AND higher quality
+                # (or equal) with at least one strict inequality
+                if cost_j <= cost_i and qual_j >= qual_i:
+                    if cost_j < cost_i or qual_j > qual_i:
+                        dominated = True
+                        break
+            if not dominated:
+                pareto.append(dep_i)
+
+        return pareto if pareto else candidates
+
+    # ------------------------------------------------------------------
+    # Combined scoring
+    # ------------------------------------------------------------------
 
     def _compute_combined_score(
         self,
@@ -1191,11 +1394,24 @@ class CostAwareRoutingStrategy(RoutingStrategy):
             1 - normalized_cost
         )
 
+    # ------------------------------------------------------------------
+    # Main routing logic
+    # ------------------------------------------------------------------
+
     def select_deployment(
         self,
         context: RoutingContext,
     ) -> Optional[Dict]:
         """Select the cheapest deployment meeting the quality threshold.
+
+        Enhanced algorithm:
+        1. Get candidates matching the requested model
+        2. Filter out providers with open circuit breakers
+        3. Score each candidate for cost and quality
+        4. Apply hard cost cap (max_cost_per_1k_tokens)
+        5. Compute Pareto frontier
+        6. Filter by quality threshold
+        7. Select best by combined cost-quality score
 
         Args:
             context: Routing context with request details
@@ -1207,15 +1423,20 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         if not candidates:
             return None
 
+        # Filter by circuit breaker status
+        candidates = self._get_available_candidates(candidates)
+
         if len(candidates) == 1:
             return candidates[0]
 
         # Score each candidate: (deployment, cost_per_1k, quality)
         scored: List[Tuple[Dict, float, float]] = []
+        quality_scores: Dict[str, float] = {}
         for deployment in candidates:
             model = deployment.get("litellm_params", {}).get("model", "")
             cost_per_1k = self._get_model_cost(model)
             quality = self._predict_quality(context, deployment)
+            quality_scores[model] = quality
 
             # Apply hard cost cap
             if (
@@ -1241,8 +1462,23 @@ class CostAwareRoutingStrategy(RoutingStrategy):
             # No candidate meets quality threshold; fall back to best quality
             return self._select_best_quality(candidates, context)
 
+        # Compute Pareto frontier among threshold-passing candidates
+        threshold_deps = [dep for dep, _, _ in above_threshold]
+        pareto_deps = self._compute_pareto_optimal(threshold_deps, quality_scores)
+
+        # Rebuild scored list with only Pareto-optimal candidates
+        pareto_ids = {id(dep) for dep in pareto_deps}
+        pareto_scored = [
+            (dep, cost, qual)
+            for dep, cost, qual in above_threshold
+            if id(dep) in pareto_ids
+        ]
+        # If Pareto filtering left nothing (shouldn't happen), use all
+        if not pareto_scored:
+            pareto_scored = above_threshold
+
         # Normalize costs for combined scoring
-        costs = [cost for _, cost, _ in above_threshold]
+        costs = [cost for _, cost, _ in pareto_scored]
         min_cost = min(costs)
         max_cost = max(costs)
         cost_range = max_cost - min_cost if max_cost > min_cost else 1.0
@@ -1250,7 +1486,7 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         best_deployment = None
         best_score = -1.0
 
-        for dep, cost, qual in above_threshold:
+        for dep, cost, qual in pareto_scored:
             normalized_cost = (cost - min_cost) / cost_range if cost_range > 0 else 0.0
             combined = self._compute_combined_score(qual, normalized_cost)
             if combined > best_score:
@@ -1276,9 +1512,10 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         Returns:
             Best quality deployment, or first candidate as fallback
         """
-        if self._inner_strategy is not None:
+        inner = self._resolve_inner_strategy()
+        if inner is not None:
             try:
-                selected = self._inner_strategy.select_deployment(context)
+                selected = inner.select_deployment(context)
                 if selected is not None:
                     return selected
             except Exception:

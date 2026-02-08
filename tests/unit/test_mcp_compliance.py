@@ -4,12 +4,14 @@ MCP Protocol Compliance Tests (2025-11-25 Spec)
 
 Tests verifying RouteIQ's compliance with MCP specification 2025-11-25.
 Covers: version negotiation, initialized notification, error codes,
-pagination, tool annotations, and resources/read.
+pagination, tool annotations, resources/read proxy, resources/list pagination,
+Mcp-Session-Id header, notifications/tools/list_changed, session management,
+and find_server_for_resource.
 """
 
 import base64
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -53,7 +55,26 @@ def mock_gateway():
     gateway.list_resources.return_value = []
     gateway.get_server.return_value = None
     gateway.get_tool.return_value = None
+    gateway.find_server_for_resource.return_value = None
+    gateway.proxy_resource_read = AsyncMock(
+        return_value={
+            "error": {
+                "code": -32002,
+                "message": "No server found for resource URI: unknown",
+            }
+        }
+    )
     return gateway
+
+
+@pytest.fixture(autouse=True)
+def _reset_sessions():
+    """Reset MCP session state between tests."""
+    from litellm_llmrouter.mcp_jsonrpc import reset_sessions
+
+    reset_sessions()
+    yield
+    reset_sessions()
 
 
 def _jsonrpc(method, params=None, request_id=1):
@@ -174,8 +195,8 @@ class TestProtocolVersionNegotiation:
             assert "tools" in caps
             assert caps["tools"]["listChanged"] is True
 
-    def test_initialize_capabilities_no_resources(self, client, mock_gateway):
-        """Initialize response no longer declares resources (G3 fix)."""
+    def test_initialize_capabilities_include_resources(self, client, mock_gateway):
+        """Initialize response declares resources capability with listChanged."""
         with patch(
             "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
             return_value=mock_gateway,
@@ -189,9 +210,9 @@ class TestProtocolVersionNegotiation:
             )
             data = response.json()
             caps = data["result"]["capabilities"]
-            # Resources removed from capabilities since resources/read
-            # is a basic stub; tools is the primary capability
-            assert "tools" in caps
+            assert "resources" in caps
+            assert caps["resources"]["listChanged"] is True
+            assert caps["resources"]["subscribe"] is False
 
 
 # ============================================================================
@@ -266,7 +287,14 @@ class TestErrorCodes:
 
     def test_resource_not_found_returns_32002(self, client, mock_gateway):
         """Resource not found returns -32002 (MCP spec reserved code)."""
-        mock_gateway.list_resources.return_value = []
+        mock_gateway.proxy_resource_read = AsyncMock(
+            return_value={
+                "error": {
+                    "code": -32002,
+                    "message": "No server found for resource URI: file:///nonexistent",
+                }
+            }
+        )
 
         with patch(
             "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
@@ -602,22 +630,26 @@ class TestToolAnnotations:
 
 
 # ============================================================================
-# G3: resources/read
+# G3: resources/read (proxy to upstream)
 # ============================================================================
 
 
 class TestResourcesRead:
-    """Test resources/read handler."""
+    """Test resources/read handler with upstream proxying."""
 
-    def test_resources_read_found(self, client, mock_gateway):
-        """resources/read returns content for known URI."""
-        mock_gateway.list_resources.return_value = [
-            {
-                "server_id": "s1",
-                "server_name": "Server 1",
-                "resource": "file:///data/config.json",
+    def test_resources_read_proxies_to_upstream(self, client, mock_gateway):
+        """resources/read proxies request and returns upstream content."""
+        mock_gateway.proxy_resource_read = AsyncMock(
+            return_value={
+                "contents": [
+                    {
+                        "uri": "file:///data/config.json",
+                        "mimeType": "text/plain",
+                        "text": "upstream content here",
+                    }
+                ]
             }
-        ]
+        )
 
         with patch(
             "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
@@ -635,11 +667,19 @@ class TestResourcesRead:
             contents = data["result"]["contents"]
             assert len(contents) == 1
             assert contents[0]["uri"] == "file:///data/config.json"
+            assert contents[0]["text"] == "upstream content here"
             assert contents[0]["mimeType"] == "text/plain"
 
     def test_resources_read_not_found(self, client, mock_gateway):
         """resources/read returns -32002 for unknown URI."""
-        mock_gateway.list_resources.return_value = []
+        mock_gateway.proxy_resource_read = AsyncMock(
+            return_value={
+                "error": {
+                    "code": -32002,
+                    "message": "No server found for resource URI: file:///nonexistent",
+                }
+            }
+        )
 
         with patch(
             "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
@@ -669,6 +709,61 @@ class TestResourcesRead:
             data = response.json()
             assert "error" in data
             assert data["error"]["code"] == -32602
+
+    def test_resources_read_upstream_error(self, client, mock_gateway):
+        """resources/read returns error when upstream server fails."""
+        mock_gateway.proxy_resource_read = AsyncMock(
+            return_value={
+                "error": {
+                    "code": -32603,
+                    "message": "Upstream server error: HTTP 500: Internal error",
+                }
+            }
+        )
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc(
+                    "resources/read",
+                    {"uri": "file:///data/broken"},
+                ),
+            )
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == -32603
+
+    def test_resources_read_calls_proxy(self, client, mock_gateway):
+        """resources/read calls gateway.proxy_resource_read with correct URI."""
+        mock_gateway.proxy_resource_read = AsyncMock(
+            return_value={
+                "contents": [
+                    {
+                        "uri": "file:///test/file.txt",
+                        "mimeType": "text/plain",
+                        "text": "content",
+                    }
+                ]
+            }
+        )
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            client.post(
+                "/mcp",
+                json=_jsonrpc(
+                    "resources/read",
+                    {"uri": "file:///test/file.txt"},
+                ),
+            )
+            mock_gateway.proxy_resource_read.assert_called_once_with(
+                "file:///test/file.txt"
+            )
 
 
 # ============================================================================
@@ -744,6 +839,436 @@ class TestToolsListChanged:
 
         # Should be callable
         assert callable(notify_tools_list_changed)
+
+    async def test_emit_tools_list_changed_queues_notifications(self):
+        """emit_tools_list_changed queues notification for active sessions."""
+        from litellm_llmrouter.mcp_jsonrpc import (
+            emit_tools_list_changed,
+            get_or_create_session,
+            get_active_sessions,
+        )
+
+        # Create a session
+        session_id = get_or_create_session({})
+        sessions = get_active_sessions()
+        assert session_id in sessions
+
+        # Emit tools list changed
+        await emit_tools_list_changed()
+
+        # Check pending notifications
+        session = sessions[session_id]
+        assert "pending_notifications" in session
+        assert len(session["pending_notifications"]) == 1
+        notification = session["pending_notifications"][0]
+        assert notification["method"] == "notifications/tools/list_changed"
+        assert notification["jsonrpc"] == "2.0"
+
+
+# ============================================================================
+# G9: resources/list Pagination
+# ============================================================================
+
+
+class TestResourcesListPagination:
+    """Test cursor-based pagination for resources/list."""
+
+    def _make_resources(self, count):
+        """Create a list of mock resources."""
+        return [
+            {
+                "server_id": f"s{i}",
+                "server_name": f"Server {i}",
+                "resource": f"file:///data/resource_{i}.json",
+            }
+            for i in range(count)
+        ]
+
+    def test_first_page_returns_all_when_under_limit(self, client, mock_gateway):
+        """Returns all resources without nextCursor when under page size."""
+        mock_gateway.list_resources.return_value = self._make_resources(3)
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            data = response.json()
+            result = data["result"]
+            assert len(result["resources"]) == 3
+            assert "nextCursor" not in result
+
+    def test_pagination_returns_next_cursor(self, client, mock_gateway):
+        """Returns nextCursor when more resources are available."""
+        mock_gateway.list_resources.return_value = self._make_resources(5)
+
+        with (
+            patch(
+                "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+                return_value=mock_gateway,
+            ),
+            patch("litellm_llmrouter.mcp_jsonrpc.MCP_RESOURCES_PAGE_SIZE", 2),
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            data = response.json()
+            result = data["result"]
+            assert len(result["resources"]) == 2
+            assert "nextCursor" in result
+
+    def test_pagination_second_page(self, client, mock_gateway):
+        """Second page uses cursor from first page."""
+        mock_gateway.list_resources.return_value = self._make_resources(5)
+
+        with (
+            patch(
+                "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+                return_value=mock_gateway,
+            ),
+            patch("litellm_llmrouter.mcp_jsonrpc.MCP_RESOURCES_PAGE_SIZE", 2),
+        ):
+            # First page
+            resp1 = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            cursor = resp1.json()["result"]["nextCursor"]
+
+            # Second page
+            resp2 = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list", {"cursor": cursor}),
+            )
+            result2 = resp2.json()["result"]
+            assert len(result2["resources"]) == 2
+            # Should have cursor for page 3
+            assert "nextCursor" in result2
+
+    def test_pagination_last_page_no_cursor(self, client, mock_gateway):
+        """Last page has no nextCursor."""
+        mock_gateway.list_resources.return_value = self._make_resources(3)
+
+        with (
+            patch(
+                "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+                return_value=mock_gateway,
+            ),
+            patch("litellm_llmrouter.mcp_jsonrpc.MCP_RESOURCES_PAGE_SIZE", 2),
+        ):
+            # First page
+            resp1 = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            cursor = resp1.json()["result"]["nextCursor"]
+
+            # Second (last) page
+            resp2 = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list", {"cursor": cursor}),
+            )
+            result2 = resp2.json()["result"]
+            assert len(result2["resources"]) == 1
+            assert "nextCursor" not in result2
+
+    def test_pagination_empty_list(self, client, mock_gateway):
+        """Empty resources list returns no resources and no cursor."""
+        mock_gateway.list_resources.return_value = []
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            data = response.json()
+            result = data["result"]
+            assert result["resources"] == []
+            assert "nextCursor" not in result
+
+    def test_pagination_page_size_capped_at_100(self, client, mock_gateway):
+        """Client-requested pageSize is capped at 100."""
+        mock_gateway.list_resources.return_value = self._make_resources(150)
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list", {"pageSize": 200}),
+            )
+            data = response.json()
+            result = data["result"]
+            # Should cap at 100
+            assert len(result["resources"]) == 100
+            assert "nextCursor" in result
+
+    def test_pagination_custom_page_size(self, client, mock_gateway):
+        """Client can request a smaller pageSize."""
+        mock_gateway.list_resources.return_value = self._make_resources(10)
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list", {"pageSize": 3}),
+            )
+            data = response.json()
+            result = data["result"]
+            assert len(result["resources"]) == 3
+            assert "nextCursor" in result
+
+    def test_pagination_boundary_exact_page(self, client, mock_gateway):
+        """When resources exactly fill the page, no nextCursor is returned."""
+        mock_gateway.list_resources.return_value = self._make_resources(4)
+
+        with (
+            patch(
+                "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+                return_value=mock_gateway,
+            ),
+            patch("litellm_llmrouter.mcp_jsonrpc.MCP_RESOURCES_PAGE_SIZE", 4),
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("resources/list"),
+            )
+            data = response.json()
+            result = data["result"]
+            assert len(result["resources"]) == 4
+            assert "nextCursor" not in result
+
+
+# ============================================================================
+# G10: Mcp-Session-Id Header Management
+# ============================================================================
+
+
+class TestMcpSessionId:
+    """Test Mcp-Session-Id header management."""
+
+    def test_response_includes_session_id_header(self, client, mock_gateway):
+        """JSON-RPC responses include Mcp-Session-Id header."""
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("initialize", {"capabilities": {}}),
+            )
+            assert response.status_code == 200
+            assert "mcp-session-id" in response.headers
+
+    def test_session_id_is_uuid_format(self, client, mock_gateway):
+        """Session ID is a valid UUID."""
+        import uuid
+
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("initialize", {"capabilities": {}}),
+            )
+            session_id = response.headers["mcp-session-id"]
+            # Should not raise
+            uuid.UUID(session_id)
+
+    def test_session_id_reused_on_subsequent_requests(self, client, mock_gateway):
+        """Same session ID is returned when client sends it back."""
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            # First request - get session ID
+            resp1 = client.post(
+                "/mcp",
+                json=_jsonrpc("initialize", {"capabilities": {}}),
+            )
+            session_id = resp1.headers["mcp-session-id"]
+
+            # Second request - send session ID back
+            resp2 = client.post(
+                "/mcp",
+                json=_jsonrpc("tools/list"),
+                headers={"Mcp-Session-Id": session_id},
+            )
+            assert resp2.headers["mcp-session-id"] == session_id
+
+    def test_new_session_for_unknown_id(self, client, mock_gateway):
+        """A new session is created when client sends unknown session ID."""
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json=_jsonrpc("initialize", {"capabilities": {}}),
+                headers={"Mcp-Session-Id": "nonexistent-session-id"},
+            )
+            session_id = response.headers["mcp-session-id"]
+            assert session_id != "nonexistent-session-id"
+
+    def test_notification_includes_session_id(self, client, mock_gateway):
+        """Notification responses include Mcp-Session-Id header."""
+        with patch(
+            "litellm_llmrouter.mcp_jsonrpc.get_mcp_gateway",
+            return_value=mock_gateway,
+        ):
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                },
+            )
+            assert response.status_code == 202
+            assert "mcp-session-id" in response.headers
+
+
+# ============================================================================
+# G11: Session Management
+# ============================================================================
+
+
+class TestSessionManagement:
+    """Test session lifecycle management."""
+
+    def test_get_or_create_session_creates_new(self):
+        """get_or_create_session creates a new session when none exists."""
+        from litellm_llmrouter.mcp_jsonrpc import (
+            get_or_create_session,
+            get_active_sessions,
+        )
+
+        session_id = get_or_create_session({})
+        assert session_id
+        sessions = get_active_sessions()
+        assert session_id in sessions
+        assert "created_at" in sessions[session_id]
+        assert "last_active" in sessions[session_id]
+
+    def test_get_or_create_session_reuses_existing(self):
+        """get_or_create_session reuses session when valid ID is provided."""
+        from litellm_llmrouter.mcp_jsonrpc import get_or_create_session
+
+        # Create session
+        session_id = get_or_create_session({})
+
+        # Reuse it
+        reused_id = get_or_create_session({"mcp-session-id": session_id})
+        assert reused_id == session_id
+
+    def test_get_or_create_session_expired_creates_new(self):
+        """get_or_create_session creates new session when existing is expired."""
+        import time
+
+        from litellm_llmrouter.mcp_jsonrpc import (
+            get_or_create_session,
+            get_active_sessions,
+        )
+
+        # Create session
+        session_id = get_or_create_session({})
+
+        # Expire it by backdating last_active
+        sessions = get_active_sessions()
+        sessions[session_id]["last_active"] = time.time() - 99999
+
+        # Should create new
+        new_id = get_or_create_session({"mcp-session-id": session_id})
+        assert new_id != session_id
+
+    def test_reset_sessions_clears_all(self):
+        """reset_sessions clears all active sessions."""
+        from litellm_llmrouter.mcp_jsonrpc import (
+            get_or_create_session,
+            get_active_sessions,
+            reset_sessions,
+        )
+
+        get_or_create_session({})
+        get_or_create_session({})
+        assert len(get_active_sessions()) >= 1
+
+        reset_sessions()
+        assert len(get_active_sessions()) == 0
+
+
+# ============================================================================
+# G13: find_server_for_resource
+# ============================================================================
+
+
+class TestFindServerForResource:
+    """Test MCPGateway.find_server_for_resource method."""
+
+    def test_find_resource_owner(self):
+        """find_server_for_resource returns correct server."""
+        from litellm_llmrouter.mcp_gateway import MCPGateway, MCPServer
+
+        gateway = MCPGateway()
+        gateway.enabled = True
+
+        server = MCPServer(
+            server_id="data-server",
+            name="Data Server",
+            url="https://data.example.com",
+            resources=["file:///data/config.json", "file:///data/users.json"],
+        )
+        gateway.register_server(server)
+
+        found = gateway.find_server_for_resource("file:///data/config.json")
+        assert found is not None
+        assert found.server_id == "data-server"
+
+    def test_find_resource_not_found(self):
+        """find_server_for_resource returns None for unknown URI."""
+        from litellm_llmrouter.mcp_gateway import MCPGateway
+
+        gateway = MCPGateway()
+        gateway.enabled = True
+
+        found = gateway.find_server_for_resource("file:///nonexistent")
+        assert found is None
+
+    def test_find_resource_multi_server(self):
+        """find_server_for_resource finds correct server among multiple."""
+        from litellm_llmrouter.mcp_gateway import MCPGateway, MCPServer
+
+        gateway = MCPGateway()
+        gateway.enabled = True
+
+        server1 = MCPServer(
+            server_id="s1",
+            name="Server 1",
+            url="https://s1.example.com",
+            resources=["file:///s1/data.json"],
+        )
+        server2 = MCPServer(
+            server_id="s2",
+            name="Server 2",
+            url="https://s2.example.com",
+            resources=["file:///s2/data.json"],
+        )
+        gateway.register_server(server1)
+        gateway.register_server(server2)
+
+        found = gateway.find_server_for_resource("file:///s2/data.json")
+        assert found is not None
+        assert found.server_id == "s2"
 
 
 # ============================================================================

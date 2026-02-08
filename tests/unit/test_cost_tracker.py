@@ -17,7 +17,7 @@ Covers:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -35,6 +35,8 @@ from litellm_llmrouter.gateway.plugins.cost_tracker import (
     _extract_usage,
     _get_metadata,
     _is_enabled,
+    _META_RESERVED_SPEND,
+    _META_QUOTA_SUBJECT,
     _META_START_TIME,
 )
 
@@ -547,3 +549,203 @@ class TestEdgeCases:
             await plugin.on_llm_success("gpt-4", response, kwargs)
 
         mock_metrics.cost_total.add.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Cost reconciliation wiring
+# ---------------------------------------------------------------------------
+
+
+class TestCostReconciliationWiring:
+    """Tests that CostTrackerPlugin.on_llm_success wires into quota reconciliation."""
+
+    @pytest.mark.asyncio
+    async def test_reconcile_called_with_reserved_spend(self):
+        """on_llm_success calls reconcile_spend when metadata has reserved_spend."""
+        plugin = CostTrackerPlugin()
+        mock_metrics = MagicMock()
+        mock_enforcer = MagicMock()
+        mock_enforcer.reconcile_spend = AsyncMock(
+            return_value={"reconciled": True, "adjustment": 0.07}
+        )
+
+        response = FakeResponse(
+            usage=FakeUsage(prompt_tokens=100, completion_tokens=50)
+        )
+        kwargs = _make_kwargs(
+            metadata={
+                _META_RESERVED_SPEND: 0.10,
+                _META_QUOTA_SUBJECT: "team:eng",
+            }
+        )
+
+        with (
+            patch(
+                "litellm_llmrouter.gateway.plugins.cost_tracker._calculate_cost",
+                return_value=(0.015, 0.015, 0.03),
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+            patch(
+                "litellm_llmrouter.quota.get_quota_enforcer",
+                return_value=mock_enforcer,
+            ),
+        ):
+            await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        mock_enforcer.reconcile_spend.assert_awaited_once_with(
+            subject="team:eng",
+            actual_cost=0.03,
+            reserved_cost=0.10,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconcile_skipped_without_reserved_spend(self):
+        """on_llm_success skips reconciliation when no reserved_spend in metadata."""
+        plugin = CostTrackerPlugin()
+        mock_metrics = MagicMock()
+        mock_enforcer = MagicMock()
+        mock_enforcer.reconcile_spend = AsyncMock()
+
+        response = FakeResponse(
+            usage=FakeUsage(prompt_tokens=100, completion_tokens=50)
+        )
+        # No _META_RESERVED_SPEND or _META_QUOTA_SUBJECT in metadata
+        kwargs = _make_kwargs(metadata={"team_id": "eng"})
+
+        with (
+            patch(
+                "litellm_llmrouter.gateway.plugins.cost_tracker._calculate_cost",
+                return_value=(0.015, 0.015, 0.03),
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+            patch(
+                "litellm_llmrouter.quota.get_quota_enforcer",
+                return_value=mock_enforcer,
+            ),
+        ):
+            await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        # reconcile_spend should NOT be called
+        mock_enforcer.reconcile_spend.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_skipped_when_subject_empty(self):
+        """on_llm_success skips reconciliation when quota_subject is empty."""
+        plugin = CostTrackerPlugin()
+        mock_metrics = MagicMock()
+        mock_enforcer = MagicMock()
+        mock_enforcer.reconcile_spend = AsyncMock()
+
+        response = FakeResponse(
+            usage=FakeUsage(prompt_tokens=100, completion_tokens=50)
+        )
+        kwargs = _make_kwargs(
+            metadata={
+                _META_RESERVED_SPEND: 0.10,
+                _META_QUOTA_SUBJECT: "",  # empty subject
+            }
+        )
+
+        with (
+            patch(
+                "litellm_llmrouter.gateway.plugins.cost_tracker._calculate_cost",
+                return_value=(0.015, 0.015, 0.03),
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+            patch(
+                "litellm_llmrouter.quota.get_quota_enforcer",
+                return_value=mock_enforcer,
+            ),
+        ):
+            await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        mock_enforcer.reconcile_spend.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_failure_does_not_crash(self):
+        """on_llm_success handles reconciliation errors gracefully."""
+        plugin = CostTrackerPlugin()
+        mock_metrics = MagicMock()
+        mock_enforcer = MagicMock()
+        mock_enforcer.reconcile_spend = AsyncMock(
+            side_effect=Exception("Redis connection lost")
+        )
+
+        response = FakeResponse(
+            usage=FakeUsage(prompt_tokens=100, completion_tokens=50)
+        )
+        kwargs = _make_kwargs(
+            metadata={
+                _META_RESERVED_SPEND: 0.10,
+                _META_QUOTA_SUBJECT: "team:eng",
+            }
+        )
+
+        with (
+            patch(
+                "litellm_llmrouter.gateway.plugins.cost_tracker._calculate_cost",
+                return_value=(0.015, 0.015, 0.03),
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+            patch(
+                "litellm_llmrouter.quota.get_quota_enforcer",
+                return_value=mock_enforcer,
+            ),
+        ):
+            # Should not raise
+            await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        # Metrics should still be recorded despite reconciliation failure
+        mock_metrics.cost_per_request.record.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_passes_actual_total_cost(self):
+        """Reconciliation receives the correct actual_cost from _calculate_cost."""
+        plugin = CostTrackerPlugin()
+        mock_metrics = MagicMock()
+        mock_enforcer = MagicMock()
+        mock_enforcer.reconcile_spend = AsyncMock(return_value={"reconciled": True})
+
+        response = FakeResponse(
+            usage=FakeUsage(prompt_tokens=200, completion_tokens=100)
+        )
+        kwargs = _make_kwargs(
+            metadata={
+                _META_RESERVED_SPEND: 0.50,
+                _META_QUOTA_SUBJECT: "user:alice",
+            }
+        )
+
+        actual_total_cost = 0.0123
+        with (
+            patch(
+                "litellm_llmrouter.gateway.plugins.cost_tracker._calculate_cost",
+                return_value=(0.006, 0.006, actual_total_cost),
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+            patch(
+                "litellm_llmrouter.quota.get_quota_enforcer",
+                return_value=mock_enforcer,
+            ),
+        ):
+            await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        # Verify the exact actual_cost and reserved_cost passed
+        call_kwargs = mock_enforcer.reconcile_spend.call_args[1]
+        assert call_kwargs["actual_cost"] == pytest.approx(actual_total_cost)
+        assert call_kwargs["reserved_cost"] == pytest.approx(0.50)

@@ -431,7 +431,7 @@ class HotReloadManager:
             return {"status": "failed", "error": "Strategy registry not available"}
 
         try:
-            status = registry.get_status()
+            status: dict[str, Any] = registry.get_status()
 
             # Add staged strategy details
             staged_details = {}
@@ -502,3 +502,9 @@ def get_hot_reload_manager() -> HotReloadManager:
     if _hot_reload_manager is None:
         _hot_reload_manager = HotReloadManager()
     return _hot_reload_manager
+
+
+def reset_hot_reload_manager() -> None:
+    """Reset the global hot reload manager (for testing)."""
+    global _hot_reload_manager
+    _hot_reload_manager = None

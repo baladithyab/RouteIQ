@@ -671,6 +671,383 @@ class TestLeaseInfo:
         assert "acquired_at" in data
         assert "expires_at" in data
 
+    def test_to_dict_includes_generation(self):
+        """Test LeaseInfo serialization includes generation field."""
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=30)
+
+        info = LeaseInfo(
+            lock_name="test_lock",
+            holder_id="test-holder",
+            acquired_at=now,
+            expires_at=expires,
+            is_leader=True,
+            generation=42,
+        )
+
+        data = info.to_dict()
+
+        assert data["generation"] == 42
+
+    def test_generation_defaults_to_zero(self):
+        """Test LeaseInfo generation defaults to 0."""
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=30)
+
+        info = LeaseInfo(
+            lock_name="test_lock",
+            holder_id="test-holder",
+            acquired_at=now,
+            expires_at=expires,
+            is_leader=True,
+        )
+
+        assert info.generation == 0
+        assert info.to_dict()["generation"] == 0
+
+
+# =============================================================================
+# Generation Counter / Fencing Token Tests
+# =============================================================================
+
+
+class TestGenerationCounter:
+    """Test generation counter (fencing token) behavior."""
+
+    def test_initial_generation_is_zero(self):
+        """New election should have generation 0."""
+        election = LeaderElection()
+        assert election._generation == 0
+
+    @pytest.mark.asyncio
+    async def test_generation_increments_on_acquire_no_db(self):
+        """Generation should increment on each acquisition (no-DB mode)."""
+        election = LeaderElection(database_url=None)
+
+        await election.try_acquire()
+        assert election._generation == 1
+
+        await election.try_acquire()
+        assert election._generation == 2
+
+        await election.try_acquire()
+        assert election._generation == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
+    async def test_generation_set_from_db_on_acquire(self):
+        """Generation should be set from the database RETURNING clause."""
+        holder_id = "test-holder"
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+
+        # Simulate DB returning generation=5
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "holder_id": holder_id,
+                "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 5,
+            }
+        )
+
+        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id=holder_id,
+            )
+            await election.try_acquire()
+
+        assert election._generation == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
+    async def test_generation_updates_on_each_renewal(self):
+        """Generation should update on each successful renewal from DB."""
+        holder_id = "test-holder"
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+
+        call_count = 0
+
+        async def mock_fetchrow(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "holder_id": holder_id,
+                "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": call_count * 10,
+            }
+
+        mock_conn.fetchrow = mock_fetchrow
+
+        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id=holder_id,
+            )
+
+            await election.try_acquire()
+            assert election._generation == 10
+
+            # renew() calls try_acquire() internally
+            await election.renew()
+            assert election._generation == 20
+
+
+# =============================================================================
+# Auto-Demotion Tests
+# =============================================================================
+
+
+class TestAutoDemotion:
+    """Test auto-demotion after consecutive renewal failures."""
+
+    def test_consecutive_failures_initially_zero(self):
+        """Consecutive renewal failures should start at zero."""
+        election = LeaderElection()
+        assert election._consecutive_renewal_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_consecutive_failures_reset_on_acquire(self):
+        """Consecutive failures should reset on successful acquisition."""
+        election = LeaderElection(database_url=None)
+        election._consecutive_renewal_failures = 5
+
+        await election.try_acquire()
+
+        assert election._consecutive_renewal_failures == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
+    async def test_consecutive_failures_reset_on_db_acquire(self):
+        """Consecutive failures should reset on successful DB acquisition."""
+        holder_id = "test-holder"
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "holder_id": holder_id,
+                "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 1,
+            }
+        )
+
+        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id=holder_id,
+            )
+            election._consecutive_renewal_failures = 5
+
+            await election.try_acquire()
+
+        assert election._consecutive_renewal_failures == 0
+
+    def test_auto_demotion_after_two_failures_in_renew_loop(self):
+        """Leader should auto-demote after 2 consecutive renewal failures in _renew_loop."""
+        election = LeaderElection(
+            database_url=None,
+            renew_interval_seconds=0,  # No wait
+        )
+        # Pretend we are leader
+        election._is_leader = True
+        election._lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=300)
+
+        callback_values = []
+
+        def callback(is_leader):
+            callback_values.append(is_leader)
+
+        election._on_leadership_change = callback
+
+        # Make renew() always return False (simulate failure)
+        async def mock_renew():
+            return False
+
+        election.renew = mock_renew
+
+        # Manually simulate what _renew_loop does for 2 iterations
+        # Iteration 1: failure -> consecutive_failures=1, still leader
+        loop = asyncio.new_event_loop()
+        try:
+            renewed = loop.run_until_complete(election.renew())
+        finally:
+            loop.close()
+
+        assert not renewed
+        # Simulate the _renew_loop logic
+        if not renewed and election._is_leader:
+            election._consecutive_renewal_failures += 1
+            if election._consecutive_renewal_failures >= 2:
+                election._is_leader = False
+                election._lease_expires_at = None
+                if election._on_leadership_change:
+                    election._on_leadership_change(False)
+
+        assert election._consecutive_renewal_failures == 1
+        assert election._is_leader is True  # Still leader after 1 failure
+
+        # Iteration 2: failure -> consecutive_failures=2, auto-demote
+        loop = asyncio.new_event_loop()
+        try:
+            renewed = loop.run_until_complete(election.renew())
+        finally:
+            loop.close()
+
+        if not renewed and election._is_leader:
+            election._consecutive_renewal_failures += 1
+            if election._consecutive_renewal_failures >= 2:
+                election._is_leader = False
+                election._lease_expires_at = None
+                if election._on_leadership_change:
+                    election._on_leadership_change(False)
+
+        assert election._consecutive_renewal_failures == 2
+        assert election._is_leader is False
+        assert election._lease_expires_at is None
+        assert False in callback_values
+
+    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
+    def test_auto_demotion_via_renew_loop_thread(self):
+        """Test auto-demotion through actual _renew_loop execution."""
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+        # Make fetchrow return None (failed acquisition) to trigger failure path
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        callback_values = []
+
+        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id="test-holder",
+                renew_interval_seconds=0,  # Minimal interval for fast test
+            )
+            # Pre-set as leader so renew() runs try_acquire()
+            election._is_leader = True
+            election._lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=300
+            )
+            election._on_leadership_change = lambda x: callback_values.append(x)
+
+            # Start the renewal thread; it should auto-demote after 2 failures
+            election.start_renewal()
+
+            # Give the thread time to run a few iterations
+            time.sleep(0.5)
+
+            election.stop_renewal()
+
+        # After 2+ consecutive failures, should have been auto-demoted
+        assert election._is_leader is False
+        assert election._consecutive_renewal_failures >= 2
+        assert False in callback_values
+
+
+# =============================================================================
+# Fencing Token Validation Tests
+# =============================================================================
+
+
+class TestFencingTokenValidation:
+    """Test the validate_fencing_token method."""
+
+    def test_valid_token_for_leader(self):
+        """Valid fencing token should return True for current leader."""
+        election = LeaderElection(database_url=None)
+        election._is_leader = True
+        election._generation = 42
+
+        assert election.validate_fencing_token(42) is True
+
+    def test_invalid_token_for_leader(self):
+        """Stale fencing token should return False even if leader."""
+        election = LeaderElection(database_url=None)
+        election._is_leader = True
+        election._generation = 42
+
+        assert election.validate_fencing_token(41) is False
+        assert election.validate_fencing_token(43) is False
+        assert election.validate_fencing_token(0) is False
+
+    def test_valid_token_but_not_leader(self):
+        """Matching token should return False if not leader."""
+        election = LeaderElection(database_url=None)
+        election._is_leader = False
+        election._generation = 42
+
+        assert election.validate_fencing_token(42) is False
+
+    def test_zero_token_for_new_instance(self):
+        """Fresh instance with generation 0 should fail validation (not leader)."""
+        election = LeaderElection(database_url=None)
+        # Not a leader, generation 0
+        assert election.validate_fencing_token(0) is False
+
+    @pytest.mark.asyncio
+    async def test_token_valid_after_acquire(self):
+        """Token should be valid after a successful acquisition."""
+        election = LeaderElection(database_url=None)
+        await election.try_acquire()
+
+        # Generation is 1 after first acquire (no-DB mode)
+        assert election.validate_fencing_token(1) is True
+        assert election.validate_fencing_token(0) is False
+
+    @pytest.mark.asyncio
+    async def test_token_invalid_after_release(self):
+        """Token should be invalid after releasing leadership."""
+        election = LeaderElection(database_url=None)
+        await election.try_acquire()
+
+        gen = election._generation
+        assert election.validate_fencing_token(gen) is True
+
+        await election.release()
+        assert election.validate_fencing_token(gen) is False
+
+
+# =============================================================================
+# Extended get_status Tests
+# =============================================================================
+
+
+class TestGetStatusExtended:
+    """Test that get_status includes new fencing/demotion fields."""
+
+    def test_get_status_includes_generation(self):
+        """get_status should include generation counter."""
+        election = LeaderElection(holder_id="test-holder")
+        status = election.get_status()
+
+        assert "generation" in status
+        assert status["generation"] == 0
+
+    def test_get_status_includes_consecutive_failures(self):
+        """get_status should include consecutive_renewal_failures."""
+        election = LeaderElection(holder_id="test-holder")
+        status = election.get_status()
+
+        assert "consecutive_renewal_failures" in status
+        assert status["consecutive_renewal_failures"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_status_generation_after_acquire(self):
+        """get_status generation should reflect post-acquisition state."""
+        election = LeaderElection(database_url=None)
+        await election.try_acquire()
+
+        status = election.get_status()
+        assert status["generation"] == 1
+
+    def test_get_status_consecutive_failures_tracked(self):
+        """get_status should reflect current consecutive failure count."""
+        election = LeaderElection()
+        election._consecutive_renewal_failures = 3
+
+        status = election.get_status()
+        assert status["consecutive_renewal_failures"] == 3
+
 
 # =============================================================================
 # Integration with ConfigSyncManager

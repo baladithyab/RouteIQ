@@ -82,7 +82,7 @@ After `rr push`, always sync local: `git pull`
 
 - **`startup.py`** - CLI entry point: `python -m litellm_llmrouter.startup`
 - **`gateway/app.py`** - App factory: `create_app()` (with LiteLLM) / `create_standalone_app()` (testing)
-- **`routes.py`** - All FastAPI routers (health, admin, llmrouter, MCP variants)
+- **`routes/`** - FastAPI routers split into focused modules (health, a2a, mcp, config)
 
 ### Startup Load Order
 
@@ -100,9 +100,9 @@ After `rr push`, always sync local: `git pull`
 |--------|---------|
 | `gateway/app.py` | FastAPI app factory (composition root) |
 | `gateway/plugin_manager.py` | Plugin lifecycle with dependency resolution |
-| `gateway/plugins/` | Built-in plugins (evaluator, skills, upskill) |
+| `gateway/plugins/` | Built-in plugins (evaluator, skills, upskill, guardrails) |
 | `startup.py` | CLI entry point, initialization orchestration |
-| `routes.py` | All API routers and endpoint definitions |
+| `routes/` | API routers split into: `health.py`, `a2a.py`, `mcp.py`, `config.py`, `models.py` |
 | `strategies.py` | 18+ ML routing strategies (KNN, MLP, SVM, ELO, MF, hybrid) |
 | `strategy_registry.py` | A/B testing, hot-swap, routing pipeline |
 | `routing_strategy_patch.py` | Monkey-patch for LiteLLM Router integration |
@@ -116,7 +116,7 @@ After `rr push`, always sync local: `git pull`
 | `a2a_tracing.py` | OTel instrumentation for A2A |
 | `observability.py` | OpenTelemetry init (traces, metrics, logs) |
 | `telemetry_contracts.py` | Versioned telemetry event schemas |
-| `auth.py` | Admin auth, RequestID middleware, secret scrubbing |
+| `auth.py` | Admin auth, RequestID middleware (raw ASGI), secret scrubbing |
 | `rbac.py` | Role-based access control |
 | `policy_engine.py` | OPA-style policy evaluation middleware |
 | `quota.py` | Per-team/per-key quota enforcement |

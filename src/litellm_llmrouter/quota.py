@@ -335,6 +335,32 @@ if ttl < 0 then ttl = window_seconds end
 return {tostring(new_value), tostring(limit), ttl, 1}
 """
 
+# Lua script for atomic float adjustment (credit or debit)
+# Used by reconcile_spend to atomically adjust a quota counter.
+# adjustment > 0 means credit back (subtract from usage)
+# adjustment < 0 means debit more (add to usage)
+# Returns: [new_value, adjustment_applied]
+ADJUST_FLOAT_LUA = """
+local key = KEYS[1]
+local adjustment = tonumber(ARGV[1])
+
+local current = tonumber(redis.call('GET', key) or '0')
+local new_value = current - adjustment
+
+if new_value < 0 then
+    new_value = 0
+end
+
+redis.call('SET', key, tostring(new_value))
+
+local existing_ttl = redis.call('TTL', key)
+if existing_ttl > 0 then
+    redis.call('EXPIRE', key, existing_ttl)
+end
+
+return {tostring(new_value), tostring(adjustment)}
+"""
+
 
 # =============================================================================
 # Quota Repository (Redis Backend)
@@ -362,6 +388,7 @@ class QuotaRepository:
         self._redis: Any = None
         self._check_incr_script: Any = None
         self._check_incr_float_script: Any = None
+        self._adjust_float_script: Any = None
         self._lock = asyncio.Lock()
 
     async def _get_redis(self) -> Any:
@@ -384,6 +411,9 @@ class QuotaRepository:
                     )
                     self._check_incr_float_script = self._redis.register_script(
                         CHECK_AND_INCREMENT_FLOAT_LUA
+                    )
+                    self._adjust_float_script = self._redis.register_script(
+                        ADJUST_FLOAT_LUA
                     )
         return self._redis
 
@@ -481,6 +511,45 @@ class QuotaRepository:
                 error=str(e),
             )
 
+    async def adjust_float(
+        self,
+        subject: QuotaSubject,
+        metric: QuotaMetric,
+        window: QuotaWindow,
+        adjustment: float,
+    ) -> tuple[float, float]:
+        """
+        Atomically adjust a float quota counter.
+
+        A positive adjustment credits back (reduces usage).
+        A negative adjustment debits more (increases usage).
+
+        Args:
+            subject: The quota subject
+            metric: The metric being adjusted
+            window: The time window
+            adjustment: Amount to adjust (positive = credit, negative = debit)
+
+        Returns:
+            Tuple of (new_value, adjustment_applied)
+        """
+        key = self._bucket_key(subject, metric, window)
+
+        try:
+            await self._get_redis()
+
+            result = await self._adjust_float_script(
+                keys=[key],
+                args=[adjustment],
+            )
+            new_value = float(result[0])
+            applied = float(result[1])
+            return new_value, applied
+
+        except Exception as e:
+            logger.error(f"Quota adjustment failed for {subject.key}: {e}")
+            return 0.0, 0.0
+
     async def get_current(
         self,
         subject: QuotaSubject,
@@ -527,6 +596,7 @@ class QuotaEnforcer:
     ):
         self._config = config or QuotaConfig.from_env()
         self._repository = repository
+        self._cumulative_savings: float = 0.0
 
     @property
     def config(self) -> QuotaConfig:
@@ -745,10 +815,151 @@ class QuotaEnforcer:
 
         return results, total_tokens, spend
 
+    async def reconcile_spend(
+        self,
+        subject: str,
+        actual_cost: float,
+        reserved_cost: float,
+    ) -> dict[str, Any]:
+        """Reconcile actual spend against reserved amount.
+
+        After an LLM call completes, the actual cost is known. This method
+        adjusts the quota counter to reflect the actual spend instead of the
+        reserved (estimated) amount.
+
+        If actual < reserved, the difference is credited back.
+        If actual > reserved, the difference is debited.
+
+        Args:
+            subject: The quota subject key (team/key identifier)
+            actual_cost: Actual cost from the LLM response
+            reserved_cost: Amount originally reserved before the call
+
+        Returns:
+            Dict with reconciliation details
+        """
+        # Check feature flag
+        if not _is_cost_reconciliation_enabled():
+            return {
+                "reconciled": False,
+                "reason": "cost_reconciliation_disabled",
+            }
+
+        if not self.is_enabled:
+            return {
+                "reconciled": False,
+                "reason": "quota_disabled",
+            }
+
+        adjustment = reserved_cost - actual_cost
+
+        # No adjustment needed if costs match
+        if abs(adjustment) < 1e-10:
+            return {
+                "reconciled": True,
+                "subject": subject,
+                "actual_cost": actual_cost,
+                "reserved_cost": reserved_cost,
+                "adjustment": 0.0,
+                "direction": "none",
+                "savings": 0.0,
+            }
+
+        direction = "credit" if adjustment > 0 else "debit"
+        savings = max(adjustment, 0.0)
+
+        # Track cumulative savings
+        self._cumulative_savings += savings
+
+        # Apply adjustment to all spend quota limits
+        repository = await self._get_repository()
+        quota_subject = QuotaSubject(key=subject, type="reconciliation")
+
+        adjusted_any = False
+        for limit in self._config.limits:
+            if limit.metric != QuotaMetric.SPEND_USD:
+                continue
+
+            new_value, applied = await repository.adjust_float(
+                subject=quota_subject,
+                metric=limit.metric,
+                window=limit.window,
+                adjustment=adjustment,
+            )
+            if abs(applied) > 1e-10:
+                adjusted_any = True
+
+        # Emit OTel metrics
+        _emit_reconciliation_metrics(
+            subject=subject,
+            adjustment=adjustment,
+            direction=direction,
+            savings=savings,
+        )
+
+        logger.debug(
+            "Quota reconciliation: subject=%s reserved=$%.6f actual=$%.6f "
+            "adjustment=$%.6f direction=%s",
+            subject,
+            reserved_cost,
+            actual_cost,
+            adjustment,
+            direction,
+        )
+
+        return {
+            "reconciled": True,
+            "subject": subject,
+            "actual_cost": actual_cost,
+            "reserved_cost": reserved_cost,
+            "adjustment": adjustment,
+            "direction": direction,
+            "savings": savings,
+            "cumulative_savings": self._cumulative_savings,
+            "adjusted_quotas": adjusted_any,
+        }
+
     async def close(self) -> None:
         """Close the enforcer and release resources."""
         if self._repository:
             await self._repository.close()
+
+
+# =============================================================================
+# Cost Reconciliation Feature Flag and OTel Helpers
+# =============================================================================
+
+
+def _is_cost_reconciliation_enabled() -> bool:
+    """Check if cost reconciliation is enabled via environment variable."""
+    return os.getenv("ROUTEIQ_COST_RECONCILIATION_ENABLED", "true").lower() != "false"
+
+
+def _emit_reconciliation_metrics(
+    subject: str,
+    adjustment: float,
+    direction: str,
+    savings: float,
+) -> None:
+    """Emit OTel metrics for a reconciliation event."""
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        metrics = get_gateway_metrics()
+        if metrics is None:
+            return
+
+        # Use the reconciliation-specific instruments if available
+        if hasattr(metrics, "reconciliation_savings"):
+            metrics.reconciliation_savings.record(
+                savings, {"subject": subject, "direction": direction}
+            )
+        if hasattr(metrics, "reconciliation_count"):
+            metrics.reconciliation_count.add(
+                1, {"subject": subject, "direction": direction}
+            )
+    except (ImportError, Exception):
+        pass
 
 
 # =============================================================================

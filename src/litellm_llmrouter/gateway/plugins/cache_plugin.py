@@ -39,9 +39,11 @@ from litellm_llmrouter.gateway.plugin_manager import (
 from litellm_llmrouter.semantic_cache import (
     CacheEntry,
     CacheKeyGenerator,
+    CacheManager,
     InMemoryCache,
     RedisCacheStore,
     is_cacheable_request,
+    set_cache_manager,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +111,7 @@ class SemanticCachePlugin(GatewayPlugin):
         self._l1: InMemoryCache | None = None
         self._l2: RedisCacheStore | None = None
         self._redis_client: Any = None
+        self._cache_manager: CacheManager | None = None
 
     @property
     def metadata(self) -> PluginMetadata:
@@ -161,6 +164,15 @@ class SemanticCachePlugin(GatewayPlugin):
                 logger.warning(f"Failed to initialize Redis cache: {e}")
                 self._l2 = None
 
+        # Register the CacheManager singleton for admin endpoints
+        self._cache_manager = CacheManager(
+            l1=self._l1,
+            l2=self._l2,
+            ttl=self._ttl,
+            semantic_enabled=self._semantic_enabled,
+        )
+        set_cache_manager(self._cache_manager)
+
         logger.info(
             f"Semantic cache plugin started "
             f"(semantic={self._semantic_enabled}, ttl={self._ttl}s)"
@@ -170,6 +182,10 @@ class SemanticCachePlugin(GatewayPlugin):
         self, app: "FastAPI", context: PluginContext | None = None
     ) -> None:
         """Clean up cache resources."""
+        # Unregister the CacheManager singleton
+        set_cache_manager(None)
+        self._cache_manager = None
+
         if self._l1:
             self._l1.clear()
             self._l1 = None
@@ -241,6 +257,8 @@ class SemanticCachePlugin(GatewayPlugin):
         entry = await self._l1.get(exact_key)
         if entry is not None:
             logger.debug(f"Cache L1 HIT: {exact_key[:20]}...")
+            if self._cache_manager:
+                self._cache_manager.record_hit()
             return self._build_hit_response(entry, "l1")
 
         # L2 lookup
@@ -250,6 +268,8 @@ class SemanticCachePlugin(GatewayPlugin):
                 # Populate L1 on L2 hit
                 await self._l1.set(exact_key, entry, self._ttl)
                 logger.debug(f"Cache L2 HIT: {exact_key[:20]}...")
+                if self._cache_manager:
+                    self._cache_manager.record_hit()
                 return self._build_hit_response(entry, "l2")
 
         # Semantic lookup
@@ -266,11 +286,15 @@ class SemanticCachePlugin(GatewayPlugin):
                     # Populate L1 on semantic hit
                     await self._l1.set(exact_key, entry, self._ttl)
                     logger.debug(f"Cache semantic HIT for model={model}")
+                    if self._cache_manager:
+                        self._cache_manager.record_hit()
                     return self._build_hit_response(entry, "semantic")
             except Exception as e:
                 logger.warning(f"Semantic cache lookup failed: {e}")
 
         logger.debug(f"Cache MISS: {exact_key[:20]}...")
+        if self._cache_manager:
+            self._cache_manager.record_miss()
         return None
 
     async def on_llm_success(
@@ -409,12 +433,25 @@ class SemanticCachePlugin(GatewayPlugin):
     @staticmethod
     def _build_hit_response(entry: CacheEntry, tier: str) -> dict[str, Any]:
         """Build kwargs override dict for a cache hit."""
+        cache_age = int(time.time() - entry.created_at)
         return {
             "metadata": {
                 "_cache_hit": True,
                 "_cache_hit_response": entry.response,
                 "_cache_tier": tier,
                 "_cache_key": entry.cache_key,
-                "_cache_age_seconds": int(time.time() - entry.created_at),
-            }
+                "_cache_age_seconds": cache_age,
+            },
+            "_cache_headers": {
+                "x-routeiq-cache": "HIT",
+                "x-routeiq-cache-tier": tier,
+                "x-routeiq-cache-age": str(cache_age),
+            },
+        }
+
+    @staticmethod
+    def build_miss_headers() -> dict[str, str]:
+        """Build cache headers for a cache miss."""
+        return {
+            "x-routeiq-cache": "MISS",
         }

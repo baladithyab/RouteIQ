@@ -756,6 +756,8 @@ async def _dispatch_jsonrpc_method(
         return await _handle_tools_call_sse(request_id, params, gateway)
     elif method == "resources/list":
         return await _handle_resources_list_sse(request_id, params, gateway)
+    elif method == "resources/read":
+        return await _handle_resources_read_sse(request_id, params, gateway)
     elif method == "resources/templates/list":
         return {
             "jsonrpc": "2.0",
@@ -791,8 +793,8 @@ async def _dispatch_jsonrpc_method(
                 "message": (
                     f"Method '{method}' not found. Supported: initialize, "
                     "notifications/initialized, tools/list, tools/call, "
-                    "resources/list, resources/templates/list, logging/setLevel, "
-                    "completion/complete"
+                    "resources/list, resources/read, resources/templates/list, "
+                    "logging/setLevel, completion/complete"
                 ),
             },
         }
@@ -831,6 +833,10 @@ async def _handle_initialize_sse(
     capabilities: dict[str, Any] = {
         "tools": {
             "listChanged": True,
+        },
+        "resources": {
+            "listChanged": True,
+            "subscribe": False,
         },
         "logging": {},
         "completion": {},
@@ -1041,10 +1047,10 @@ async def _handle_resources_list_sse(
     params: dict[str, Any] | None,
     gateway: Any,
 ) -> dict[str, Any]:
-    """Handle MCP resources/list request."""
-    resources = []
+    """Handle MCP resources/list request with cursor-based pagination."""
+    all_resources = []
     for res in gateway.list_resources():
-        resources.append(
+        all_resources.append(
             {
                 "uri": res.get("resource", ""),
                 "name": res.get("resource", "").split("/")[-1]
@@ -1054,10 +1060,61 @@ async def _handle_resources_list_sse(
             }
         )
 
+    # Apply cursor-based pagination
+    cursor = (params or {}).get("cursor")
+    offset = _decode_cursor(cursor)
+    page_size = min((params or {}).get("pageSize", 50), 100)
+
+    page = all_resources[offset : offset + page_size]
+
+    result: dict[str, Any] = {"resources": page}
+    if offset + page_size < len(all_resources):
+        result["nextCursor"] = _encode_cursor(offset + page_size)
+
     return {
         "jsonrpc": "2.0",
         "id": request_id,
-        "result": {"resources": resources},
+        "result": result,
+    }
+
+
+async def _handle_resources_read_sse(
+    request_id: int | str | None,
+    params: dict[str, Any] | None,
+    gateway: Any,
+) -> dict[str, Any]:
+    """Handle MCP resources/read request by proxying to upstream server."""
+    if not params or not params.get("uri"):
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32602,  # JSONRPC_INVALID_PARAMS
+                "message": "Missing required param: uri",
+            },
+        }
+
+    uri = params["uri"]
+
+    # Proxy the read request to the upstream server
+    result = await gateway.proxy_resource_read(uri)
+
+    # Check for error from the proxy
+    if "error" in result:
+        error = result["error"]
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": error.get("code", -32002),
+                "message": error.get("message", f"Resource not found: {uri}"),
+            },
+        }
+
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
     }
 
 

@@ -34,8 +34,7 @@ from contextvars import ContextVar
 from typing import Optional
 
 from fastapi import HTTPException, Request
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -309,21 +308,38 @@ def sanitize_error_response(
     }
 
 
-class RequestIDMiddleware(BaseHTTPMiddleware):
+class RequestIDMiddleware:
     """
-    Middleware to inject request correlation IDs.
+    Raw ASGI middleware to inject request correlation IDs.
+
+    Uses the raw ASGI pattern (same as BackpressureMiddleware and
+    RouterDecisionMiddleware) instead of BaseHTTPMiddleware, which buffers
+    the entire response and breaks streaming.
 
     - Reads X-Request-ID from incoming request headers (for passthrough)
     - Generates a UUID if not provided
     - Sets the request ID in context for access throughout the request lifecycle
-    - Adds X-Request-ID to response headers
+    - Injects X-Request-ID into response headers via send wrapper
     """
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
-        # Get existing request ID or generate new one
-        request_id = request.headers.get(REQUEST_ID_HEADER, "").strip()
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """ASGI entry point."""
+        # Only process HTTP requests; pass through websocket/lifespan
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Extract X-Request-ID from ASGI scope headers
+        request_id = ""
+        header_name = REQUEST_ID_HEADER.lower().encode("latin-1")
+        for header_key, header_value in scope.get("headers", []):
+            if header_key == header_name:
+                request_id = header_value.decode("latin-1").strip()
+                break
+
         if not request_id:
             request_id = str(uuid.uuid4())
 
@@ -331,13 +347,20 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         token = _request_id_ctx.set(request_id)
 
         try:
-            # Process request
-            response = await call_next(request)
+            # Wrap send to inject X-Request-ID into response headers
+            request_id_header_pair = (
+                REQUEST_ID_HEADER.lower().encode("latin-1"),
+                request_id.encode("latin-1"),
+            )
 
-            # Add request ID to response headers
-            response.headers[REQUEST_ID_HEADER] = request_id
+            async def send_with_request_id(message: dict) -> None:
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers", []))
+                    headers.append(request_id_header_pair)
+                    message = {**message, "headers": headers}
+                await send(message)
 
-            return response
+            await self.app(scope, receive, send_with_request_id)
         finally:
             # Reset context
             _request_id_ctx.reset(token)

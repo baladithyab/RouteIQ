@@ -26,11 +26,14 @@ from litellm_llmrouter.gateway.plugin_manager import (
 from litellm_llmrouter.semantic_cache import (
     CacheEntry,
     CacheKeyGenerator,
+    CacheManager,
     InMemoryCache,
     RedisCacheStore,
     _cosine_similarity,
     extract_semantic_content,
+    get_cache_manager,
     is_cacheable_request,
+    set_cache_manager,
 )
 from litellm_llmrouter.gateway.plugins.cache_plugin import (
     SemanticCachePlugin,
@@ -49,6 +52,14 @@ def reset_embedder_singleton():
     _reset_embedder()
     yield
     _reset_embedder()
+
+
+@pytest.fixture(autouse=True)
+def reset_cache_manager_singleton():
+    """Reset the cache manager singleton before each test."""
+    set_cache_manager(None)
+    yield
+    set_cache_manager(None)
 
 
 @pytest.fixture
@@ -972,3 +983,515 @@ class TestSemanticCachePlugin:
         assert plugin._l1.size == 0
 
         await plugin.shutdown(app)
+
+
+# =============================================================================
+# CacheManager
+# =============================================================================
+
+
+class TestCacheManager:
+    def test_get_stats_basic(self):
+        """get_stats returns expected structure."""
+        l1 = InMemoryCache(max_size=100)
+        manager = CacheManager(l1=l1, ttl=3600, semantic_enabled=False)
+        stats = manager.get_stats()
+
+        assert stats["enabled"] is True
+        assert stats["semantic_enabled"] is False
+        assert stats["ttl_seconds"] == 3600
+        assert stats["total_hits"] == 0
+        assert stats["total_misses"] == 0
+        assert stats["l1"]["size"] == 0
+        assert stats["l1"]["max_size"] == 100
+        assert stats["l2_configured"] is False
+
+    def test_record_hit_and_miss(self):
+        """record_hit/miss increment aggregate counters."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+
+        manager.record_hit()
+        manager.record_hit()
+        manager.record_miss()
+
+        stats = manager.get_stats()
+        assert stats["total_hits"] == 2
+        assert stats["total_misses"] == 1
+
+    async def test_flush_all(self, sample_entry):
+        """flush() without prefix clears all L1 entries and resets counters."""
+        l1 = InMemoryCache()
+        await l1.set("k1", sample_entry, ttl=3600)
+        await l1.set("k2", sample_entry, ttl=3600)
+
+        manager = CacheManager(l1=l1)
+        manager.record_hit()
+        manager.record_miss()
+
+        count = await manager.flush()
+        assert count == 2
+        assert l1.size == 0
+        assert manager._total_hits == 0
+        assert manager._total_misses == 0
+
+    async def test_flush_with_prefix(self, sample_entry):
+        """flush(prefix) removes only matching entries."""
+        l1 = InMemoryCache()
+        await l1.set("routeiq:cache:v1:a:123", sample_entry, ttl=3600)
+        await l1.set("routeiq:cache:v1:a:456", sample_entry, ttl=3600)
+        await l1.set("routeiq:cache:v1:b:789", sample_entry, ttl=3600)
+
+        manager = CacheManager(l1=l1)
+        count = await manager.flush(prefix="routeiq:cache:v1:a:")
+        assert count == 2
+        assert l1.size == 1
+
+    async def test_flush_no_l1(self):
+        """flush() with no L1 returns 0."""
+        manager = CacheManager(l1=None)
+        count = await manager.flush()
+        assert count == 0
+
+    def test_list_entries_empty(self):
+        """list_entries returns empty when no entries."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+        result = manager.list_entries()
+        assert result["enabled"] is True
+        assert result["count"] == 0
+        assert result["entries"] == []
+
+    async def test_list_entries_with_data(self, sample_entry):
+        """list_entries returns entry metadata."""
+        l1 = InMemoryCache()
+        await l1.set("key1", sample_entry, ttl=3600)
+
+        manager = CacheManager(l1=l1)
+        result = manager.list_entries()
+        assert result["count"] == 1
+        assert len(result["entries"]) == 1
+        entry = result["entries"][0]
+        assert entry["key"] == "key1"
+        assert entry["model"] == "gpt-4"
+        assert entry["token_count"] == 42
+        assert entry["ttl_remaining"] > 0
+        assert entry["has_embedding"] is False
+
+    async def test_list_entries_with_limit(self, sample_entry):
+        """list_entries respects the limit parameter."""
+        l1 = InMemoryCache()
+        for i in range(5):
+            await l1.set(f"key{i}", sample_entry, ttl=3600)
+
+        manager = CacheManager(l1=l1)
+        result = manager.list_entries(limit=3)
+        assert result["count"] == 3
+
+    def test_list_entries_no_l1(self):
+        """list_entries with no L1 returns empty."""
+        manager = CacheManager(l1=None)
+        result = manager.list_entries()
+        assert result["enabled"] is True
+        assert result["count"] == 0
+
+
+# =============================================================================
+# CacheManager: SSE Streaming Replay
+# =============================================================================
+
+
+class TestSSEStreamingReplay:
+    async def test_replay_basic_response(self):
+        """replay_as_sse_stream produces valid SSE format."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+
+        cached_response = {
+            "model": "gpt-4",
+            "choices": [{"message": {"content": "Hello world"}}],
+        }
+
+        chunks = []
+        async for chunk in manager.replay_as_sse_stream(cached_response):
+            chunks.append(chunk)
+
+        assert len(chunks) == 2
+        # First chunk should be SSE data with content
+        assert chunks[0].startswith("data: ")
+        assert chunks[0].endswith("\n\n")
+        # Parse the JSON from the SSE data line
+        data = json.loads(chunks[0].removeprefix("data: ").strip())
+        assert data["object"] == "chat.completion.chunk"
+        assert data["model"] == "gpt-4"
+        assert data["choices"][0]["delta"]["content"] == "Hello world"
+        assert data["choices"][0]["finish_reason"] == "stop"
+        assert data["id"].startswith("chatcmpl-cache-")
+
+        # Last chunk should be [DONE]
+        assert chunks[1] == "data: [DONE]\n\n"
+
+    async def test_replay_empty_response(self):
+        """replay_as_sse_stream handles empty choices."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+
+        cached_response = {"model": "gpt-3.5-turbo", "choices": []}
+
+        chunks = []
+        async for chunk in manager.replay_as_sse_stream(cached_response):
+            chunks.append(chunk)
+
+        assert len(chunks) == 2
+        data = json.loads(chunks[0].removeprefix("data: ").strip())
+        assert data["choices"][0]["delta"]["content"] == ""
+        assert data["model"] == "gpt-3.5-turbo"
+
+    async def test_replay_no_model(self):
+        """replay_as_sse_stream uses default model when not present."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+
+        cached_response = {
+            "choices": [{"message": {"content": "test"}}],
+        }
+
+        chunks = []
+        async for chunk in manager.replay_as_sse_stream(cached_response):
+            chunks.append(chunk)
+
+        data = json.loads(chunks[0].removeprefix("data: ").strip())
+        assert data["model"] == "cached-model"
+
+
+# =============================================================================
+# Cache Manager Singleton
+# =============================================================================
+
+
+class TestCacheManagerSingleton:
+    def test_get_cache_manager_default_none(self):
+        """get_cache_manager returns None when not set."""
+        assert get_cache_manager() is None
+
+    def test_set_and_get_cache_manager(self):
+        """set/get cache manager works."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+        set_cache_manager(manager)
+        assert get_cache_manager() is manager
+
+    def test_clear_cache_manager(self):
+        """Setting to None clears the singleton."""
+        l1 = InMemoryCache()
+        manager = CacheManager(l1=l1)
+        set_cache_manager(manager)
+        set_cache_manager(None)
+        assert get_cache_manager() is None
+
+
+# =============================================================================
+# Cache Response Headers
+# =============================================================================
+
+
+class TestCacheResponseHeaders:
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_hit_response_includes_cache_headers(self):
+        """Cache hit response includes _cache_headers with HIT, tier, and age."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        messages = [{"role": "user", "content": "test headers"}]
+        kwargs = {"messages": messages, "temperature": 0.0}
+        response = {
+            "choices": [{"message": {"content": "cached"}}],
+            "usage": {"total_tokens": 5},
+        }
+        await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        result = await plugin.on_llm_pre_call("gpt-4", messages, kwargs)
+        assert result is not None
+
+        # Check _cache_headers key
+        headers = result["_cache_headers"]
+        assert headers["x-routeiq-cache"] == "HIT"
+        assert headers["x-routeiq-cache-tier"] == "l1"
+        assert "x-routeiq-cache-age" in headers
+        # Age should be a string-formatted integer
+        age_val = int(headers["x-routeiq-cache-age"])
+        assert age_val >= 0
+
+        await plugin.shutdown(app)
+
+    def test_miss_headers(self):
+        """build_miss_headers returns MISS status."""
+        headers = SemanticCachePlugin.build_miss_headers()
+        assert headers["x-routeiq-cache"] == "MISS"
+
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_cache_hit_tier_l1(self):
+        """L1 cache hit has tier=l1 in headers."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        messages = [{"role": "user", "content": "tier test"}]
+        kwargs = {"messages": messages, "temperature": 0.0}
+        response = {
+            "choices": [{"message": {"content": "l1 answer"}}],
+            "usage": {"total_tokens": 5},
+        }
+        await plugin.on_llm_success("gpt-4", response, kwargs)
+        result = await plugin.on_llm_pre_call("gpt-4", messages, kwargs)
+
+        assert result["_cache_headers"]["x-routeiq-cache-tier"] == "l1"
+        assert result["metadata"]["_cache_tier"] == "l1"
+
+        await plugin.shutdown(app)
+
+
+# =============================================================================
+# Per-Request Cache Bypass
+# =============================================================================
+
+
+class TestPerRequestCacheBypass:
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_no_cache_header_bypasses_cache(self):
+        """x-routeiq-cache-control: no-cache skips cache lookup."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        messages = [{"role": "user", "content": "bypass test"}]
+
+        # Store a response first
+        kwargs_store = {"messages": messages, "temperature": 0.0}
+        response = {
+            "choices": [{"message": {"content": "answer"}}],
+            "usage": {"total_tokens": 5},
+        }
+        await plugin.on_llm_success("gpt-4", response, kwargs_store)
+
+        # Verify it's cached without bypass
+        result = await plugin.on_llm_pre_call("gpt-4", messages, kwargs_store)
+        assert result is not None
+        assert result["metadata"]["_cache_hit"] is True
+
+        # Now use no-cache header to bypass
+        kwargs_bypass = {
+            "messages": messages,
+            "temperature": 0.0,
+            "litellm_params": {
+                "proxy_server_request": {
+                    "headers": {"x-routeiq-cache-control": "no-cache"}
+                }
+            },
+        }
+        result = await plugin.on_llm_pre_call("gpt-4", messages, kwargs_bypass)
+        assert result is None  # Bypassed - cache miss
+
+        await plugin.shutdown(app)
+
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_no_cache_header_also_prevents_storage(self):
+        """x-routeiq-cache-control: no-cache also prevents storing response."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        messages = [{"role": "user", "content": "no store test"}]
+        kwargs = {
+            "messages": messages,
+            "temperature": 0.0,
+            "litellm_params": {
+                "proxy_server_request": {
+                    "headers": {"x-routeiq-cache-control": "no-cache"}
+                }
+            },
+        }
+        response = {
+            "choices": [{"message": {"content": "should not be cached"}}],
+            "usage": {"total_tokens": 5},
+        }
+        await plugin.on_llm_success("gpt-4", response, kwargs)
+        assert plugin._l1.size == 0  # Not stored
+
+        await plugin.shutdown(app)
+
+
+# =============================================================================
+# Cache Stats Tracking
+# =============================================================================
+
+
+class TestCacheStatsTracking:
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_hit_increments_total_hits(self):
+        """Cache hit increments CacheManager total_hits."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        manager = get_cache_manager()
+        assert manager is not None
+        assert manager._total_hits == 0
+
+        messages = [{"role": "user", "content": "stats test"}]
+        kwargs = {"messages": messages, "temperature": 0.0}
+        response = {
+            "choices": [{"message": {"content": "answer"}}],
+            "usage": {"total_tokens": 5},
+        }
+        await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        # First lookup is a hit
+        await plugin.on_llm_pre_call("gpt-4", messages, kwargs)
+        assert manager._total_hits == 1
+        assert manager._total_misses == 0
+
+        await plugin.shutdown(app)
+
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_miss_increments_total_misses(self):
+        """Cache miss increments CacheManager total_misses."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        manager = get_cache_manager()
+        assert manager is not None
+
+        messages = [{"role": "user", "content": "miss stats test"}]
+        kwargs = {"messages": messages, "temperature": 0.0}
+
+        # Lookup on empty cache is a miss
+        await plugin.on_llm_pre_call("gpt-4", messages, kwargs)
+        assert manager._total_misses == 1
+        assert manager._total_hits == 0
+
+        await plugin.shutdown(app)
+
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_cache_manager_registered_on_startup(self):
+        """CacheManager singleton is registered during plugin startup."""
+        assert get_cache_manager() is None
+
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        manager = get_cache_manager()
+        assert manager is not None
+        assert manager._l1 is plugin._l1
+
+        await plugin.shutdown(app)
+        assert get_cache_manager() is None
+
+    @patch.dict("os.environ", {"CACHE_ENABLED": "true"})
+    async def test_stats_endpoint_integration(self):
+        """get_stats reflects actual cache activity."""
+        plugin = SemanticCachePlugin()
+        app = MagicMock()
+        await plugin.startup(app)
+
+        manager = get_cache_manager()
+        assert manager is not None
+
+        messages = [{"role": "user", "content": "stats integration"}]
+        kwargs = {"messages": messages, "temperature": 0.0}
+        response = {
+            "choices": [{"message": {"content": "answer"}}],
+            "usage": {"total_tokens": 10},
+        }
+
+        # Store
+        await plugin.on_llm_success("gpt-4", response, kwargs)
+
+        # Miss on different query
+        diff_msgs = [{"role": "user", "content": "different query"}]
+        diff_kwargs = {"messages": diff_msgs, "temperature": 0.0}
+        await plugin.on_llm_pre_call("gpt-4", diff_msgs, diff_kwargs)
+
+        # Hit on original query
+        await plugin.on_llm_pre_call("gpt-4", messages, kwargs)
+
+        stats = manager.get_stats()
+        assert stats["total_hits"] == 1
+        assert stats["total_misses"] == 1
+        assert stats["l1"]["size"] == 1
+
+        await plugin.shutdown(app)
+
+
+# =============================================================================
+# Admin Cache Endpoints (unit tests via function call)
+# =============================================================================
+
+
+class TestAdminCacheEndpoints:
+    """
+    Test the admin cache endpoint logic via the CacheManager singleton.
+
+    These tests verify the same logic that the admin endpoints call,
+    testing through the get_cache_manager() singleton rather than
+    through FastAPI dependency injection.
+    """
+
+    async def test_stats_when_cache_disabled(self):
+        """get_cache_manager returns None when cache is not enabled."""
+        assert get_cache_manager() is None
+
+    async def test_flush_when_cache_disabled(self):
+        """No cache manager means flush is not possible."""
+        manager = get_cache_manager()
+        assert manager is None
+
+    async def test_entries_when_cache_disabled(self):
+        """No cache manager means entries listing is not possible."""
+        manager = get_cache_manager()
+        assert manager is None
+
+    async def test_stats_with_cache_enabled(self, sample_entry):
+        """get_stats returns stats when cache is enabled."""
+        l1 = InMemoryCache()
+        await l1.set("k1", sample_entry, ttl=3600)
+        manager = CacheManager(l1=l1, ttl=3600)
+        manager.record_hit()
+        set_cache_manager(manager)
+
+        mgr = get_cache_manager()
+        assert mgr is not None
+        stats = mgr.get_stats()
+        assert stats["enabled"] is True
+        assert stats["total_hits"] == 1
+        assert stats["l1"]["size"] == 1
+
+    async def test_flush_with_cache_enabled(self, sample_entry):
+        """flush returns count of removed entries."""
+        l1 = InMemoryCache()
+        await l1.set("k1", sample_entry, ttl=3600)
+        await l1.set("k2", sample_entry, ttl=3600)
+        manager = CacheManager(l1=l1, ttl=3600)
+        set_cache_manager(manager)
+
+        mgr = get_cache_manager()
+        assert mgr is not None
+        count = await mgr.flush()
+        assert count == 2
+        assert l1.size == 0
+
+    async def test_entries_with_cache_enabled(self, sample_entry):
+        """list_entries returns entry metadata."""
+        l1 = InMemoryCache()
+        await l1.set("k1", sample_entry, ttl=3600)
+        manager = CacheManager(l1=l1, ttl=3600)
+        set_cache_manager(manager)
+
+        mgr = get_cache_manager()
+        assert mgr is not None
+        result = mgr.list_entries(limit=50)
+        assert result["count"] == 1
+        assert result["entries"][0]["key"] == "k1"

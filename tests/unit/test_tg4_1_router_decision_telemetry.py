@@ -455,3 +455,146 @@ class TestRouterDecisionTelemetryIntegration:
 
         # 8 attributes should be set (no model_selected)
         assert call_count == 8
+
+
+# Import the GenAI attributes helper
+set_genai_attributes = observability.set_genai_attributes
+
+
+class TestSetGenAIAttributes:
+    """Test suite for set_genai_attributes helper function."""
+
+    def _create_mock_span(self):
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        return mock_span
+
+    def test_sets_system_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, system="openai")
+        mock_span.set_attribute.assert_called_with("gen_ai.system", "openai")
+
+    def test_sets_request_model_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, request_model="gpt-4")
+        mock_span.set_attribute.assert_called_with("gen_ai.request.model", "gpt-4")
+
+    def test_sets_response_model_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, response_model="gpt-4-0613")
+        mock_span.set_attribute.assert_called_with(
+            "gen_ai.response.model", "gpt-4-0613"
+        )
+
+    def test_sets_operation_name_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, operation_name="chat_completion")
+        mock_span.set_attribute.assert_called_with(
+            "gen_ai.operation.name", "chat_completion"
+        )
+
+    def test_sets_input_tokens_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, input_tokens=100)
+        mock_span.set_attribute.assert_called_with("gen_ai.usage.input_tokens", 100)
+
+    def test_sets_output_tokens_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, output_tokens=250)
+        mock_span.set_attribute.assert_called_with("gen_ai.usage.output_tokens", 250)
+
+    def test_sets_finish_reasons_attribute(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span, finish_reasons=["stop"])
+        mock_span.set_attribute.assert_called_with(
+            "gen_ai.response.finish_reasons", ["stop"]
+        )
+
+    def test_sets_all_attributes(self):
+        mock_span = self._create_mock_span()
+        attrs_set = {}
+
+        def capture(key, value):
+            attrs_set[key] = value
+
+        mock_span.set_attribute.side_effect = capture
+
+        set_genai_attributes(
+            mock_span,
+            system="openai",
+            request_model="gpt-4",
+            response_model="gpt-4-0613",
+            operation_name="chat_completion",
+            input_tokens=100,
+            output_tokens=250,
+            finish_reasons=["stop"],
+        )
+
+        assert attrs_set["gen_ai.system"] == "openai"
+        assert attrs_set["gen_ai.request.model"] == "gpt-4"
+        assert attrs_set["gen_ai.response.model"] == "gpt-4-0613"
+        assert attrs_set["gen_ai.operation.name"] == "chat_completion"
+        assert attrs_set["gen_ai.usage.input_tokens"] == 100
+        assert attrs_set["gen_ai.usage.output_tokens"] == 250
+        assert attrs_set["gen_ai.response.finish_reasons"] == ["stop"]
+
+    def test_does_not_set_none_values(self):
+        mock_span = self._create_mock_span()
+        set_genai_attributes(mock_span)
+        mock_span.set_attribute.assert_not_called()
+
+    def test_skips_non_recording_span(self):
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = False
+        set_genai_attributes(mock_span, system="openai")
+        mock_span.set_attribute.assert_not_called()
+
+    def test_skips_none_span(self):
+        # Should not raise
+        set_genai_attributes(None, system="openai")
+
+
+class TestGenAIRequestAttributesContract:
+    """Test GenAIRequestAttributes dataclass from telemetry_contracts."""
+
+    def test_default_values(self):
+        from litellm_llmrouter.telemetry_contracts import GenAIRequestAttributes
+
+        attrs = GenAIRequestAttributes()
+        assert attrs.gen_ai_system == ""
+        assert attrs.gen_ai_request_model == ""
+        assert attrs.gen_ai_response_model == ""
+        assert attrs.gen_ai_operation_name == ""
+        assert attrs.gen_ai_usage_input_tokens == 0
+        assert attrs.gen_ai_usage_output_tokens == 0
+        assert attrs.gen_ai_response_finish_reasons == []
+
+    def test_to_span_attributes_populated(self):
+        from litellm_llmrouter.telemetry_contracts import GenAIRequestAttributes
+
+        attrs = GenAIRequestAttributes(
+            gen_ai_system="openai",
+            gen_ai_request_model="gpt-4",
+            gen_ai_response_model="gpt-4-0613",
+            gen_ai_operation_name="chat_completion",
+            gen_ai_usage_input_tokens=100,
+            gen_ai_usage_output_tokens=250,
+            gen_ai_response_finish_reasons=["stop"],
+        )
+        span_attrs = attrs.to_span_attributes()
+        assert span_attrs["gen_ai.system"] == "openai"
+        assert span_attrs["gen_ai.request.model"] == "gpt-4"
+        assert span_attrs["gen_ai.response.model"] == "gpt-4-0613"
+        assert span_attrs["gen_ai.operation.name"] == "chat_completion"
+        assert span_attrs["gen_ai.usage.input_tokens"] == 100
+        assert span_attrs["gen_ai.usage.output_tokens"] == 250
+        assert span_attrs["gen_ai.response.finish_reasons"] == ["stop"]
+
+    def test_to_span_attributes_omits_defaults(self):
+        from litellm_llmrouter.telemetry_contracts import GenAIRequestAttributes
+
+        attrs = GenAIRequestAttributes(gen_ai_system="anthropic")
+        span_attrs = attrs.to_span_attributes()
+        assert span_attrs == {"gen_ai.system": "anthropic"}
+        assert "gen_ai.request.model" not in span_attrs
+        assert "gen_ai.usage.input_tokens" not in span_attrs

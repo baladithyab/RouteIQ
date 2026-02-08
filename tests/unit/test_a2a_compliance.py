@@ -6,12 +6,17 @@ Tests for A2A spec compliance features:
 - Both tasks/send and message/send dispatch to same handler
 - Task creation, state transitions, get, cancel
 - State machine validation (invalid transitions rejected)
+- validate_state_transition() standalone function
+- A2AError standardized error responses
 - Agent Card endpoint returns valid JSON with required fields
 - SSE event framing format
 - Task TTL cleanup
+- Concurrent state transitions (optimistic locking)
+- Error response format compliance
 """
 
 import json
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,15 +25,19 @@ import pytest
 from litellm_llmrouter import a2a_gateway
 from litellm_llmrouter.a2a_gateway import (
     A2AAgent,
+    A2AError,
     A2AGateway,
     A2ATask,
     A2ATaskStore,
     InvalidTaskTransitionError,
     JSONRPCRequest,
+    JSONRPCResponse,
     TaskState,
+    VALID_STATE_TRANSITIONS,
     VALID_TRANSITIONS,
     format_sse_event,
     reset_a2a_gateway,
+    validate_state_transition,
 )
 
 # Mark all tests as async
@@ -123,6 +132,24 @@ class TestA2ATaskStateMachine:
         assert task.history[0]["from"] == "submitted"
         assert task.history[0]["to"] == "working"
 
+    def test_valid_transition_submitted_to_completed(self):
+        """submitted -> completed should be valid (fast-track completion)."""
+        task = A2ATask(id="t1", state=TaskState.SUBMITTED, agent_id="a1")
+        task.transition(TaskState.COMPLETED)
+        assert task.state == TaskState.COMPLETED
+
+    def test_valid_transition_submitted_to_failed(self):
+        """submitted -> failed should be valid (immediate failure)."""
+        task = A2ATask(id="t1", state=TaskState.SUBMITTED, agent_id="a1")
+        task.transition(TaskState.FAILED)
+        assert task.state == TaskState.FAILED
+
+    def test_valid_transition_submitted_to_canceled(self):
+        """submitted -> canceled should be valid (cancel before work starts)."""
+        task = A2ATask(id="t1", state=TaskState.SUBMITTED, agent_id="a1")
+        task.transition(TaskState.CANCELED)
+        assert task.state == TaskState.CANCELED
+
     def test_valid_transition_working_to_completed(self):
         """working -> completed should be valid."""
         task = A2ATask(id="t1", state=TaskState.WORKING, agent_id="a1")
@@ -159,13 +186,17 @@ class TestA2ATaskStateMachine:
         task.transition(TaskState.CANCELED)
         assert task.state == TaskState.CANCELED
 
-    def test_invalid_transition_submitted_to_completed(self):
-        """submitted -> completed should be invalid (must go through working)."""
-        task = A2ATask(id="t1", state=TaskState.SUBMITTED, agent_id="a1")
-        with pytest.raises(InvalidTaskTransitionError) as exc_info:
-            task.transition(TaskState.COMPLETED)
-        assert exc_info.value.current == TaskState.SUBMITTED
-        assert exc_info.value.target == TaskState.COMPLETED
+    def test_valid_transition_input_required_to_completed(self):
+        """input-required -> completed should be valid."""
+        task = A2ATask(id="t1", state=TaskState.INPUT_REQUIRED, agent_id="a1")
+        task.transition(TaskState.COMPLETED)
+        assert task.state == TaskState.COMPLETED
+
+    def test_valid_transition_input_required_to_failed(self):
+        """input-required -> failed should be valid."""
+        task = A2ATask(id="t1", state=TaskState.INPUT_REQUIRED, agent_id="a1")
+        task.transition(TaskState.FAILED)
+        assert task.state == TaskState.FAILED
 
     def test_invalid_transition_completed_to_working(self):
         """completed -> working should be invalid (terminal state)."""
@@ -173,17 +204,41 @@ class TestA2ATaskStateMachine:
         with pytest.raises(InvalidTaskTransitionError):
             task.transition(TaskState.WORKING)
 
+    def test_invalid_transition_completed_to_submitted(self):
+        """completed -> submitted should be invalid (terminal state)."""
+        task = A2ATask(id="t1", state=TaskState.COMPLETED, agent_id="a1")
+        with pytest.raises(InvalidTaskTransitionError):
+            task.transition(TaskState.SUBMITTED)
+
     def test_invalid_transition_failed_to_working(self):
         """failed -> working should be invalid (terminal state)."""
         task = A2ATask(id="t1", state=TaskState.FAILED, agent_id="a1")
         with pytest.raises(InvalidTaskTransitionError):
             task.transition(TaskState.WORKING)
 
+    def test_invalid_transition_failed_to_completed(self):
+        """failed -> completed should be invalid (terminal state)."""
+        task = A2ATask(id="t1", state=TaskState.FAILED, agent_id="a1")
+        with pytest.raises(InvalidTaskTransitionError):
+            task.transition(TaskState.COMPLETED)
+
     def test_invalid_transition_canceled_to_working(self):
         """canceled -> working should be invalid (terminal state)."""
         task = A2ATask(id="t1", state=TaskState.CANCELED, agent_id="a1")
         with pytest.raises(InvalidTaskTransitionError):
             task.transition(TaskState.WORKING)
+
+    def test_invalid_transition_canceled_to_submitted(self):
+        """canceled -> submitted should be invalid (terminal state)."""
+        task = A2ATask(id="t1", state=TaskState.CANCELED, agent_id="a1")
+        with pytest.raises(InvalidTaskTransitionError):
+            task.transition(TaskState.SUBMITTED)
+
+    def test_invalid_transition_submitted_to_input_required(self):
+        """submitted -> input-required should be invalid (must work first)."""
+        task = A2ATask(id="t1", state=TaskState.SUBMITTED, agent_id="a1")
+        with pytest.raises(InvalidTaskTransitionError):
+            task.transition(TaskState.INPUT_REQUIRED)
 
     def test_transition_records_history(self):
         """State transitions should be recorded in history."""
@@ -230,6 +285,178 @@ class TestA2ATaskStateMachine:
             assert VALID_TRANSITIONS[state] == set(), (
                 f"{state.value} should have no valid transitions"
             )
+
+    def test_all_terminal_states_reject_all_targets(self):
+        """Terminal states must reject transitions to every other state."""
+        terminal_states = [TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED]
+        all_states = [
+            TaskState.SUBMITTED,
+            TaskState.WORKING,
+            TaskState.INPUT_REQUIRED,
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        ]
+        for terminal in terminal_states:
+            for target in all_states:
+                task = A2ATask(id="t1", state=terminal, agent_id="a1")
+                with pytest.raises(InvalidTaskTransitionError):
+                    task.transition(target)
+
+    def test_all_valid_transitions_succeed(self):
+        """Every transition in VALID_TRANSITIONS should succeed."""
+        for source, targets in VALID_TRANSITIONS.items():
+            if source == TaskState.UNKNOWN:
+                continue  # skip UNKNOWN since it's internal
+            for target in targets:
+                task = A2ATask(id="t1", state=source, agent_id="a1")
+                task.transition(target)
+                assert task.state == target, (
+                    f"Transition {source.value} -> {target.value} should succeed"
+                )
+
+    def test_invalid_transition_error_message_includes_valid_targets(self):
+        """InvalidTaskTransitionError message should list valid transition targets."""
+        task = A2ATask(id="t1", state=TaskState.COMPLETED, agent_id="a1")
+        with pytest.raises(InvalidTaskTransitionError) as exc_info:
+            task.transition(TaskState.WORKING)
+        error_msg = str(exc_info.value)
+        assert "completed" in error_msg
+        assert "working" in error_msg
+        assert "Valid transitions" in error_msg
+
+
+# =============================================================================
+# validate_state_transition() Standalone Function Tests
+# =============================================================================
+
+
+class TestValidateStateTransition:
+    """Tests for the standalone validate_state_transition() function."""
+
+    def test_valid_transition_returns_true(self):
+        """Valid transitions should return True."""
+        assert validate_state_transition("submitted", "working") is True
+        assert validate_state_transition("working", "completed") is True
+        assert validate_state_transition("working", "failed") is True
+        assert validate_state_transition("input-required", "working") is True
+
+    def test_invalid_transition_raises_value_error(self):
+        """Invalid transitions should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid state transition"):
+            validate_state_transition("completed", "working")
+
+    def test_terminal_states_reject_all(self):
+        """Terminal states should reject all transitions."""
+        for terminal in ("completed", "failed", "canceled"):
+            for target in ("submitted", "working", "completed", "failed", "canceled"):
+                with pytest.raises(ValueError):
+                    validate_state_transition(terminal, target)
+
+    def test_unknown_current_state_raises(self):
+        """Unknown current state should raise ValueError."""
+        with pytest.raises(ValueError, match="Unknown current state"):
+            validate_state_transition("nonexistent", "working")
+
+    def test_submitted_valid_targets(self):
+        """submitted should allow working, completed, failed, canceled."""
+        for target in ("working", "completed", "failed", "canceled"):
+            assert validate_state_transition("submitted", target) is True
+
+    def test_submitted_rejects_input_required(self):
+        """submitted -> input-required should be invalid."""
+        with pytest.raises(ValueError):
+            validate_state_transition("submitted", "input-required")
+
+    def test_working_valid_targets(self):
+        """working should allow completed, failed, canceled, input-required."""
+        for target in ("completed", "failed", "canceled", "input-required"):
+            assert validate_state_transition("working", target) is True
+
+    def test_input_required_valid_targets(self):
+        """input-required should allow working, completed, failed, canceled."""
+        for target in ("working", "completed", "failed", "canceled"):
+            assert validate_state_transition("input-required", target) is True
+
+    def test_string_alias_matches_enum_transitions(self):
+        """VALID_STATE_TRANSITIONS should match VALID_TRANSITIONS."""
+        for state, targets in VALID_TRANSITIONS.items():
+            str_targets = VALID_STATE_TRANSITIONS.get(state.value, set())
+            expected = {t.value for t in targets}
+            assert str_targets == expected, (
+                f"String alias mismatch for state '{state.value}': "
+                f"expected {expected}, got {str_targets}"
+            )
+
+
+# =============================================================================
+# A2AError Standardized Error Response Tests
+# =============================================================================
+
+
+class TestA2AError:
+    """Tests for A2AError standardized error responses."""
+
+    def test_predefined_error_codes(self):
+        """Predefined errors should have correct codes."""
+        assert A2AError.TASK_NOT_FOUND["code"] == -32001
+        assert A2AError.AGENT_NOT_FOUND["code"] == -32002
+        assert A2AError.RATE_LIMITED["code"] == -32003
+        assert A2AError.INVALID_TRANSITION["code"] == -32602
+        assert A2AError.INVALID_PARAMS["code"] == -32602
+        assert A2AError.METHOD_NOT_FOUND["code"] == -32601
+        assert A2AError.INVALID_REQUEST["code"] == -32600
+        assert A2AError.INTERNAL_ERROR["code"] == -32603
+
+    def test_predefined_error_messages(self):
+        """Predefined errors should have human-readable messages."""
+        assert A2AError.TASK_NOT_FOUND["message"] == "Task not found"
+        assert A2AError.AGENT_NOT_FOUND["message"] == "Agent not found"
+        assert A2AError.RATE_LIMITED["message"] == "Rate limited"
+        assert A2AError.INTERNAL_ERROR["message"] == "Internal error"
+
+    def test_make_error_basic(self):
+        """make_error should produce a valid JSON-RPC error response."""
+        result = A2AError.make_error(-32000, "Test error")
+        assert result["jsonrpc"] == "2.0"
+        assert result["error"]["code"] == -32000
+        assert result["error"]["message"] == "Test error"
+        assert result["id"] is None
+        assert "data" not in result["error"]
+
+    def test_make_error_with_data(self):
+        """make_error with data should include it in the error."""
+        result = A2AError.make_error(
+            -32602,
+            "Invalid params",
+            data={"field": "id", "reason": "missing"},
+        )
+        assert result["error"]["data"]["field"] == "id"
+        assert result["error"]["data"]["reason"] == "missing"
+
+    def test_task_not_found_response(self):
+        """task_not_found should create properly formatted error."""
+        result = A2AError.task_not_found("task-123")
+        assert result["jsonrpc"] == "2.0"
+        assert result["error"]["code"] == -32001
+        assert "task-123" in result["error"]["message"]
+
+    def test_agent_not_found_response(self):
+        """agent_not_found should create properly formatted error."""
+        result = A2AError.agent_not_found("agent-xyz")
+        assert result["jsonrpc"] == "2.0"
+        assert result["error"]["code"] == -32002
+        assert "agent-xyz" in result["error"]["message"]
+
+    def test_invalid_transition_response(self):
+        """invalid_transition should include state details."""
+        result = A2AError.invalid_transition("completed", "working")
+        assert result["jsonrpc"] == "2.0"
+        assert result["error"]["code"] == -32602
+        assert "completed" in result["error"]["message"]
+        assert "working" in result["error"]["message"]
+        assert result["error"]["data"]["current_state"] == "completed"
+        assert result["error"]["data"]["requested_state"] == "working"
 
 
 # =============================================================================
@@ -288,6 +515,22 @@ class TestA2ATaskStore:
         msgs = [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]
         task = task_store.create_task(agent_id="a1", messages=msgs)
         assert len(task.messages) == 1
+
+    def test_rate_limiting(self):
+        """Task store should enforce per-agent rate limits."""
+        store = A2ATaskStore(rate_limit_per_minute=2)
+        store.create_task(agent_id="a1")
+        store.create_task(agent_id="a1")
+        with pytest.raises(ValueError, match="Rate limit exceeded"):
+            store.create_task(agent_id="a1")
+
+    def test_max_capacity(self):
+        """Task store should reject when at max capacity."""
+        store = A2ATaskStore(max_tasks=2, rate_limit_per_minute=100)
+        store.create_task(agent_id="a1")
+        store.create_task(agent_id="a2")
+        with pytest.raises(ValueError, match="at capacity"):
+            store.create_task(agent_id="a3")
 
 
 # =============================================================================
@@ -435,11 +678,11 @@ class TestTaskGetAndCancel:
         assert resp.error["code"] == -32602
 
     async def test_tasks_get_not_found(self, gateway):
-        """tasks/get for unknown task should return error."""
+        """tasks/get for unknown task should return -32001 error."""
         req = JSONRPCRequest(method="tasks/get", params={"id": "nonexistent"}, id=1)
         resp = await gateway.handle_task_get(req)
         assert resp.error is not None
-        assert resp.error["code"] == -32001
+        assert resp.error["code"] == A2AError.TASK_NOT_FOUND["code"]
 
     async def test_tasks_cancel_working_task(self, gateway):
         """tasks/cancel should cancel a working task."""
@@ -452,14 +695,13 @@ class TestTaskGetAndCancel:
         assert resp.result["status"]["state"] == "canceled"
 
     async def test_tasks_cancel_submitted_task(self, gateway):
-        """tasks/cancel should not cancel a submitted task (no direct transition)."""
+        """tasks/cancel should cancel a submitted task (now a valid transition)."""
         task = gateway.task_store.create_task(agent_id="a1")
-        # submitted -> canceled is not a valid transition
 
         req = JSONRPCRequest(method="tasks/cancel", params={"id": task.id}, id=1)
         resp = await gateway.handle_task_cancel(req)
-        assert resp.error is not None
-        assert resp.error["code"] == -32002
+        assert resp.error is None
+        assert resp.result["status"]["state"] == "canceled"
 
     async def test_tasks_cancel_completed_task(self, gateway):
         """tasks/cancel should not cancel a completed task (terminal state)."""
@@ -470,7 +712,18 @@ class TestTaskGetAndCancel:
         req = JSONRPCRequest(method="tasks/cancel", params={"id": task.id}, id=1)
         resp = await gateway.handle_task_cancel(req)
         assert resp.error is not None
-        assert resp.error["code"] == -32002
+        assert resp.error["code"] == A2AError.INVALID_TRANSITION["code"]
+
+    async def test_tasks_cancel_failed_task(self, gateway):
+        """tasks/cancel should not cancel a failed task (terminal state)."""
+        task = gateway.task_store.create_task(agent_id="a1")
+        task.transition(TaskState.WORKING)
+        task.transition(TaskState.FAILED)
+
+        req = JSONRPCRequest(method="tasks/cancel", params={"id": task.id}, id=1)
+        resp = await gateway.handle_task_cancel(req)
+        assert resp.error is not None
+        assert resp.error["code"] == A2AError.INVALID_TRANSITION["code"]
 
     async def test_tasks_cancel_missing_id(self, gateway):
         """tasks/cancel without id param should return error."""
@@ -480,11 +733,11 @@ class TestTaskGetAndCancel:
         assert resp.error["code"] == -32602
 
     async def test_tasks_cancel_not_found(self, gateway):
-        """tasks/cancel for unknown task should return error."""
+        """tasks/cancel for unknown task should return -32001 error."""
         req = JSONRPCRequest(method="tasks/cancel", params={"id": "nonexistent"}, id=1)
         resp = await gateway.handle_task_cancel(req)
         assert resp.error is not None
-        assert resp.error["code"] == -32001
+        assert resp.error["code"] == A2AError.TASK_NOT_FOUND["code"]
 
     async def test_invoke_agent_dispatches_tasks_get(self, gateway):
         """invoke_agent should dispatch tasks/get to handle_task_get."""
@@ -582,6 +835,50 @@ class TestAgentCard:
         card = gateway.get_gateway_agent_card()
         assert card["url"] == "/a2a"
 
+    def test_gateway_agent_card_has_all_required_a2a_fields(self, gateway):
+        """Gateway agent card must include all fields required by A2A spec."""
+        card = gateway.get_gateway_agent_card(base_url="https://example.com")
+        required_fields = [
+            "name",
+            "description",
+            "url",
+            "version",
+            "capabilities",
+            "skills",
+            "defaultInputModes",
+            "defaultOutputModes",
+            "authentication",
+        ]
+        for field in required_fields:
+            assert field in card, f"Missing required A2A field: '{field}'"
+
+    def test_gateway_agent_card_capabilities_structure(self, gateway):
+        """Gateway card capabilities must have streaming and pushNotifications."""
+        card = gateway.get_gateway_agent_card()
+        caps = card["capabilities"]
+        assert "streaming" in caps
+        assert "pushNotifications" in caps
+        assert isinstance(caps["streaming"], bool)
+        assert isinstance(caps["pushNotifications"], bool)
+
+    def test_agent_card_skills_array(self, gateway, sample_agent):
+        """Agent card skills should be an array of skill objects with id and name."""
+        gateway.register_agent(sample_agent)
+        card = gateway.get_agent_card("agent-1")
+        assert isinstance(card["skills"], list)
+        for skill in card["skills"]:
+            assert "id" in skill
+            assert "name" in skill
+
+    def test_agent_card_default_modes_are_arrays(self, gateway, sample_agent):
+        """defaultInputModes and defaultOutputModes should be arrays."""
+        gateway.register_agent(sample_agent)
+        card = gateway.get_agent_card("agent-1")
+        assert isinstance(card["defaultInputModes"], list)
+        assert isinstance(card["defaultOutputModes"], list)
+        assert len(card["defaultInputModes"]) > 0
+        assert len(card["defaultOutputModes"]) > 0
+
 
 # =============================================================================
 # SSE Event Framing Tests
@@ -604,6 +901,31 @@ class TestSSEEventFraming:
         assert data["id"] == "t1"
         assert data["status"]["state"] == "working"
         # Should end with double newline
+        assert result.endswith("\n\n")
+
+    def test_format_sse_event_has_event_prefix(self):
+        """SSE event must start with 'event: ' prefix."""
+        result = format_sse_event("my-event", {"key": "value"})
+        assert result.startswith("event: my-event\n")
+
+    def test_format_sse_event_has_data_prefix(self):
+        """SSE event data line must start with 'data: ' prefix."""
+        result = format_sse_event("my-event", {"key": "value"})
+        lines = result.split("\n")
+        assert lines[1].startswith("data: ")
+
+    def test_format_sse_event_data_is_valid_json(self):
+        """SSE event data payload must be valid JSON."""
+        data_in = {"nested": {"key": [1, 2, 3]}, "flag": True}
+        result = format_sse_event("test", data_in)
+        data_line = result.split("\n")[1]
+        data_str = data_line[len("data: ") :]
+        parsed = json.loads(data_str)
+        assert parsed == data_in
+
+    def test_format_sse_event_ends_with_double_newline(self):
+        """SSE events must end with \\n\\n per the SSE specification."""
+        result = format_sse_event("test", {})
         assert result.endswith("\n\n")
 
     def test_format_sse_event_artifact_update(self):
@@ -633,6 +955,14 @@ class TestSSEEventFraming:
         )
         data = json.loads(result.split("data: ")[1].rstrip("\n"))
         assert data["final"] is True
+
+    def test_format_sse_event_no_extra_newlines_in_data(self):
+        """SSE data must be on a single line (no embedded newlines)."""
+        # json.dumps should produce single-line output by default
+        result = format_sse_event("test", {"multi": "line\ndata"})
+        lines = result.rstrip("\n").split("\n")
+        # Should be exactly: event line, data line
+        assert len(lines) == 2
 
     async def test_stream_agent_response_sse_lifecycle(self, gateway, sample_agent):
         """
@@ -754,6 +1084,138 @@ class TestTaskTTLCleanup:
 
 
 # =============================================================================
+# Concurrent State Transition Tests
+# =============================================================================
+
+
+class TestConcurrentStateTransitions:
+    """Tests for thread-safety of state transitions."""
+
+    def test_concurrent_transitions_one_wins(self):
+        """When two threads race to transition, exactly one should succeed."""
+        task = A2ATask(id="t1", state=TaskState.WORKING, agent_id="a1")
+        results = {"completed": 0, "failed": 0, "errors": 0}
+        barrier = threading.Barrier(2)
+
+        def try_transition(target: TaskState, result_key: str):
+            barrier.wait()
+            try:
+                task.transition(target)
+                results[result_key] += 1
+            except InvalidTaskTransitionError:
+                results["errors"] += 1
+
+        t1 = threading.Thread(
+            target=try_transition, args=(TaskState.COMPLETED, "completed")
+        )
+        t2 = threading.Thread(target=try_transition, args=(TaskState.FAILED, "failed"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Exactly one should succeed, one should fail
+        total_success = results["completed"] + results["failed"]
+        assert total_success == 1, (
+            f"Expected exactly 1 success, got {total_success}: {results}"
+        )
+        assert results["errors"] == 1, (
+            f"Expected exactly 1 error, got {results['errors']}: {results}"
+        )
+
+    def test_concurrent_task_store_creates(self, task_store):
+        """Multiple threads creating tasks should all succeed (within limits)."""
+        results = []
+
+        def create_task(idx):
+            try:
+                task = task_store.create_task(agent_id=f"agent-{idx}")
+                results.append(("ok", task.id))
+            except ValueError as e:
+                results.append(("error", str(e)))
+
+        threads = [threading.Thread(target=create_task, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r[0] == "ok"]
+        assert len(successes) == 10
+        assert task_store.count() == 10
+
+
+# =============================================================================
+# Error Response Format Tests
+# =============================================================================
+
+
+class TestErrorResponseFormat:
+    """Tests for JSON-RPC error response format compliance."""
+
+    async def test_agent_not_found_uses_correct_code(self, gateway):
+        """Agent not found should return -32002 error code."""
+        with patch.object(
+            a2a_gateway, "validate_outbound_url_async", new_callable=AsyncMock
+        ):
+            req = JSONRPCRequest(method="message/send", params={}, id=1)
+            resp = await gateway.invoke_agent("nonexistent-agent", req)
+        assert resp.error is not None
+        assert resp.error["code"] == A2AError.AGENT_NOT_FOUND["code"]
+        assert "nonexistent-agent" in resp.error["message"]
+
+    async def test_task_not_found_uses_correct_code(self, gateway):
+        """Task not found should return -32001 error code."""
+        req = JSONRPCRequest(method="tasks/get", params={"id": "no-such-task"}, id=1)
+        resp = await gateway.handle_task_get(req)
+        assert resp.error is not None
+        assert resp.error["code"] == A2AError.TASK_NOT_FOUND["code"]
+        assert "no-such-task" in resp.error["message"]
+
+    async def test_method_not_found_uses_correct_code(self, gateway, sample_agent):
+        """Unknown method should return -32601 error code."""
+        gateway.register_agent(sample_agent)
+        with patch.object(
+            a2a_gateway, "validate_outbound_url_async", new_callable=AsyncMock
+        ):
+            req = JSONRPCRequest(method="unknown/method", params={}, id=1)
+            resp = await gateway.invoke_agent("agent-1", req)
+        assert resp.error is not None
+        assert resp.error["code"] == A2AError.METHOD_NOT_FOUND["code"]
+
+    async def test_invalid_jsonrpc_version(self, gateway, sample_agent):
+        """Invalid JSON-RPC version should return -32600 error code."""
+        gateway.register_agent(sample_agent)
+        with patch.object(
+            a2a_gateway, "validate_outbound_url_async", new_callable=AsyncMock
+        ):
+            req = JSONRPCRequest(method="message/send", params={}, id=1)
+            req.jsonrpc = "1.0"
+            resp = await gateway.invoke_agent("agent-1", req)
+        assert resp.error is not None
+        assert resp.error["code"] == A2AError.INVALID_REQUEST["code"]
+
+    def test_jsonrpc_response_error_format(self):
+        """JSONRPCResponse.error_response should produce valid format."""
+        resp = JSONRPCResponse.error_response("req-1", -32001, "Task not found")
+        d = resp.to_dict()
+        assert d["jsonrpc"] == "2.0"
+        assert d["id"] == "req-1"
+        assert d["error"]["code"] == -32001
+        assert d["error"]["message"] == "Task not found"
+        assert "result" not in d
+
+    def test_jsonrpc_response_success_format(self):
+        """JSONRPCResponse.success_response should produce valid format."""
+        resp = JSONRPCResponse.success_response("req-1", {"data": "ok"})
+        d = resp.to_dict()
+        assert d["jsonrpc"] == "2.0"
+        assert d["id"] == "req-1"
+        assert d["result"]["data"] == "ok"
+        assert "error" not in d
+
+
+# =============================================================================
 # Gateway Agent Card Integration (via get_gateway_agent_card)
 # =============================================================================
 
@@ -843,3 +1305,12 @@ class TestGatewayIntegration:
 
         assert resp.error is not None
         assert resp.error["code"] == -32601
+
+    async def test_gateway_disabled_returns_error(self, sample_agent):
+        """invoke_agent on disabled gateway should return error."""
+        gw = A2AGateway()
+        gw.enabled = False
+        req = JSONRPCRequest(method="message/send", params={}, id=1)
+        resp = await gw.invoke_agent("agent-1", req)
+        assert resp.error is not None
+        assert "not enabled" in resp.error["message"].lower()

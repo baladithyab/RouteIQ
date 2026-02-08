@@ -5,7 +5,7 @@ Tests the /mcp endpoint with JSON-RPC 2.0 protocol.
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -41,6 +41,16 @@ def client(app):
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _reset_sessions():
+    """Reset MCP session state between tests."""
+    from litellm_llmrouter.mcp_jsonrpc import reset_sessions
+
+    reset_sessions()
+    yield
+    reset_sessions()
+
+
 @pytest.fixture
 def mock_gateway():
     """Create a mock MCP gateway."""
@@ -51,6 +61,15 @@ def mock_gateway():
     gateway.list_resources.return_value = []
     gateway.get_server.return_value = None
     gateway.get_tool.return_value = None
+    gateway.find_server_for_resource.return_value = None
+    gateway.proxy_resource_read = AsyncMock(
+        return_value={
+            "error": {
+                "code": -32002,
+                "message": "No server found for resource URI: unknown",
+            }
+        }
+    )
     return gateway
 
 

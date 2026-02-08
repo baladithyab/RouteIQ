@@ -25,6 +25,11 @@ This module provides gateway-level resilience primitives for the LLMRouter gatew
    - Exposes degraded mode status for health checks
    - Supports graceful degradation (cached reads when writes fail)
 
+5. **Per-Provider Circuit Breakers**: Protect outbound LLM HTTP calls per provider
+   - Feature-flagged via ROUTEIQ_PROVIDER_CB_ENABLED (default: false)
+   - Per-provider env overrides: ROUTEIQ_CB_{PROVIDER}_FAILURE_THRESHOLD, etc.
+   - OTel event emission on state changes
+
 Configuration via environment variables (disabled by default for non-breaking behavior):
 - ROUTEIQ_MAX_CONCURRENT_REQUESTS: Max concurrent requests (0 = disabled)
 - ROUTEIQ_DRAIN_TIMEOUT_SECONDS: Max time to wait for drain (default: 30)
@@ -32,6 +37,7 @@ Configuration via environment variables (disabled by default for non-breaking be
 - ROUTEIQ_CB_SUCCESS_THRESHOLD: Successes before circuit closes (default: 2)
 - ROUTEIQ_CB_TIMEOUT_SECONDS: Time before half-open test (default: 30)
 - ROUTEIQ_CB_WINDOW_SECONDS: Failure tracking window (default: 60)
+- ROUTEIQ_PROVIDER_CB_ENABLED: Enable per-provider LLM circuit breakers (default: false)
 
 Usage:
     from litellm_llmrouter.resilience import (
@@ -56,6 +62,10 @@ Usage:
     except CircuitBreakerOpenError:
         # Fail fast - use cached data or return error
         pass
+
+    # Per-provider circuit breaker for LLM calls:
+    from litellm_llmrouter.resilience import execute_with_provider_circuit_breaker
+    result = await execute_with_provider_circuit_breaker("openai", llm_call, prompt)
 
     # Middleware is added by calling add_backpressure_middleware(app)
     # It wraps the ASGI app to track concurrency
@@ -469,7 +479,8 @@ class BackpressureMiddleware:
         headers = scope.get("headers", [])
         for name, value in headers:
             if name.lower() == b"x-request-id":
-                return value.decode("utf-8", errors="replace")
+                result: str = value.decode("utf-8", errors="replace")
+                return result
         return None
 
 
@@ -865,6 +876,7 @@ class CircuitBreakerManager:
     - database: PostgreSQL connections
     - redis: Redis cache connections
     - leader_election: Leader election operations
+    - provider:<name>: Per-LLM-provider HTTP call protection
 
     Exposes aggregated degraded mode status for health checks.
     """
@@ -894,6 +906,25 @@ class CircuitBreakerManager:
                 config=CircuitBreakerConfig.from_env(name),
             )
         return self._breakers[name]
+
+    def get_or_create_provider_breaker(self, provider_name: str) -> CircuitBreaker:
+        """
+        Get or create a circuit breaker for an LLM provider.
+
+        Provider breakers use per-provider configuration from environment:
+        ROUTEIQ_CB_{PROVIDER}_FAILURE_THRESHOLD, etc.
+
+        Args:
+            provider_name: LLM provider name (e.g., 'openai', 'anthropic', 'bedrock')
+
+        Returns:
+            CircuitBreaker instance keyed as ``provider:<provider_name>``
+        """
+        key = f"provider:{provider_name}"
+        if key not in self._breakers:
+            config = CircuitBreakerConfig.from_env(prefix=provider_name)
+            self._breakers[key] = CircuitBreaker(name=key, config=config)
+        return self._breakers[key]
 
     @property
     def database(self) -> CircuitBreaker:
@@ -967,6 +998,74 @@ def reset_circuit_breaker_manager() -> None:
     """Reset the global circuit breaker manager (for testing)."""
     global _circuit_breaker_manager
     _circuit_breaker_manager = None
+
+
+# =============================================================================
+# Per-Provider Circuit Breaker Support
+# =============================================================================
+
+# Feature flag: opt-in per-provider circuit breakers for LLM HTTP calls
+PROVIDER_CB_ENABLED = (
+    os.getenv("ROUTEIQ_PROVIDER_CB_ENABLED", "false").lower() == "true"
+)
+
+
+def _notify_circuit_breaker_change(provider_name: str, breaker: CircuitBreaker) -> None:
+    """Emit OTel event and log on circuit breaker state change."""
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if span and span.is_recording():
+            span.add_event(
+                "circuit_breaker.provider.state_change",
+                attributes={
+                    "provider": provider_name,
+                    "state": breaker.state.value,
+                    "failure_count": breaker.failure_count,
+                },
+            )
+    except Exception:
+        pass  # OTel is best-effort; never break the request path
+
+
+async def execute_with_provider_circuit_breaker(
+    provider_name: str,
+    operation: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """
+    Execute an operation with provider circuit breaker protection.
+
+    Only applies if ``ROUTEIQ_PROVIDER_CB_ENABLED`` is true.
+    Falls back to direct execution if disabled.
+
+    Args:
+        provider_name: LLM provider name (e.g., 'openai', 'anthropic')
+        operation: Async callable to execute
+        *args: Positional arguments forwarded to *operation*
+        **kwargs: Keyword arguments forwarded to *operation*
+
+    Returns:
+        The result of *operation*
+
+    Raises:
+        CircuitBreakerOpenError: If the provider circuit is open
+    """
+    if not PROVIDER_CB_ENABLED:
+        return await operation(*args, **kwargs)
+
+    cb_manager = get_circuit_breaker_manager()
+    breaker = cb_manager.get_or_create_provider_breaker(provider_name)
+
+    try:
+        async with breaker.execute():
+            return await operation(*args, **kwargs)
+    except CircuitBreakerOpenError:
+        # Notify plugin hooks / OTel about state change
+        _notify_circuit_breaker_change(provider_name, breaker)
+        raise
 
 
 # =============================================================================

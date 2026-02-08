@@ -44,7 +44,7 @@ except ImportError:
 
 # Try to import yaml for YAML manifest support
 try:
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     YAML_AVAILABLE = True
 except ImportError:
@@ -1338,7 +1338,7 @@ class ManifestSigner:
     def _sign_content(
         self, signable_content: bytes, signature_type: SignatureType
     ) -> str:
-        pass
+        raise NotImplementedError  # pragma: no cover
 
     def sign_manifest(
         self,
@@ -1351,6 +1351,8 @@ class ManifestSigner:
 
         if signature_type == SignatureType.ED25519:
             private_key = self._load_private_key()
+            if private_key is None:
+                raise ValueError("No private key configured for Ed25519 signing")
             signature = private_key.sign(signable_content)
         elif signature_type == SignatureType.HMAC_SHA256:
             if not self.hmac_secret:
@@ -1451,7 +1453,7 @@ class ManifestSigner:
         if manifest.description:
             data["description"] = manifest.description
         if manifest.metadata:
-            data["metadata"] = manifest.metadata
+            data["metadata"] = manifest.metadata  # type: ignore[assignment]
 
         with open(output_path, "w") as f:
             if format == "yaml" and YAML_AVAILABLE:

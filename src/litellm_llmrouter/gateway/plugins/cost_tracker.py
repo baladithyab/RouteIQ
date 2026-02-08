@@ -74,6 +74,8 @@ ATTR_ESTIMATION_ERROR = "llm.cost.estimation_error_pct"
 # Internal metadata key stored in kwargs["litellm_params"]["metadata"]
 _META_START_TIME = "_cost_tracker_start_time"
 _META_ESTIMATED_COST = "_estimated_cost"
+_META_RESERVED_SPEND = "_reserved_spend"
+_META_QUOTA_SUBJECT = "_quota_subject"
 
 
 def _is_enabled() -> bool:
@@ -276,6 +278,9 @@ class CostTrackerPlugin(GatewayPlugin):
             metrics.cost_per_request.record(total_cost, {"model": model})
             metrics.request_active.add(-1, {"model": model})
 
+        # -- Post-call cost reconciliation ---------------------------------
+        await self._reconcile_quota(metadata, total_cost)
+
         logger.debug(
             "CostTracker: model=%s tokens=%d cost=$%.6f estimated=$%.6f error=%.1f%%",
             model,
@@ -313,6 +318,36 @@ class CostTrackerPlugin(GatewayPlugin):
             model,
             str(exception)[:200],
         )
+
+    # --------------------------------------------------------------------- #
+    # Cost reconciliation
+    # --------------------------------------------------------------------- #
+
+    @staticmethod
+    async def _reconcile_quota(metadata: dict[str, Any], actual_cost: float) -> None:
+        """Reconcile quota spend if reserved_spend was recorded pre-call.
+
+        Extracts the reserved spend and quota subject from request metadata
+        (stored during ``quota_guard`` pre-call reservation) and calls
+        ``QuotaEnforcer.reconcile_spend()`` to adjust the quota counter.
+        """
+        reserved_spend = float(metadata.get(_META_RESERVED_SPEND, 0) or 0)
+        subject = metadata.get(_META_QUOTA_SUBJECT, "")
+
+        if not reserved_spend or not subject:
+            return
+
+        try:
+            from litellm_llmrouter.quota import get_quota_enforcer
+
+            enforcer = get_quota_enforcer()
+            await enforcer.reconcile_spend(
+                subject=subject,
+                actual_cost=actual_cost,
+                reserved_cost=reserved_spend,
+            )
+        except Exception:
+            logger.debug("CostTracker: reconciliation failed for subject=%s", subject)
 
     # --------------------------------------------------------------------- #
     # Internal helpers

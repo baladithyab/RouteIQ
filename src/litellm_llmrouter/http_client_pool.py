@@ -342,6 +342,48 @@ async def get_client_for_request(
 
 
 # =============================================================================
+# Provider Circuit Breaker Integration
+# =============================================================================
+
+
+async def request_with_provider_cb(
+    provider_name: str,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """
+    Make an HTTP request with provider circuit breaker protection.
+
+    Uses the shared pooled client (with automatic fallback) and wraps the
+    call with :func:`~litellm_llmrouter.resilience.execute_with_provider_circuit_breaker`.
+
+    If ``ROUTEIQ_PROVIDER_CB_ENABLED`` is false the circuit breaker layer is
+    a no-op passthrough.
+
+    Args:
+        provider_name: LLM provider name (e.g., 'openai', 'anthropic', 'bedrock')
+        method: HTTP method (GET, POST, etc.)
+        url: Request URL
+        **kwargs: Additional arguments forwarded to ``httpx.AsyncClient.request``
+
+    Returns:
+        httpx.Response from the outbound call
+
+    Raises:
+        CircuitBreakerOpenError: If the provider circuit is open
+        httpx.HTTPError: On transport-level failures
+    """
+    from .resilience import execute_with_provider_circuit_breaker
+
+    async def _do_request() -> httpx.Response:
+        async with get_client_for_request() as client:
+            return await client.request(method, url, **kwargs)
+
+    return await execute_with_provider_circuit_breaker(provider_name, _do_request)
+
+
+# =============================================================================
 # Testing Helpers
 # =============================================================================
 

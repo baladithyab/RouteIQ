@@ -233,22 +233,41 @@ class TaskState(str, Enum):
 
 
 # Valid state transitions per the A2A spec state machine:
-#   submitted -> working
+#   submitted -> working | completed | failed | canceled
 #   working -> completed | failed | canceled | input-required
-#   input-required -> working | canceled
+#   input-required -> working | completed | failed | canceled
+#   completed -> (terminal, no transitions)
+#   failed -> (terminal, no transitions)
+#   canceled -> (terminal, no transitions)
 VALID_TRANSITIONS: dict[TaskState, set[TaskState]] = {
-    TaskState.SUBMITTED: {TaskState.WORKING},
+    TaskState.SUBMITTED: {
+        TaskState.WORKING,
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.CANCELED,
+    },
     TaskState.WORKING: {
         TaskState.COMPLETED,
         TaskState.FAILED,
         TaskState.CANCELED,
         TaskState.INPUT_REQUIRED,
     },
-    TaskState.INPUT_REQUIRED: {TaskState.WORKING, TaskState.CANCELED},
+    TaskState.INPUT_REQUIRED: {
+        TaskState.WORKING,
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.CANCELED,
+    },
     TaskState.COMPLETED: set(),
     TaskState.FAILED: set(),
     TaskState.CANCELED: set(),
     TaskState.UNKNOWN: {TaskState.SUBMITTED, TaskState.WORKING},
+}
+
+# String-based alias for external callers that don't use the TaskState enum
+VALID_STATE_TRANSITIONS: dict[str, set[str]] = {
+    state.value: {t.value for t in targets}
+    for state, targets in VALID_TRANSITIONS.items()
 }
 
 
@@ -258,7 +277,113 @@ class InvalidTaskTransitionError(ValueError):
     def __init__(self, current: TaskState, target: TaskState):
         self.current = current
         self.target = target
-        super().__init__(f"Invalid state transition: {current.value} -> {target.value}")
+        valid = VALID_TRANSITIONS.get(current, set())
+        valid_names = {s.value for s in valid} if valid else set()
+        super().__init__(
+            f"Invalid state transition: {current.value} -> {target.value}. "
+            f"Valid transitions from '{current.value}': {valid_names}"
+        )
+
+
+def validate_state_transition(current_state: str, new_state: str) -> bool:
+    """Validate an A2A task state transition using string state names.
+
+    Returns True if the transition is valid per the A2A spec.
+    Raises ValueError with JSON-RPC -32602 error details if invalid.
+
+    Args:
+        current_state: Current state name (e.g., 'submitted', 'working').
+        new_state: Target state name (e.g., 'working', 'completed').
+
+    Returns:
+        True if transition is valid.
+
+    Raises:
+        ValueError: If the transition is invalid, with details about valid targets.
+    """
+    valid_targets = VALID_STATE_TRANSITIONS.get(current_state)
+    if valid_targets is None:
+        raise ValueError(
+            f"Unknown current state: '{current_state}'. "
+            f"Valid states: {set(VALID_STATE_TRANSITIONS.keys())}"
+        )
+    if new_state not in valid_targets:
+        raise ValueError(
+            f"Invalid state transition: {current_state} -> {new_state}. "
+            f"Valid transitions from '{current_state}': {valid_targets}"
+        )
+    return True
+
+
+class A2AError:
+    """Standard A2A JSON-RPC error responses.
+
+    Provides predefined error codes and a factory method for creating
+    JSON-RPC 2.0 error response dictionaries.
+
+    Error codes follow JSON-RPC 2.0 conventions:
+    - -32600 to -32699: Standard JSON-RPC errors
+    - -32000 to -32099: Server/implementation errors
+    - -32001 to -32003: A2A-specific application errors
+    """
+
+    # A2A application errors
+    TASK_NOT_FOUND = {"code": -32001, "message": "Task not found"}
+    AGENT_NOT_FOUND = {"code": -32002, "message": "Agent not found"}
+    RATE_LIMITED = {"code": -32003, "message": "Rate limited"}
+
+    # JSON-RPC standard errors
+    INVALID_PARAMS = {"code": -32602, "message": "Invalid params"}
+    INVALID_TRANSITION = {"code": -32602, "message": "Invalid state transition"}
+    METHOD_NOT_FOUND = {"code": -32601, "message": "Method not found"}
+    INVALID_REQUEST = {"code": -32600, "message": "Invalid Request"}
+    INTERNAL_ERROR = {"code": -32603, "message": "Internal error"}
+
+    @staticmethod
+    def make_error(
+        code: int, message: str, data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Create a JSON-RPC 2.0 error response envelope.
+
+        Args:
+            code: JSON-RPC error code.
+            message: Human-readable error message.
+            data: Optional additional error data.
+
+        Returns:
+            Complete JSON-RPC 2.0 error response dict.
+        """
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data:
+            error["data"] = data
+        return {"jsonrpc": "2.0", "error": error, "id": None}
+
+    @classmethod
+    def task_not_found(cls, task_id: str) -> dict[str, Any]:
+        """Create a task-not-found error response."""
+        return cls.make_error(
+            cls.TASK_NOT_FOUND["code"],
+            f"Task '{task_id}' not found",
+        )
+
+    @classmethod
+    def agent_not_found(cls, agent_id: str) -> dict[str, Any]:
+        """Create an agent-not-found error response."""
+        return cls.make_error(
+            cls.AGENT_NOT_FOUND["code"],
+            f"Agent '{agent_id}' not found",
+        )
+
+    @classmethod
+    def invalid_transition(cls, current_state: str, new_state: str) -> dict[str, Any]:
+        """Create an invalid-state-transition error response."""
+        valid = VALID_STATE_TRANSITIONS.get(current_state, set())
+        return cls.make_error(
+            cls.INVALID_TRANSITION["code"],
+            f"Invalid state transition: {current_state} -> {new_state}. "
+            f"Valid transitions from '{current_state}': {valid}",
+            data={"current_state": current_state, "requested_state": new_state},
+        )
 
 
 @dataclass
@@ -739,7 +864,11 @@ class A2AGateway:
         try:
             task.transition(TaskState.CANCELED)
         except InvalidTaskTransitionError as e:
-            return JSONRPCResponse.error_response(request.id, -32002, str(e))
+            return JSONRPCResponse.error_response(
+                request.id,
+                A2AError.INVALID_TRANSITION["code"],
+                str(e),
+            )
 
         return JSONRPCResponse.success_response(request.id, task.to_dict())
 
@@ -782,12 +911,16 @@ class A2AGateway:
 
         if not agent:
             return JSONRPCResponse.error_response(
-                request.id, -32000, f"Agent '{agent_id}' not found"
+                request.id,
+                A2AError.AGENT_NOT_FOUND["code"],
+                f"Agent '{agent_id}' not found",
             )
 
         if not agent.url:
             return JSONRPCResponse.error_response(
-                request.id, -32000, f"Agent '{agent_id}' has no URL configured"
+                request.id,
+                A2AError.AGENT_NOT_FOUND["code"],
+                f"Agent '{agent_id}' has no URL configured",
             )
 
         # Security: Validate URL against SSRF attacks (outside lock)
@@ -800,7 +933,7 @@ class A2AGateway:
             )
             return JSONRPCResponse.error_response(
                 request.id,
-                -32000,
+                A2AError.INTERNAL_ERROR["code"],
                 f"Agent URL blocked for security reasons: {e.reason}",
             )
         except ValueError as e:
@@ -808,13 +941,17 @@ class A2AGateway:
                 f"A2A: Invalid URL for agent '{agent_id}': {e}"
             )
             return JSONRPCResponse.error_response(
-                request.id, -32000, f"Agent URL is invalid: {str(e)}"
+                request.id,
+                A2AError.INVALID_PARAMS["code"],
+                f"Agent URL is invalid: {str(e)}",
             )
 
         # Validate JSON-RPC format
         if request.jsonrpc != "2.0":
             return JSONRPCResponse.error_response(
-                request.id, -32600, "Invalid Request: jsonrpc must be '2.0'"
+                request.id,
+                A2AError.INVALID_REQUEST["code"],
+                "Invalid Request: jsonrpc must be '2.0'",
             )
 
         # Resolve method aliases (tasks/send -> message/send, etc.)
@@ -824,14 +961,16 @@ class A2AGateway:
         if self._is_streaming_method(request.method):
             return JSONRPCResponse.error_response(
                 request.id,
-                -32600,
+                A2AError.INVALID_REQUEST["code"],
                 "Use streaming endpoint for streaming methods. "
                 "POST to /a2a/{agent_id} with Accept: text/event-stream header.",
             )
 
         if resolved_method != "message/send":
             return JSONRPCResponse.error_response(
-                request.id, -32601, f"Method '{request.method}' not found"
+                request.id,
+                A2AError.METHOD_NOT_FOUND["code"],
+                f"Method '{request.method}' not found",
             )
 
         verbose_proxy_logger.info(
@@ -894,7 +1033,9 @@ class A2AGateway:
             verbose_proxy_logger.error(f"A2A: Timeout invoking agent '{agent_id}'")
             task.transition(TaskState.FAILED)
             return JSONRPCResponse.error_response(
-                request.id, -32000, f"Timeout invoking agent '{agent_id}'"
+                request.id,
+                A2AError.INTERNAL_ERROR["code"],
+                f"Timeout invoking agent '{agent_id}'",
             )
         except httpx.HTTPStatusError as e:
             verbose_proxy_logger.error(
@@ -902,7 +1043,9 @@ class A2AGateway:
             )
             task.transition(TaskState.FAILED)
             return JSONRPCResponse.error_response(
-                request.id, -32000, f"HTTP error: {e.response.status_code}"
+                request.id,
+                A2AError.INTERNAL_ERROR["code"],
+                f"HTTP error: {e.response.status_code}",
             )
         except Exception as e:
             verbose_proxy_logger.exception(
@@ -910,7 +1053,9 @@ class A2AGateway:
             )
             task.transition(TaskState.FAILED)
             return JSONRPCResponse.error_response(
-                request.id, -32603, f"Internal error: {str(e)}"
+                request.id,
+                A2AError.INTERNAL_ERROR["code"],
+                f"Internal error: {str(e)}",
             )
 
     async def stream_agent_response(

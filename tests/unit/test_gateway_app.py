@@ -42,7 +42,7 @@ class TestStandaloneApp:
 
         app = create_standalone_app()
 
-        # Check middleware stack
+        # RequestIDMiddleware is raw ASGI but registered via add_middleware()
         middleware_classes = [m.cls for m in app.user_middleware]
         assert RequestIDMiddleware in middleware_classes
 

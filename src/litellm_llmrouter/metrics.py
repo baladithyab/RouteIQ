@@ -89,6 +89,19 @@ TTFT_BUCKETS = (
     20.48,
 )
 
+# Tokens per second (throughput): covers 1 to ~500 tok/s
+TOKENS_PER_SECOND_BUCKETS = (
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+)
+
 # Routing decision duration (seconds): covers 100us to ~1s
 ROUTING_DURATION_BUCKETS = (
     0.0001,
@@ -161,6 +174,13 @@ class GatewayMetrics:
             explicit_bucket_boundaries_advisory=TTFT_BUCKETS,
         )
 
+        self.tokens_per_second: Histogram = meter.create_histogram(
+            name="gen_ai.client.tokens_per_second",
+            description="Token generation throughput",
+            unit="{token}/s",
+            explicit_bucket_boundaries_advisory=TOKENS_PER_SECOND_BUCKETS,
+        )
+
         # =================================================================
         # Gateway Operational Metrics
         # =================================================================
@@ -229,6 +249,23 @@ class GatewayMetrics:
         )
 
         # =================================================================
+        # Cost Reconciliation
+        # =================================================================
+
+        self.reconciliation_savings: Histogram = meter.create_histogram(
+            name="quota.reconciliation.savings",
+            description="Amount credited back by post-call cost reconciliation",
+            unit="USD",
+            explicit_bucket_boundaries_advisory=COST_BUCKETS,
+        )
+
+        self.reconciliation_count: Counter = meter.create_counter(
+            name="quota.reconciliation.count",
+            description="Number of post-call cost reconciliations performed",
+            unit="{reconciliation}",
+        )
+
+        # =================================================================
         # Resilience Metrics
         # =================================================================
 
@@ -275,6 +312,31 @@ class GatewayMetrics:
                 "to_state": to_state,
             },
         )
+
+    def record_streaming_metrics(
+        self,
+        ttft_ms: float,
+        tps: float,
+        total_tokens: int,
+        attrs: dict | None = None,
+    ) -> None:
+        """
+        Record streaming-specific metrics (TTFT, throughput, token usage).
+
+        Args:
+            ttft_ms: Time to first token in milliseconds.
+            tps: Tokens per second throughput.
+            total_tokens: Total tokens generated in the streaming response.
+            attrs: Optional base attributes (e.g., model, provider).
+        """
+        base_attrs = attrs or {}
+        self.time_to_first_token.record(
+            ttft_ms / 1000.0, base_attrs
+        )  # Convert ms to seconds
+        if tps > 0:
+            self.tokens_per_second.record(tps, base_attrs)
+        if total_tokens > 0:
+            self.token_usage.record(total_tokens, base_attrs)
 
 
 # =============================================================================

@@ -42,5 +42,11 @@ def _reset_observability_singleton():
     """Reset observability and metrics singletons between tests."""
     yield
     from litellm_llmrouter.observability import reset_observability_manager
+    from litellm_llmrouter.config_sync import reset_config_sync_manager
+    from litellm_llmrouter.hot_reload import reset_hot_reload_manager
+    from litellm_llmrouter.metrics import reset_gateway_metrics
 
     reset_observability_manager()
+    reset_config_sync_manager()
+    reset_hot_reload_manager()
+    reset_gateway_metrics()

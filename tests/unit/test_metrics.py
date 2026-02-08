@@ -122,6 +122,9 @@ class TestInstrumentCreation:
     def test_time_to_first_token_is_histogram(self, gateway_metrics):
         assert isinstance(gateway_metrics.time_to_first_token, Histogram)
 
+    def test_tokens_per_second_is_histogram(self, gateway_metrics):
+        assert isinstance(gateway_metrics.tokens_per_second, Histogram)
+
     def test_request_total_is_counter(self, gateway_metrics):
         assert isinstance(gateway_metrics.request_total, Counter)
 
@@ -588,3 +591,173 @@ class TestBucketBoundaries:
         from litellm_llmrouter.metrics import COST_BUCKETS
 
         assert list(COST_BUCKETS) == sorted(COST_BUCKETS)
+
+    def test_tokens_per_second_buckets_sorted(self):
+        from litellm_llmrouter.metrics import TOKENS_PER_SECOND_BUCKETS
+
+        assert list(TOKENS_PER_SECOND_BUCKETS) == sorted(TOKENS_PER_SECOND_BUCKETS)
+        assert len(TOKENS_PER_SECOND_BUCKETS) > 3
+
+
+# ===========================================================================
+# record_streaming_metrics convenience method
+# ===========================================================================
+
+
+class TestRecordStreamingMetrics:
+    """Tests for the record_streaming_metrics convenience method."""
+
+    def test_records_ttft(self, gateway_metrics):
+        """TTFT in ms should be recorded as seconds on time_to_first_token."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=350.0,
+            tps=0.0,
+            total_tokens=0,
+            attrs={"gen_ai.request.model": "gpt-4"},
+        )
+        # No exception means it was recorded
+
+    def test_records_tokens_per_second(self, gateway_metrics):
+        """Positive tps should be recorded on tokens_per_second histogram."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=200.0,
+            tps=45.5,
+            total_tokens=0,
+            attrs={"gen_ai.request.model": "gpt-4"},
+        )
+
+    def test_records_total_tokens(self, gateway_metrics):
+        """Positive total_tokens should be recorded on token_usage histogram."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=100.0,
+            tps=30.0,
+            total_tokens=512,
+            attrs={"gen_ai.request.model": "gpt-4"},
+        )
+
+    def test_skips_zero_tps(self, gateway_metrics):
+        """Zero tps should not be recorded."""
+        gateway_metrics.record_streaming_metrics(ttft_ms=100.0, tps=0.0, total_tokens=0)
+
+    def test_skips_zero_total_tokens(self, gateway_metrics):
+        """Zero total_tokens should not be recorded."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=100.0, tps=10.0, total_tokens=0
+        )
+
+    def test_none_attrs_defaults_to_empty(self, gateway_metrics):
+        """None attrs should default to empty dict."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=100.0, tps=10.0, total_tokens=100, attrs=None
+        )
+
+    def test_all_metrics_recorded_together(self, gateway_metrics):
+        """All three metrics should be recorded when all values are positive."""
+        gateway_metrics.record_streaming_metrics(
+            ttft_ms=250.0,
+            tps=55.0,
+            total_tokens=1024,
+            attrs={"gen_ai.request.model": "gpt-4", "gen_ai.system": "openai"},
+        )
+
+
+# ===========================================================================
+# GenAI finish_reasons span attributes on success and failure
+# ===========================================================================
+
+
+class TestGenAIFinishReasonsSuccess:
+    """Test gen_ai.response.finish_reasons on successful responses."""
+
+    def _make_callback(self):
+        cb = RouterDecisionCallback(strategy_name="test-strategy", enabled=True)
+        cb._enabled = True
+        return cb
+
+    def test_finish_reasons_set_from_choices(self, gateway_metrics):
+        """finish_reasons should be extracted from response.choices."""
+        cb = self._make_callback()
+        choice = SimpleNamespace(finish_reason="stop")
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+        resp = SimpleNamespace(usage=usage, model="gpt-4", choices=[choice])
+        kwargs = {
+            "model": "gpt-4",
+            "litellm_call_id": "",
+            "litellm_params": {"custom_llm_provider": "openai"},
+            "metadata": {},
+        }
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        with patch.object(trace, "get_current_span", return_value=mock_span):
+            cb.log_success_event(kwargs, resp, 0.0, 1.0)
+
+        calls = {c.args[0]: c.args[1] for c in mock_span.set_attribute.call_args_list}
+        assert calls["gen_ai.response.finish_reasons"] == ["stop"]
+
+    def test_finish_reasons_multiple_choices(self, gateway_metrics):
+        """Multiple choices should produce multiple finish reasons."""
+        cb = self._make_callback()
+        choices = [
+            SimpleNamespace(finish_reason="stop"),
+            SimpleNamespace(finish_reason="length"),
+        ]
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+        resp = SimpleNamespace(usage=usage, model="gpt-4", choices=choices)
+        kwargs = {
+            "model": "gpt-4",
+            "litellm_call_id": "",
+            "litellm_params": {"custom_llm_provider": "openai"},
+            "metadata": {},
+        }
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        with patch.object(trace, "get_current_span", return_value=mock_span):
+            cb.log_success_event(kwargs, resp, 0.0, 1.0)
+
+        calls = {c.args[0]: c.args[1] for c in mock_span.set_attribute.call_args_list}
+        assert calls["gen_ai.response.finish_reasons"] == ["stop", "length"]
+
+    def test_finish_reasons_not_set_when_no_choices(self, gateway_metrics):
+        """finish_reasons should not be set when response has no choices."""
+        cb = self._make_callback()
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+        resp = SimpleNamespace(usage=usage, model="gpt-4")
+        kwargs = {
+            "model": "gpt-4",
+            "litellm_call_id": "",
+            "litellm_params": {"custom_llm_provider": "openai"},
+            "metadata": {},
+        }
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        with patch.object(trace, "get_current_span", return_value=mock_span):
+            cb.log_success_event(kwargs, resp, 0.0, 1.0)
+
+        attr_names = [c.args[0] for c in mock_span.set_attribute.call_args_list]
+        assert "gen_ai.response.finish_reasons" not in attr_names
+
+
+class TestGenAIFinishReasonsFailure:
+    """Test gen_ai.response.finish_reasons on failed responses."""
+
+    def _make_callback(self):
+        cb = RouterDecisionCallback(strategy_name="test-strategy", enabled=True)
+        cb._enabled = True
+        return cb
+
+    def test_failure_sets_finish_reasons_error(self, gateway_metrics):
+        """Failure path should set finish_reasons to ['error']."""
+        cb = self._make_callback()
+        kwargs = {
+            "model": "gpt-4",
+            "litellm_call_id": "",
+            "litellm_params": {"custom_llm_provider": "openai"},
+            "exception": TimeoutError("timed out"),
+        }
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+        with patch.object(trace, "get_current_span", return_value=mock_span):
+            cb.log_failure_event(kwargs, None, 0.0, 1.0)
+
+        calls = {c.args[0]: c.args[1] for c in mock_span.set_attribute.call_args_list}
+        assert calls["gen_ai.response.finish_reasons"] == ["error"]

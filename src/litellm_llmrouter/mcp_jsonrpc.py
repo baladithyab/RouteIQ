@@ -39,6 +39,8 @@ import base64
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -62,6 +64,89 @@ MCP_SERVER_VERSION = os.getenv("MCP_SERVER_VERSION", "1.0.0")
 
 # Pagination config for tools/list
 MCP_TOOLS_PAGE_SIZE = int(os.getenv("MCP_TOOLS_PAGE_SIZE", "100"))
+
+# Pagination config for resources/list
+MCP_RESOURCES_PAGE_SIZE = int(os.getenv("MCP_RESOURCES_PAGE_SIZE", "50"))
+
+# Maximum resources page size (cap for client-requested sizes)
+MCP_RESOURCES_MAX_PAGE_SIZE = 100
+
+# Session timeout in seconds (default: 30 minutes)
+MCP_SESSION_TIMEOUT = float(os.getenv("MCP_SESSION_TIMEOUT", "1800"))
+
+
+# ============================================================================
+# Session Management
+# ============================================================================
+
+# Active sessions: session_id -> session metadata
+_active_sessions: dict[str, dict[str, Any]] = {}
+
+
+def get_or_create_session(request_headers: dict[str, str]) -> str:
+    """
+    Get existing session or create a new one.
+
+    Implements Mcp-Session-Id header management per MCP 2025-06-18 spec.
+    Returns the session ID for the Mcp-Session-Id response header.
+
+    Args:
+        request_headers: HTTP request headers (case-insensitive keys)
+
+    Returns:
+        Session ID string
+    """
+    # Check for existing session
+    session_id = request_headers.get("mcp-session-id", "")
+    if session_id and session_id in _active_sessions:
+        session = _active_sessions[session_id]
+        # Check if session is still valid
+        if time.time() - session["last_active"] < MCP_SESSION_TIMEOUT:
+            session["last_active"] = time.time()
+            return session_id
+        else:
+            # Session expired, remove it
+            del _active_sessions[session_id]
+
+    # Create new session
+    session_id = str(uuid.uuid4())
+    _active_sessions[session_id] = {
+        "created_at": time.time(),
+        "last_active": time.time(),
+    }
+    return session_id
+
+
+def get_active_sessions() -> dict[str, dict[str, Any]]:
+    """Return active sessions (for testing/admin)."""
+    return _active_sessions
+
+
+def reset_sessions() -> None:
+    """Reset all sessions. For testing only."""
+    _active_sessions.clear()
+
+
+async def emit_tools_list_changed() -> None:
+    """
+    Emit notifications/tools/list_changed to all connected JSON-RPC sessions.
+
+    Per MCP 2025-03-26 spec, this notification informs clients that the
+    tool list has changed and they should re-fetch it.
+
+    Note: In the streamable HTTP transport, this notification is delivered
+    on the next request from each session. For SSE transport, it is pushed
+    immediately via the event stream.
+    """
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    }
+    # Track pending notifications per session for delivery on next request
+    for session_id, session in _active_sessions.items():
+        if "pending_notifications" not in session:
+            session["pending_notifications"] = []
+        session["pending_notifications"].append(notification)
 
 
 # ============================================================================
@@ -195,6 +280,10 @@ async def _handle_initialize(
     capabilities: dict[str, Any] = {
         "tools": {
             "listChanged": True,
+        },
+        "resources": {
+            "listChanged": True,
+            "subscribe": False,
         },
         "logging": {},
         "completion": {},
@@ -428,13 +517,15 @@ async def _handle_resources_list(
     Handle MCP resources/list request.
 
     Returns all available resources from all registered MCP servers.
+    Supports cursor-based pagination per MCP 2025-03-26 spec.
 
     Params:
-        cursor: str (optional) - Pagination cursor (not implemented)
+        cursor: str (optional) - Base64-encoded pagination cursor
+        pageSize: int (optional) - Number of results per page (max 100)
 
     Returns:
         resources: list[dict] - List of resource definitions
-        nextCursor: str (optional) - Pagination cursor (not implemented)
+        nextCursor: str (optional) - Cursor for next page if more results
     """
     gateway = get_mcp_gateway()
 
@@ -445,9 +536,9 @@ async def _handle_resources_list(
             "MCP Gateway is not enabled. Set MCP_GATEWAY_ENABLED=true",
         )
 
-    resources = []
+    all_resources = []
     for res in gateway.list_resources():
-        resources.append(
+        all_resources.append(
             {
                 "uri": res.get("resource", ""),
                 "name": res.get("resource", "").split("/")[-1]
@@ -457,7 +548,21 @@ async def _handle_resources_list(
             }
         )
 
-    return _make_success_response(request_id, {"resources": resources})
+    # Apply cursor-based pagination
+    cursor = (params or {}).get("cursor")
+    offset = _decode_cursor(cursor)
+    page_size = min(
+        (params or {}).get("pageSize", MCP_RESOURCES_PAGE_SIZE),
+        MCP_RESOURCES_MAX_PAGE_SIZE,
+    )
+
+    page = all_resources[offset : offset + page_size]
+
+    result: dict[str, Any] = {"resources": page}
+    if offset + page_size < len(all_resources):
+        result["nextCursor"] = _encode_cursor(offset + page_size)
+
+    return _make_success_response(request_id, result)
 
 
 async def _handle_resources_read(
@@ -467,8 +572,9 @@ async def _handle_resources_read(
     """
     Handle MCP resources/read request.
 
-    Reads a specific resource by URI. Looks up the owning server from the
-    gateway registry and returns the resource content.
+    Proxies the read request to the upstream MCP server that owns the resource.
+    Looks up the owning server from the gateway registry and forwards the
+    request, returning the upstream response.
 
     Params:
         uri: str - URI of the resource to read
@@ -494,27 +600,19 @@ async def _handle_resources_read(
 
     uri = params["uri"]
 
-    # Find the server that owns this resource
-    for res in gateway.list_resources():
-        if res.get("resource") == uri:
-            return _make_success_response(
-                request_id,
-                {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/plain",
-                            "text": f"Resource from {res.get('server_name', 'unknown')}",
-                        }
-                    ]
-                },
-            )
+    # Proxy the read request to the upstream server
+    result = await gateway.proxy_resource_read(uri)
 
-    return _make_error_response(
-        request_id,
-        MCP_RESOURCE_NOT_FOUND,
-        f"Resource not found: {uri}",
-    )
+    # Check for error from the proxy
+    if "error" in result:
+        error = result["error"]
+        return _make_error_response(
+            request_id,
+            error.get("code", MCP_RESOURCE_NOT_FOUND),
+            error.get("message", f"Resource not found: {uri}"),
+        )
+
+    return _make_success_response(request_id, result)
 
 
 async def _handle_resources_templates_list(
@@ -637,6 +735,10 @@ async def mcp_jsonrpc_endpoint(request: Request) -> JSONResponse:
     """
     http_request_id = get_request_id() or "unknown"
 
+    # Session management: get or create Mcp-Session-Id
+    request_headers = {k.lower(): v for k, v in request.headers.items()}
+    session_id = get_or_create_session(request_headers)
+
     # Parse request body
     try:
         body = await request.body()
@@ -675,7 +777,9 @@ async def mcp_jsonrpc_endpoint(request: Request) -> JSONResponse:
     # Handle notifications (no id, no response expected)
     if method in NOTIFICATION_HANDLERS:
         # Notifications are fire-and-forget; return 202 Accepted with no body
-        return JSONResponse(content={}, status_code=202)
+        response = JSONResponse(content={}, status_code=202)
+        response.headers["Mcp-Session-Id"] = session_id
+        return response
 
     # Dispatch to method handler
     handler = METHOD_HANDLERS.get(method)
@@ -688,7 +792,10 @@ async def mcp_jsonrpc_endpoint(request: Request) -> JSONResponse:
 
     # Execute handler
     try:
-        return await handler(request_id, params)
+        response = await handler(request_id, params)
+        # Add Mcp-Session-Id header to all responses
+        response.headers["Mcp-Session-Id"] = session_id
+        return response
     except Exception as e:
         return _make_error_response(
             request_id,

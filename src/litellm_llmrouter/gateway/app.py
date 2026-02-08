@@ -88,9 +88,11 @@ def _configure_middleware(app: FastAPI) -> None:
     from ..router_decision_callback import register_router_decision_middleware
     from .plugin_middleware import PluginMiddleware
 
-    # Request ID middleware - should be outermost for correlation
+    # Request ID middleware - raw ASGI (streaming-safe, outermost for correlation)
+    # Starlette's add_middleware works with any class accepting (app, **kwargs) --
+    # our raw ASGI class qualifies since __init__(self, app: ASGIApp).
     app.add_middleware(RequestIDMiddleware)
-    logger.debug("Added RequestIDMiddleware")
+    logger.debug("Added RequestIDMiddleware (raw ASGI)")
 
     # Policy middleware - OPA-style enforcement at ASGI layer
     # This runs BEFORE routing and FastAPI authentication
@@ -429,7 +431,7 @@ def create_app(
 def create_standalone_app(
     *,
     title: str = "LLMRouter Gateway",
-    version: str = "0.1.1",
+    version: str = "0.0.3",
     include_admin_routes: bool = True,
     enable_plugins: bool = True,
     enable_resilience: bool = True,

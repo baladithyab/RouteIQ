@@ -1026,3 +1026,293 @@ class TestRetryAfter:
         )
 
         assert result.retry_after == 60  # Default
+
+
+# =============================================================================
+# Cost Reconciliation Tests
+# =============================================================================
+
+
+class TestReconcileSpend:
+    """Tests for post-call spend quota reconciliation."""
+
+    @pytest.mark.asyncio
+    async def test_reconcile_over_estimation_credits_back(self):
+        """When actual < reserved, difference is credited back to quota."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        mock_repo.adjust_float = AsyncMock(return_value=(4.95, 0.05))
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            result = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+
+        assert result["reconciled"] is True
+        assert result["direction"] == "credit"
+        assert result["adjustment"] == pytest.approx(0.05)
+        assert result["savings"] == pytest.approx(0.05)
+        assert result["actual_cost"] == pytest.approx(0.05)
+        assert result["reserved_cost"] == pytest.approx(0.10)
+
+        # Verify adjust_float was called with positive adjustment (credit)
+        mock_repo.adjust_float.assert_called_once()
+        call_kwargs = mock_repo.adjust_float.call_args
+        assert call_kwargs[1]["adjustment"] == pytest.approx(0.05)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_under_estimation_debits(self):
+        """When actual > reserved, difference is debited from quota."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        mock_repo.adjust_float = AsyncMock(return_value=(5.15, -0.05))
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            result = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.15,
+                reserved_cost=0.10,
+            )
+
+        assert result["reconciled"] is True
+        assert result["direction"] == "debit"
+        assert result["adjustment"] == pytest.approx(-0.05)
+        assert result["savings"] == 0.0  # No savings when under-estimated
+
+    @pytest.mark.asyncio
+    async def test_reconcile_exact_estimation_no_adjustment(self):
+        """When actual == reserved, no adjustment is made."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            result = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.10,
+                reserved_cost=0.10,
+            )
+
+        assert result["reconciled"] is True
+        assert result["direction"] == "none"
+        assert result["adjustment"] == 0.0
+        # adjust_float should NOT be called
+        mock_repo.adjust_float.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_feature_flag_disabled(self):
+        """Reconciliation is skipped when feature flag is disabled."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "false"}, clear=False
+        ):
+            result = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+
+        assert result["reconciled"] is False
+        assert result["reason"] == "cost_reconciliation_disabled"
+        mock_repo.adjust_float.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_quota_disabled(self):
+        """Reconciliation is skipped when quota enforcement is disabled."""
+        config = QuotaConfig(enabled=False)
+        enforcer = QuotaEnforcer(config=config)
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            result = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+
+        assert result["reconciled"] is False
+        assert result["reason"] == "quota_disabled"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_cumulative_savings_tracked(self):
+        """Cumulative savings are tracked across multiple reconciliations."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        mock_repo.adjust_float = AsyncMock(return_value=(5.0, 0.05))
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            # First reconciliation: reserved=0.10, actual=0.05 -> savings=0.05
+            result1 = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+            assert result1["cumulative_savings"] == pytest.approx(0.05)
+
+            # Second reconciliation: reserved=0.20, actual=0.08 -> savings=0.12
+            result2 = await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.08,
+                reserved_cost=0.20,
+            )
+            assert result2["cumulative_savings"] == pytest.approx(0.17)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_emits_otel_metrics(self):
+        """Reconciliation emits OTel metrics for savings and count."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=10.0,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        mock_repo.adjust_float = AsyncMock(return_value=(4.95, 0.05))
+        enforcer._repository = mock_repo
+
+        mock_metrics = MagicMock()
+        with (
+            patch.dict(
+                os.environ,
+                {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"},
+                clear=False,
+            ),
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+        ):
+            await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+
+        mock_metrics.reconciliation_savings.record.assert_called_once()
+        savings_args = mock_metrics.reconciliation_savings.record.call_args
+        assert savings_args[0][0] == pytest.approx(0.05)
+        assert savings_args[0][1]["direction"] == "credit"
+
+        mock_metrics.reconciliation_count.add.assert_called_once()
+        count_args = mock_metrics.reconciliation_count.add.call_args
+        assert count_args[0][0] == 1
+
+    @pytest.mark.asyncio
+    async def test_reconcile_multiple_spend_windows(self):
+        """Reconciliation adjusts all matching spend quota windows."""
+        config = QuotaConfig(
+            enabled=True,
+            limits=[
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.HOUR,
+                    limit=5.0,
+                ),
+                QuotaLimit(
+                    metric=QuotaMetric.SPEND_USD,
+                    window=QuotaWindow.DAY,
+                    limit=50.0,
+                ),
+                QuotaLimit(
+                    metric=QuotaMetric.REQUESTS,
+                    window=QuotaWindow.MINUTE,
+                    limit=100,
+                ),
+            ],
+        )
+        enforcer = QuotaEnforcer(config=config)
+
+        mock_repo = AsyncMock()
+        mock_repo.adjust_float = AsyncMock(return_value=(1.0, 0.05))
+        enforcer._repository = mock_repo
+
+        with patch.dict(
+            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "true"}, clear=False
+        ):
+            await enforcer.reconcile_spend(
+                subject="team:eng",
+                actual_cost=0.05,
+                reserved_cost=0.10,
+            )
+
+        # Should call adjust_float for both SPEND_USD limits (hour + day),
+        # but NOT for the REQUESTS limit
+        assert mock_repo.adjust_float.call_count == 2

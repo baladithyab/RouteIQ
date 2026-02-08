@@ -130,7 +130,7 @@ class ConfigSyncManager:
 
             s3_client = boto3.client("s3")
             response = s3_client.head_object(Bucket=self.s3_bucket, Key=self.s3_key)
-            return response.get("ETag", "").strip('"')
+            return str(response.get("ETag", "")).strip('"')
         except Exception as e:
             verbose_proxy_logger.warning(f"Failed to get S3 ETag: {e}")
             return None
@@ -372,3 +372,11 @@ def stop_config_sync():
     """Stop background config synchronization."""
     if _sync_manager:
         _sync_manager.stop()
+
+
+def reset_config_sync_manager() -> None:
+    """Reset the global config sync manager (for testing)."""
+    global _sync_manager
+    if _sync_manager is not None:
+        _sync_manager.stop()
+    _sync_manager = None

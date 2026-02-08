@@ -605,6 +605,190 @@ class MCPGateway:
                 return self.servers.get(server_id)
         return None
 
+    def find_server_for_resource(self, uri: str) -> MCPServer | None:
+        """
+        Find the server that owns a given resource URI. Thread-safe.
+
+        Iterates over all registered servers and checks if the URI
+        matches any of their declared resources.
+
+        Args:
+            uri: Resource URI to look up
+
+        Returns:
+            Server that owns the resource, or None if not found
+        """
+        with self._lock:
+            for server in self.servers.values():
+                if uri in server.resources:
+                    return server
+        return None
+
+    async def proxy_resource_read(self, uri: str) -> dict[str, Any]:
+        """
+        Proxy a resources/read request to the upstream MCP server.
+
+        Finds the server that owns the resource URI and forwards the
+        read request to it. Returns the upstream response or an error.
+
+        Security:
+        - Server URLs are validated against SSRF attacks before requests.
+
+        Args:
+            uri: Resource URI to read
+
+        Returns:
+            Dict with 'contents' list on success, or 'error' dict on failure.
+        """
+        server = self.find_server_for_resource(uri)
+        if server is None:
+            return {
+                "error": {
+                    "code": -32002,
+                    "message": f"No server found for resource URI: {uri}",
+                }
+            }
+
+        if not server.url:
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": f"Server '{server.server_id}' has no URL configured",
+                }
+            }
+
+        # Security: Validate URL against SSRF attacks
+        try:
+            await validate_outbound_url_async(server.url)
+        except SSRFBlockedError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: SSRF blocked for resource read on server '{server.server_id}': {e}"
+            )
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": "Server URL blocked for security reasons",
+                }
+            }
+        except ValueError as e:
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": f"Server URL is invalid: {str(e)}",
+                }
+            }
+
+        # Build the resources/read endpoint URL
+        base_url = server.url.rstrip("/")
+        if base_url.endswith("/mcp"):
+            read_url = f"{base_url}/resources/read"
+        else:
+            read_url = f"{base_url}/mcp/resources/read"
+
+        # Build headers (include auth if configured)
+        headers = {"Content-Type": "application/json"}
+        if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
+            headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
+        elif server.auth_type == "api_key" and server.metadata.get("api_key"):
+            headers["X-API-Key"] = server.metadata["api_key"]
+
+        # Proxy the request to the upstream server
+        timeout = httpx.Timeout(
+            connect=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+            read=self.TOOL_INVOCATION_READ_TIMEOUT,
+            write=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+        )
+
+        try:
+            async with get_client_for_request(timeout=timeout) as client:
+                response = await client.post(
+                    read_url,
+                    json={"uri": uri},
+                    headers=headers,
+                    timeout=timeout,
+                )
+
+                if response.status_code >= 400:
+                    error_detail = (
+                        response.text[:500]
+                        if response.text
+                        else f"HTTP {response.status_code}"
+                    )
+                    return {
+                        "error": {
+                            "code": -32603,
+                            "message": f"Upstream server error: HTTP {response.status_code}: {error_detail}",
+                        }
+                    }
+
+                try:
+                    response_data = response.json()
+                except json.JSONDecodeError:
+                    return {
+                        "error": {
+                            "code": -32603,
+                            "message": "Invalid JSON response from upstream server",
+                        }
+                    }
+
+                # If upstream returns MCP-format contents, pass through
+                if isinstance(response_data, dict) and "contents" in response_data:
+                    return response_data
+
+                # Otherwise wrap text response in MCP format
+                if isinstance(response_data, dict) and "text" in response_data:
+                    return {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": response_data.get("mimeType", "text/plain"),
+                                "text": response_data["text"],
+                            }
+                        ]
+                    }
+
+                # Fallback: wrap entire response as JSON text
+                return {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": json.dumps(response_data),
+                        }
+                    ]
+                }
+
+        except httpx.TimeoutException as e:
+            verbose_proxy_logger.warning(
+                f"MCP: Timeout reading resource '{uri}' from server '{server.server_id}': {e}"
+            )
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": f"Timeout reading resource from upstream server: {str(e)}",
+                }
+            }
+        except httpx.ConnectError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: Connection error reading resource '{uri}': {e}"
+            )
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": f"Failed to connect to upstream server: {str(e)}",
+                }
+            }
+        except Exception as e:
+            verbose_proxy_logger.exception(
+                f"MCP: Unexpected error reading resource '{uri}': {e}"
+            )
+            return {
+                "error": {
+                    "code": -32603,
+                    "message": f"Unexpected error reading resource: {str(e)}",
+                }
+            }
+
     def register_tool_definition(
         self,
         server_id: str,

@@ -53,7 +53,7 @@ import socket
 import threading
 import time
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from litellm._logging import verbose_proxy_logger
@@ -469,7 +469,7 @@ def _is_ip_literal(hostname: str) -> bool:
         return False
 
 
-def _check_ip_address(ip_str: str, config: dict = None) -> tuple[bool, str]:
+def _check_ip_address(ip_str: str, config: dict | None = None) -> tuple[bool, str]:
     """
     Check if an IP address should be blocked.
 
@@ -556,7 +556,7 @@ def _check_ip_address(ip_str: str, config: dict = None) -> tuple[bool, str]:
     return False, ""
 
 
-def _check_hostname(hostname: str, config: dict = None) -> tuple[bool, str]:
+def _check_hostname(hostname: str, config: dict | None = None) -> tuple[bool, str]:
     """
     Check if a hostname should be blocked.
 
@@ -717,14 +717,14 @@ def _resolve_and_check_dns_sync(
             hostname, parsed.port or (443 if scheme == "https" else 80)
         )
         for family, type_, proto, canonname, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            blocked, reason = _check_ip_address(ip_str, config)
+            resolved_ip = str(sockaddr[0])
+            blocked, reason = _check_ip_address(resolved_ip, config)
             if blocked:
                 verbose_proxy_logger.warning(
-                    f"SSRF: Blocked URL due to resolved IP {ip_str}: {url}"
+                    f"SSRF: Blocked URL due to resolved IP {resolved_ip}: {url}"
                 )
                 raise SSRFBlockedError(
-                    url, f"resolved IP {ip_str} is blocked: {reason}"
+                    url, f"resolved IP {resolved_ip} is blocked: {reason}"
                 )
 
     except socket.gaierror:
@@ -772,10 +772,11 @@ async def _resolve_dns_async(
 
     # Perform async DNS resolution
     loop = asyncio.get_running_loop()
-    result = await asyncio.wait_for(
+    raw_result = await asyncio.wait_for(
         loop.getaddrinfo(hostname, port, family=0, type=socket.SOCK_STREAM),
         timeout=timeout,
     )
+    result = cast(list[tuple[int, int, int, str, tuple[Any, ...]]], raw_result)
 
     # Cache the result
     cache.set(cache_key, result)

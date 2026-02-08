@@ -388,6 +388,14 @@ class RouterDecisionCallback:
             input_tokens = getattr(usage, "prompt_tokens", 0) or 0
             output_tokens = getattr(usage, "completion_tokens", 0) or 0
 
+        # Extract finish reasons from response object
+        finish_reasons: List[str] = []
+        if hasattr(response_obj, "choices") and response_obj.choices:
+            for choice in response_obj.choices:
+                reason = getattr(choice, "finish_reason", None)
+                if reason:
+                    finish_reasons.append(str(reason))
+
         attrs = {
             "gen_ai.request.model": model,
             "gen_ai.system": provider,
@@ -428,6 +436,8 @@ class RouterDecisionCallback:
             span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
             if hasattr(response_obj, "model") and response_obj.model:
                 span.set_attribute("gen_ai.response.model", response_obj.model)
+            if finish_reasons:
+                span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
 
     def log_failure_event(
         self,
@@ -485,6 +495,11 @@ class RouterDecisionCallback:
 
             # Decrement active gauge
             gm.request_active.add(-1, {"model": model})
+
+        # Set gen_ai.response.finish_reasons = ["error"] on the span
+        span = trace.get_current_span()
+        if span and span.is_recording():
+            span.set_attribute("gen_ai.response.finish_reasons", ["error"])
 
     async def async_log_pre_api_call(
         self,

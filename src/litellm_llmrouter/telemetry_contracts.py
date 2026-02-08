@@ -35,6 +35,63 @@ CONTRACT_FULL_NAME = f"{CONTRACT_NAME}.{CONTRACT_VERSION}"
 SUPPORTED_CONTRACT_VERSIONS = ["v1", "v1.0", "v1.1"]
 
 
+@dataclass
+class GenAIRequestAttributes:
+    """
+    GenAI semantic convention attributes for request telemetry.
+
+    Follows the OpenTelemetry GenAI Semantic Conventions for recording
+    gen_ai.* attributes on spans and metric dimensions.
+
+    See: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+    """
+
+    gen_ai_system: str = ""
+    """GenAI provider system (e.g., 'openai', 'anthropic', 'bedrock')."""
+
+    gen_ai_request_model: str = ""
+    """Model requested by the caller (e.g., 'gpt-4', 'claude-3-opus')."""
+
+    gen_ai_response_model: str = ""
+    """Model actually used in the response (may differ from request)."""
+
+    gen_ai_operation_name: str = ""
+    """Operation type (e.g., 'chat_completion', 'embedding', 'completion')."""
+
+    gen_ai_usage_input_tokens: int = 0
+    """Number of input/prompt tokens consumed."""
+
+    gen_ai_usage_output_tokens: int = 0
+    """Number of output/completion tokens generated."""
+
+    gen_ai_response_finish_reasons: list[str] = field(default_factory=list)
+    """Finish reasons from the response (e.g., ['stop'], ['length'], ['error'])."""
+
+    def to_span_attributes(self) -> Dict[str, Any]:
+        """Convert to a dict of gen_ai.* span attribute key-value pairs.
+
+        Only includes non-empty/non-zero values.
+        """
+        attrs: Dict[str, Any] = {}
+        if self.gen_ai_system:
+            attrs["gen_ai.system"] = self.gen_ai_system
+        if self.gen_ai_request_model:
+            attrs["gen_ai.request.model"] = self.gen_ai_request_model
+        if self.gen_ai_response_model:
+            attrs["gen_ai.response.model"] = self.gen_ai_response_model
+        if self.gen_ai_operation_name:
+            attrs["gen_ai.operation.name"] = self.gen_ai_operation_name
+        if self.gen_ai_usage_input_tokens:
+            attrs["gen_ai.usage.input_tokens"] = self.gen_ai_usage_input_tokens
+        if self.gen_ai_usage_output_tokens:
+            attrs["gen_ai.usage.output_tokens"] = self.gen_ai_usage_output_tokens
+        if self.gen_ai_response_finish_reasons:
+            attrs["gen_ai.response.finish_reasons"] = (
+                self.gen_ai_response_finish_reasons
+            )
+        return attrs
+
+
 class RoutingOutcome(str, Enum):
     """Outcome of a routing decision."""
 

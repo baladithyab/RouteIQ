@@ -51,6 +51,41 @@ exporters:
     namespace: RouteIQ/Gateway
     log_group_name: /routeiq/metrics
     dimension_rollup_option: NoDimensionRollup
+    metric_declarations:
+      # GenAI Semantic Convention metrics
+      - dimensions: [["gen_ai.request.model", "gen_ai.system"]]
+        metric_name_selectors:
+          - "gen_ai.client.operation.duration"
+      - dimensions:
+          - ["gen_ai.request.model", "gen_ai.system", "gen_ai.token.type"]
+        metric_name_selectors:
+          - "gen_ai.client.token.usage"
+      - dimensions: [["gen_ai.request.model"]]
+        metric_name_selectors:
+          - "gen_ai.server.time_to_first_token"
+          - "gen_ai.client.tokens_per_second"
+      # Gateway operational metrics
+      - dimensions: [["model", "provider", "status"]]
+        metric_name_selectors:
+          - "gateway.request.total"
+      - dimensions: [["model", "provider", "error_type"]]
+        metric_name_selectors:
+          - "gateway.request.error"
+      - dimensions: [["model"]]
+        metric_name_selectors:
+          - "gateway.request.active"
+      # Routing metrics
+      - dimensions: [["strategy", "model"]]
+        metric_name_selectors:
+          - "gateway.routing.decision.duration"
+      - dimensions: [["strategy", "outcome"]]
+        metric_name_selectors:
+          - "gateway.routing.strategy.usage"
+      # Cost metrics
+      - dimensions: [["model", "provider"]]
+        metric_name_selectors:
+          - "gateway.cost.total"
+          - "gateway.cost.per_request"
 
   # AWS CloudWatch Logs exporter
   awscloudwatchlogs:

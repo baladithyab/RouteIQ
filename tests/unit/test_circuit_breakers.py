@@ -8,6 +8,7 @@ Tests for:
 - Success threshold for recovery
 - Circuit breaker manager and degraded mode
 - Configuration from environment variables
+- Per-provider circuit breakers for LLM HTTP calls
 """
 
 import asyncio
@@ -23,8 +24,10 @@ from litellm_llmrouter.resilience import (
     CircuitBreakerOpenError,
     CircuitBreakerState,
     execute_with_circuit_breaker,
+    execute_with_provider_circuit_breaker,
     get_circuit_breaker_manager,
     reset_circuit_breaker_manager,
+    _notify_circuit_breaker_change,
 )
 
 
@@ -636,3 +639,375 @@ class TestCircuitBreakerOpenError:
         assert error.time_until_retry == 15.5
         assert "test-breaker" in str(error)
         assert "15.5s" in str(error)
+
+
+# =============================================================================
+# Per-Provider Circuit Breaker Tests
+# =============================================================================
+
+
+class TestGetOrCreateProviderBreaker:
+    """Tests for CircuitBreakerManager.get_or_create_provider_breaker()."""
+
+    def test_creates_new_breaker_with_provider_prefix(self):
+        """Test that a new breaker is created with the provider: key prefix."""
+        manager = CircuitBreakerManager()
+        breaker = manager.get_or_create_provider_breaker("openai")
+
+        assert breaker is not None
+        assert breaker.name == "provider:openai"
+
+    def test_returns_same_instance_on_repeated_call(self):
+        """Test that repeated calls return the same breaker instance."""
+        manager = CircuitBreakerManager()
+        b1 = manager.get_or_create_provider_breaker("anthropic")
+        b2 = manager.get_or_create_provider_breaker("anthropic")
+
+        assert b1 is b2
+
+    def test_different_providers_get_independent_breakers(self):
+        """Test that different providers have independent breakers."""
+        manager = CircuitBreakerManager()
+        openai_breaker = manager.get_or_create_provider_breaker("openai")
+        anthropic_breaker = manager.get_or_create_provider_breaker("anthropic")
+        bedrock_breaker = manager.get_or_create_provider_breaker("bedrock")
+
+        assert openai_breaker is not anthropic_breaker
+        assert openai_breaker is not bedrock_breaker
+        assert anthropic_breaker is not bedrock_breaker
+
+        assert openai_breaker.name == "provider:openai"
+        assert anthropic_breaker.name == "provider:anthropic"
+        assert bedrock_breaker.name == "provider:bedrock"
+
+    @pytest.mark.asyncio
+    async def test_provider_breaker_state_is_independent(self):
+        """Test that opening one provider breaker does not affect another."""
+        manager = CircuitBreakerManager()
+        openai_breaker = manager.get_or_create_provider_breaker("openai")
+        anthropic_breaker = manager.get_or_create_provider_breaker("anthropic")
+
+        await openai_breaker.force_open()
+
+        assert openai_breaker.is_open
+        assert anthropic_breaker.is_closed
+
+    def test_provider_breaker_uses_per_provider_env_config(self):
+        """Test that provider breakers read ROUTEIQ_CB_{PROVIDER}_* env vars."""
+        env = {
+            "ROUTEIQ_CB_OPENAI_FAILURE_THRESHOLD": "10",
+            "ROUTEIQ_CB_OPENAI_TIMEOUT_SECONDS": "45.0",
+            "ROUTEIQ_CB_FAILURE_THRESHOLD": "5",  # global fallback
+        }
+        with patch.dict(os.environ, env, clear=False):
+            manager = CircuitBreakerManager()
+            breaker = manager.get_or_create_provider_breaker("openai")
+
+            assert breaker._config.failure_threshold == 10
+            assert breaker._config.timeout_seconds == 45.0
+
+    def test_provider_breaker_falls_back_to_global_config(self):
+        """Test that provider breakers use global defaults when no per-provider env is set."""
+        env = {
+            "ROUTEIQ_CB_FAILURE_THRESHOLD": "7",
+        }
+        # Remove any provider-specific env vars that might exist
+        cleaned_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("ROUTEIQ_CB_BEDROCK_")
+        }
+        cleaned_env.update(env)
+        with patch.dict(os.environ, cleaned_env, clear=True):
+            manager = CircuitBreakerManager()
+            breaker = manager.get_or_create_provider_breaker("bedrock")
+
+            assert breaker._config.failure_threshold == 7
+
+    def test_provider_breaker_shows_in_degraded_components(self):
+        """Test that open provider breakers appear in degraded component list."""
+        manager = CircuitBreakerManager()
+        breaker = manager.get_or_create_provider_breaker("openai")
+        # Directly set to open state for testing
+        breaker._state = CircuitBreakerState.OPEN
+        import time
+
+        breaker._opened_at = time.monotonic()
+
+        assert manager.is_degraded() is True
+        components = manager.get_degraded_components()
+        assert len(components) == 1
+        assert components[0].name == "provider:openai"
+
+
+class TestProviderCBFeatureFlag:
+    """Tests for the ROUTEIQ_PROVIDER_CB_ENABLED feature flag."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default_passes_through(self):
+        """Test that when disabled, operations execute directly without breaker."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = False
+
+            call_count = 0
+
+            async def operation():
+                nonlocal call_count
+                call_count += 1
+                return "direct_result"
+
+            result = await execute_with_provider_circuit_breaker("openai", operation)
+
+            assert result == "direct_result"
+            assert call_count == 1
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_enabled_uses_circuit_breaker(self):
+        """Test that when enabled, operations go through the circuit breaker."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            call_count = 0
+
+            async def operation():
+                nonlocal call_count
+                call_count += 1
+                return "cb_result"
+
+            result = await execute_with_provider_circuit_breaker("anthropic", operation)
+
+            assert result == "cb_result"
+            assert call_count == 1
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_enabled_raises_when_circuit_open(self):
+        """Test that when enabled and circuit is open, CircuitBreakerOpenError is raised."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            # Pre-open the breaker
+            manager = get_circuit_breaker_manager()
+            breaker = manager.get_or_create_provider_breaker("openai")
+            await breaker.force_open()
+
+            async def operation():
+                return "should not run"
+
+            with pytest.raises(CircuitBreakerOpenError) as exc:
+                await execute_with_provider_circuit_breaker("openai", operation)
+
+            assert exc.value.breaker_name == "provider:openai"
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_disabled_ignores_open_circuit(self):
+        """Test that when disabled, open circuits are completely bypassed."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = False
+
+            # Even if we pre-open the breaker, disabled flag means passthrough
+            manager = get_circuit_breaker_manager()
+            breaker = manager.get_or_create_provider_breaker("openai")
+            await breaker.force_open()
+
+            async def operation():
+                return "passthrough"
+
+            result = await execute_with_provider_circuit_breaker("openai", operation)
+            assert result == "passthrough"
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+
+class TestExecuteWithProviderCircuitBreaker:
+    """Tests for execute_with_provider_circuit_breaker()."""
+
+    @pytest.mark.asyncio
+    async def test_success_records_on_breaker(self):
+        """Test that a successful call records success on the provider breaker."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            async def operation():
+                return 42
+
+            result = await execute_with_provider_circuit_breaker("openai", operation)
+            assert result == 42
+
+            # Breaker should exist and be closed (success recorded)
+            manager = get_circuit_breaker_manager()
+            breaker = manager.get_or_create_provider_breaker("openai")
+            assert breaker.is_closed
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_failure_records_on_breaker(self):
+        """Test that a failed call records failure on the provider breaker."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            async def operation():
+                raise ConnectionError("provider down")
+
+            with pytest.raises(ConnectionError, match="provider down"):
+                await execute_with_provider_circuit_breaker("openai", operation)
+
+            manager = get_circuit_breaker_manager()
+            breaker = manager.get_or_create_provider_breaker("openai")
+            assert breaker.failure_count == 1
+            assert breaker.last_failure_error == "provider down"
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_forwards_args_and_kwargs(self):
+        """Test that positional and keyword args are forwarded to the operation."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            async def operation(a, b, c=None):
+                return f"{a}-{b}-{c}"
+
+            result = await execute_with_provider_circuit_breaker(
+                "anthropic", operation, "x", "y", c="z"
+            )
+            assert result == "x-y-z"
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+    @pytest.mark.asyncio
+    async def test_repeated_failures_open_circuit(self):
+        """Test that repeated failures open the provider circuit."""
+        import litellm_llmrouter.resilience as mod
+
+        original = mod.PROVIDER_CB_ENABLED
+        try:
+            mod.PROVIDER_CB_ENABLED = True
+
+            call_count = 0
+
+            async def failing_operation():
+                nonlocal call_count
+                call_count += 1
+                raise ConnectionError("timeout")
+
+            # Use a breaker with a low threshold
+            manager = get_circuit_breaker_manager()
+            key = "provider:openai"
+            config = CircuitBreakerConfig(
+                failure_threshold=3,
+                success_threshold=2,
+                timeout_seconds=30.0,
+                window_seconds=60.0,
+            )
+            manager._breakers[key] = CircuitBreaker(name=key, config=config)
+
+            # Fail 3 times to open the circuit
+            for _ in range(3):
+                with pytest.raises(ConnectionError):
+                    await execute_with_provider_circuit_breaker(
+                        "openai", failing_operation
+                    )
+
+            assert call_count == 3
+            breaker = manager.get_or_create_provider_breaker("openai")
+            assert breaker.is_open
+
+            # Next call should fail fast
+            with pytest.raises(CircuitBreakerOpenError):
+                await execute_with_provider_circuit_breaker("openai", failing_operation)
+
+            # Operation should NOT have been called for the rejected request
+            assert call_count == 3
+        finally:
+            mod.PROVIDER_CB_ENABLED = original
+
+
+class TestNotifyCircuitBreakerChange:
+    """Tests for _notify_circuit_breaker_change() OTel event emission."""
+
+    @pytest.mark.asyncio
+    async def test_emits_otel_event_on_state_change(self, shared_span_exporter):
+        """Test that state change emits an OTel span event."""
+        from opentelemetry import trace
+
+        tracer = trace.get_tracer("test-provider-cb")
+
+        manager = CircuitBreakerManager()
+        breaker = manager.get_or_create_provider_breaker("openai")
+        await breaker.force_open()
+
+        with tracer.start_as_current_span("test-span"):
+            _notify_circuit_breaker_change("openai", breaker)
+
+        # Force export
+        shared_span_exporter.force_flush()
+
+        spans = shared_span_exporter.get_finished_spans()
+        assert len(spans) >= 1
+
+        test_span = spans[-1]
+        events = test_span.events
+        assert len(events) == 1
+        event = events[0]
+        assert event.name == "circuit_breaker.provider.state_change"
+        assert event.attributes["provider"] == "openai"
+        assert event.attributes["state"] == "open"
+
+    @pytest.mark.asyncio
+    async def test_no_error_when_no_active_span(self):
+        """Test that _notify does not raise when no span is active."""
+        manager = CircuitBreakerManager()
+        breaker = manager.get_or_create_provider_breaker("anthropic")
+        await breaker.force_open()
+
+        # Should not raise even with no active span
+        _notify_circuit_breaker_change("anthropic", breaker)
+
+    @pytest.mark.asyncio
+    async def test_no_error_when_otel_unavailable(self):
+        """Test that _notify does not raise when OTel import fails."""
+        manager = CircuitBreakerManager()
+        breaker = manager.get_or_create_provider_breaker("bedrock")
+
+        # Patch the import inside _notify_circuit_breaker_change to simulate
+        # OTel not being available (the import is local, so we patch builtins)
+        import builtins
+
+        original_import = builtins.__import__
+
+        def fail_on_otel(name, *args, **kwargs):
+            if name == "opentelemetry":
+                raise ImportError("OTel not available")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=fail_on_otel):
+            # Should not raise
+            _notify_circuit_breaker_change("bedrock", breaker)

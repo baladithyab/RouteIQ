@@ -18,7 +18,7 @@ a different provider than the one used by auto-instrumentation.
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from opentelemetry import trace, metrics
 from opentelemetry._logs import set_logger_provider
@@ -170,6 +170,58 @@ def set_router_decision_attributes(
 
     if fallback_triggered is not None:
         span.set_attribute(ROUTER_FALLBACK_TRIGGERED_ATTR, fallback_triggered)
+
+
+def set_genai_attributes(
+    span: trace.Span,
+    *,
+    system: Optional[str] = None,
+    request_model: Optional[str] = None,
+    response_model: Optional[str] = None,
+    operation_name: Optional[str] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    finish_reasons: Optional[list[str]] = None,
+) -> None:
+    """
+    Set GenAI semantic convention span attributes on the given span.
+
+    These attributes follow the OpenTelemetry GenAI Semantic Conventions
+    (https://opentelemetry.io/docs/specs/semconv/gen-ai/).
+
+    Args:
+        span: The OpenTelemetry span to add attributes to.
+        system: GenAI provider system (e.g., 'openai', 'anthropic').
+        request_model: Model requested by the caller.
+        response_model: Model actually used in the response.
+        operation_name: Operation type (e.g., 'chat_completion', 'embedding').
+        input_tokens: Number of input/prompt tokens used.
+        output_tokens: Number of output/completion tokens used.
+        finish_reasons: List of finish reasons from the response.
+    """
+    if not span or not span.is_recording():
+        return
+
+    if system is not None:
+        span.set_attribute("gen_ai.system", system)
+
+    if request_model is not None:
+        span.set_attribute("gen_ai.request.model", request_model)
+
+    if response_model is not None:
+        span.set_attribute("gen_ai.response.model", response_model)
+
+    if operation_name is not None:
+        span.set_attribute("gen_ai.operation.name", operation_name)
+
+    if input_tokens is not None:
+        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+
+    if output_tokens is not None:
+        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+    if finish_reasons is not None:
+        span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
 
 
 def _is_sdk_tracer_provider(provider: Any) -> bool:
@@ -482,7 +534,7 @@ class ObservabilityManager:
         if _is_sdk_tracer_provider(existing_provider):
             # Reuse existing SDK provider - this is the preferred path
             # It ensures all spans go to the same exporter
-            self._tracer_provider = existing_provider
+            self._tracer_provider = cast(TracerProvider, existing_provider)
             logger.info("Reusing existing SDK TracerProvider - attaching OTLP exporter")
         else:
             # No SDK provider exists yet - create one with our resource and sampler
@@ -500,7 +552,7 @@ class ObservabilityManager:
 
         # Add our OTLP exporter as a BatchSpanProcessor
         # This ensures spans are exported even if LiteLLM didn't configure OTLP
-        if not self._span_processor_added:
+        if not self._span_processor_added and self._tracer_provider is not None:
             try:
                 otlp_exporter = OTLPSpanExporter(
                     endpoint=self.otlp_endpoint, insecure=True
@@ -528,7 +580,7 @@ class ObservabilityManager:
 
             existing_provider = get_logger_provider()
             if hasattr(existing_provider, "add_log_record_processor"):
-                self._logger_provider = existing_provider
+                self._logger_provider = cast(LoggerProvider, existing_provider)
                 logger.info("Using existing LoggerProvider")
             else:
                 # Create new provider
@@ -542,6 +594,7 @@ class ObservabilityManager:
             logger.info("Created new LoggerProvider")
 
         # Add OTLP exporter for logs
+        assert self._logger_provider is not None  # Set in all branches above
         otlp_log_exporter = OTLPLogExporter(endpoint=self.otlp_endpoint, insecure=True)
         log_processor = BatchLogRecordProcessor(otlp_log_exporter)
         self._logger_provider.add_log_record_processor(log_processor)
@@ -562,7 +615,7 @@ class ObservabilityManager:
         # Check if a meter provider already exists
         existing_provider = metrics.get_meter_provider()
         if hasattr(existing_provider, "register_metric_reader"):
-            self._meter_provider = existing_provider
+            self._meter_provider = cast(MeterProvider, existing_provider)
             logger.info("Using existing MeterProvider")
         else:
             # Create OTLP metric exporter
@@ -658,7 +711,7 @@ class ObservabilityManager:
             latency_ms: Routing decision latency
             extra: Additional context to log
         """
-        log_data = {
+        log_data: Dict[str, Any] = {
             "event": "routing.decision",
             "strategy": strategy,
             "selected_model": selected_model,
@@ -742,16 +795,24 @@ def init_observability(
     global _observability_manager
 
     # Get values from environment if not provided
-    service_name = service_name or os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
-    service_version = service_version or os.getenv("OTEL_SERVICE_VERSION", "1.0.0")
-    deployment_environment = deployment_environment or os.getenv(
-        "OTEL_DEPLOYMENT_ENVIRONMENT", "production"
+    resolved_service_name: str = (
+        service_name
+        or os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
+        or "litellm-gateway"
+    )
+    resolved_service_version: str = (
+        service_version or os.getenv("OTEL_SERVICE_VERSION", "1.0.0") or "1.0.0"
+    )
+    resolved_deployment_env: str = (
+        deployment_environment
+        or os.getenv("OTEL_DEPLOYMENT_ENVIRONMENT", "production")
+        or "production"
     )
 
     _observability_manager = ObservabilityManager(
-        service_name=service_name,
-        service_version=service_version,
-        deployment_environment=deployment_environment,
+        service_name=resolved_service_name,
+        service_version=resolved_service_version,
+        deployment_environment=resolved_deployment_env,
         otlp_endpoint=otlp_endpoint,
         enable_traces=enable_traces,
         enable_logs=enable_logs,

@@ -31,7 +31,10 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 try:
     import numpy as np
@@ -539,6 +542,177 @@ class RedisCacheStore:
             return None
 
 
+class CacheManager:
+    """
+    Facade for cache admin operations (stats, flush, list entries, SSE replay).
+
+    Wraps L1 (InMemoryCache) and optional L2 (RedisCacheStore) stores.
+    The SemanticCachePlugin creates and registers this during startup.
+    """
+
+    def __init__(
+        self,
+        l1: InMemoryCache | None = None,
+        l2: RedisCacheStore | None = None,
+        ttl: int = 3600,
+        semantic_enabled: bool = False,
+    ) -> None:
+        self._l1 = l1
+        self._l2 = l2
+        self._ttl = ttl
+        self._semantic_enabled = semantic_enabled
+        self._total_hits = 0
+        self._total_misses = 0
+
+    def record_hit(self) -> None:
+        """Record a cache hit for aggregate stats."""
+        self._total_hits += 1
+
+    def record_miss(self) -> None:
+        """Record a cache miss for aggregate stats."""
+        self._total_misses += 1
+
+    def get_stats(self) -> dict[str, Any]:
+        """
+        Get cache statistics: hit/miss counts, entry count, configuration.
+
+        Returns:
+            Dictionary with cache statistics.
+        """
+        stats: dict[str, Any] = {
+            "enabled": True,
+            "semantic_enabled": self._semantic_enabled,
+            "ttl_seconds": self._ttl,
+            "total_hits": self._total_hits,
+            "total_misses": self._total_misses,
+        }
+
+        if self._l1 is not None:
+            stats["l1"] = {
+                "size": self._l1.size,
+                "hits": self._l1.hits,
+                "misses": self._l1.misses,
+                "max_size": self._l1._max_size,
+            }
+
+        stats["l2_configured"] = self._l2 is not None
+        return stats
+
+    async def flush(self, prefix: str | None = None) -> int:
+        """
+        Flush all cache entries or entries matching a prefix.
+
+        Args:
+            prefix: Optional key prefix filter. If None, flush all.
+
+        Returns:
+            Number of entries removed.
+        """
+        count = 0
+
+        if self._l1 is not None:
+            if prefix is None:
+                count += self._l1.size
+                self._l1.clear()
+            else:
+                # Remove entries matching prefix from L1
+                keys_to_remove = [k for k in self._l1._store if k.startswith(prefix)]
+                for k in keys_to_remove:
+                    del self._l1._store[k]
+                count += len(keys_to_remove)
+
+        # Reset aggregate counters on full flush
+        if prefix is None:
+            self._total_hits = 0
+            self._total_misses = 0
+
+        return count
+
+    def list_entries(self, limit: int = 100) -> dict[str, Any]:
+        """
+        List cached keys with metadata.
+
+        Args:
+            limit: Maximum number of entries to return.
+
+        Returns:
+            Dictionary with enabled status and entries list.
+        """
+        entries: list[dict[str, Any]] = []
+
+        if self._l1 is not None:
+            now = time.time()
+            for key, (entry, expiry) in list(self._l1._store.items())[:limit]:
+                entries.append(
+                    {
+                        "key": key,
+                        "model": entry.model,
+                        "created_at": entry.created_at,
+                        "token_count": entry.token_count,
+                        "ttl_remaining": max(0, int(expiry - now)),
+                        "has_embedding": entry.embedding is not None,
+                    }
+                )
+
+        return {"enabled": True, "count": len(entries), "entries": entries}
+
+    async def replay_as_sse_stream(
+        self, cached_response: dict[str, Any]
+    ) -> "AsyncIterator[str]":
+        """
+        Convert a cached response to synthetic SSE chunks (OpenAI format).
+
+        Yields SSE-formatted strings that mimic streaming output, ending with [DONE].
+        This allows cached non-streaming responses to be served to clients that
+        request streaming.
+
+        Args:
+            cached_response: The cached LLM response dict.
+
+        Yields:
+            SSE-formatted strings.
+        """
+        # Extract content from the cached response
+        content = ""
+        model = cached_response.get("model", "cached-model")
+        choices = cached_response.get("choices", [])
+        if choices:
+            first_choice = choices[0]
+            message = first_choice.get("message", {})
+            content = message.get("content", "")
+
+        # Build a synthetic streaming chunk
+        chunk = {
+            "id": f"chatcmpl-cache-{hash(json.dumps(cached_response, sort_keys=True, default=str)) & 0xFFFFFFFF:08x}",
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+# Module-level singleton for CacheManager
+_cache_manager: CacheManager | None = None
+
+
+def set_cache_manager(manager: CacheManager | None) -> None:
+    """Register the global CacheManager singleton (called by SemanticCachePlugin)."""
+    global _cache_manager
+    _cache_manager = manager
+
+
+def get_cache_manager() -> CacheManager | None:
+    """Get the global CacheManager singleton, or None if cache is not enabled."""
+    return _cache_manager
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors using numpy when available."""
     if len(a) != len(b) or not a:
@@ -561,4 +735,4 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
 
-    return dot / (norm_a * norm_b)
+    return float(dot / (norm_a * norm_b))

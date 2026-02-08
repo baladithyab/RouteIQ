@@ -127,6 +127,7 @@ class LeaseInfo:
     acquired_at: datetime
     expires_at: datetime
     is_leader: bool
+    generation: int = 0
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -136,6 +137,7 @@ class LeaseInfo:
             "acquired_at": self.acquired_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
             "is_leader": self.is_leader,
+            "generation": self.generation,
         }
 
 
@@ -150,6 +152,7 @@ CREATE TABLE IF NOT EXISTS config_sync_leader (
     holder_id VARCHAR(255) NOT NULL,
     acquired_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 0,
     metadata JSONB DEFAULT '{}'
 );
 
@@ -202,6 +205,8 @@ class LeaderElection:
         # State
         self._is_leader = False
         self._lease_expires_at: datetime | None = None
+        self._generation: int = 0
+        self._consecutive_renewal_failures: int = 0
         self._stop_event = threading.Event()
         self._renew_thread: threading.Thread | None = None
         self._on_leadership_change: Callable[[bool], None] | None = None
@@ -281,6 +286,8 @@ class LeaderElection:
 
             self._is_leader = True
             self._lease_expires_at = datetime.now(timezone.utc) + timedelta(days=365)
+            self._generation += 1
+            self._consecutive_renewal_failures = 0
             return True
 
         try:
@@ -296,18 +303,20 @@ class LeaderElection:
                 # 1. No lock exists (INSERT)
                 # 2. Lock exists but is expired (UPDATE with WHERE)
                 # 3. Lock exists and we already hold it (UPDATE with WHERE)
+                # Generation is incremented atomically on every acquisition.
                 result = await conn.fetchrow(
                     """
-                    INSERT INTO config_sync_leader (lock_name, holder_id, acquired_at, expires_at)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO config_sync_leader (lock_name, holder_id, acquired_at, expires_at, generation)
+                    VALUES ($1, $2, $3, $4, 1)
                     ON CONFLICT (lock_name) DO UPDATE SET
                         holder_id = EXCLUDED.holder_id,
                         acquired_at = EXCLUDED.acquired_at,
-                        expires_at = EXCLUDED.expires_at
+                        expires_at = EXCLUDED.expires_at,
+                        generation = config_sync_leader.generation + 1
                     WHERE
                         config_sync_leader.expires_at < $3
                         OR config_sync_leader.holder_id = $2
-                    RETURNING holder_id, expires_at
+                    RETURNING holder_id, expires_at, generation
                     """,
                     self.lock_name,
                     self.holder_id,
@@ -319,6 +328,8 @@ class LeaderElection:
                     was_leader = self._is_leader
                     self._is_leader = True
                     self._lease_expires_at = result["expires_at"]
+                    self._generation = result["generation"]
+                    self._consecutive_renewal_failures = 0
                     self._last_renewal_error = None
 
                     if not was_leader:
@@ -485,12 +496,52 @@ class LeaderElection:
                 # Run async renewal in sync context
                 loop = asyncio.new_event_loop()
                 try:
-                    loop.run_until_complete(self.renew())
+                    renewed = loop.run_until_complete(self.renew())
                 finally:
                     loop.close()
 
+                if renewed:
+                    self._consecutive_renewal_failures = 0
+                elif self._is_leader:
+                    # Renewal returned False while we think we're leader
+                    self._consecutive_renewal_failures += 1
+                    verbose_proxy_logger.warning(
+                        f"Leader election: Renewal failed "
+                        f"(consecutive_failures="
+                        f"{self._consecutive_renewal_failures})"
+                    )
+
+                    # Auto-demote after 2 consecutive failures
+                    if self._consecutive_renewal_failures >= 2:
+                        verbose_proxy_logger.error(
+                            "Leader election: Auto-demoting after "
+                            f"{self._consecutive_renewal_failures} "
+                            "consecutive renewal failures"
+                        )
+                        self._is_leader = False
+                        self._lease_expires_at = None
+                        if self._on_leadership_change:
+                            self._on_leadership_change(False)
+
             except Exception as e:
                 verbose_proxy_logger.error(f"Leader election: Renewal error: {e}")
+                if self._is_leader:
+                    self._consecutive_renewal_failures += 1
+                    verbose_proxy_logger.warning(
+                        f"Leader election: Renewal exception "
+                        f"(consecutive_failures="
+                        f"{self._consecutive_renewal_failures})"
+                    )
+                    if self._consecutive_renewal_failures >= 2:
+                        verbose_proxy_logger.error(
+                            "Leader election: Auto-demoting after "
+                            f"{self._consecutive_renewal_failures} "
+                            "consecutive renewal failures (exception)"
+                        )
+                        self._is_leader = False
+                        self._lease_expires_at = None
+                        if self._on_leadership_change:
+                            self._on_leadership_change(False)
 
             # Wait for next renewal interval
             self._stop_event.wait(self.renew_interval_seconds)
@@ -531,11 +582,28 @@ class LeaderElection:
             "lease_expires_at": (
                 self._lease_expires_at.isoformat() if self._lease_expires_at else None
             ),
+            "generation": self._generation,
+            "consecutive_renewal_failures": self._consecutive_renewal_failures,
             "database_configured": self.database_configured,
             "last_renewal_error": self._last_renewal_error,
             "renewal_thread_alive": self._renew_thread is not None
             and self._renew_thread.is_alive(),
         }
+
+    def validate_fencing_token(self, token: int) -> bool:
+        """Validate that a fencing token matches the current generation.
+
+        Operations should include the current generation to ensure they're
+        not executing with a stale leadership claim.
+
+        Args:
+            token: The fencing token (generation number) to validate.
+
+        Returns:
+            True if this instance is the leader and the token matches
+            the current generation, False otherwise.
+        """
+        return self._is_leader and token == self._generation
 
 
 # =============================================================================

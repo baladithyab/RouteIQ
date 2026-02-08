@@ -16,15 +16,19 @@ Tests cover:
 from __future__ import annotations
 
 import os
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 from litellm_llmrouter.auth import (
+    REQUEST_ID_HEADER,
+    RequestIDMiddleware,
     _extract_bearer_token,
     _is_admin_auth_enabled,
     _load_admin_api_keys,
+    _request_id_ctx,
     _scrub_secrets,
     admin_api_key_auth,
     create_admin_error_response,
@@ -389,6 +393,268 @@ class TestGetRequestId:
         result = get_request_id()
         # May return None or OTEL trace ID depending on environment
         assert result is None or isinstance(result, str)
+
+
+# =============================================================================
+# RequestIDMiddleware (Raw ASGI) Tests
+# =============================================================================
+
+
+def _make_http_scope(headers: list[tuple[bytes, bytes]] | None = None) -> dict:
+    """Create a minimal HTTP ASGI scope for testing."""
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": "/test",
+        "headers": headers or [],
+    }
+
+
+def _make_inner_app(captured: dict):
+    """
+    Create a simple ASGI inner app that captures the scope and context var,
+    then sends a minimal HTTP response.
+    """
+
+    async def inner_app(scope, receive, send):
+        # Capture the request_id context var as seen by downstream handlers
+        captured["request_id_in_context"] = _request_id_ctx.get()
+        # Send a minimal response
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b"OK",
+            }
+        )
+
+    return inner_app
+
+
+class TestRequestIDMiddleware:
+    """Tests for the raw ASGI RequestIDMiddleware."""
+
+    @pytest.mark.asyncio
+    async def test_generates_uuid_when_no_header(self):
+        """When no X-Request-ID header is provided, a UUID is generated."""
+        captured: dict = {}
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        inner = _make_inner_app(captured)
+        middleware = RequestIDMiddleware(inner)
+
+        scope = _make_http_scope()
+        await middleware(scope, None, mock_send)
+
+        # Context should have been set with a valid UUID
+        ctx_id = captured["request_id_in_context"]
+        assert ctx_id is not None
+        uuid.UUID(ctx_id)  # Raises if not a valid UUID
+
+        # Response should have X-Request-ID header
+        start_msg = sent_messages[0]
+        assert start_msg["type"] == "http.response.start"
+        header_dict = dict(start_msg["headers"])
+        assert REQUEST_ID_HEADER.lower().encode("latin-1") in header_dict
+        assert header_dict[
+            REQUEST_ID_HEADER.lower().encode("latin-1")
+        ] == ctx_id.encode("latin-1")
+
+    @pytest.mark.asyncio
+    async def test_passthrough_existing_request_id(self):
+        """When X-Request-ID is provided, it is used as-is."""
+        captured: dict = {}
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        inner = _make_inner_app(captured)
+        middleware = RequestIDMiddleware(inner)
+
+        existing_id = "my-custom-request-id-123"
+        scope = _make_http_scope(
+            headers=[
+                (b"x-request-id", existing_id.encode("latin-1")),
+            ]
+        )
+        await middleware(scope, None, mock_send)
+
+        assert captured["request_id_in_context"] == existing_id
+
+        # Response header should also have the passthrough ID
+        start_msg = sent_messages[0]
+        header_dict = dict(start_msg["headers"])
+        assert header_dict[
+            REQUEST_ID_HEADER.lower().encode("latin-1")
+        ] == existing_id.encode("latin-1")
+
+    @pytest.mark.asyncio
+    async def test_strips_whitespace_from_header(self):
+        """Whitespace in the X-Request-ID header value is stripped."""
+        captured: dict = {}
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        inner = _make_inner_app(captured)
+        middleware = RequestIDMiddleware(inner)
+
+        scope = _make_http_scope(
+            headers=[
+                (b"x-request-id", b"  req-456  "),
+            ]
+        )
+        await middleware(scope, None, mock_send)
+
+        assert captured["request_id_in_context"] == "req-456"
+
+    @pytest.mark.asyncio
+    async def test_empty_header_generates_uuid(self):
+        """An empty X-Request-ID header triggers UUID generation."""
+        captured: dict = {}
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        inner = _make_inner_app(captured)
+        middleware = RequestIDMiddleware(inner)
+
+        scope = _make_http_scope(
+            headers=[
+                (b"x-request-id", b""),
+            ]
+        )
+        await middleware(scope, None, mock_send)
+
+        ctx_id = captured["request_id_in_context"]
+        assert ctx_id is not None
+        uuid.UUID(ctx_id)  # Should be a valid UUID
+
+    @pytest.mark.asyncio
+    async def test_context_var_reset_after_request(self):
+        """Context variable is reset after the request completes."""
+        captured: dict = {}
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        inner = _make_inner_app(captured)
+        middleware = RequestIDMiddleware(inner)
+
+        scope = _make_http_scope()
+        await middleware(scope, None, mock_send)
+
+        # After the middleware returns, the context var should be reset
+        assert _request_id_ctx.get() is None
+
+    @pytest.mark.asyncio
+    async def test_context_var_reset_on_exception(self):
+        """Context variable is reset even when the inner app raises."""
+
+        async def failing_app(scope, receive, send):
+            raise RuntimeError("inner app failure")
+
+        middleware = RequestIDMiddleware(failing_app)
+        scope = _make_http_scope()
+
+        with pytest.raises(RuntimeError, match="inner app failure"):
+            await middleware(scope, None, lambda msg: None)
+
+        # Context var should still be reset
+        assert _request_id_ctx.get() is None
+
+    @pytest.mark.asyncio
+    async def test_passthrough_non_http_scope(self):
+        """Non-HTTP scopes (websocket, lifespan) are passed through unchanged."""
+        called = {"inner": False}
+
+        async def inner_app(scope, receive, send):
+            called["inner"] = True
+
+        middleware = RequestIDMiddleware(inner_app)
+
+        # Test with lifespan scope
+        lifespan_scope = {"type": "lifespan"}
+        await middleware(lifespan_scope, None, None)
+        assert called["inner"] is True
+
+        # Test with websocket scope
+        called["inner"] = False
+        ws_scope = {"type": "websocket"}
+        await middleware(ws_scope, None, None)
+        assert called["inner"] is True
+
+    @pytest.mark.asyncio
+    async def test_preserves_existing_response_headers(self):
+        """Existing response headers from the inner app are preserved."""
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        async def inner_app(scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"x-custom", b"value"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        middleware = RequestIDMiddleware(inner_app)
+        scope = _make_http_scope()
+        await middleware(scope, None, mock_send)
+
+        start_msg = sent_messages[0]
+        header_dict = dict(start_msg["headers"])
+        # Original headers preserved
+        assert header_dict[b"content-type"] == b"application/json"
+        assert header_dict[b"x-custom"] == b"value"
+        # Request ID header added
+        assert REQUEST_ID_HEADER.lower().encode("latin-1") in header_dict
+
+    @pytest.mark.asyncio
+    async def test_body_messages_pass_through_unchanged(self):
+        """Non-start messages (http.response.body) pass through without modification."""
+        sent_messages: list[dict] = []
+
+        async def mock_send(message):
+            sent_messages.append(message)
+
+        async def inner_app(scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"hello"})
+
+        middleware = RequestIDMiddleware(inner_app)
+        scope = _make_http_scope()
+        await middleware(scope, None, mock_send)
+
+        body_msg = sent_messages[1]
+        assert body_msg["type"] == "http.response.body"
+        assert body_msg["body"] == b"hello"
 
 
 # =============================================================================
