@@ -85,6 +85,7 @@ ALLOWLISTED_SECRETS = {
     # Docker Compose health check tokens (local dev/test only)
     "Bearer local-dev-master-key",
     "Bearer quota-test-master-key",
+    "Bearer local-dev-streaming-perf-key",
     # Example API keys (obviously fake patterns)
     "AKIAIOSFODNN7EXAMPLE",  # AWS example key
     "test-fake-key-12345",
