@@ -82,6 +82,9 @@ ALLOWLISTED_SECRETS = {
     "Bearer user-with-mcp-server-write",
     "Bearer user-with-mcp-tool-call",
     "Bearer user-with-mcp-wildcard",
+    # Docker Compose health check tokens (local dev/test only)
+    "Bearer local-dev-master-key",
+    "Bearer quota-test-master-key",
     # Example API keys (obviously fake patterns)
     "AKIAIOSFODNN7EXAMPLE",  # AWS example key
     "test-fake-key-12345",
