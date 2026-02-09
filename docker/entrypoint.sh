@@ -54,11 +54,12 @@ if [ -n "$DATABASE_URL" ]; then
         # Only run migrations if explicitly enabled
         if [ "${LITELLM_RUN_DB_MIGRATIONS:-false}" = "true" ]; then
             echo "   ⚠️  LITELLM_RUN_DB_MIGRATIONS=true - running migrations (use with caution in HA!)"
-            # Use 'prisma migrate deploy' for production (applies existing migrations)
-            # Fallback to 'db push' if migrate deploy fails (for dev-style schema sync)
-            prisma migrate deploy --schema="$SCHEMA_PATH" 2>&1 || \
-                prisma db push --schema="$SCHEMA_PATH" 2>&1 || \
-                echo "   Warning: prisma migration failed, continuing..."
+            # Use 'prisma db push' to sync schema directly (creates tables if missing,
+            # adds columns for schema changes). LiteLLM doesn't ship migration files,
+            # so 'prisma migrate deploy' exits 0 with "no pending migrations" and
+            # never creates tables — making the fallback unreachable.
+            prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1 || \
+                echo "   Warning: prisma db push failed, continuing..."
         else
             echo "   ℹ️  Skipping migrations (LITELLM_RUN_DB_MIGRATIONS not set)"
             echo "      For HA deployments, run migrations via a separate init job or leader election"

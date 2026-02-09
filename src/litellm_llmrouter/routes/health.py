@@ -172,12 +172,14 @@ async def readiness_probe():
             is_degraded = True
         else:
             redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            redis_ssl = os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes")
             try:
                 import redis.asyncio as aioredis
 
                 r = aioredis.Redis(
                     host=redis_host,
                     port=redis_port,
+                    ssl=redis_ssl,
                     socket_connect_timeout=2.0,
                     socket_timeout=2.0,
                 )

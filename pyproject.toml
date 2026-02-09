@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litellm-llmrouter"
-version = "0.1.0"
+version = "0.0.4"
 description = "LiteLLM + LLMRouter Gateway - Production AI Gateway with ML-based routing"
 readme = "README.md"
 license = { text = "MIT" }
