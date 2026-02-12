@@ -63,6 +63,10 @@ tasks:
     description: "Sync code and force push to GitHub from remote"
     run: "LEFTHOOK=0 git push --force-with-lease"
 
+  push-tags:
+    description: "Push all tags to GitHub from remote"
+    run: "LEFTHOOK=0 git push --tags"
+
   git-status:
     description: "Check git status on remote"
     run: "git status"
