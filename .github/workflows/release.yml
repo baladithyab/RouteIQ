@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Create releases
+      actions: read     # Read workflow runs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Docker build to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          echo "Waiting for Docker build workflow to finish for tag $RELEASE_TAG..."
+          for i in $(seq 1 60); do
+            RUN_JSON=$(gh run list \
+              --workflow docker-build.yml \
+              --branch "$RELEASE_TAG" \
+              --limit 1 \
+              --json databaseId,status,conclusion \
+              --jq '.[0]')
+
+            STATUS=$(echo "$RUN_JSON" | jq -r '.status')
+            CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+            DB_ID=$(echo "$RUN_JSON" | jq -r '.databaseId')
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "Docker build completed successfully (run $DB_ID)"
+                break
+              else
+                echo "Docker build failed with conclusion: $CONCLUSION"
+                echo "Proceeding with release anyway (image may not be available)"
+                break
+              fi
+            fi
+
+            echo "  Attempt $i/60: Docker build status=$STATUS (run $DB_ID)"
+            sleep 15
+          done
+
+      - name: Generate release notes
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Get the previous tag for changelog
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]' | sed -n '2p')
+
+          # Build release body
+          cat > /tmp/release-notes.md << EOF
+          ## Container Image
+
+          \`\`\`
+          ghcr.io/baladithyab/routeiq:${RELEASE_VERSION}
+          ghcr.io/baladithyab/routeiq:latest
+          \`\`\`
+
+          Multi-arch: \`linux/amd64\` + \`linux/arm64\`
+
+          ## Changes
+          EOF
+
+          # Append commit log as changelog
+          if [ -n "$PREV_TAG" ]; then
+            echo "" >> /tmp/release-notes.md
+            git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"- %s (%h)" >> /tmp/release-notes.md
+          fi
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG exists, updating..."
+            gh release edit "$RELEASE_TAG" \
+              --notes-file /tmp/release-notes.md
+          else
+            echo "Creating release $RELEASE_TAG..."
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file /tmp/release-notes.md \
+              --verify-tag
+          fi
