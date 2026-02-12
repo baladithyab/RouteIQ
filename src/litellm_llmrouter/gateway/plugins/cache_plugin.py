@@ -150,7 +150,7 @@ class SemanticCachePlugin(GatewayPlugin):
         self._l1 = InMemoryCache(max_size=self._l1_max_size)
         logger.info(f"Cache L1 initialized (max_size={self._l1_max_size})")
 
-        # Initialize L2 (Redis) if URL provided
+        # Initialize L2 (Redis) if URL provided or REDIS_HOST is set
         if self._redis_url:
             try:
                 import redis.asyncio as aioredis
@@ -162,6 +162,16 @@ class SemanticCachePlugin(GatewayPlugin):
                 logger.info(f"Cache L2 Redis initialized ({self._redis_url})")
             except Exception as e:
                 logger.warning(f"Failed to initialize Redis cache: {e}")
+                self._l2 = None
+        elif os.getenv("REDIS_HOST"):
+            try:
+                from litellm_llmrouter.redis_pool import create_async_redis_client
+
+                self._redis_client = create_async_redis_client()
+                self._l2 = RedisCacheStore(redis_client=self._redis_client)
+                logger.info("Cache L2 Redis initialized via shared pool settings")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Redis cache via pool: {e}")
                 self._l2 = None
 
         # Register the CacheManager singleton for admin endpoints

@@ -98,7 +98,7 @@ from .strategy_registry import (
 from .gateway import create_app, create_standalone_app
 from .gateway.plugin_manager import GatewayPlugin, PluginManager, get_plugin_manager
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 __all__ = [
     # Router patch (for llmrouter-* strategies)
     "patch_litellm_router",

@@ -21,6 +21,11 @@ Configuration:
     - ADMIN_API_KEYS: Comma-separated list of admin API keys
     - ADMIN_API_KEY: Single admin API key (legacy, use ADMIN_API_KEYS instead)
     - ADMIN_AUTH_ENABLED: Set to "false" to disable admin auth (NOT recommended)
+    - ROUTEIQ_KEY_PREFIX: Key prefix applied to master/admin keys (default: "sk-riq-")
+
+    On module load, the RouteIQ key prefix is applied to LITELLM_MASTER_KEY,
+    ADMIN_API_KEYS, and ADMIN_API_KEY environment variables. During validation,
+    both prefixed and unprefixed keys are accepted for backwards compatibility.
 
     When no admin keys are configured and ADMIN_AUTH_ENABLED is not explicitly "false",
     control-plane endpoints will deny all requests (fail-closed).
@@ -37,6 +42,86 @@ from fastapi import HTTPException, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# RouteIQ Key Prefix Support
+# ============================================================================
+
+# Default prefix for RouteIQ API keys
+ROUTEIQ_KEY_PREFIX = os.getenv("ROUTEIQ_KEY_PREFIX", "sk-riq-")
+
+
+def _ensure_prefix(key: str) -> str:
+    """
+    Ensure a key has the RouteIQ prefix.
+
+    If the key already starts with the prefix, it is returned unchanged.
+    Otherwise the prefix is prepended.
+    """
+    if not key or key.startswith(ROUTEIQ_KEY_PREFIX):
+        return key
+    return f"{ROUTEIQ_KEY_PREFIX}{key}"
+
+
+def _strip_prefix(key: str) -> str:
+    """Strip the RouteIQ prefix from a key, if present."""
+    if key and key.startswith(ROUTEIQ_KEY_PREFIX):
+        return key[len(ROUTEIQ_KEY_PREFIX) :]
+    return key
+
+
+def _apply_key_prefix_to_env() -> None:
+    """
+    Apply the RouteIQ key prefix to LITELLM_MASTER_KEY and ADMIN_API_KEYS
+    environment variables on startup.
+
+    If LITELLM_MASTER_KEY is set and does not already have the prefix,
+    the prefixed value is written back so that downstream LiteLLM code
+    sees the canonical form.
+
+    Same logic applies to each key in ADMIN_API_KEYS and the legacy
+    ADMIN_API_KEY variable.
+    """
+    # --- LITELLM_MASTER_KEY ---
+    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
+    if master_key:
+        prefixed = _ensure_prefix(master_key)
+        if prefixed != master_key:
+            os.environ["LITELLM_MASTER_KEY"] = prefixed
+            logger.info(
+                "Applied RouteIQ key prefix to LITELLM_MASTER_KEY (prefix=%s)",
+                ROUTEIQ_KEY_PREFIX,
+            )
+
+    # --- ADMIN_API_KEYS ---
+    admin_keys_str = os.getenv("ADMIN_API_KEYS", "").strip()
+    if admin_keys_str:
+        parts = [k.strip() for k in admin_keys_str.split(",") if k.strip()]
+        prefixed_parts = [_ensure_prefix(k) for k in parts]
+        new_val = ",".join(prefixed_parts)
+        if new_val != admin_keys_str:
+            os.environ["ADMIN_API_KEYS"] = new_val
+            logger.info(
+                "Applied RouteIQ key prefix to ADMIN_API_KEYS (prefix=%s)",
+                ROUTEIQ_KEY_PREFIX,
+            )
+
+    # --- ADMIN_API_KEY (legacy) ---
+    single_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if single_key:
+        prefixed = _ensure_prefix(single_key)
+        if prefixed != single_key:
+            os.environ["ADMIN_API_KEY"] = prefixed
+            logger.info(
+                "Applied RouteIQ key prefix to ADMIN_API_KEY (prefix=%s)",
+                ROUTEIQ_KEY_PREFIX,
+            )
+
+
+# Apply prefix on module load so that all downstream code sees the
+# canonical prefixed keys from the start.
+_apply_key_prefix_to_env()
+
 
 # Context variable to store request ID for the current request
 _request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
@@ -135,8 +220,14 @@ def _load_admin_api_keys() -> set[str]:
     """
     Load admin API keys from environment configuration.
 
+    For backwards compatibility, both the stored (prefixed) form and the
+    unprefixed form of each key are accepted.  For example, if the stored
+    key is ``sk-riq-abc123``, then both ``sk-riq-abc123`` **and**
+    ``abc123`` will be in the returned set.
+
     Returns:
-        Set of valid admin API keys. Empty set if none configured.
+        Set of valid admin API keys (includes prefixed and unprefixed
+        variants). Empty set if none configured.
 
     Configuration sources (in order of precedence):
     1. ADMIN_API_KEYS: Comma-separated list of keys
@@ -157,7 +248,14 @@ def _load_admin_api_keys() -> set[str]:
     if single_key:
         keys.add(single_key)
 
-    return keys
+    # For backwards compatibility, also accept the unprefixed variant of
+    # each key (and the prefixed variant of any unprefixed key).
+    expanded: set[str] = set()
+    for key in keys:
+        expanded.add(key)
+        expanded.add(_strip_prefix(key))
+        expanded.add(_ensure_prefix(key))
+    return expanded
 
 
 def _is_admin_auth_enabled() -> bool:

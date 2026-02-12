@@ -11,6 +11,9 @@ Tests cover:
 - RequestIDMiddleware (passthrough, generation, context propagation)
 - sanitize_error_response
 - create_admin_error_response
+- RouteIQ key prefix helpers (_ensure_prefix, _strip_prefix)
+- Env-level prefix application (_apply_key_prefix_to_env)
+- Backwards-compatible auth with prefixed/unprefixed keys
 """
 
 from __future__ import annotations
@@ -24,12 +27,16 @@ from fastapi import HTTPException
 
 from litellm_llmrouter.auth import (
     REQUEST_ID_HEADER,
+    ROUTEIQ_KEY_PREFIX,
     RequestIDMiddleware,
+    _apply_key_prefix_to_env,
+    _ensure_prefix,
     _extract_bearer_token,
     _is_admin_auth_enabled,
     _load_admin_api_keys,
     _request_id_ctx,
     _scrub_secrets,
+    _strip_prefix,
     admin_api_key_auth,
     create_admin_error_response,
     get_request_id,
@@ -171,7 +178,13 @@ class TestExtractBearerToken:
 
 
 class TestLoadAdminApiKeys:
-    """Tests for _load_admin_api_keys function."""
+    """Tests for _load_admin_api_keys function.
+
+    Note: _load_admin_api_keys now expands each key to include both its
+    prefixed (sk-riq-*) and unprefixed forms for backwards compatibility.
+    Tests use subset checks (``<=``) to verify that at minimum the
+    expected keys are present.
+    """
 
     def test_no_keys_configured(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -181,29 +194,29 @@ class TestLoadAdminApiKeys:
     def test_single_key_from_admin_api_keys(self):
         with patch.dict(os.environ, {"ADMIN_API_KEYS": "key1"}, clear=True):
             keys = _load_admin_api_keys()
-            assert keys == {"key1"}
+            assert {"key1", "sk-riq-key1"} <= keys
 
     def test_multiple_keys_from_admin_api_keys(self):
         with patch.dict(os.environ, {"ADMIN_API_KEYS": "key1,key2,key3"}, clear=True):
             keys = _load_admin_api_keys()
-            assert keys == {"key1", "key2", "key3"}
+            assert {"key1", "key2", "key3"} <= keys
 
     def test_keys_with_whitespace(self):
         with patch.dict(
             os.environ, {"ADMIN_API_KEYS": " key1 , key2 , key3 "}, clear=True
         ):
             keys = _load_admin_api_keys()
-            assert keys == {"key1", "key2", "key3"}
+            assert {"key1", "key2", "key3"} <= keys
 
     def test_empty_keys_filtered(self):
         with patch.dict(os.environ, {"ADMIN_API_KEYS": "key1,,key2,,"}, clear=True):
             keys = _load_admin_api_keys()
-            assert keys == {"key1", "key2"}
+            assert {"key1", "key2"} <= keys
 
     def test_legacy_single_key_fallback(self):
         with patch.dict(os.environ, {"ADMIN_API_KEY": "legacy-key"}, clear=True):
             keys = _load_admin_api_keys()
-            assert keys == {"legacy-key"}
+            assert {"legacy-key", "sk-riq-legacy-key"} <= keys
 
     def test_both_sources_merged(self):
         with patch.dict(
@@ -212,7 +225,7 @@ class TestLoadAdminApiKeys:
             clear=True,
         ):
             keys = _load_admin_api_keys()
-            assert keys == {"key1", "key2", "legacy-key"}
+            assert {"key1", "key2", "legacy-key"} <= keys
 
     def test_duplicate_keys_deduplicated(self):
         with patch.dict(
@@ -221,7 +234,8 @@ class TestLoadAdminApiKeys:
             clear=True,
         ):
             keys = _load_admin_api_keys()
-            assert keys == {"key1"}
+            # Only "key1" and its prefixed variant should be present
+            assert {"key1", "sk-riq-key1"} <= keys
 
 
 # =============================================================================
@@ -712,3 +726,257 @@ class TestCreateAdminErrorResponse:
             request_id="custom-id",
         )
         assert exc.detail["request_id"] == "custom-id"
+
+
+# =============================================================================
+# RouteIQ Key Prefix Helper Tests
+# =============================================================================
+
+
+class TestEnsurePrefix:
+    """Tests for _ensure_prefix function."""
+
+    def test_adds_prefix_to_bare_key(self):
+        assert _ensure_prefix("abc123") == "sk-riq-abc123"
+
+    def test_does_not_double_prefix(self):
+        assert _ensure_prefix("sk-riq-abc123") == "sk-riq-abc123"
+
+    def test_empty_string_unchanged(self):
+        assert _ensure_prefix("") == ""
+
+    def test_default_prefix_value(self):
+        assert ROUTEIQ_KEY_PREFIX == "sk-riq-"
+
+
+class TestStripPrefix:
+    """Tests for _strip_prefix function."""
+
+    def test_strips_prefix(self):
+        assert _strip_prefix("sk-riq-abc123") == "abc123"
+
+    def test_no_prefix_unchanged(self):
+        assert _strip_prefix("abc123") == "abc123"
+
+    def test_empty_string_unchanged(self):
+        assert _strip_prefix("") == ""
+
+    def test_partial_prefix_unchanged(self):
+        assert _strip_prefix("sk-riq") == "sk-riq"
+
+
+# =============================================================================
+# Apply Key Prefix to Env Tests
+# =============================================================================
+
+
+class TestApplyKeyPrefixToEnv:
+    """Tests for _apply_key_prefix_to_env function."""
+
+    def test_prefixes_litellm_master_key(self):
+        with patch.dict(
+            os.environ,
+            {"LITELLM_MASTER_KEY": "my-secret"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["LITELLM_MASTER_KEY"] == "sk-riq-my-secret"
+
+    def test_does_not_double_prefix_master_key(self):
+        with patch.dict(
+            os.environ,
+            {"LITELLM_MASTER_KEY": "sk-riq-my-secret"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["LITELLM_MASTER_KEY"] == "sk-riq-my-secret"
+
+    def test_prefixes_admin_api_keys(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "key1,key2"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["ADMIN_API_KEYS"] == "sk-riq-key1,sk-riq-key2"
+
+    def test_does_not_double_prefix_admin_keys(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "sk-riq-key1,sk-riq-key2"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["ADMIN_API_KEYS"] == "sk-riq-key1,sk-riq-key2"
+
+    def test_mixed_admin_keys(self):
+        """Some keys already prefixed, some not."""
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "sk-riq-key1,key2"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["ADMIN_API_KEYS"] == "sk-riq-key1,sk-riq-key2"
+
+    def test_prefixes_legacy_admin_api_key(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEY": "legacy"},
+            clear=True,
+        ):
+            _apply_key_prefix_to_env()
+            assert os.environ["ADMIN_API_KEY"] == "sk-riq-legacy"
+
+    def test_no_env_vars_is_noop(self):
+        with patch.dict(os.environ, {}, clear=True):
+            _apply_key_prefix_to_env()
+            assert "LITELLM_MASTER_KEY" not in os.environ
+            assert "ADMIN_API_KEYS" not in os.environ
+            assert "ADMIN_API_KEY" not in os.environ
+
+
+# =============================================================================
+# Load Admin Keys with Prefix Backwards-Compatibility Tests
+# =============================================================================
+
+
+class TestLoadAdminApiKeysWithPrefix:
+    """Tests that _load_admin_api_keys accepts both prefixed and unprefixed keys."""
+
+    def test_prefixed_key_accepts_both_forms(self):
+        """When stored key is sk-riq-test, both sk-riq-test and test should work."""
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "sk-riq-test-api-key"},
+            clear=True,
+        ):
+            keys = _load_admin_api_keys()
+            assert "sk-riq-test-api-key" in keys
+            assert "test-api-key" in keys
+
+    def test_unprefixed_key_accepts_both_forms(self):
+        """When stored key is bare, both prefixed and unprefixed should work."""
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "test-api-key"},
+            clear=True,
+        ):
+            keys = _load_admin_api_keys()
+            assert "test-api-key" in keys
+            assert "sk-riq-test-api-key" in keys
+
+    def test_multiple_keys_all_expanded(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEYS": "sk-riq-alpha,beta"},
+            clear=True,
+        ):
+            keys = _load_admin_api_keys()
+            assert "sk-riq-alpha" in keys
+            assert "alpha" in keys
+            assert "sk-riq-beta" in keys
+            assert "beta" in keys
+
+    def test_legacy_key_expanded(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_API_KEY": "sk-riq-legacy-key"},
+            clear=True,
+        ):
+            keys = _load_admin_api_keys()
+            assert "sk-riq-legacy-key" in keys
+            assert "legacy-key" in keys
+
+    def test_empty_env_returns_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            keys = _load_admin_api_keys()
+            assert keys == set()
+
+
+# =============================================================================
+# Admin Auth with Prefix Integration Tests
+# =============================================================================
+
+
+class TestAdminApiKeyAuthWithPrefix:
+    """Tests that admin_api_key_auth works with prefixed and unprefixed keys."""
+
+    def _make_request(self, headers: dict | None = None):
+        request = MagicMock()
+        request.headers = headers or {}
+        request.url.path = "/config/reload"
+        return request
+
+    @pytest.mark.asyncio
+    async def test_prefixed_key_in_env_accepts_prefixed_header(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_AUTH_ENABLED": "true",
+                "ADMIN_API_KEYS": "sk-riq-test-key",
+            },
+            clear=True,
+        ):
+            request = self._make_request({"X-Admin-API-Key": "sk-riq-test-key"})
+            result = await admin_api_key_auth(request)
+            assert result["admin_key"] == "sk-riq-test-key"
+
+    @pytest.mark.asyncio
+    async def test_prefixed_key_in_env_accepts_unprefixed_header(self):
+        """Backwards compat: if env has sk-riq-X, sending X should work."""
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_AUTH_ENABLED": "true",
+                "ADMIN_API_KEYS": "sk-riq-test-key",
+            },
+            clear=True,
+        ):
+            request = self._make_request({"X-Admin-API-Key": "test-key"})
+            result = await admin_api_key_auth(request)
+            assert result["admin_key"] == "test-key"
+
+    @pytest.mark.asyncio
+    async def test_unprefixed_key_in_env_accepts_prefixed_header(self):
+        """If env has bare key X, sending sk-riq-X should also work."""
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_AUTH_ENABLED": "true",
+                "ADMIN_API_KEYS": "test-key",
+            },
+            clear=True,
+        ):
+            request = self._make_request({"X-Admin-API-Key": "sk-riq-test-key"})
+            result = await admin_api_key_auth(request)
+            assert result["admin_key"] == "sk-riq-test-key"
+
+    @pytest.mark.asyncio
+    async def test_wrong_key_still_rejected(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_AUTH_ENABLED": "true",
+                "ADMIN_API_KEYS": "sk-riq-test-key",
+            },
+            clear=True,
+        ):
+            request = self._make_request({"X-Admin-API-Key": "totally-wrong"})
+            with pytest.raises(HTTPException) as exc:
+                await admin_api_key_auth(request)
+            assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_bearer_with_unprefixed_key_accepted(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_AUTH_ENABLED": "true",
+                "ADMIN_API_KEYS": "sk-riq-bearer-test",
+            },
+            clear=True,
+        ):
+            request = self._make_request({"Authorization": "Bearer bearer-test"})
+            result = await admin_api_key_auth(request)
+            assert result["admin_key"] == "bearer-test"

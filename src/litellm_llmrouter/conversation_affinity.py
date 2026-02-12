@@ -151,12 +151,24 @@ class ConversationAffinityTracker:
             self._redis_available = False
 
     async def _connect_redis(self) -> None:
-        """Attempt to connect to Redis."""
+        """Attempt to connect to Redis.
+
+        If an explicit ``redis_url`` was provided, it is used as-is via
+        ``from_url``.  Otherwise, falls back to ``build_redis_url()``
+        which constructs a URL from the shared REDIS_* env vars
+        (including REDIS_PASSWORD).
+        """
         try:
             import redis.asyncio as aioredis
 
+            url = self._redis_url
+            if url is None:
+                from litellm_llmrouter.redis_pool import build_redis_url
+
+                url = build_redis_url()
+
             self._redis = aioredis.from_url(
-                self._redis_url,
+                url,
                 decode_responses=True,
                 socket_connect_timeout=5.0,
             )

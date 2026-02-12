@@ -171,18 +171,10 @@ async def readiness_probe():
             }
             is_degraded = True
         else:
-            redis_port = int(os.getenv("REDIS_PORT", "6379"))
-            redis_ssl = os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes")
             try:
-                import redis.asyncio as aioredis
+                from ..redis_pool import create_async_redis_client
 
-                r = aioredis.Redis(
-                    host=redis_host,
-                    port=redis_port,
-                    ssl=redis_ssl,
-                    socket_connect_timeout=2.0,
-                    socket_timeout=2.0,
-                )
+                r = create_async_redis_client()
                 await asyncio.wait_for(r.ping(), timeout=2.0)
                 await r.aclose()
                 checks["redis"] = {"status": "healthy"}
@@ -197,9 +189,21 @@ async def readiness_probe():
                     "reason": "redis package not installed",
                 }
             except Exception as e:
-                await redis_breaker.record_failure(str(e))
-                # Sanitize: don't leak exception details in health check response
-                checks["redis"] = {"status": "unhealthy", "error": "connection failed"}
+                import redis.exceptions
+
+                if isinstance(e, redis.exceptions.AuthenticationError):
+                    await redis_breaker.record_failure("authentication_failed")
+                    checks["redis"] = {
+                        "status": "unhealthy",
+                        "error": "authentication_failed",
+                    }
+                else:
+                    await redis_breaker.record_failure(str(e))
+                    # Sanitize: don't leak exception details in health check
+                    checks["redis"] = {
+                        "status": "unhealthy",
+                        "error": "connection failed",
+                    }
                 is_ready = False
 
     # Check MCP gateway health if enabled

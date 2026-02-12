@@ -245,7 +245,6 @@ class MCPGateway:
             return
 
         redis_host = os.getenv("REDIS_HOST")
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
 
         if not redis_host:
             verbose_proxy_logger.debug("MCP: REDIS_HOST not set, HA sync disabled")
@@ -253,17 +252,12 @@ class MCPGateway:
             return
 
         try:
-            self._redis_client = redis.Redis(
-                host=redis_host,
-                port=redis_port,
-                decode_responses=True,
-                socket_timeout=5.0,
-            )
+            from .redis_pool import create_sync_redis_client
+
+            self._redis_client = create_sync_redis_client()
             # Test connection
             self._redis_client.ping()
-            verbose_proxy_logger.info(
-                f"MCP: Redis HA sync enabled ({redis_host}:{redis_port})"
-            )
+            verbose_proxy_logger.info(f"MCP: Redis HA sync enabled ({redis_host})")
 
             # Load existing servers from Redis
             self._load_servers_from_redis()

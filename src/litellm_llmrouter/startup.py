@@ -26,6 +26,7 @@ Docker Usage:
     python -m litellm_llmrouter.startup --config /app/config/config.yaml --port 4000
 """
 
+import asyncio as _asyncio
 import logging
 import os
 import signal
@@ -64,6 +65,44 @@ def register_router_decision_callback():
     except Exception as e:
         logger.warning(f"Failed to register router decision callback: {e}")
         return None
+
+
+def run_leader_migrations_if_enabled():
+    """Run DB migrations via leader election if ROUTEIQ_LEADER_MIGRATIONS=true.
+
+    Initialises leader election, checks leadership, and delegates to
+    :func:`litellm_llmrouter.migrations.run_migrations_if_leader`.
+    This is a no-op when the feature is disabled.
+    """
+    if os.getenv("ROUTEIQ_LEADER_MIGRATIONS", "false").lower() not in (
+        "true",
+        "1",
+        "yes",
+    ):
+        return
+
+    try:
+        from litellm_llmrouter.leader_election import initialize_leader_election
+        from litellm_llmrouter.migrations import run_migrations_if_leader
+
+        async def _do_migrations():
+            election = await initialize_leader_election()
+            is_leader = election.is_leader if election else True
+            success = await run_migrations_if_leader(is_leader)
+            if success:
+                print("✅ Leader migrations completed")
+            else:
+                print("⚠️ Leader migrations failed (continuing startup)")
+
+        try:
+            _asyncio.get_event_loop().run_until_complete(_do_migrations())
+        except RuntimeError:
+            _asyncio.run(_do_migrations())
+    except ImportError as e:
+        logger.debug(f"Could not run leader migrations: {e}")
+    except Exception as e:
+        logger.warning(f"Leader migrations failed: {e}")
+        print(f"⚠️ Leader migrations failed: {e}")
 
 
 def register_strategies():
@@ -413,6 +452,9 @@ Examples:
 
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()
+
+    # Run leader-election-based migrations if opted in
+    run_leader_migrations_if_enabled()
 
     # Register router decision callback for TG4.1 telemetry
     register_router_decision_callback()

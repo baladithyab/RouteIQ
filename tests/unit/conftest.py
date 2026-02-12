@@ -50,3 +50,7 @@ def _reset_observability_singleton():
     reset_config_sync_manager()
     reset_hot_reload_manager()
     reset_gateway_metrics()
+
+    from litellm_llmrouter.migrations import reset_migration_state
+
+    reset_migration_state()

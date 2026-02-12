@@ -396,14 +396,13 @@ class QuotaRepository:
         if self._redis is None:
             async with self._lock:
                 if self._redis is None:
-                    import redis.asyncio as aioredis
+                    from litellm_llmrouter.redis_pool import (
+                        create_async_redis_client,
+                    )
 
-                    self._redis = aioredis.Redis(
+                    self._redis = create_async_redis_client(
                         host=self.redis_host,
                         port=self.redis_port,
-                        decode_responses=True,
-                        socket_connect_timeout=2.0,
-                        socket_timeout=2.0,
                     )
                     # Register Lua scripts
                     self._check_incr_script = self._redis.register_script(

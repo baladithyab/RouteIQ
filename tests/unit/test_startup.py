@@ -357,6 +357,11 @@ class TestMain:
             ),
             patch.object(
                 startup,
+                "run_leader_migrations_if_enabled",
+                side_effect=track("leader_migrations"),
+            ),
+            patch.object(
+                startup,
                 "register_router_decision_callback",
                 side_effect=track("router_callback"),
             ),
@@ -393,6 +398,7 @@ class TestMain:
         call_order, _ = self._run_main_with_patches(["startup"])
         assert call_order == [
             "observability",
+            "leader_migrations",
             "router_callback",
             "mcp_tracing",
             "strategies",
