@@ -56,6 +56,47 @@ def diff_model_configs(
     return ConfigDiffResult(added=added, removed=removed, changed=changed)
 
 
+@dataclasses.dataclass
+class ConfigSyncStatus:
+    """Status of the config sync system."""
+
+    config_source: str | None
+    sync_enabled: bool
+    sync_interval_seconds: int
+    last_sync_attempt: str | None
+    last_sync_success: str | None
+    last_sync_error: str | None
+    config_version_hash: str | None
+    model_count: int
+    next_sync_at: str | None
+
+
+def get_config_sync_status() -> ConfigSyncStatus:
+    """Get current config sync status."""
+    manager = get_sync_manager()
+    source = None
+    if manager.s3_sync_enabled:
+        source = f"s3://{manager.s3_bucket}/{manager.s3_key}"
+    elif manager.gcs_sync_enabled:
+        source = f"gs://{manager.gcs_bucket}/{manager.gcs_key}"
+
+    config_hash = None
+    if manager._last_config_hash:
+        config_hash = f"sha256:{manager._last_config_hash[:16]}"
+
+    return ConfigSyncStatus(
+        config_source=source,
+        sync_enabled=manager.sync_enabled,
+        sync_interval_seconds=manager.sync_interval,
+        last_sync_attempt=None,
+        last_sync_success=None,
+        last_sync_error=None,
+        config_version_hash=config_hash,
+        model_count=len(getattr(manager, "_current_model_configs", [])),
+        next_sync_at=None,
+    )
+
+
 class ConfigSyncManager:
     """Manages config synchronization from S3/GCS with hot reload support.
 

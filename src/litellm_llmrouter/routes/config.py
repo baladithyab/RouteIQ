@@ -9,13 +9,15 @@ Hot Reload and Config Sync Endpoints.
 
 from fastapi import Depends, HTTPException
 
+import dataclasses
+
 from ..auth import get_request_id, sanitize_error_response
 from ..rbac import requires_permission, PERMISSION_SYSTEM_CONFIG_RELOAD
 from ..audit import audit_log, AuditAction, AuditOutcome, AuditWriteError
 from ..hot_reload import get_hot_reload_manager
-from ..config_sync import get_sync_manager
+from ..config_sync import get_sync_manager, get_config_sync_status
 from .models import ReloadRequest
-from . import admin_router, llmrouter_router
+from . import admin_router, llmrouter_router, health_router
 
 
 async def _handle_audit_write(
@@ -222,3 +224,15 @@ async def get_router_info():
     """Get information about the current routing configuration."""
     manager = get_hot_reload_manager()
     return manager.get_router_info()
+
+
+# =============================================================================
+# Config Status (unauthenticated, like health probes)
+# =============================================================================
+
+
+@health_router.get("/config/status")
+async def config_status():
+    """Config sync status. Unauthenticated (same as health probes)."""
+    status = get_config_sync_status()
+    return dataclasses.asdict(status)
