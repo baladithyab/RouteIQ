@@ -10,14 +10,50 @@ to ensure only one replica performs the sync at a time, avoiding
 thundering herd problems and conflicting updates.
 """
 
+import dataclasses
 import hashlib
 import os
 import signal
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from litellm._logging import verbose_proxy_logger
+
+
+@dataclasses.dataclass
+class ConfigDiffResult:
+    """Result of diffing two model config lists."""
+
+    added: list[dict[str, Any]]
+    removed: list[dict[str, Any]]
+    changed: list[dict[str, Any]]
+
+
+def diff_model_configs(
+    old_models: list[dict[str, Any]],
+    new_models: list[dict[str, Any]],
+) -> ConfigDiffResult:
+    """Diff two model config lists by model_name.
+
+    Models are matched by model_name. A model is "changed" if its
+    serialized dict differs but the name is the same.
+    """
+    old_by_name = {m.get("model_name"): m for m in old_models}
+    new_by_name = {m.get("model_name"): m for m in new_models}
+
+    old_names = set(old_by_name.keys())
+    new_names = set(new_by_name.keys())
+
+    added = [new_by_name[n] for n in sorted(new_names - old_names)]
+    removed = [old_by_name[n] for n in sorted(old_names - new_names)]
+    changed = [
+        new_by_name[n]
+        for n in sorted(old_names & new_names)
+        if old_by_name[n] != new_by_name[n]
+    ]
+
+    return ConfigDiffResult(added=added, removed=removed, changed=changed)
 
 
 class ConfigSyncManager:
