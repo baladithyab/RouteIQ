@@ -53,13 +53,31 @@ if [ -n "$DATABASE_URL" ]; then
 
         # Only run migrations if explicitly enabled
         if [ "${LITELLM_RUN_DB_MIGRATIONS:-false}" = "true" ]; then
-            echo "   ⚠️  LITELLM_RUN_DB_MIGRATIONS=true - running migrations (use with caution in HA!)"
-            # Use 'prisma db push' to sync schema directly (creates tables if missing,
-            # adds columns for schema changes). LiteLLM doesn't ship migration files,
-            # so 'prisma migrate deploy' exits 0 with "no pending migrations" and
-            # never creates tables — making the fallback unreachable.
-            prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1 || \
-                echo "   Warning: prisma db push failed, continuing..."
+            if [ "${DB_MIGRATION_SKIP:-false}" = "true" ]; then
+                echo "   ℹ️  DB_MIGRATION_SKIP=true - skipping migrations (replica mode)"
+            else
+                echo "   ⚠️  LITELLM_RUN_DB_MIGRATIONS=true - running migrations (use with caution in HA!)"
+
+                MAX_RETRIES=${DB_MIGRATION_MAX_RETRIES:-10}
+                RETRY_DELAY=${DB_MIGRATION_RETRY_DELAY:-5}
+                MIGRATION_SUCCESS=false
+
+                for i in $(seq 1 $MAX_RETRIES); do
+                    echo "   Attempting database migration (attempt $i/$MAX_RETRIES)..."
+                    if prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1; then
+                        echo "   ✅ Database migration successful."
+                        MIGRATION_SUCCESS=true
+                        break
+                    fi
+                    if [ "$i" -eq "$MAX_RETRIES" ]; then
+                        echo "   ❌ Database migration failed after $MAX_RETRIES attempts."
+                        exit 1
+                    fi
+                    SLEEP_TIME=$((RETRY_DELAY * i))
+                    echo "   Migration failed. Retrying in ${SLEEP_TIME}s..."
+                    sleep $SLEEP_TIME
+                done
+            fi
         else
             echo "   ℹ️  Skipping migrations (LITELLM_RUN_DB_MIGRATIONS not set)"
             echo "      For HA deployments, run migrations via a separate init job or leader election"
