@@ -29,6 +29,7 @@ Usage standalone (without LiteLLM):
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -47,6 +48,17 @@ from ..http_client_pool import (
 from ..policy_engine import add_policy_middleware
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_cors_origins() -> list[str]:
+    """Parse ROUTEIQ_CORS_ORIGINS into a list of allowed origins."""
+    raw = os.getenv("ROUTEIQ_CORS_ORIGINS", "*")
+    return [o.strip() for o in raw.split(",")]
+
+
+def _parse_cors_credentials() -> bool:
+    """Parse ROUTEIQ_CORS_CREDENTIALS flag."""
+    return os.getenv("ROUTEIQ_CORS_CREDENTIALS", "false").lower() == "true"
 
 
 def _apply_patch_safely() -> bool:
@@ -84,9 +96,21 @@ def _configure_middleware(app: FastAPI) -> None:
     Args:
         app: The FastAPI application instance
     """
+    from starlette.middleware.cors import CORSMiddleware
+
     from ..auth import RequestIDMiddleware
     from ..router_decision_callback import register_router_decision_middleware
     from .plugin_middleware import PluginMiddleware
+
+    # CORS middleware - configurable via ROUTEIQ_CORS_ORIGINS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_parse_cors_origins(),
+        allow_credentials=_parse_cors_credentials(),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.debug("Added CORSMiddleware")
 
     # Request ID middleware - raw ASGI (streaming-safe, outermost for correlation)
     # Starlette's add_middleware works with any class accepting (app, **kwargs) --
