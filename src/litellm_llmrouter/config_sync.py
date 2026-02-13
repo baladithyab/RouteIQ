@@ -100,6 +100,9 @@ class ConfigSyncManager:
         )
         self.sync_enabled = os.getenv("CONFIG_SYNC_ENABLED", "true").lower() == "true"
 
+        # Incremental reload tracking
+        self._current_model_configs: list[dict[str, Any]] = []
+
         # Leader election (optional, for HA deployments)
         self._leader_election = None
         self._leader_election_enabled = False
@@ -384,6 +387,16 @@ class ConfigSyncManager:
             status["leader_election"].update(self._leader_election.get_status())
 
         return status
+
+    def _compute_reload_plan(
+        self, new_model_configs: list[dict[str, Any]]
+    ) -> ConfigDiffResult:
+        """Compute what needs to change for an incremental reload.
+
+        Does not mutate _current_model_configs. The caller is responsible
+        for updating it after a successful reload.
+        """
+        return diff_model_configs(self._current_model_configs, new_model_configs)
 
 
 # Singleton instance
