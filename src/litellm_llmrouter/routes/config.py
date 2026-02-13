@@ -226,6 +226,19 @@ async def get_router_info():
     return manager.get_router_info()
 
 
+# Read-only - user auth
+@llmrouter_router.get("/llmrouter/strategies/compare")
+async def compare_strategies():
+    """Compare active routing strategies.
+
+    Returns all registered strategies with their state, version,
+    and the current A/B testing configuration.
+    """
+    from ..strategy_registry import get_strategy_comparison
+
+    return get_strategy_comparison()
+
+
 # =============================================================================
 # Config Status (unauthenticated, like health probes)
 # =============================================================================

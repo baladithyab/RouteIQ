@@ -1414,3 +1414,40 @@ def reset_routing_singletons() -> None:
     with _instance_lock:
         _registry_instance = None
         _pipeline_instance = None
+
+
+def get_strategy_comparison() -> Dict[str, Any]:
+    """Get comparison data for active routing strategies.
+
+    Returns a summary of all registered strategies, their state,
+    version information, and the current A/B testing configuration.
+
+    Returns:
+        Dict containing strategies list, total count, and active/AB info.
+    """
+    registry = get_routing_registry()
+    strategies: List[Dict[str, Any]] = []
+
+    for name in registry.list_strategies():
+        entry = registry.get_entry(name)
+        if entry is not None:
+            strategies.append(
+                {
+                    "name": name,
+                    "family": entry.family,
+                    "version": entry.get_version_string(),
+                    "state": entry.state.value,
+                    "active": entry.state == StrategyState.ACTIVE,
+                    "registered_at": entry.registered_at,
+                }
+            )
+
+    status = registry.get_status()
+
+    return {
+        "strategies": strategies,
+        "total": len(strategies),
+        "active_strategy": status.get("active_strategy"),
+        "ab_enabled": status.get("ab_enabled", False),
+        "ab_weights": status.get("ab_weights", {}),
+    }
