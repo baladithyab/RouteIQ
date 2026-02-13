@@ -59,9 +59,13 @@ if [ -n "$DATABASE_URL" ]; then
                 echo "   ⚠️  LITELLM_RUN_DB_MIGRATIONS=true - running migrations (use with caution in HA!)"
 
                 MAX_RETRIES=${DB_MIGRATION_MAX_RETRIES:-10}
-                RETRY_DELAY=${DB_MIGRATION_RETRY_DELAY:-5}
+                BASE_DELAY=${DB_MIGRATION_RETRY_DELAY:-2}
+                MAX_DELAY=${DB_MIGRATION_MAX_DELAY:-30}
                 MIGRATION_SUCCESS=false
 
+                # Exponential backoff with cap: 2, 4, 8, 16, 30, 30, ...
+                # Optimized for serverless databases (Aurora Serverless v2)
+                # that may need 15-30s to scale from zero.
                 for i in $(seq 1 $MAX_RETRIES); do
                     echo "   Attempting database migration (attempt $i/$MAX_RETRIES)..."
                     if prisma db push --schema="$SCHEMA_PATH" --accept-data-loss 2>&1; then
@@ -73,7 +77,11 @@ if [ -n "$DATABASE_URL" ]; then
                         echo "   ❌ Database migration failed after $MAX_RETRIES attempts."
                         exit 1
                     fi
-                    SLEEP_TIME=$((RETRY_DELAY * i))
+                    # Exponential backoff: base * 2^(attempt-1), capped at MAX_DELAY
+                    SLEEP_TIME=$((BASE_DELAY * (1 << (i - 1))))
+                    if [ "$SLEEP_TIME" -gt "$MAX_DELAY" ]; then
+                        SLEEP_TIME=$MAX_DELAY
+                    fi
                     echo "   Migration failed. Retrying in ${SLEEP_TIME}s..."
                     sleep $SLEEP_TIME
                 done
