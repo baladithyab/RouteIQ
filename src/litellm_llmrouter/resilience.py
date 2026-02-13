@@ -1000,6 +1000,35 @@ def reset_circuit_breaker_manager() -> None:
     _circuit_breaker_manager = None
 
 
+def compute_model_health_summary(
+    breakers: dict[str, Any],
+) -> dict[str, int]:
+    """Compute model health summary from circuit breaker states.
+
+    Maps circuit breaker states to health categories:
+    - closed -> healthy
+    - half_open -> degraded
+    - open -> unhealthy
+    """
+    healthy = degraded = unhealthy = 0
+    for breaker in breakers.values():
+        raw_state = getattr(breaker, "state", "closed")
+        # Handle both enum (CircuitBreakerState) and plain string states
+        state = raw_state.value if hasattr(raw_state, "value") else raw_state
+        if state == "closed":
+            healthy += 1
+        elif state == "half_open":
+            degraded += 1
+        else:
+            unhealthy += 1
+    return {
+        "healthy": healthy,
+        "degraded": degraded,
+        "unhealthy": unhealthy,
+        "total": healthy + degraded + unhealthy,
+    }
+
+
 # =============================================================================
 # Per-Provider Circuit Breaker Support
 # =============================================================================

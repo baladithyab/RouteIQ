@@ -14,7 +14,11 @@ from fastapi import HTTPException
 
 from ..auth import get_request_id, sanitize_error_response  # noqa: F401
 from ..mcp_gateway import get_mcp_gateway
-from ..resilience import get_drain_manager, get_circuit_breaker_manager
+from ..resilience import (
+    get_drain_manager,
+    get_circuit_breaker_manager,
+    compute_model_health_summary,
+)
 from . import health_router
 
 
@@ -223,6 +227,9 @@ async def readiness_probe():
             # MCP gateway failure is non-fatal for readiness
             # is_ready = False
 
+    # Model health summary from circuit breakers
+    model_summary = compute_model_health_summary(cb_manager._breakers)
+
     # Determine overall status
     if is_degraded and is_ready:
         status = "degraded"
@@ -236,6 +243,7 @@ async def readiness_probe():
         "service": "litellm-llmrouter",
         "is_degraded": is_degraded,
         "checks": checks,
+        "models": model_summary,
         "request_id": request_id,
     }
 
@@ -243,6 +251,29 @@ async def readiness_probe():
         raise HTTPException(status_code=503, detail=response)
 
     return response
+
+
+@health_router.get("/_health/models")
+async def model_health():
+    """Per-model health detail. Unauthenticated."""
+    cb_manager = get_circuit_breaker_manager()
+    models = []
+    for name, breaker in cb_manager._breakers.items():
+        state_value = (
+            breaker.state.value if hasattr(breaker.state, "value") else breaker.state
+        )
+        models.append(
+            {
+                "model_id": name,
+                "status": (
+                    "healthy"
+                    if state_value == "closed"
+                    else ("degraded" if state_value == "half_open" else "unhealthy")
+                ),
+                "circuit_breaker": state_value,
+            }
+        )
+    return {"models": models}
 
 
 # =============================================================================
