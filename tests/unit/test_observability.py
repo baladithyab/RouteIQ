@@ -767,3 +767,31 @@ class TestObservabilityManagerSampler:
         with patch.dict(os.environ, {}, clear=True):
             manager = ObservabilityManager()
             assert isinstance(manager.sampler, ParentBased)
+
+
+# Import the get_routeiq_resource_attributes function
+get_routeiq_resource_attributes = observability.get_routeiq_resource_attributes
+
+
+def test_custom_metrics_namespace(monkeypatch):
+    """ROUTEIQ_METRICS_NAMESPACE configures OTel resource."""
+    monkeypatch.setenv("ROUTEIQ_METRICS_NAMESPACE", "RouteIQ/prod")
+    monkeypatch.setenv("ROUTEIQ_SERVICE_NAME", "routeiq-prod")
+    monkeypatch.setenv("ROUTEIQ_DEPLOYMENT_ENV", "production")
+
+    attrs = get_routeiq_resource_attributes()
+    assert attrs["service.name"] == "routeiq-prod"
+    assert attrs["deployment.environment"] == "production"
+    assert attrs["routeiq.metrics.namespace"] == "RouteIQ/prod"
+
+
+def test_default_metrics_namespace(monkeypatch):
+    """Defaults work when env vars are not set."""
+    monkeypatch.delenv("ROUTEIQ_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("ROUTEIQ_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.delenv("ROUTEIQ_METRICS_NAMESPACE", raising=False)
+
+    attrs = get_routeiq_resource_attributes()
+    assert attrs["service.name"] == "routeiq"
+    assert attrs["deployment.environment"] == "default"
+    assert attrs["routeiq.metrics.namespace"] == "RouteIQ"

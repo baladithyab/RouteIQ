@@ -422,6 +422,15 @@ def _build_sampler_from_type(
         return ParentBased(root=TraceIdRatioBased(0.1))
 
 
+def get_routeiq_resource_attributes() -> dict[str, str]:
+    """Return OTel resource attributes from RouteIQ env vars."""
+    return {
+        "service.name": os.getenv("ROUTEIQ_SERVICE_NAME", "routeiq"),
+        "deployment.environment": os.getenv("ROUTEIQ_DEPLOYMENT_ENV", "default"),
+        "routeiq.metrics.namespace": os.getenv("ROUTEIQ_METRICS_NAMESPACE", "RouteIQ"),
+    }
+
+
 class ObservabilityManager:
     """
     Manages OpenTelemetry observability for the LiteLLM + LLMRouter Gateway.
