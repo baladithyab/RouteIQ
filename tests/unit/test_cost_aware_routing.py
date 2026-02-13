@@ -1489,3 +1489,108 @@ class TestVersionUpdate:
         strategy = CostAwareRoutingStrategy()
         assert strategy._cost_db == {}
         assert strategy._last_cost_refresh == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test: OTel cost histogram metric emission
+# ---------------------------------------------------------------------------
+
+
+class TestCostHistogramMetric:
+    """Test OTel cost-per-1K-tokens histogram emission."""
+
+    def test_cost_histogram_creation(self):
+        """Cost histogram can be created without error."""
+        from litellm_llmrouter.strategies import _get_cost_histogram
+
+        # Should not raise, may return None if OTel not configured
+        result = _get_cost_histogram()
+        # Just verify it doesn't crash; in test env with OTel it returns a histogram
+        assert result is None or hasattr(result, "record")
+
+    def test_cost_histogram_singleton(self):
+        """Cost histogram is a singleton (returns same instance)."""
+        from litellm_llmrouter.strategies import _get_cost_histogram
+
+        h1 = _get_cost_histogram()
+        h2 = _get_cost_histogram()
+        # Both calls return the same object (or both None)
+        assert h1 is h2
+
+    @patch("litellm.model_cost", MOCK_MODEL_COST)
+    def test_select_deployment_emits_metric(self):
+        """select_deployment emits the cost histogram metric."""
+        strategy = CostAwareRoutingStrategy(
+            quality_threshold=0.0,
+            cost_weight=1.0,  # Pure cost
+        )
+
+        deployments = [
+            _make_deployment("gpt-4"),
+            _make_deployment("gpt-3.5-turbo"),
+        ]
+        context = _make_context(deployments)
+
+        mock_histogram = MagicMock()
+
+        with patch(
+            "litellm_llmrouter.strategies._get_cost_histogram",
+            return_value=mock_histogram,
+        ):
+            result = strategy.select_deployment(context)
+
+        assert result is not None
+        assert result["litellm_params"]["model"] == "gpt-3.5-turbo"
+
+        # Verify histogram.record was called with cost and model attributes
+        mock_histogram.record.assert_called_once()
+        call_args = mock_histogram.record.call_args
+        cost_value = call_args[0][0]
+        attributes = call_args[0][1]
+
+        assert cost_value > 0  # Some positive cost
+        assert attributes["model"] == "gpt-3.5-turbo"
+        assert attributes["strategy"] == "cost-aware"
+
+    @patch("litellm.model_cost", MOCK_MODEL_COST)
+    def test_no_metric_for_single_candidate(self):
+        """Single candidate skips the scoring loop (early return)."""
+        strategy = CostAwareRoutingStrategy(quality_threshold=0.0)
+
+        deployments = [_make_deployment("gpt-4")]
+        context = _make_context(deployments)
+
+        mock_histogram = MagicMock()
+
+        with patch(
+            "litellm_llmrouter.strategies._get_cost_histogram",
+            return_value=mock_histogram,
+        ):
+            result = strategy.select_deployment(context)
+
+        assert result is not None
+        # Single candidate returns early before the scoring loop
+        mock_histogram.record.assert_not_called()
+
+    @patch("litellm.model_cost", MOCK_MODEL_COST)
+    def test_no_metric_when_histogram_none(self):
+        """No crash when histogram returns None."""
+        strategy = CostAwareRoutingStrategy(
+            quality_threshold=0.0,
+            cost_weight=1.0,
+        )
+
+        deployments = [
+            _make_deployment("gpt-4"),
+            _make_deployment("gpt-3.5-turbo"),
+        ]
+        context = _make_context(deployments)
+
+        with patch(
+            "litellm_llmrouter.strategies._get_cost_histogram",
+            return_value=None,
+        ):
+            result = strategy.select_deployment(context)
+
+        # Should not crash
+        assert result is not None

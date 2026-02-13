@@ -58,6 +58,33 @@ try:
 except ImportError:
     OTEL_AVAILABLE = False
 
+# Cost metric for cost-aware routing (lazy-initialized)
+_cost_meter = None
+_cost_histogram = None
+
+
+def _get_cost_histogram():
+    """Get or create the cost-per-1K-tokens histogram for cost-aware routing.
+
+    Lazy-initializes the OpenTelemetry meter and histogram on first call.
+    Returns None if OpenTelemetry metrics are not available.
+    """
+    global _cost_meter, _cost_histogram
+    if _cost_histogram is None:
+        try:
+            from opentelemetry import metrics
+
+            _cost_meter = metrics.get_meter("routeiq.routing")
+            _cost_histogram = _cost_meter.create_histogram(
+                "routeiq.routing.cost_per_1k_tokens",
+                unit="USD",
+                description="Cost per 1K tokens for the selected model",
+            )
+        except Exception:
+            pass
+    return _cost_histogram
+
+
 # Lazy import for sentence-transformers to avoid startup cost if not needed
 _sentence_transformer_model = None
 _sentence_transformer_lock = threading.Lock()
@@ -1485,6 +1512,7 @@ class CostAwareRoutingStrategy(RoutingStrategy):
 
         best_deployment = None
         best_score = -1.0
+        best_cost_per_1k: Optional[float] = None
 
         for dep, cost, qual in pareto_scored:
             normalized_cost = (cost - min_cost) / cost_range if cost_range > 0 else 0.0
@@ -1492,6 +1520,19 @@ class CostAwareRoutingStrategy(RoutingStrategy):
             if combined > best_score:
                 best_score = combined
                 best_deployment = dep
+                best_cost_per_1k = cost
+
+        # Emit cost-per-1K-tokens metric for observability
+        if best_deployment is not None and best_cost_per_1k is not None:
+            histogram = _get_cost_histogram()
+            if histogram and best_cost_per_1k != float("inf"):
+                selected_model = best_deployment.get("litellm_params", {}).get(
+                    "model", "unknown"
+                )
+                histogram.record(
+                    best_cost_per_1k,
+                    {"model": selected_model, "strategy": "cost-aware"},
+                )
 
         return best_deployment
 
