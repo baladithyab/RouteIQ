@@ -189,11 +189,11 @@ services:
     environment:
       # Core settings
       - LITELLM_CONFIG_PATH=/app/config/config.local-test.yaml
-      - LITELLM_MASTER_KEY=local-dev-master-key
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-routeiq-local-dev-test}
       # Admin API key for control-plane authentication (MCP, A2A, hot-reload management)
       # Using the same key as master for simplicity in local testing
       - ADMIN_API_KEY=local-dev-admin-key
-      - ADMIN_API_KEYS=local-dev-admin-key,local-dev-master-key
+      - ADMIN_API_KEYS=local-dev-admin-key,${LITELLM_MASTER_KEY:-sk-routeiq-local-dev-test}
       # Database (prisma db push done separately; prisma migrate deploy hangs in Finch)
       - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
       # - LITELLM_RUN_DB_MIGRATIONS=true  # Not needed - tables created via prisma db push
