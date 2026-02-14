@@ -55,6 +55,18 @@ PERMISSION_MCP_TOOL_CALL = "mcp.tool.call"
 PERMISSION_SYSTEM_CONFIG_RELOAD = "system.config.reload"
 PERMISSION_A2A_AGENT_WRITE = "a2a.agent.write"
 
+# Management permissions (v0.2.0)
+PERMISSION_KEY_WRITE = "key.write"
+PERMISSION_KEY_READ = "key.read"
+PERMISSION_TEAM_WRITE = "team.write"
+PERMISSION_TEAM_READ = "team.read"
+PERMISSION_MODEL_WRITE = "model.write"
+PERMISSION_MODEL_READ = "model.read"
+PERMISSION_SPEND_READ = "spend.read"
+PERMISSION_SPEND_WRITE = "spend.write"
+PERMISSION_BUDGET_WRITE = "budget.write"
+PERMISSION_BUDGET_READ = "budget.read"
+
 # All known permissions (used for validation/documentation)
 ALL_PERMISSIONS = frozenset(
     {
@@ -63,6 +75,16 @@ ALL_PERMISSIONS = frozenset(
         PERMISSION_MCP_TOOL_CALL,
         PERMISSION_SYSTEM_CONFIG_RELOAD,
         PERMISSION_A2A_AGENT_WRITE,
+        PERMISSION_KEY_WRITE,
+        PERMISSION_KEY_READ,
+        PERMISSION_TEAM_WRITE,
+        PERMISSION_TEAM_READ,
+        PERMISSION_MODEL_WRITE,
+        PERMISSION_MODEL_READ,
+        PERMISSION_SPEND_READ,
+        PERMISSION_SPEND_WRITE,
+        PERMISSION_BUDGET_WRITE,
+        PERMISSION_BUDGET_READ,
     }
 )
 

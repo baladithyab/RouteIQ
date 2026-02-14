@@ -88,6 +88,20 @@ ROUTER_FALLBACK_TRIGGERED_ATTR = "router.fallback_triggered"
 """Whether fallback to another model was triggered."""
 
 
+# ==============================================================================
+# v0.2.0: Management Operation Span Attributes
+# ==============================================================================
+
+MGMT_OPERATION_ATTR = "routeiq.management.operation"
+"""Classified management operation name (e.g., 'key.generate')."""
+
+MGMT_RESOURCE_TYPE_ATTR = "routeiq.management.resource_type"
+"""Resource category (e.g., 'key', 'team', 'model')."""
+
+MGMT_SENSITIVITY_ATTR = "routeiq.management.sensitivity"
+"""Operation sensitivity level ('read' or 'write')."""
+
+
 def set_router_decision_attributes(
     span: trace.Span,
     *,

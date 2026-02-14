@@ -143,7 +143,29 @@ class RouterDecisionMiddleware:
                 fallback_triggered=False,
             )
 
+            # GenAI semantic convention attributes
             span.set_attribute("gen_ai.operation.name", operation_name)
+
+            # Try to resolve the system (provider) from the router config
+            try:
+                from litellm.proxy.proxy_server import llm_router
+
+                if llm_router is not None:
+                    model_list = getattr(llm_router, "model_list", []) or []
+                    if model_list:
+                        first_model = model_list[0]
+                        litellm_model = first_model.get("litellm_params", {}).get(
+                            "model", ""
+                        )
+                        provider = first_model.get("litellm_params", {}).get(
+                            "custom_llm_provider", ""
+                        )
+                        if not provider and "/" in litellm_model:
+                            provider = litellm_model.split("/")[0]
+                        if provider:
+                            span.set_attribute("gen_ai.system", provider)
+            except Exception:
+                pass
 
         except Exception as e:
             logger.debug(f"Failed to emit router telemetry in middleware: {e}")

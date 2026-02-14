@@ -124,6 +124,12 @@ def _configure_middleware(app: FastAPI) -> None:
     if add_policy_middleware(app):
         logger.info("Added PolicyMiddleware (policy enforcement enabled)")
 
+    # Management middleware - classifies LiteLLM management endpoints and layers
+    # RBAC, audit, OTel attributes, and plugin hooks on top
+    from ..management_middleware import add_management_middleware
+
+    add_management_middleware(app)
+
     # Plugin middleware - hooks for on_request/on_response
     # Starlette creates the instance lazily; __init__ self-registers
     # as the module singleton so plugin startup can call set_plugins().

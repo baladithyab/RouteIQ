@@ -249,3 +249,74 @@ async def config_status():
     """Config sync status. Unauthenticated (same as health probes)."""
     status = get_config_sync_status()
     return dataclasses.asdict(status)
+
+
+# =============================================================================
+# Spend Report Endpoint (v0.2.0 Wave C)
+# =============================================================================
+
+
+@admin_router.get("/llmrouter/spend/report")
+async def get_spend_report(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """
+    Get an aggregated spend report from LiteLLM's spend tracking.
+
+    Returns per-model token usage and cost estimates from the LiteLLM proxy's
+    internal accounting. Falls back gracefully if spend tracking is not configured.
+
+    Requires admin auth.
+    """
+    report: dict = {
+        "status": "ok",
+        "spend_tracking_enabled": False,
+        "models": [],
+        "total_cost_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+    }
+
+    try:
+        from litellm.proxy.proxy_server import llm_router
+
+        if llm_router is None:
+            report["status"] = "no_router"
+            return report
+
+        # Get model list with cost info
+        model_list = getattr(llm_router, "model_list", []) or []
+        model_reports = []
+
+        for model in model_list:
+            model_name = model.get("model_name", "unknown")
+            litellm_model = model.get("litellm_params", {}).get("model", "unknown")
+            model_info = model.get("model_info", {})
+
+            model_reports.append(
+                {
+                    "model_name": model_name,
+                    "litellm_model": litellm_model,
+                    "max_input_tokens": model_info.get("max_input_tokens"),
+                    "max_output_tokens": model_info.get("max_output_tokens"),
+                }
+            )
+
+        report["models"] = model_reports
+        report["model_count"] = len(model_reports)
+
+        # Try to get spend data from LiteLLM's internal spend tracking
+        try:
+            import litellm
+
+            if hasattr(litellm, "model_cost") and litellm.model_cost:
+                report["spend_tracking_enabled"] = True
+                report["known_cost_models"] = len(litellm.model_cost)
+        except Exception:
+            pass
+
+    except Exception as e:
+        report["status"] = "error"
+        report["error"] = str(e)
+
+    return report

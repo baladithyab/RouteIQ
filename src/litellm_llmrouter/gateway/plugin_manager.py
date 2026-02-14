@@ -71,6 +71,15 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from .plugin_middleware import PluginRequest, PluginResponse, ResponseMetadata
+    from .plugin_protocols import (
+        MCPGatewayAccessor,
+        A2AGatewayAccessor,
+        ConfigSyncAccessor,
+        RoutingAccessor,
+        ResilienceAccessor,
+        ModelsAccessor,
+        MetricsAccessor,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +184,10 @@ class PluginContext:
 
     Provides controlled access to gateway resources without
     exposing raw internals.
+
+    The original 3 fields (settings, logger, validate_outbound_url) remain
+    for backwards compatibility. Seven new subsystem accessor fields are
+    added, all defaulting to ``None`` so existing plugins are unaffected.
     """
 
     settings: dict[str, Any] = field(default_factory=dict)
@@ -189,6 +202,31 @@ class PluginContext:
     Plugins making outbound HTTP requests SHOULD use this.
     Raises SSRFBlockedError if URL is dangerous.
     """
+
+    # =========================================================================
+    # Subsystem accessors (v0.2.0) — all optional for backwards compat
+    # =========================================================================
+
+    mcp: "MCPGatewayAccessor | None" = None
+    """MCP Gateway accessor: register/list servers, list/invoke tools."""
+
+    a2a: "A2AGatewayAccessor | None" = None
+    """A2A Gateway accessor: register/list agents, invoke agents."""
+
+    config_sync: "ConfigSyncAccessor | None" = None
+    """Config sync accessor: force sync, get status, get config."""
+
+    routing: "RoutingAccessor | None" = None
+    """Routing accessor: list/set strategies, register strategies, get weights."""
+
+    resilience: "ResilienceAccessor | None" = None
+    """Resilience accessor: circuit breaker status, force open/close, is_degraded."""
+
+    models: "ModelsAccessor | None" = None
+    """Models accessor: list/get LLM model deployments."""
+
+    metrics: "MetricsAccessor | None" = None
+    """Metrics accessor: get meter, create counters/histograms."""
 
 
 class GatewayPlugin(ABC):
@@ -433,6 +471,31 @@ class GatewayPlugin(ABC):
             breaker_name: Name of the circuit breaker (e.g., "database", "redis")
             old_state: Previous state ("closed", "open", "half_open")
             new_state: New state ("closed", "open", "half_open")
+        """
+        pass
+
+    async def on_management_operation(
+        self,
+        operation: str,
+        resource_type: str,
+        method: str,
+        path: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Called when a LiteLLM management endpoint is invoked.
+
+        Override to observe, audit, or react to management operations
+        (key generation, team updates, model changes, etc.).
+
+        Args:
+            operation: Classified operation name (e.g., "key.generate",
+                       "team.create", "model.add").
+            resource_type: Resource category (e.g., "key", "team", "model").
+            method: HTTP method (GET, POST, PUT, DELETE).
+            path: Request URL path.
+            metadata: Optional dict with additional context (actor, outcome).
         """
         pass
 
@@ -780,10 +843,26 @@ class PluginManager:
         # Populate settings from environment for plugin consumption
         settings = self._collect_plugin_settings()
 
+        # Create subsystem adapters (lazy imports inside each adapter)
+        try:
+            from .plugin_adapters import create_all_adapters
+
+            adapters = create_all_adapters()
+        except Exception as e:
+            logger.warning(f"Could not create plugin adapters: {e}")
+            adapters = {}
+
         return PluginContext(
             settings=settings,
             logger=logger,
             validate_outbound_url=url_validator,
+            mcp=adapters.get("mcp"),
+            a2a=adapters.get("a2a"),
+            config_sync=adapters.get("config_sync"),
+            routing=adapters.get("routing"),
+            resilience=adapters.get("resilience"),
+            models=adapters.get("models"),
+            metrics=adapters.get("metrics"),
         )
 
     def _collect_plugin_settings(self) -> dict[str, Any]:
@@ -1081,6 +1160,37 @@ class PluginManager:
             except Exception as e:
                 logger.warning(
                     f"Plugin {plugin.name} on_circuit_breaker_change failed: {e}"
+                )
+
+    async def notify_management_operation(
+        self,
+        operation: str,
+        resource_type: str,
+        method: str,
+        path: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Dispatch on_management_operation to all active plugins."""
+        source = (
+            self._sorted_plugins if self._sorted_plugins is not None else self._plugins
+        )
+        for plugin in source:
+            if plugin.name in self._quarantined:
+                continue
+            # Only dispatch to plugins that override the hook
+            if (
+                type(plugin).on_management_operation
+                is GatewayPlugin.on_management_operation
+            ):
+                continue
+            try:
+                await plugin.on_management_operation(
+                    operation, resource_type, method, path, metadata=metadata
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Plugin {plugin.name} on_management_operation failed: {e}"
                 )
 
     async def health_checks(self) -> dict[str, dict[str, Any]]:

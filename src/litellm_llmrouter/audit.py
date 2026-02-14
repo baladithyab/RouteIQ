@@ -96,6 +96,19 @@ class AuditAction(str, Enum):
     A2A_AGENT_CREATE = "a2a.agent.create"
     A2A_AGENT_DELETE = "a2a.agent.delete"
 
+    # Management Operations (v0.2.0 — catch-all for LiteLLM passthrough)
+    MANAGEMENT_KEY_GENERATE = "management.key.generate"
+    MANAGEMENT_KEY_DELETE = "management.key.delete"
+    MANAGEMENT_TEAM_CREATE = "management.team.create"
+    MANAGEMENT_TEAM_DELETE = "management.team.delete"
+    MANAGEMENT_MODEL_ADD = "management.model.add"
+    MANAGEMENT_MODEL_DELETE = "management.model.delete"
+    MANAGEMENT_BUDGET_CREATE = "management.budget.create"
+    MANAGEMENT_CREDENTIAL_CREATE = "management.credential.create"
+    MANAGEMENT_CREDENTIAL_DELETE = "management.credential.delete"
+    MANAGEMENT_GUARDRAIL_CREATE = "management.guardrail.create"
+    MANAGEMENT_CONFIG_RELOAD = "management.config.reload"
+
 
 class AuditOutcome(str, Enum):
     """Outcome of an audited action."""

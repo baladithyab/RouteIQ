@@ -1,0 +1,110 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "properties": {
+        "title": "GenAI Request Duration (p50/p95/p99)",
+        "metrics": [
+          ["RouteIQ", "gen_ai.client.operation.duration", "gen_ai.request.model", "ALL", {"stat": "p50", "label": "p50"}],
+          ["RouteIQ", "gen_ai.client.operation.duration", "gen_ai.request.model", "ALL", {"stat": "p95", "label": "p95"}],
+          ["RouteIQ", "gen_ai.client.operation.duration", "gen_ai.request.model", "ALL", {"stat": "p99", "label": "p99"}]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Token Usage (Input vs Output)",
+        "metrics": [
+          ["RouteIQ", "gen_ai.client.token.usage", "gen_ai.token.type", "input", {"stat": "Sum", "label": "Input Tokens"}],
+          ["RouteIQ", "gen_ai.client.token.usage", "gen_ai.token.type", "output", {"stat": "Sum", "label": "Output Tokens"}]
+        ],
+        "period": 300,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Time to First Token (Streaming)",
+        "metrics": [
+          ["RouteIQ", "gen_ai.server.time_to_first_token", "gen_ai.request.model", "ALL", {"stat": "p50", "label": "p50"}],
+          ["RouteIQ", "gen_ai.server.time_to_first_token", "gen_ai.request.model", "ALL", {"stat": "p95", "label": "p95"}]
+        ],
+        "period": 60,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Gateway Request Total",
+        "metrics": [
+          ["RouteIQ", "gateway.request.total", "operation", "chat_completion", {"stat": "Sum"}],
+          ["RouteIQ", "gateway.request.total", "operation", "embedding", {"stat": "Sum"}]
+        ],
+        "period": 60,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Gateway Request Errors",
+        "metrics": [
+          ["RouteIQ", "gateway.request.error", {"stat": "Sum"}]
+        ],
+        "period": 60,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Active Requests",
+        "metrics": [
+          ["RouteIQ", "gateway.request.active", {"stat": "Average"}]
+        ],
+        "period": 10,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Routing Strategy Usage",
+        "metrics": [
+          ["RouteIQ", "gateway.routing.strategy.usage", "strategy", "ALL", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "view": "bar"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Routing Decision Latency",
+        "metrics": [
+          ["RouteIQ", "gateway.routing.decision.duration", {"stat": "p50", "label": "p50"}],
+          ["RouteIQ", "gateway.routing.decision.duration", {"stat": "p99", "label": "p99"}]
+        ],
+        "period": 60,
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "title": "Management Operations",
+        "metrics": [
+          ["RouteIQ", "routeiq.management.operation", {"stat": "SampleCount"}]
+        ],
+        "period": 300,
+        "view": "bar"
+      }
+    }
+  ]
+}
