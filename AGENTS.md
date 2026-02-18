@@ -31,12 +31,31 @@ RouteIQ/
 │   ├── gateway/                   # Composition root & plugin system
 │   │   ├── app.py                 # FastAPI app factory (create_app / create_standalone_app)
 │   │   ├── plugin_manager.py      # Plugin lifecycle, dependency resolution
-│   │   └── plugins/               # Built-in plugins
+│   │   ├── plugin_adapters.py     # Plugin adapter implementations
+│   │   ├── plugin_callback_bridge.py # Bridge between plugins and LiteLLM callbacks
+│   │   ├── plugin_middleware.py   # Plugin middleware integration
+│   │   ├── plugin_protocols.py    # Plugin protocol definitions (typing)
+│   │   └── plugins/               # Built-in plugins (13 total)
 │   │       ├── evaluator.py       # LLM-as-judge evaluation plugin
 │   │       ├── skills_discovery.py # Anthropic skills (bash, computer, editor)
-│   │       └── upskill_evaluator.py # Combined skill + evaluation plugin
+│   │       ├── upskill_evaluator.py # Combined skill + evaluation plugin
+│   │       ├── bedrock_agentcore_mcp.py # Bedrock AgentCore MCP integration
+│   │       ├── bedrock_guardrails.py # AWS Bedrock Guardrails plugin
+│   │       ├── cache_plugin.py    # Caching plugin
+│   │       ├── content_filter.py  # Content filtering plugin
+│   │       ├── cost_tracker.py    # Cost tracking plugin
+│   │       ├── guardrails_base.py # Base guardrails plugin class
+│   │       ├── llamaguard_plugin.py # LlamaGuard safety plugin
+│   │       ├── pii_guard.py       # PII detection/redaction plugin
+│   │       └── prompt_injection_guard.py # Prompt injection detection plugin
 │   ├── startup.py                 # Entry point: python -m litellm_llmrouter.startup
-│   ├── routes.py                  # All FastAPI routers (health, admin, MCP, llmrouter)
+│   ├── routes/                    # FastAPI routers (package)
+│   │   ├── __init__.py            # Re-exports all routers + feature flags
+│   │   ├── health.py              # Health/readiness probes
+│   │   ├── a2a.py                 # A2A agent routes
+│   │   ├── mcp.py                 # MCP gateway routes (all surfaces)
+│   │   ├── config.py              # Config/admin routes
+│   │   └── models.py              # Model management routes
 │   ├── strategies.py              # ML routing strategies (18+ algorithms)
 │   ├── strategy_registry.py       # A/B testing, hot-swap, routing pipeline
 │   ├── routing_strategy_patch.py  # Monkey-patch to LiteLLM's Router for ML strategies
@@ -49,6 +68,7 @@ RouteIQ/
 │   ├── a2a_gateway.py             # A2A agent registry (wraps LiteLLM's global_agent_registry)
 │   ├── a2a_tracing.py             # OpenTelemetry instrumentation for A2A
 │   ├── observability.py           # OpenTelemetry init (traces, metrics, logs)
+│   ├── metrics.py                 # OTel metric helpers
 │   ├── telemetry_contracts.py     # Versioned telemetry event schemas
 │   ├── auth.py                    # Admin auth, RequestID middleware, secret scrubbing
 │   ├── rbac.py                    # Role-based access control
@@ -63,7 +83,14 @@ RouteIQ/
 │   ├── model_artifacts.py         # ML model verification (hash, signature, manifest)
 │   ├── url_security.py            # SSRF protection for external requests
 │   ├── database.py                # Database connection helpers
+│   ├── migrations.py              # Database migration utilities
 │   ├── leader_election.py         # HA leader election (Redis-based)
+│   ├── redis_pool.py              # Redis connection pool
+│   ├── env_validation.py          # Startup env var validation (advisory only)
+│   ├── conversation_affinity.py   # Conversation-based routing affinity
+│   ├── management_classifier.py   # Classifies LiteLLM management endpoints
+│   ├── management_middleware.py   # RBAC/audit middleware for management ops
+│   ├── semantic_cache.py          # Semantic caching for LLM responses
 │   └── __init__.py                # Public API exports
 ├── tests/
 │   ├── conftest.py                # Root conftest: auto-skip integration if stack not running
@@ -107,6 +134,7 @@ RouteIQ/
 ├── deploy/charts/                 # Helm charts for Kubernetes
 ├── docs/                          # Comprehensive documentation (~35 files)
 ├── plans/                         # Development planning (TG epics, roadmaps)
+│   └── archive/                   # Archived plan files (completed TG epics)
 ├── models/                        # Trained ML models (empty .gitkeep placeholder)
 ├── custom_routers/                # Custom routing strategies (empty .gitkeep placeholder)
 ├── reference/litellm/             # Upstream LiteLLM submodule (READ-ONLY)
@@ -262,9 +290,10 @@ app = create_app()
 app = create_standalone_app()
 ```
 
-**Load order**: Patch LiteLLM Router -> Get FastAPI app -> Add middleware
-(RequestID, Policy, RouterDecision) -> Load plugins -> Register routes ->
-Setup lifecycle hooks -> Add backpressure middleware
+**Load order**: Patch LiteLLM Router -> Get FastAPI app -> Add backpressure
+middleware (innermost, registered first) -> Configure middleware (CORS,
+RequestID, Policy, Management, Plugin, RouterDecision) -> Load plugins ->
+Register routes -> Setup lifecycle hooks
 
 The entry point is `startup.py`:
 ```bash
@@ -323,8 +352,10 @@ class MyPlugin(GatewayPlugin):
         ...
 ```
 
-Built-in plugins: `evaluator` (LLM-as-judge), `skills_discovery` (Anthropic skills),
-`upskill_evaluator` (combined). Plugins are loaded from config before routes and
+Built-in plugins (13 total): `evaluator` (LLM-as-judge), `skills_discovery` (Anthropic
+skills), `upskill_evaluator` (combined), `bedrock_agentcore_mcp`, `bedrock_guardrails`,
+`cache_plugin`, `content_filter`, `cost_tracker`, `guardrails_base`, `llamaguard_plugin`,
+`pii_guard`, `prompt_injection_guard`. Plugins are loaded from config before routes and
 started during app lifespan.
 
 ### 5. Observability
@@ -415,7 +446,7 @@ LiteLLM's Router is patched at runtime via `routing_strategy_patch.py`. This mea
 
 ### Adding a New Endpoint
 
-1. Add route in `src/litellm_llmrouter/routes.py` (choose correct router: health, admin, llmrouter, MCP)
+1. Add route in the appropriate module under `src/litellm_llmrouter/routes/` (choose correct file: `health.py`, `a2a.py`, `mcp.py`, `config.py`, or `models.py`)
 2. Add Pydantic models for request/response
 3. Add appropriate auth dependency (`admin_api_key_auth` for control-plane, `user_api_key_auth` for data-plane)
 4. Register router in `gateway/app.py` `_register_routes()` if using a new router
@@ -483,6 +514,9 @@ Development follows a Task Group pattern with quality gates:
 | `LLMROUTER_ALLOW_PICKLE_MODELS` | No | Allow pickle model loading (default: false) |
 | `LLMROUTER_ENFORCE_SIGNED_MODELS` | No | Require manifest verification |
 | `LLMROUTER_ROUTER_CALLBACK_ENABLED` | No | Router decision telemetry (default: true) |
+| `ROUTEIQ_CORS_ORIGINS` | No | Allowed CORS origins |
+| `ROUTEIQ_SKIP_ENV_VALIDATION` | No | Skip startup env validation |
+| `ROUTEIQ_EVALUATOR_ENABLED` | No | Enable LLM-as-judge evaluator plugin |
 
 ## DOCUMENTATION
 
@@ -497,12 +531,11 @@ Development follows a Task Group pattern with quality gates:
 | [`docs/a2a-gateway.md`](docs/a2a-gateway.md) | A2A Protocol guide |
 | [`docs/security.md`](docs/security.md) | Security considerations |
 | [`docs/observability.md`](docs/observability.md) | OpenTelemetry setup |
-| [`docs/high-availability.md`](docs/high-availability.md) | HA configuration |
-| [`docs/hot-reloading.md`](docs/hot-reloading.md) | Config hot-reload |
 | [`docs/plugins.md`](docs/plugins.md) | Plugin system guide |
 | [`docs/skills-gateway.md`](docs/skills-gateway.md) | Skills gateway guide |
 | [`docs/mlops-training.md`](docs/mlops-training.md) | MLOps training loop |
 | [`docs/rr-workflow.md`](docs/rr-workflow.md) | Remote push workflow |
+| [`docs/aws-production-guide.md`](docs/aws-production-guide.md) | AWS production deployment guide |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 
 ## NON-OBVIOUS BEHAVIORS & GOTCHAS
@@ -511,9 +544,10 @@ Development follows a Task Group pattern with quality gates:
    of `os.execvp()`. This is critical because `os.execvp()` replaces the process and would
    lose all monkey-patches to LiteLLM's Router class.
 
-2. **BackpressureMiddleware wraps ASGI directly**: It replaces `app.app` (the inner ASGI app),
-   not using `add_middleware()`. This is required because `BaseHTTPMiddleware` does NOT properly
-   handle streaming responses.
+2. **BackpressureMiddleware is the innermost middleware**: It is registered first via
+   `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app
+   directly (replaces `app.app`). This is required because `BaseHTTPMiddleware` does NOT
+   properly handle streaming responses.
 
 3. **Plugin hooks on `app.state`, not lifespan**: LiteLLM manages its own lifespan, so plugin
    startup/shutdown are stored as lambdas on `app.state` and called by `startup.py`.

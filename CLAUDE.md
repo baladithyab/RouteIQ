@@ -88,11 +88,11 @@ After `rr push`, always sync local: `git pull`
 
 1. Apply LiteLLM Router monkey-patch (`routing_strategy_patch.py`)
 2. Get/create FastAPI app
-3. Add middleware: RequestID -> Policy -> RouterDecision
-4. Load plugins (discovery + validation)
-5. Register routes (health, llmrouter, admin, MCP surfaces)
-6. Setup lifecycle hooks (plugins, HTTP pool, drain)
-7. Add backpressure middleware
+3. Add backpressure middleware (innermost, registered first)
+4. Configure middleware (CORS, RequestID, Policy, Management, Plugin, RouterDecision)
+5. Load plugins (discovery + validation)
+6. Register routes (health, llmrouter, admin, MCP surfaces)
+7. Setup lifecycle hooks (plugins, HTTP pool, drain)
 
 ### Source Layout (`src/litellm_llmrouter/`)
 
@@ -100,7 +100,11 @@ After `rr push`, always sync local: `git pull`
 |--------|---------|
 | `gateway/app.py` | FastAPI app factory (composition root) |
 | `gateway/plugin_manager.py` | Plugin lifecycle with dependency resolution |
-| `gateway/plugins/` | Built-in plugins (evaluator, skills, upskill, guardrails) |
+| `gateway/plugin_adapters.py` | Plugin adapter implementations |
+| `gateway/plugin_callback_bridge.py` | Bridge between plugins and LiteLLM callbacks |
+| `gateway/plugin_middleware.py` | Plugin middleware integration |
+| `gateway/plugin_protocols.py` | Plugin protocol definitions (typing) |
+| `gateway/plugins/` | Built-in plugins (13 total) |
 | `startup.py` | CLI entry point, initialization orchestration |
 | `routes/` | API routers split into: `health.py`, `a2a.py`, `mcp.py`, `config.py`, `models.py` |
 | `strategies.py` | 18+ ML routing strategies (KNN, MLP, SVM, ELO, MF, hybrid) |
@@ -115,6 +119,7 @@ After `rr push`, always sync local: `git pull`
 | `a2a_gateway.py` | A2A agent registry (wraps LiteLLM) |
 | `a2a_tracing.py` | OTel instrumentation for A2A |
 | `observability.py` | OpenTelemetry init (traces, metrics, logs) |
+| `metrics.py` | OTel metric helpers |
 | `telemetry_contracts.py` | Versioned telemetry event schemas |
 | `auth.py` | Admin auth, RequestID middleware (raw ASGI), secret scrubbing |
 | `rbac.py` | Role-based access control |
@@ -128,7 +133,15 @@ After `rr push`, always sync local: `git pull`
 | `config_sync.py` | Background config sync (S3 ETag-based) |
 | `model_artifacts.py` | ML model verification (hash, signature) |
 | `url_security.py` | SSRF protection |
+| `database.py` | Database connection helpers |
+| `migrations.py` | Database migration utilities |
 | `leader_election.py` | HA leader election (Redis-based) |
+| `redis_pool.py` | Redis connection pool |
+| `env_validation.py` | Startup env var validation (advisory only) |
+| `conversation_affinity.py` | Conversation-based routing affinity |
+| `management_classifier.py` | Classifies LiteLLM management endpoints |
+| `management_middleware.py` | RBAC/audit middleware for management ops |
+| `semantic_cache.py` | Semantic caching for LLM responses |
 
 ## Key Patterns
 
@@ -149,7 +162,9 @@ Each is feature-flagged via environment variables.
 
 Plugins extend the gateway via `GatewayPlugin` base class. They are loaded from
 config BEFORE routes (deterministic ordering) and started during app lifespan.
-Built-in: evaluator, skills_discovery, upskill_evaluator.
+Built-in plugins (13 total): evaluator, skills_discovery, upskill_evaluator,
+bedrock_agentcore_mcp, bedrock_guardrails, cache_plugin, content_filter,
+cost_tracker, guardrails_base, llamaguard_plugin, pii_guard, prompt_injection_guard.
 
 ### Policy Engine
 
@@ -225,7 +240,7 @@ push via `rr push` if blocked.
 
 ### Adding an Endpoint
 
-1. Add route to `routes.py` (pick the right router: `health_router`, `admin_router`, `llmrouter_router`)
+1. Add route in the appropriate module under `routes/` (`health.py`, `a2a.py`, `mcp.py`, `config.py`, or `models.py`)
 2. Add auth dependency (`admin_api_key_auth` or `user_api_key_auth`)
 3. Register in `gateway/app.py` `_register_routes()` if new router
 4. Add unit test in `tests/unit/`
@@ -257,7 +272,7 @@ uv run python -m litellm_llmrouter.startup --config config/config.local-test.yam
 These are critical gotchas that are easy to miss:
 
 - **In-process uvicorn is mandatory** - `startup.py` runs LiteLLM in-process (not via `os.execvp()`) to preserve monkey-patches. Always use 1 worker.
-- **BackpressureMiddleware wraps ASGI directly** (replaces `app.app`), not via `add_middleware()`, because `BaseHTTPMiddleware` breaks streaming.
+- **BackpressureMiddleware is the innermost middleware** registered first via `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app directly (replaces `app.app`). This is because `BaseHTTPMiddleware` breaks streaming.
 - **Plugin hooks live on `app.state`** as lambdas, not in lifespan, because LiteLLM manages its own lifespan.
 - **`/_health/ready` returns 200 for degraded state** (circuit breakers open), not 503.
 - **Two MCP systems exist**: `/llmrouter/mcp/*` (REST gateway) and `/mcp` (JSON-RPC for Claude Desktop) are separate.
