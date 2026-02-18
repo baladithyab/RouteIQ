@@ -638,6 +638,12 @@ def get_leader_election() -> LeaderElection | None:
     return _leader_election
 
 
+def reset_leader_election() -> None:
+    """Reset the leader election singleton. For testing only."""
+    global _leader_election
+    _leader_election = None
+
+
 async def initialize_leader_election() -> LeaderElection | None:
     """
     Initialize leader election (create table and try initial acquisition).

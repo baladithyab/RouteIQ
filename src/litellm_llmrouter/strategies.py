@@ -1575,16 +1575,27 @@ class CostAwareRoutingStrategy(RoutingStrategy):
 
 def register_llmrouter_strategies():
     """
-    Register LLMRouter strategies with LiteLLM's routing infrastructure.
+    Log available LLMRouter strategies and return their names.
 
-    This function should be called during startup to make LLMRouter
-    strategies available for use in LiteLLM routing configurations.
+    Despite its name, this function does NOT register strategies in any
+    runtime registry.  The ``llmrouter-*`` strategies are activated at
+    request time through the monkey-patch system in
+    ``routing_strategy_patch.py`` (see :func:`patch_litellm_router`).
+
+    This function exists to:
+    1. Enumerate the known strategy names at startup for diagnostics.
+    2. Log them so operators can confirm which strategies are available.
+
+    The function name is preserved for **backward compatibility** — callers
+    (e.g., ``startup.py``) rely on it to obtain the strategy list and log
+    readiness.  A future major version may rename or deprecate it.
 
     Returns:
-        List of registered strategy names
+        List of available strategy name strings (e.g. ["llmrouter-knn", ...]).
     """
     verbose_proxy_logger.info(
-        f"Registering {len(LLMROUTER_STRATEGIES)} LLMRouter strategies"
+        f"✅ {len(LLMROUTER_STRATEGIES)} LLMRouter strategies available "
+        "(activated via routing_strategy_patch)"
     )
 
     # Log available strategies

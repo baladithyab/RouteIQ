@@ -106,15 +106,23 @@ def run_leader_migrations_if_enabled():
 
 
 def register_strategies():
-    """Register LLMRouter strategies with LiteLLM."""
+    """Log available LLMRouter strategies.
+
+    Strategies are activated at request time via the monkey-patch in
+    ``routing_strategy_patch.py``, not through a runtime registry.
+    This helper calls :func:`register_llmrouter_strategies` to enumerate
+    and log the available strategy names at startup.
+    """
     try:
         from litellm_llmrouter.strategies import register_llmrouter_strategies
 
         strategies = register_llmrouter_strategies()
-        print(f"✅ Registered {len(strategies)} LLMRouter strategies")
+        print(
+            f"✅ {len(strategies)} LLMRouter strategies available (activated via routing_strategy_patch)"
+        )
         return strategies
     except ImportError as e:
-        print(f"⚠️ Could not register strategies: {e}")
+        print(f"⚠️ Could not load strategies: {e}")
         return []
 
 
@@ -449,6 +457,17 @@ Examples:
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
     print(f"   Port: {args.port}")
+
+    # Validate environment variables early (advisory only — never prevents startup)
+    from litellm_llmrouter.env_validation import validate_environment
+
+    env_result = validate_environment()
+    if env_result.errors:
+        logger.error("Environment validation found %d error(s)", len(env_result.errors))
+    if env_result.warnings:
+        logger.warning(
+            "Environment validation found %d warning(s)", len(env_result.warnings)
+        )
 
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()

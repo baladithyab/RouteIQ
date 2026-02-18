@@ -713,6 +713,12 @@ def get_cache_manager() -> CacheManager | None:
     return _cache_manager
 
 
+def reset_cache_manager() -> None:
+    """Reset the cache manager singleton. For testing only."""
+    global _cache_manager
+    _cache_manager = None
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors using numpy when available."""
     if len(a) != len(b) or not a:

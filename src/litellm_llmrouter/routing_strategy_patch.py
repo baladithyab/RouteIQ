@@ -38,6 +38,8 @@ _patch_applied = False
 
 # Store original method for potential restoration
 _original_routing_strategy_init = None
+_original_get_available_deployment = None
+_original_async_get_available_deployment = None
 
 # Feature flag: Use pipeline routing (enables A/B testing)
 # Set LLMROUTER_USE_PIPELINE=false to disable
@@ -446,6 +448,7 @@ def patch_litellm_router() -> bool:
         True if patch was applied successfully, False otherwise.
     """
     global _patch_applied, _original_routing_strategy_init
+    global _original_get_available_deployment, _original_async_get_available_deployment
 
     if _patch_applied:
         logger.debug("LiteLLM Router patch already applied")
@@ -463,12 +466,12 @@ def patch_litellm_router() -> bool:
 
         # Store original methods
         _original_routing_strategy_init = Router.routing_strategy_init
-        original_get_available_deployment = Router.get_available_deployment
+        _original_get_available_deployment = Router.get_available_deployment
 
         # Check if async method exists
         has_async_method = hasattr(Router, "async_get_available_deployment")
         if has_async_method:
-            original_async_get_available_deployment = (
+            _original_async_get_available_deployment = (
                 Router.async_get_available_deployment
             )
 
@@ -477,13 +480,13 @@ def patch_litellm_router() -> bool:
             _original_routing_strategy_init
         )
         Router.get_available_deployment = create_patched_get_available_deployment(
-            original_get_available_deployment
+            _original_get_available_deployment
         )
 
         if has_async_method:
             Router.async_get_available_deployment = (
                 create_patched_async_get_available_deployment(
-                    original_async_get_available_deployment
+                    _original_async_get_available_deployment
                 )
             )
 
@@ -510,6 +513,7 @@ def unpatch_litellm_router() -> bool:
         True if unpatch was successful, False otherwise.
     """
     global _patch_applied, _original_routing_strategy_init
+    global _original_get_available_deployment, _original_async_get_available_deployment
 
     if not _patch_applied:
         logger.debug("LiteLLM Router patch not applied, nothing to unpatch")
@@ -520,9 +524,17 @@ def unpatch_litellm_router() -> bool:
 
         if _original_routing_strategy_init is not None:
             Router.routing_strategy_init = _original_routing_strategy_init
+        if _original_get_available_deployment is not None:
+            Router.get_available_deployment = _original_get_available_deployment
+        if _original_async_get_available_deployment is not None:
+            Router.async_get_available_deployment = (
+                _original_async_get_available_deployment
+            )
 
         _patch_applied = False
         _original_routing_strategy_init = None
+        _original_get_available_deployment = None
+        _original_async_get_available_deployment = None
         logger.info("LiteLLM Router patch removed")
         return True
 

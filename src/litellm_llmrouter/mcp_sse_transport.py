@@ -165,6 +165,11 @@ _sse_sessions: dict[str, SSESession] = {}
 _sessions_lock = asyncio.Lock()
 
 
+def reset_sse_sessions() -> None:
+    """Reset SSE session store. For testing only."""
+    _sse_sessions.clear()
+
+
 async def get_session(session_id: str) -> SSESession | None:
     """Get a session by ID if it exists and is active."""
     session = _sse_sessions.get(session_id)

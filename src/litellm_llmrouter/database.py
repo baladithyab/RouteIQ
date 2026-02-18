@@ -15,9 +15,9 @@ Database Schema:
 
 import os
 import uuid
-from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
+from dataclasses import dataclass, field
 
 from litellm._logging import verbose_proxy_logger
 
@@ -964,3 +964,11 @@ def get_mcp_repository() -> MCPServerRepository:
     if _mcp_repository is None:
         _mcp_repository = MCPServerRepository()
     return _mcp_repository
+
+
+def reset_database_singletons() -> None:
+    """Reset all database singleton instances. For testing only."""
+    global _a2a_repository, _a2a_activity_tracker, _mcp_repository
+    _a2a_repository = None
+    _a2a_activity_tracker = None
+    _mcp_repository = None

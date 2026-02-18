@@ -20,7 +20,8 @@ Usage:
     # This is explicit and idempotent (safe to call multiple times)
     patch_litellm_router()
 
-    # Register all LLMRouter strategies with LiteLLM
+    # Log available LLMRouter strategies (activated via the patch above,
+    # NOT registered in a separate registry despite the function name)
     register_llmrouter_strategies()
 
 A/B Testing:
@@ -98,7 +99,13 @@ from .strategy_registry import (
 from .gateway import create_app, create_standalone_app
 from .gateway.plugin_manager import GatewayPlugin, PluginManager, get_plugin_manager
 
-__version__ = "0.0.5"
+try:
+    from importlib.metadata import version as _get_version
+
+    __version__ = _get_version("routeiq")
+except Exception:
+    __version__ = "0.2.0"  # fallback if not installed as package
+
 __all__ = [
     # Router patch (for llmrouter-* strategies)
     "patch_litellm_router",

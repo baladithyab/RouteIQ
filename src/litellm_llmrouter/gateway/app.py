@@ -8,12 +8,14 @@ It explicitly configures all middleware, routers, and patches in a single place.
 Load Order:
 1. Apply LiteLLM router patch (if enabled)
 2. Get/create FastAPI app
-3. Add middleware (including backpressure/resilience)
-4. Load and register plugins (deterministically before routes)
-5. Register built-in routes
-6. Set up plugin lifecycle hooks
-7. Set up HTTP client pool lifecycle hooks
-8. Set up graceful shutdown hooks
+3. Add backpressure middleware (INNERMOST – registered first so outer
+   middleware like RequestID and CORS can decorate its 503 responses)
+4. Add remaining middleware (RequestID, CORS, Policy, Plugins, etc.)
+5. Load and register plugins (deterministically before routes)
+6. Register built-in routes
+7. Set up plugin lifecycle hooks
+8. Set up HTTP client pool lifecycle hooks
+9. Set up graceful shutdown hooks
 
 Usage with LiteLLM proxy (in-process):
     from litellm_llmrouter.gateway import create_app
@@ -369,12 +371,13 @@ def create_app(
     This function:
     1. Applies the LiteLLM router patch (explicit, idempotent)
     2. Gets the LiteLLM proxy's FastAPI app
-    3. Adds RequestID middleware
-    4. Loads plugins (discovery + validation, before routes)
-    5. Registers LLMRouter routes (health, llmrouter, admin)
-    6. Sets up plugin lifecycle hooks (startup runs later)
-    7. Sets up HTTP client pool lifecycle hooks
-    8. Adds backpressure middleware and drain manager (if enabled)
+    3. Adds backpressure middleware (innermost, so 503s get CORS/RequestID headers)
+    4. Adds remaining middleware (RequestID, CORS, Policy, Plugins, etc.)
+    5. Loads plugins (discovery + validation, before routes)
+    6. Registers LLMRouter routes (health, llmrouter, admin)
+    7. Sets up plugin lifecycle hooks (startup runs later)
+    8. Sets up HTTP client pool lifecycle hooks
+    9. Configures graceful shutdown via drain manager
 
     This is the preferred method for in-process LiteLLM proxy usage.
 
@@ -394,10 +397,26 @@ def create_app(
     # Step 2: Get LiteLLM's FastAPI app
     from litellm.proxy.proxy_server import app
 
-    # Step 3: Add middleware
+    # Step 3: Add backpressure middleware FIRST (wraps app.app directly).
+    # ─────────────────────────────────────────────────────────────────
+    # ASGI middleware is LIFO: last-registered = outermost.  By registering
+    # backpressure BEFORE RequestID/CORS, it becomes the INNERMOST layer.
+    # This ensures 503 load-shed responses still pass through CORS and
+    # RequestID middleware on the way out, so clients always receive
+    # X-Request-ID and proper CORS headers — even under back-pressure.
+    # ─────────────────────────────────────────────────────────────────
+    if enable_resilience:
+        add_backpressure_middleware(app)
+        # Store graceful shutdown function for external use
+        app.state.graceful_shutdown = lambda timeout=None: graceful_shutdown(
+            app, timeout
+        )
+        logger.debug("Resilience middleware and drain manager attached (innermost)")
+
+    # Step 4: Add remaining middleware (outermost layers)
     _configure_middleware(app)
 
-    # Step 4: Load plugins BEFORE routes (for deterministic ordering)
+    # Step 5: Load plugins BEFORE routes (for deterministic ordering)
     if enable_plugins:
         try:
             _load_plugins_before_routes()
@@ -405,10 +424,10 @@ def create_app(
             logger.error(f"Failed to load plugins: {e}")
             # Continue without plugins if loading fails
 
-    # Step 5: Register routes
+    # Step 6: Register routes
     _register_routes(app, include_admin=include_admin_routes)
 
-    # Step 6: Set up plugin lifecycle if enabled
+    # Step 7: Set up plugin lifecycle if enabled
     if enable_plugins:
         # Store original lifespan if any
         original_lifespan = getattr(app.router, "lifespan_context", None)
@@ -436,23 +455,11 @@ def create_app(
         app.state.llmrouter_plugin_startup = lambda: _run_plugin_startup(app)
         app.state.llmrouter_plugin_shutdown = lambda: _run_plugin_shutdown(app)
 
-    # Step 7: Set up HTTP client pool lifecycle hooks
+    # Step 8: Set up HTTP client pool lifecycle hooks
     # These are called explicitly by startup.py for proper ordering
-    def http_pool_setup(app: FastAPI) -> None:
-        app.state.llmrouter_http_pool_startup = _startup_http_client_pool
-        app.state.llmrouter_http_pool_shutdown = _shutdown_http_client_pool
-        logger.debug("HTTP client pool lifecycle hooks attached")
-
-    app.state.http_pool_setup = http_pool_setup
-
-    # Step 8: Add backpressure middleware (wraps ASGI app)
-    if enable_resilience:
-        add_backpressure_middleware(app)
-        # Store graceful shutdown function for external use
-        app.state.graceful_shutdown = lambda timeout=None: graceful_shutdown(
-            app, timeout
-        )
-        logger.debug("Resilience middleware and drain manager attached")
+    app.state.llmrouter_http_pool_startup = _startup_http_client_pool
+    app.state.llmrouter_http_pool_shutdown = _shutdown_http_client_pool
+    logger.debug("HTTP client pool lifecycle hooks attached")
 
     logger.info("Gateway app created and configured")
     return app
@@ -519,19 +526,22 @@ def create_standalone_app(
         lifespan=lifespan,
     )
 
-    # Add middleware
-    _configure_middleware(app)
-
-    # Register routes
-    _register_routes(app, include_admin=include_admin_routes)
-
-    # Add backpressure middleware (wraps ASGI app)
+    # Add backpressure middleware FIRST (wraps app.app directly).
+    # See create_app() for the full rationale — registering backpressure
+    # before CORS/RequestID makes it the INNERMOST layer so that 503
+    # load-shed responses still receive X-Request-ID and CORS headers.
     if enable_resilience:
         add_backpressure_middleware(app)
         app.state.graceful_shutdown = lambda timeout=None: graceful_shutdown(
             app, timeout
         )
-        logger.debug("Resilience middleware and drain manager attached")
+        logger.debug("Resilience middleware and drain manager attached (innermost)")
+
+    # Add remaining middleware (outermost layers)
+    _configure_middleware(app)
+
+    # Register routes
+    _register_routes(app, include_admin=include_admin_routes)
 
     logger.info("Standalone gateway app created")
     return app

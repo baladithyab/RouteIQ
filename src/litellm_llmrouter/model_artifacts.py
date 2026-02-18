@@ -1182,6 +1182,12 @@ def get_activation_manager() -> ModelActivationManager:
         return _global_activation_manager
 
 
+def reset_activation_manager() -> None:
+    """Reset the activation manager singleton. For testing only."""
+    global _global_activation_manager
+    _global_activation_manager = None
+
+
 def stage_model(
     model_path: str,
     correlation_id: Optional[str] = None,
@@ -1243,6 +1249,12 @@ def get_artifact_verifier() -> ModelArtifactVerifier:
         if _global_verifier is None:
             _global_verifier = ModelArtifactVerifier()
         return _global_verifier
+
+
+def reset_artifact_verifier() -> None:
+    """Reset the artifact verifier singleton. For testing only."""
+    global _global_verifier
+    _global_verifier = None
 
 
 def verify_model_artifact(
