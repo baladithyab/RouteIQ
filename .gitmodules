@@ -4,3 +4,6 @@
 [submodule "reference/LLMRouter"]
 	path = reference/LLMRouter
 	url = https://github.com/ulab-uiuc/LLMRouter.git
+[submodule "reference/NadirClaw"]
+	path = reference/NadirClaw
+	url = https://github.com/doramirdor/NadirClaw.git
