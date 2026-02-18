@@ -9,8 +9,8 @@ type: application
 # Chart version - follows SemVer
 version: 0.1.0
 
-# Application version - matches container image tag
-appVersion: "1.81.3"
+# Application version - matches RouteIQ package version in pyproject.toml
+appVersion: "0.2.0"
 
 # Keywords for discovery
 keywords:

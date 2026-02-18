@@ -1,8 +1,8 @@
 """
-LiteLLM + LLMRouter Startup Script
-===================================
+RouteIQ Gateway Startup Script
+===============================
 
-This script starts LiteLLM proxy with LLMRouter extensions:
+This script starts the RouteIQ Gateway (LiteLLM proxy with LLMRouter extensions):
 - A2A Gateway convenience routes (/a2a/agents - wraps LiteLLM's global_agent_registry)
 - MCP Gateway routes
 - Hot reload routes
@@ -375,7 +375,7 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
 
 def main():
     """
-    Main entry point for LiteLLM + LLMRouter.
+    Main entry point for RouteIQ Gateway.
 
     CLI Args Supported (compatible with litellm CLI):
         --config PATH    Path to config file (also: -c, --config_file)
@@ -395,7 +395,7 @@ def main():
     from litellm_llmrouter import is_patch_applied
 
     parser = argparse.ArgumentParser(
-        description="LiteLLM + LLMRouter Gateway",
+        description="RouteIQ Gateway",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -450,7 +450,7 @@ Examples:
     if unknown:
         print(f"   Note: Ignoring unknown args: {unknown}")
 
-    print("🚀 Starting LiteLLM + LLMRouter Gateway...")
+    print("🚀 Starting RouteIQ Gateway...")
     print(
         f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
     )

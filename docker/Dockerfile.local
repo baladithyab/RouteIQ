@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # =============================================================================
-# LiteLLM + LLMRouter Local Development Dockerfile
+# RouteIQ Gateway Local Development Dockerfile
 # =============================================================================
 # Clones LLMRouter from GitHub with pinned version for reproducibility
 # Uses uv for fast, lockfile-driven package management
@@ -31,8 +31,9 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${
 ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
 
-LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Local Development Build"
-LABEL org.opencontainers.image.version="${LITELLM_VERSION}-dev"
+LABEL org.opencontainers.image.description="RouteIQ Gateway: Local Development Build"
+LABEL org.opencontainers.image.version="0.2.0-dev"
+LABEL litellm.version="${LITELLM_VERSION}"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
 LABEL build.reproducible="true"
 LABEL build.lockfile-driven="uv.lock"

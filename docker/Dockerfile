@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # =============================================================================
-# LiteLLM + LLMRouter Production Dockerfile
+# RouteIQ Gateway Production Dockerfile
 # =============================================================================
 # Multi-stage build for minimal, secure production images
 # Uses uv for fast, reproducible Python package management with lockfile
@@ -80,13 +80,14 @@ ARG VCS_REF
 
 # OCI Image Labels (https://github.com/opencontainers/image-spec)
 LABEL org.opencontainers.image.source="https://github.com/baladithyab/litellm-llm-router"
-LABEL org.opencontainers.image.description="LiteLLM + LLMRouter: Intelligent LLM Gateway with ML-Powered Routing"
+LABEL org.opencontainers.image.description="RouteIQ: Intelligent LLM Gateway with ML-Powered Routing"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.version="${LITELLM_VERSION}"
+LABEL org.opencontainers.image.version="0.2.0"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
-LABEL org.opencontainers.image.vendor="LiteLLM + LLMRouter"
-LABEL org.opencontainers.image.title="LiteLLM Gateway"
+LABEL org.opencontainers.image.vendor="RouteIQ"
+LABEL org.opencontainers.image.title="RouteIQ Gateway"
+LABEL litellm.version="${LITELLM_VERSION}"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
 LABEL build.reproducible="true"
 LABEL build.lockfile-driven="uv.lock"

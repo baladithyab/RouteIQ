@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-# LiteLLM + LLMRouter Local Dev Entrypoint
+# RouteIQ Gateway Local Dev Entrypoint
 
-echo "🚀 Starting LiteLLM + LLMRouter Gateway (Local Dev)..."
+echo "🚀 Starting RouteIQ Gateway (Local Dev)..."
 echo "   Config: ${LITELLM_CONFIG_PATH:-/app/config/config.yaml}"
 
 # =============================================================================
@@ -80,7 +80,7 @@ fi
 # 3. The startup module runs uvicorn in-process, preserving monkey-patches
 # =============================================================================
 
-echo "🌐 Starting LiteLLM Proxy Server via LLMRouter startup module..."
+echo "🌐 Starting RouteIQ Gateway via startup module..."
 echo "   ✅ llmrouter-* routing strategies will be available"
 
 # Use opentelemetry-instrument if OTEL endpoint is configured for auto-instrumentation
