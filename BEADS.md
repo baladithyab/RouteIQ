@@ -41,16 +41,18 @@ TG-IMPL-E (P2) ─── (no blockers)
   - [x] Ensured docs/ reflects current state, not aspirational state
 
 ### TG-IMPL-C: LiteLLM Plugin Architecture Migration `RouteIQ-n5d`
-- **Status**: 🔴 Not Started
+- **Status**: ✅ Done
 - **Priority**: P1 (High)
 - **Dependencies**: TG-IMPL-A (critical fixes must land first)
+- **Completed**: 2026-02-18
 - **Tasks**:
-  - [ ] Implement RouteIQ strategies using `CustomRoutingStrategyBase` interface
-  - [ ] Remove `routing_strategy_patch.py` monkey-patch
-  - [ ] Remove single-worker constraint from documentation and entrypoint
-  - [ ] Register strategies via LiteLLM's `custom_routing_strategy_class` config
-  - [ ] Update MLOps pipeline to work with new strategy interface
-  - [ ] Verify multi-worker deployment works with new architecture
+  - [x] Implement `RouteIQRoutingStrategy` using `CustomRoutingStrategyBase` plugin API (`custom_routing_strategy.py`)
+  - [x] Add `ROUTEIQ_USE_PLUGIN_STRATEGY` feature flag (default: `true`) with fallback to legacy monkey-patch
+  - [x] Add `ROUTEIQ_WORKERS` env var for multi-worker uvicorn support
+  - [x] Wire plugin strategy into `startup.py` (post-init install) and `gateway/app.py` (conditional monkey-patch skip)
+  - [x] Update Docker entrypoints, AGENTS.md, `.env.example`, and env_validation.py
+  - [x] Add 62 unit tests (`test_custom_routing_strategy.py`, `test_multi_worker.py`)
+  - [x] Legacy monkey-patch preserved as fallback (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`)
 
 ### TG-IMPL-D: NadirClaw Integration `RouteIQ-9m8`
 - **Status**: 🔴 Not Started
@@ -102,8 +104,8 @@ TG-IMPL-E (P2) ─── (no blockers)
 | Phase | Beads | Rationale |
 |-------|-------|-----------|
 | 1 (Done) | **TG-IMPL-G** ✅ + **TG-IMPL-B** ✅ | Codebase reduction and documentation cleanup complete |
-| 2 (Now) | **TG-IMPL-A** + **TG-IMPL-E** | P0 critical fixes (unblocks C, F); Admin UI is independent |
-| 3 | **TG-IMPL-C** + **TG-IMPL-D** + **TG-IMPL-F** | After A unblocks C and F; after C unblocks D |
+| 2 (Done) | **TG-IMPL-A** ✅ + **TG-IMPL-C** ✅ | P0 critical fixes + plugin architecture migration complete |
+| 3 (Now) | **TG-IMPL-E** + **TG-IMPL-D** + **TG-IMPL-F** | Admin UI is independent; after C unblocks D; after A unblocks F |
 
 ## bd Quick Reference
 

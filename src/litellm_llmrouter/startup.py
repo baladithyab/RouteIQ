@@ -18,6 +18,10 @@ The key difference from the standard LiteLLM startup is that we run
 the proxy IN-PROCESS using uvicorn, not via os.execvp. This ensures
 our monkey-patches to LiteLLM's Router class persist.
 
+When using the plugin strategy (ROUTEIQ_USE_PLUGIN_STRATEGY=true, default),
+multiple uvicorn workers can be configured via ROUTEIQ_WORKERS. In legacy
+monkey-patch mode, only 1 worker is supported.
+
 Usage:
     python -m litellm_llmrouter.startup --config config.yaml --port 4000
 
@@ -126,6 +130,82 @@ def register_strategies():
         return []
 
 
+def install_plugin_routing_strategy(app):
+    """
+    Install the RouteIQ plugin routing strategy on the active Router.
+
+    Called after ``litellm.proxy.proxy_server.initialize()`` has created
+    the Router instance.  Reads ``app.state.use_plugin_strategy`` (set by
+    ``create_app()``) and only proceeds when the plugin strategy is active.
+
+    The strategy name is determined in priority order:
+    1. ``ROUTEIQ_ROUTING_STRATEGY`` env var (explicit override)
+    2. ``routing_strategy`` from the Router's config (e.g., ``"llmrouter-knn"``)
+    3. ``None`` (use default — RouteIQ plugin without ML model)
+
+    When the config contains a ``routing_strategy`` starting with ``"llmrouter-"``,
+    we extract it as our ML strategy name.  LiteLLM does not need to recognise
+    this value because :func:`install_routeiq_strategy` replaces the Router's
+    ``get_available_deployment`` entirely via ``set_custom_routing_strategy()``.
+
+    Returns:
+        True if the strategy was installed, False otherwise.
+    """
+    # Check if plugin strategy mode is active (set by create_app)
+    use_plugin = getattr(app.state, "use_plugin_strategy", False)
+    if not use_plugin:
+        logger.debug(
+            "Plugin routing strategy not active — "
+            "using legacy monkey-patch approach"
+        )
+        return False
+
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except ImportError:
+        logger.warning("Could not import llm_router from litellm.proxy.proxy_server")
+        return False
+
+    if llm_router is None:
+        logger.warning(
+            "LiteLLM Router is not initialised (llm_router is None). "
+            "Plugin routing strategy cannot be installed."
+        )
+        return False
+
+    # Determine the strategy name:
+    # 1. Explicit env var override
+    strategy_name = os.environ.get("ROUTEIQ_ROUTING_STRATEGY")
+
+    # 2. Extract from Router config's routing_strategy if it's an llmrouter-* value
+    if not strategy_name:
+        router_settings = getattr(llm_router, "router_settings", {}) or {}
+        config_strategy = router_settings.get("routing_strategy") or getattr(
+            llm_router, "routing_strategy", None
+        )
+        if isinstance(config_strategy, str) and config_strategy.startswith(
+            "llmrouter-"
+        ):
+            strategy_name = config_strategy
+            logger.info(
+                f"Extracted routing strategy '{strategy_name}' from Router config"
+            )
+
+    # Install the plugin strategy
+    from litellm_llmrouter.gateway.app import _install_plugin_strategy
+
+    success = _install_plugin_strategy(llm_router, strategy_name)
+    if success:
+        print(
+            f"✅ Plugin routing strategy installed "
+            f"(strategy={strategy_name or 'default'})"
+        )
+    else:
+        print("⚠️ Plugin routing strategy failed — fell back to legacy monkey-patch")
+
+    return success
+
+
 def start_config_sync_if_enabled():
     """Start background config sync if enabled."""
     if os.getenv("CONFIG_HOT_RELOAD", "false").lower() == "true":
@@ -136,6 +216,75 @@ def start_config_sync_if_enabled():
             print("✅ Config sync started")
         except ImportError as e:
             print(f"⚠️ Could not start config sync: {e}")
+
+
+def resolve_worker_count(cli_workers: int | None = None) -> int:
+    """Resolve the number of uvicorn workers based on strategy mode.
+
+    Resolution order:
+    1. ``ROUTEIQ_WORKERS`` env var (if set and valid)
+    2. *cli_workers* argument (from ``--workers`` CLI flag)
+    3. Default: ``1``
+
+    When using the **legacy monkey-patch** mode
+    (``ROUTEIQ_USE_PLUGIN_STRATEGY=false``), workers is always forced to 1.
+    A warning is emitted if the user attempted to configure > 1 in that mode.
+
+    When using the **plugin strategy** (default), the resolved value is
+    returned as-is, allowing multi-worker deployments.
+
+    Invalid values (non-integer, zero, negative) are silently coerced to 1.
+    """
+    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    # --- resolve the raw desired worker count ---
+    workers = 1  # default
+    source = "default"
+
+    env_val = os.environ.get("ROUTEIQ_WORKERS")
+    if env_val is not None:
+        try:
+            parsed = int(env_val)
+            if parsed >= 1:
+                workers = parsed
+                source = "ROUTEIQ_WORKERS"
+            else:
+                logger.warning(
+                    "ROUTEIQ_WORKERS=%s is invalid (must be >= 1), defaulting to 1",
+                    env_val,
+                )
+        except ValueError:
+            logger.warning(
+                "ROUTEIQ_WORKERS=%s is not a valid integer, defaulting to 1",
+                env_val,
+            )
+    elif cli_workers is not None and cli_workers >= 1:
+        workers = cli_workers
+        source = "--workers CLI"
+
+    # --- enforce single-worker in legacy monkey-patch mode ---
+    if not use_plugin:
+        if workers > 1:
+            logger.warning(
+                "ROUTEIQ_WORKERS=%d requested but legacy monkey-patch mode is active "
+                "(ROUTEIQ_USE_PLUGIN_STRATEGY=false). Forcing workers=1. "
+                "Enable the plugin strategy to use multiple workers.",
+                workers,
+            )
+        workers = 1
+        logger.info("Legacy monkey-patch mode: using 1 worker")
+    else:
+        logger.info(
+            "Plugin strategy mode: using %d worker(s) (source: %s)",
+            workers,
+            source,
+        )
+
+    return workers
 
 
 def init_observability_if_enabled():
@@ -242,6 +391,9 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     to LiteLLM's Router class. Using os.execvp() would replace the process
     and lose all patches.
 
+    When using the plugin strategy (default), multiple workers are supported
+    via ``ROUTEIQ_WORKERS`` or the ``workers`` kwarg.
+
     Args:
         config_path: Path to the LiteLLM config file
         host: Host to bind to
@@ -293,6 +445,11 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     except RuntimeError:
         # No event loop in current thread
         asyncio.run(init_litellm())
+
+    # Install plugin routing strategy AFTER LiteLLM initialisation creates the Router.
+    # This must happen after initialize() because the Router instance doesn't exist
+    # until LiteLLM processes the config and creates its model_list / deployments.
+    install_plugin_routing_strategy(app)
 
     # Initialize HTTP client pool BEFORE plugins (they may use it)
     async def run_http_pool_startup():
@@ -354,13 +511,14 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # Configure uvicorn
+    workers = kwargs.get("workers", 1)
     uvicorn_config = {
         "app": app,
         "host": host,
         "port": port,
         "log_level": kwargs.get("log_level", "info"),
         "access_log": kwargs.get("access_log", True),
-        "workers": kwargs.get("workers", 1),  # Use 1 worker to preserve patches
+        "workers": workers,
     }
 
     # Add SSL config if provided
@@ -369,7 +527,7 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     if kwargs.get("ssl_certfile"):
         uvicorn_config["ssl_certfile"] = kwargs["ssl_certfile"]
 
-    print(f"🚀 Starting LiteLLM proxy on {host}:{port}")
+    print(f"🚀 Starting LiteLLM proxy on {host}:{port} (workers: {workers})")
     uvicorn.run(**uvicorn_config)
 
 
@@ -382,12 +540,15 @@ def main():
         --port PORT      Port to listen on (default: 4000)
         --host HOST      Host to bind to (default: 0.0.0.0)
         --debug          Enable debug mode
-        --workers N      Number of uvicorn workers (1 recommended for patches)
+        --workers N      Number of uvicorn workers (default: 1, multi-worker
+                         requires ROUTEIQ_USE_PLUGIN_STRATEGY=true)
         --ssl-keyfile    SSL key file path
         --ssl-certfile   SSL certificate file path
 
     Environment Variables:
         LITELLM_CONFIG_PATH  Default config path if --config not provided
+        ROUTEIQ_WORKERS      Number of uvicorn workers (overrides --workers)
+        ROUTEIQ_USE_PLUGIN_STRATEGY  Enable plugin strategy mode (default: true)
     """
     import argparse
 
@@ -439,7 +600,7 @@ Examples:
         "-w",
         type=int,
         default=1,
-        help="Number of workers (1 recommended to preserve patches)",
+        help="Number of workers (multi-worker requires plugin strategy mode)",
     )
     parser.add_argument("--ssl-keyfile", type=str, help="SSL key file path")
     parser.add_argument("--ssl-certfile", type=str, help="SSL certificate file path")
@@ -450,6 +611,9 @@ Examples:
     if unknown:
         print(f"   Note: Ignoring unknown args: {unknown}")
 
+    # Resolve worker count (env var overrides CLI, legacy mode forces 1)
+    workers = resolve_worker_count(cli_workers=args.workers)
+
     print("🚀 Starting RouteIQ Gateway...")
     print(
         f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
@@ -457,6 +621,7 @@ Examples:
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
     print(f"   Port: {args.port}")
+    print(f"   Workers: {workers}")
 
     # Validate environment variables early (advisory only — never prevents startup)
     from litellm_llmrouter.env_validation import validate_environment
@@ -493,7 +658,7 @@ Examples:
         host=args.host,
         port=args.port,
         debug=args.debug,
-        workers=args.workers,
+        workers=workers,
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
     )

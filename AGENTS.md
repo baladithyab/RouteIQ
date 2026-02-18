@@ -431,7 +431,7 @@ The `reference/litellm/` directory is a git submodule containing upstream LiteLL
 ### 4. Monkey-Patch Constraint
 
 LiteLLM's Router is patched at runtime via `routing_strategy_patch.py`. This means:
-- **Always run with 1 uvicorn worker** (patches don't survive `os.execvp()`)
+- **When using legacy monkey-patch mode** (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`), only 1 uvicorn worker is supported. When using the plugin strategy (default), multiple workers can be configured via `ROUTEIQ_WORKERS`.
 - **Call `patch_litellm_router()` BEFORE creating Router instances**
 - The `create_app()` factory handles this automatically
 
@@ -517,6 +517,8 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_CORS_ORIGINS` | No | Allowed CORS origins |
 | `ROUTEIQ_SKIP_ENV_VALIDATION` | No | Skip startup env validation |
 | `ROUTEIQ_EVALUATOR_ENABLED` | No | Enable LLM-as-judge evaluator plugin |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Use plugin routing strategy instead of monkey-patch (default: true) |
+| `ROUTEIQ_WORKERS` | No | Number of uvicorn workers (default: 1, multi-worker requires plugin strategy) |
 
 ## DOCUMENTATION
 
@@ -542,8 +544,10 @@ Development follows a Task Group pattern with quality gates:
 
 1. **In-process uvicorn is mandatory**: `startup.py` uses `uvicorn.run(app=app)` instead
    of `os.execvp()`. This is critical because `os.execvp()` replaces the process and would
-   lose all monkey-patches to LiteLLM's Router class.
-
+   lose all monkey-patches to LiteLLM's Router class. When using the plugin strategy
+   (default), multiple workers are supported via `ROUTEIQ_WORKERS` since `os.fork()`
+   preserves the app state including installed strategies. Legacy monkey-patch mode
+   is restricted to 1 worker.
 2. **BackpressureMiddleware is the innermost middleware**: It is registered first via
    `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app
    directly (replaces `app.app`). This is required because `BaseHTTPMiddleware` does NOT

@@ -6,7 +6,7 @@ This module provides the FastAPI application factory for the LLMRouter gateway.
 It explicitly configures all middleware, routers, and patches in a single place.
 
 Load Order:
-1. Apply LiteLLM router patch (if enabled)
+1. Apply LiteLLM router patch (if enabled, and not using plugin strategy)
 2. Get/create FastAPI app
 3. Add backpressure middleware (INNERMOST – registered first so outer
    middleware like RequestID and CORS can decorate its 503 responses)
@@ -33,7 +33,7 @@ Usage standalone (without LiteLLM):
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI
 
@@ -50,6 +50,21 @@ from ..http_client_pool import (
 from ..policy_engine import add_policy_middleware
 
 logger = logging.getLogger(__name__)
+
+
+def _use_plugin_strategy() -> bool:
+    """
+    Check whether the plugin-based routing strategy should be used.
+
+    Reads ``ROUTEIQ_USE_PLUGIN_STRATEGY`` environment variable.
+    Defaults to ``True`` (new behaviour).  Set to ``"false"`` to fall back
+    to the legacy monkey-patch approach.
+    """
+    return os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
 
 
 def _parse_cors_origins() -> list[str]:
@@ -81,6 +96,43 @@ def _apply_patch_safely() -> bool:
         logger.warning("Failed to apply LiteLLM router patch")
 
     return result
+
+
+def _install_plugin_strategy(
+    router_instance: Any,
+    strategy_name: Optional[str] = None,
+) -> bool:
+    """
+    Install the RouteIQ custom routing strategy on a Router instance.
+
+    Uses ``install_routeiq_strategy`` from ``custom_routing_strategy`` to wire
+    the strategy into the Router via ``set_custom_routing_strategy()``.
+
+    On failure, falls back to the legacy monkey-patch approach via
+    ``_apply_patch_safely()`` and logs a warning.
+
+    Args:
+        router_instance: The LiteLLM Router instance
+        strategy_name: Optional ML strategy name (e.g., "llmrouter-knn")
+
+    Returns:
+        True if the strategy was installed (either plugin or fallback patch)
+    """
+    try:
+        from ..custom_routing_strategy import install_routeiq_strategy
+
+        install_routeiq_strategy(router_instance, strategy_name)
+        logger.info(
+            "Plugin routing strategy installed successfully "
+            f"(strategy={strategy_name or 'default'})"
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            f"Failed to install plugin routing strategy: {e}. "
+            f"Falling back to legacy monkey-patch approach."
+        )
+        return _apply_patch_safely()
 
 
 def _configure_middleware(app: FastAPI) -> None:
@@ -369,7 +421,9 @@ def create_app(
     Configure the LiteLLM proxy's FastAPI app with LLMRouter extensions.
 
     This function:
-    1. Applies the LiteLLM router patch (explicit, idempotent)
+    1. Applies the LiteLLM router patch (explicit, idempotent) — OR skips it
+       when ``ROUTEIQ_USE_PLUGIN_STRATEGY=true`` (default), deferring to the
+       plugin-based strategy that is installed after ``initialize()`` completes.
     2. Gets the LiteLLM proxy's FastAPI app
     3. Adds backpressure middleware (innermost, so 503s get CORS/RequestID headers)
     4. Adds remaining middleware (RequestID, CORS, Policy, Plugins, etc.)
@@ -390,12 +444,30 @@ def create_app(
     Returns:
         The configured FastAPI application instance
     """
-    # Step 1: Apply patch BEFORE importing litellm.proxy
+    # Step 1: Determine routing approach — plugin strategy vs legacy monkey-patch.
+    #
+    # When ROUTEIQ_USE_PLUGIN_STRATEGY=true (the default), we skip the
+    # monkey-patch entirely.  The plugin strategy will be installed later
+    # by startup.py after LiteLLM's initialize() creates the Router instance.
+    #
+    # When ROUTEIQ_USE_PLUGIN_STRATEGY=false, we apply the legacy monkey-patch
+    # BEFORE importing litellm.proxy (preserving the original behaviour).
+    use_plugin = _use_plugin_strategy()
+
     if apply_patch:
-        _apply_patch_safely()
+        if use_plugin:
+            logger.info(
+                "ROUTEIQ_USE_PLUGIN_STRATEGY=true — skipping legacy monkey-patch. "
+                "Plugin routing strategy will be installed after Router initialisation."
+            )
+        else:
+            _apply_patch_safely()
 
     # Step 2: Get LiteLLM's FastAPI app
     from litellm.proxy.proxy_server import app
+
+    # Store the routing approach decision so startup.py can read it
+    app.state.use_plugin_strategy = use_plugin
 
     # Step 3: Add backpressure middleware FIRST (wraps app.app directly).
     # ─────────────────────────────────────────────────────────────────

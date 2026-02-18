@@ -159,6 +159,16 @@ start_config_sync()
 fi
 
 # =============================================================================
+# Worker Configuration
+# =============================================================================
+# Multi-worker mode requires ROUTEIQ_USE_PLUGIN_STRATEGY=true (the default).
+# In legacy monkey-patch mode, workers is forced to 1 by startup.py.
+# =============================================================================
+
+ROUTEIQ_WORKERS="${ROUTEIQ_WORKERS:-1}"
+echo "👷 Workers: ${ROUTEIQ_WORKERS} (ROUTEIQ_USE_PLUGIN_STRATEGY=${ROUTEIQ_USE_PLUGIN_STRATEGY:-true})"
+
+# =============================================================================
 # Start LiteLLM Proxy via LLMRouter Startup Module
 # =============================================================================
 # We use our startup module instead of `litellm` CLI directly because:
@@ -173,7 +183,7 @@ echo "   ✅ llmrouter-* routing strategies will be available"
 # Use opentelemetry-instrument if OTEL is configured for additional auto-instrumentation
 if [ -n "$OTEL_EXPORTER_OTLP_ENDPOINT" ] && command -v opentelemetry-instrument &> /dev/null; then
     echo "   With OpenTelemetry instrumentation"
-    exec opentelemetry-instrument python -m litellm_llmrouter.startup "$@"
+    exec opentelemetry-instrument python -m litellm_llmrouter.startup --workers "${ROUTEIQ_WORKERS}" "$@"
 else
-    exec python -m litellm_llmrouter.startup "$@"
+    exec python -m litellm_llmrouter.startup --workers "${ROUTEIQ_WORKERS}" "$@"
 fi

@@ -49,6 +49,7 @@ _BOOLEAN_ENV_VARS: tuple[str, ...] = (
     "MCP_PROTOCOL_PROXY_ENABLED",
     "LLMROUTER_ALLOW_PICKLE_MODELS",
     "LLMROUTER_ENFORCE_SIGNED_MODELS",
+    "ROUTEIQ_USE_PLUGIN_STRATEGY",
 )
 
 _VALID_BOOLEAN_VALUES: frozenset[str] = frozenset(
@@ -60,6 +61,12 @@ _VALID_BOOLEAN_VALUES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 _PORT_ENV_VARS: tuple[str, ...] = ("REDIS_PORT",)
+
+# ---------------------------------------------------------------------------
+# Known positive-integer env vars (workers, counts, etc.)
+# ---------------------------------------------------------------------------
+
+_POSITIVE_INT_ENV_VARS: tuple[str, ...] = ("ROUTEIQ_WORKERS",)
 
 # ---------------------------------------------------------------------------
 # Placeholder values that shouldn't appear in production admin keys
@@ -102,6 +109,7 @@ def validate_environment() -> ValidationResult:
     _validate_admin_api_keys(result)
     _validate_boolean_vars(result)
     _validate_port_vars(result)
+    _validate_positive_int_vars(result)
 
     # Summary log
     n_errors = len(result.errors)
@@ -219,6 +227,22 @@ def _validate_port_vars(result: ValidationResult) -> None:
             if not (1 <= port <= 65535):
                 result.warnings.append(
                     f"{var} value '{value}' is outside the valid port range (1-65535)"
+                )
+        except ValueError:
+            result.warnings.append(f"{var} value '{value}' is not a valid integer")
+
+
+def _validate_positive_int_vars(result: ValidationResult) -> None:
+    """Warn for env vars that should be positive integers."""
+    for var in _POSITIVE_INT_ENV_VARS:
+        value = os.environ.get(var)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+            if parsed < 1:
+                result.warnings.append(
+                    f"{var} value '{value}' must be a positive integer (>= 1)"
                 )
         except ValueError:
             result.warnings.append(f"{var} value '{value}' is not a valid integer")

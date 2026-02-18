@@ -99,6 +99,13 @@ from .strategy_registry import (
 from .gateway import create_app, create_standalone_app
 from .gateway.plugin_manager import GatewayPlugin, PluginManager, get_plugin_manager
 
+# Custom routing strategy (plugin-based, replaces monkey-patch)
+from .custom_routing_strategy import (
+    RouteIQRoutingStrategy,
+    create_routeiq_strategy,
+    install_routeiq_strategy,
+)
+
 try:
     from importlib.metadata import version as _get_version
 
@@ -119,6 +126,10 @@ __all__ = [
     "GatewayPlugin",
     "PluginManager",
     "get_plugin_manager",
+    # Custom routing strategy (plugin-based)
+    "RouteIQRoutingStrategy",
+    "create_routeiq_strategy",
+    "install_routeiq_strategy",
     # Strategies
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",
