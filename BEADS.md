@@ -28,15 +28,17 @@ TG-IMPL-E (P2) ─── (no blockers)
   - [ ] Solve multi-worker scaling (move routing state to Redis or use CustomRoutingStrategyBase)
 
 ### TG-IMPL-B: Documentation Cleanup `RouteIQ-d4i`
-- **Status**: 🔴 Not Started
+- **Status**: ✅ Done
 - **Priority**: P1 (High)
 - **Dependencies**: TG-IMPL-G (must reduce code before documenting it)
+- **Completed**: 2026-02-18
 - **Tasks**:
-  - [ ] Consolidate redundant doc files (remove placeholder stubs with `# TODO` content)
-  - [ ] Remove outdated plans/ files that no longer apply
-  - [ ] Update AGENTS.md to reflect actual architecture post-cleanup
-  - [ ] Ensure docs/ reflects current state, not aspirational state
-  - [ ] Update README.md quick start section
+  - [x] Fixed AGENTS.md/CLAUDE.md drift — synchronized both files with actual codebase architecture
+  - [x] Consolidated redundant docs — merged plugin-development-guide.md into plugins.md, deleted docs-consolidation-plan.md
+  - [x] Updated project-state.md, parity-roadmap.md, and quickstart links to reflect current state
+  - [x] Added cross-references between related docs (plugins, skills, security)
+  - [x] Rewrote docs/index.md as comprehensive documentation hub — 39 docs across 7 categories with descriptions and status indicators
+  - [x] Ensured docs/ reflects current state, not aspirational state
 
 ### TG-IMPL-C: LiteLLM Plugin Architecture Migration `RouteIQ-n5d`
 - **Status**: 🔴 Not Started
@@ -99,9 +101,9 @@ TG-IMPL-E (P2) ─── (no blockers)
 
 | Phase | Beads | Rationale |
 |-------|-------|-----------|
-| 1 (Now) | **TG-IMPL-A** + **TG-IMPL-G** | Unblocked P0/P1 work — fix critical bugs, reduce code |
-| 2 | **TG-IMPL-C** + **TG-IMPL-B** + **TG-IMPL-E** | After A unblocks C; after G unblocks B; E is independent |
-| 3 | **TG-IMPL-D** + **TG-IMPL-F** | After C unblocks D; after A unblocks F |
+| 1 (Done) | **TG-IMPL-G** ✅ + **TG-IMPL-B** ✅ | Codebase reduction and documentation cleanup complete |
+| 2 (Now) | **TG-IMPL-A** + **TG-IMPL-E** | P0 critical fixes (unblocks C, F); Admin UI is independent |
+| 3 | **TG-IMPL-C** + **TG-IMPL-D** + **TG-IMPL-F** | After A unblocks C and F; after C unblocks D |
 
 ## bd Quick Reference
 
