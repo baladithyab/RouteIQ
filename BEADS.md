@@ -85,15 +85,15 @@ TG-IMPL-E (P2) ─── (no blockers)
   - [ ] Add Kubernetes-native leader election (replace Redis-based)
 
 ### TG-IMPL-G: Codebase Reduction `RouteIQ-2qz`
-- **Status**: 🔴 Not Started
+- **Status**: ✅ Done
 - **Priority**: P1 (High)
 - **Dependencies**: None (ready to start)
+- **Completed**: 2026-02-18
 - **Tasks**:
-  - [ ] Remove `mcp_parity.py` (thin aliases to upstream LiteLLM MCP)
-  - [ ] Remove `a2a_gateway.py` wrapper (thin wrapper around LiteLLM's global_agent_registry)
-  - [ ] Fix version identity to report RouteIQ version instead of LiteLLM
-  - [ ] Audit and remove dead code paths in routes.py
-  - [ ] Update imports and tests after removals
+  - [x] Phase 1: Removed 23 obsolete files (GATE reports, stub docs, CRITICAL_ARCHITECTURE_ASSESSMENT.md) — ~3,766 lines
+  - [x] Phase 1: Archived 10 completed plan files to `plans/archive/`
+  - [x] Phase 2: MCP/A2A redundancy evaluated — 3 modules (3,379 lines) identified as fully redundant (`mcp_jsonrpc.py`, `mcp_sse_transport.py`, `mcp_parity.py`); 2 modules flagged for future removal; 2 tracing modules kept (unique value)
+  - [x] Phase 3: Version identity unified — Helm Chart appVersion, Dockerfile labels, entrypoint banners, `pyproject.toml` description all aligned to RouteIQ 0.2.0
 
 ## Execution Order (Recommended)
 
