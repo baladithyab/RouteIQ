@@ -1,6 +1,6 @@
 # Project State & Gaps
 
-**Last Updated:** 2026-02-03
+**Last Updated:** 2026-02-18
 
 > **Attribution**:
 > RouteIQ is built on top of upstream [LiteLLM](https://github.com/BerriAI/litellm) for proxy/API compatibility and [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) for ML routing.
@@ -64,23 +64,28 @@ RouteIQ is a **superset** of LiteLLM. We aim to maintain 100% compatibility whil
 These are the highest priority technical debt and missing features as of the latest audit.
 
 1.  **Quotas & Limits**: No granular quota management (e.g., "Team A gets $50/day").
-2.  **RBAC**: Admin UI/API lacks fine-grained Role-Based Access Control (currently basic Admin/User).
-3.  **Audit Logs**: Audit logs are ephemeral or local; need durable export to S3/Kafka for compliance.
-4.  **Backpressure**: No mechanism to reject traffic when overloaded (risk of cascading failure).
+2.  ~~**RBAC**: Admin UI/API lacks fine-grained Role-Based Access Control.~~ ✅ **Resolved** — Implemented in [`rbac.py`](../src/litellm_llmrouter/rbac.py) with per-role permission sets.
+3.  ~~**Audit Logs**: Audit logs are ephemeral or local.~~ ✅ **Resolved** — Implemented in [`audit.py`](../src/litellm_llmrouter/audit.py) with PostgreSQL-backed durable logging.
+4.  ~~**Backpressure**: No mechanism to reject traffic when overloaded.~~ ✅ **Resolved** — Implemented in [`resilience.py`](../src/litellm_llmrouter/resilience.py) with configurable max concurrent requests and 503 rejection.
 5.  **Failover**: Database/Redis failover is handled by infrastructure, but app-level circuit breakers are basic.
 6.  **CI Load Tests**: No automated load testing in CI pipeline to catch performance regressions.
 7.  **MCP Tool Invocation**: Tool execution is currently flag-gated and lacks full OAuth delegation.
+
+> **Also implemented since last audit:**
+> - **Policy Engine**: OPA-style pre-request policy evaluation in [`policy_engine.py`](../src/litellm_llmrouter/policy_engine.py)
+> - **Env Validation**: Startup environment variable validation in [`env_validation.py`](../src/litellm_llmrouter/env_validation.py)
+> - **Plugin System**: Full plugin lifecycle management with 13 built-in plugins in [`gateway/plugins/`](../src/litellm_llmrouter/gateway/plugins/)
 
 ## 4. Phased Roadmap
 
 ### Now (Current Focus)
 *   **Stability**: Fixing edge cases in ML routing and config syncing.
-*   **Documentation**: Aligning docs with actual code state (this update).
+*   **Documentation**: Consolidating docs to match actual code state (TG-IMPL-B).
 *   **Validation**: Manual verification of HA and Security gates.
 
 ### Next (Q2 2026)
-*   **Enterprise Hardening**: Implementing Backpressure and Load Shedding.
-*   **Durable Auditing**: Shipping audit logs to S3.
+*   **Enterprise Hardening**: ~~Implementing Backpressure and Load Shedding.~~ ✅ Done. Focusing on quota management and secret rotation.
+*   **Durable Auditing**: ~~Shipping audit logs to S3.~~ ✅ Done (PostgreSQL-backed). S3 export is a future enhancement.
 *   **Automated MLOps**: Moving from scripts to a fully automated pipeline.
 
 ### Later (Q3 2026+)

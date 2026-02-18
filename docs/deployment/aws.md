@@ -3,6 +3,8 @@
 > **Attribution**:
 > RouteIQ is built on top of upstream [LiteLLM](https://github.com/BerriAI/litellm) for proxy/API compatibility and [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) for ML routing.
 
+> **See also**: For a comprehensive end-to-end AWS production deployment guide including feature overview, architecture diagrams, cost estimation, and operational playbook, see the [AWS Production Guide](../aws-production-guide.md).
+
 This guide covers deploying RouteIQ to AWS using various compute options.
 
 ## Component Overview

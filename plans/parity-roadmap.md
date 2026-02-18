@@ -32,15 +32,15 @@ Our roadmap is prioritized into P0 (Critical), P1 (High), and P2 (Medium) items.
 
 ### P1: Enterprise Hardening (Q2 2026)
 
-- [ ] **Backpressure & Load Shedding**: Protect gateway from overload during spikes.
+- [x] **Backpressure & Load Shedding**: Protect gateway from overload during spikes. ✅ Implemented in `resilience.py` (backpressure middleware, drain manager).
 - [ ] **Multi-Replica Trace Correlation**: End-to-end tracing across load balancers.
-- [ ] **Durable Audit Export**: Compliance logging to S3/Kafka.
+- [x] **Durable Audit Export**: Compliance logging to PostgreSQL. ✅ Implemented in `audit.py`. S3/Kafka export is a future enhancement.
 - [ ] **Secret Rotation**: Patterns for dynamic secret updates without downtime.
 
 ### P2: Advanced MLOps & Scale (Q3 2026)
 
 - [ ] **Autoscaling Guidance**: KEDA/HPA metrics based on token throughput.
-- [ ] **Degraded Mode**: Circuit breakers for DB/Redis failures.
+- [x] **Degraded Mode**: Circuit breakers for DB/Redis failures. ✅ Implemented in `resilience.py` (per-provider circuit breakers).
 - [ ] **Multi-Region Sync**: Patterns for global deployments.
 - [ ] **Automated MLOps Pipeline**: Trace -> Train -> Deploy loop.
 

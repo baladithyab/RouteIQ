@@ -2,6 +2,8 @@
 
 > A complete guide to deploying RouteIQ as a production AI gateway on AWS using cloud-native services.
 
+> **See also**: For detailed technical deployment steps covering multiple AWS compute options (ECS Fargate, EKS, App Runner, Lambda), database configuration, and caching setup, see the [AWS Deployment Guide](deployment/aws.md).
+
 ## What Is RouteIQ?
 
 RouteIQ is a **production-grade AI gateway** that sits between your applications and LLM providers (Amazon Bedrock, OpenAI, Anthropic, Azure OpenAI, etc.). It provides a single OpenAI-compatible API endpoint while adding intelligent routing, cost controls, security, observability, and multi-protocol support.

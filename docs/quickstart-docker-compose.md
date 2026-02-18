@@ -99,6 +99,6 @@ The default setup mounts `./config/config.yaml` to the container. You can modify
 
 ## Next Steps
 
-- **Need reliability?** Switch to the [High Availability Setup](quickstart-ha-compose.md).
-- **Need visibility?** Add the [Observability Stack](quickstart-otel-compose.md).
+- **Need reliability?** Switch to the [High Availability Setup](tutorials/ha-quickstart.md).
+- **Need visibility?** Add the [Observability Stack](tutorials/observability-quickstart.md).
 - **Configuration:** See the [Configuration Guide](configuration.md).
