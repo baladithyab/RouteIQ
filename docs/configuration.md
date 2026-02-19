@@ -32,8 +32,6 @@ model_list:
       api_key: os.environ/ANTHROPIC_API_KEY
 ```
 
-### Issue
-
 ### Router Settings
 
 Configure routing behavior:
@@ -510,3 +508,196 @@ Consider HPA based on:
 - CPU/Memory utilization
 - Custom metrics (requests per second, queue depth)
 - External metrics from OTEL
+
+---
+
+## Comprehensive Environment Variables Reference
+
+This section provides a complete reference of all environment variables supported by RouteIQ Gateway. Variables are grouped by category and include defaults, descriptions, and notes.
+
+> **Tip**: Use `python -m litellm_llmrouter.startup --validate-env` to validate your environment variables before deployment (CI/CD friendly).
+
+### Required
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LITELLM_MASTER_KEY` | *(none)* | Master API key for admin access. **Required.** Generate with `openssl rand -hex 32`. |
+
+### Admin / Auth
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADMIN_API_KEYS` | *(none)* | Comma-separated admin API keys for control-plane endpoints (hot reload, MCP management, A2A registration). |
+| `ADMIN_API_KEY` | *(none)* | Legacy single admin key (prefer `ADMIN_API_KEYS`). |
+| `ADMIN_AUTH_ENABLED` | `true` | Set to `false` to disable admin auth. **Not recommended for production.** |
+| `ROUTEIQ_KEY_PREFIX` | `sk-riq-` | Custom prefix for RouteIQ-generated API keys. |
+| `ROUTEIQ_SKIP_ENV_VALIDATION` | `false` | Skip environment variable validation at startup. Useful for CI/testing. |
+
+### LLM Provider Keys
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | *(none)* | OpenAI API key. |
+| `ANTHROPIC_API_KEY` | *(none)* | Anthropic API key. |
+| `AZURE_API_KEY` | *(none)* | Azure OpenAI API key. |
+| `AZURE_API_BASE` | *(none)* | Azure OpenAI endpoint base URL. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | *(none)* | Path to Google Cloud service account JSON file (Vertex AI). |
+| `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for Bedrock. |
+| `AWS_ACCESS_KEY_ID` | *(none)* | AWS access key (prefer IRSA/Pod Identity in K8s). |
+| `AWS_SECRET_ACCESS_KEY` | *(none)* | AWS secret key (prefer IRSA/Pod Identity in K8s). |
+
+### Database (PostgreSQL)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | *(none)* | PostgreSQL connection string. Required for HA. Format: `postgresql://USER:PASS@HOST:PORT/DB`. |
+| `POSTGRES_USER` | `litellm` | PostgreSQL username (used by Docker Compose). |
+| `POSTGRES_PASSWORD` | *(none)* | PostgreSQL password (used by Docker Compose). |
+| `POSTGRES_DB` | `litellm` | PostgreSQL database name (used by Docker Compose). |
+| `STORE_MODEL_IN_DB` | `false` | Store LiteLLM models/config in database. Set to `true` for K8s. |
+
+### Redis
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_HOST` | *(none)* | Redis hostname. Optional — Redis is not required for basic operation. |
+| `REDIS_PORT` | `6379` | Redis port. |
+| `REDIS_PASSWORD` | *(none)* | Redis password (if authentication is required). |
+| `REDIS_SSL` | `false` | Enable TLS/SSL for Redis connections. |
+
+### Config Sync / Hot Reload
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LITELLM_CONFIG_PATH` | `/app/config/config.yaml` | Path to the LiteLLM config file. |
+| `CONFIG_S3_BUCKET` | *(none)* | S3 bucket for config sync. |
+| `CONFIG_S3_KEY` | `configs/config.yaml` | S3 key for config file. |
+| `CONFIG_GCS_BUCKET` | *(none)* | GCS bucket for config sync (alternative to S3). |
+| `CONFIG_GCS_KEY` | `configs/config.yaml` | GCS key for config file. |
+| `CONFIG_HOT_RELOAD` | `false` | Enable filesystem-watching config hot reload. |
+| `CONFIG_SYNC_ENABLED` | `true` | Enable background config sync from S3/GCS. |
+| `CONFIG_SYNC_INTERVAL` | `60` | Config sync polling interval in seconds. |
+| `LLMROUTER_MODEL_S3_BUCKET` | *(none)* | S3 bucket for ML model artifacts. |
+| `LLMROUTER_MODEL_S3_KEY` | `models/router.pt` | S3 key for ML model file. |
+| `LLMROUTER_HOT_RELOAD` | `true` | Enable hot-reloading of LLMRouter ML models. |
+| `LLMROUTER_RELOAD_INTERVAL` | `300` | ML model hot reload polling interval in seconds. |
+
+### Feature Flags
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_GATEWAY_ENABLED` | `false` | Enable MCP gateway (JSON-RPC, SSE, REST surfaces). |
+| `MCP_SSE_TRANSPORT_ENABLED` | `false` | Enable MCP SSE transport at `/mcp/sse`. Requires `MCP_GATEWAY_ENABLED`. |
+| `MCP_SSE_LEGACY_MODE` | `false` | Enable MCP SSE legacy mode for older clients. |
+| `MCP_PROTOCOL_PROXY_ENABLED` | `false` | Enable MCP protocol-level proxy at `/mcp-proxy/*` (admin-only). |
+| `MCP_OAUTH_ENABLED` | `false` | Enable MCP OAuth support. |
+| `LLMROUTER_ENABLE_MCP_TOOL_INVOCATION` | `false` | Enable MCP remote tool invocation. **Security sensitive** — only enable in trusted environments. |
+| `MCP_HA_SYNC_ENABLED` | `false` | MCP registry sync via Redis for multi-replica deployments. |
+| `A2A_GATEWAY_ENABLED` | `false` | Enable A2A (Agent-to-Agent) gateway. |
+| `POLICY_ENGINE_ENABLED` | `false` | Enable OPA-style policy evaluation middleware. |
+| `POLICY_CONFIG_PATH` | *(none)* | Path to policy YAML config file (required when `POLICY_ENGINE_ENABLED=true`). |
+| `LLMROUTER_ALLOW_PICKLE_MODELS` | `false` | Allow loading pickle-serialized ML models. **Security risk** — only enable in trusted environments. |
+| `LLMROUTER_ENFORCE_SIGNED_MODELS` | `false` | Require manifest verification for ML model artifacts. |
+| `LLMROUTER_ROUTER_CALLBACK_ENABLED` | `true` | Enable router decision callback for routing telemetry (TG4.1). |
+
+### Plugin Strategy & Routing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | `true` | Use LiteLLM's official `CustomRoutingStrategyBase` plugin API instead of legacy monkey-patch. |
+| `ROUTEIQ_ROUTING_STRATEGY` | *(auto-detected)* | Override routing strategy name (e.g., `llmrouter-knn`, `llmrouter-mlp`). Auto-detected from config if not set. |
+| `ROUTEIQ_WORKERS` | `1` | Number of uvicorn workers. Multi-worker requires plugin strategy mode. Legacy monkey-patch forces 1. |
+
+### Centroid Routing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_CENTROID_ROUTING` | `true` | Enable centroid routing fallback (~2ms, zero-config). |
+| `ROUTEIQ_ROUTING_PROFILE` | `auto` | Default routing profile. Values: `auto`, `eco`, `premium`, `free`, `reasoning`. |
+| `ROUTEIQ_CENTROID_WARMUP` | `false` | Pre-warm centroid classifier at startup (loads embeddings into memory). |
+| `ROUTEIQ_CENTROID_DIR` | `models/centroids` | Directory containing centroid `.npy` files. |
+| `ROUTEIQ_CONFIDENCE_THRESHOLD` | `0.06` | Centroid classification confidence threshold (cosine distance). |
+
+### Admin UI
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_ADMIN_UI_ENABLED` | `false` | Enable Admin UI (serves React SPA at `/ui/`). Requires `ui/dist/` to be built. |
+
+### SSRF Protection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLMROUTER_ALLOW_PRIVATE_IPS` | `false` | Allow all private IP ranges. Only for development/testing. |
+| `LLMROUTER_SSRF_ALLOWLIST_HOSTS` | *(none)* | Allowlist specific hosts/domains (comma-separated). Supports exact and suffix match. |
+| `LLMROUTER_SSRF_ALLOWLIST_CIDRS` | *(none)* | Allowlist specific IP ranges in CIDR notation (comma-separated). |
+| `LLMROUTER_OUTBOUND_ALLOW_PRIVATE` | `false` | Canonical name for `LLMROUTER_ALLOW_PRIVATE_IPS`. |
+| `LLMROUTER_OUTBOUND_HOST_ALLOWLIST` | *(none)* | Canonical name for `LLMROUTER_SSRF_ALLOWLIST_HOSTS`. |
+| `LLMROUTER_OUTBOUND_CIDR_ALLOWLIST` | *(none)* | Canonical name for `LLMROUTER_SSRF_ALLOWLIST_CIDRS`. |
+| `LLMROUTER_OUTBOUND_URL_ALLOWLIST` | *(none)* | Allowlist full URL prefixes that bypass SSRF checks (comma-separated). |
+| `LLMROUTER_SSRF_USE_SYNC_DNS` | `false` | Use synchronous DNS resolution (rollback flag). |
+| `LLMROUTER_SSRF_DNS_TIMEOUT` | `5.0` | DNS resolution timeout in seconds. |
+| `LLMROUTER_SSRF_DNS_CACHE_TTL` | `60` | DNS cache TTL in seconds. |
+| `LLMROUTER_SSRF_DNS_CACHE_SIZE` | `1000` | Maximum entries in the DNS resolution cache. |
+
+### Semantic Cache
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_ENABLED` | `false` | Enable the semantic cache plugin. |
+| `CACHE_SEMANTIC_ENABLED` | `false` | Enable embedding-based semantic matching. |
+| `CACHE_TTL_SECONDS` | `3600` | Default TTL for cached responses in seconds. |
+| `CACHE_L1_MAX_SIZE` | `1000` | Maximum entries in the L1 in-memory LRU cache. |
+| `CACHE_SIMILARITY_THRESHOLD` | `0.95` | Cosine similarity threshold for semantic cache hits (0.0–1.0). |
+| `CACHE_REDIS_URL` | *(none)* | Redis URL for L2 shared cache tier. Format: `redis://[:password@]host:port/db`. |
+| `CACHE_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformer model for semantic embeddings. |
+| `CACHE_MAX_TEMPERATURE` | `0.1` | Maximum temperature for cacheable requests. |
+
+### Resilience / Backpressure
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_MAX_CONCURRENT_REQUESTS` | `0` | Maximum concurrent requests before 503 load shedding. `0` = disabled. |
+| `ROUTEIQ_DRAIN_TIMEOUT_SECONDS` | `30` | Graceful shutdown drain timeout in seconds. |
+| `ROUTEIQ_BACKPRESSURE_EXCLUDED_PATHS` | *(none)* | Additional paths excluded from backpressure (comma-separated). |
+| `ROUTEIQ_CB_FAILURE_THRESHOLD` | `5` | Global circuit breaker: failures before circuit opens. |
+| `ROUTEIQ_CB_SUCCESS_THRESHOLD` | `2` | Global circuit breaker: successes in half-open before closing. |
+| `ROUTEIQ_CB_TIMEOUT_SECONDS` | `30` | Global circuit breaker: seconds before recovery attempt. |
+| `ROUTEIQ_CB_WINDOW_SECONDS` | `60` | Global circuit breaker: sliding window for failure tracking. |
+
+### Observability (OTel)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTEL_ENABLED` | `true` | Enable OpenTelemetry integration. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | OTel Collector endpoint (gRPC). E.g., `http://localhost:4317`. |
+| `OTEL_SERVICE_NAME` | `litellm-gateway` | Service name for traces/metrics. |
+| `OTEL_TRACES_EXPORTER` | `none` | Traces exporter type (`none`, `otlp`, `console`). |
+| `OTEL_METRICS_EXPORTER` | `none` | Metrics exporter type (`none`, `otlp`, `console`). |
+| `OTEL_LOGS_EXPORTER` | `none` | Logs exporter type (`none`, `otlp`, `console`). |
+| `OTEL_TRACES_SAMPLER` | *(none)* | Sampler type: `always_on`, `always_off`, `traceidratio`, `parentbased_traceidratio`, etc. |
+| `OTEL_TRACES_SAMPLER_ARG` | *(none)* | Ratio for ratio-based samplers (0.0–1.0). |
+| `LLMROUTER_OTEL_SAMPLE_RATE` | *(none)* | Convenience: sampling rate 0.0–1.0 (uses `parentbased_traceidratio`). |
+| `PROMETHEUS_MULTIPROC_DIR` | *(none)* | Shared directory for Prometheus multiprocess metrics. |
+
+### Leader Election / HA
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLMROUTER_CONFIG_SYNC_LEADER_ELECTION_ENABLED` | `true` (if `DATABASE_URL` set) | Enable leader election for config sync. |
+| `LLMROUTER_CONFIG_SYNC_LEASE_SECONDS` | `30` | Lease duration in seconds. |
+| `LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS` | `10` | Lease renewal interval (should be < `lease_seconds / 3`). |
+| `LLMROUTER_CONFIG_SYNC_LOCK_NAME` | `config_sync` | Lock name for leader election. |
+| `ROUTEIQ_LEADER_MIGRATIONS` | `false` | Enable leader-election-based DB migrations on startup. |
+
+### MLOps (Reference Only)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow tracking server URI. |
+| `MLFLOW_ARTIFACT_BUCKET` | `llmrouter-artifacts` | MLflow artifact storage bucket. |
+| `WANDB_API_KEY` | *(none)* | Weights & Biases API key. |
+| `HF_TOKEN` | *(none)* | Hugging Face token. |
+| `MINIO_ROOT_USER` | `minioadmin` | MinIO root username (local dev). |
+| `MINIO_ROOT_PASSWORD` | `minioadmin` | MinIO root password (local dev). |
+| `JUPYTER_TOKEN` | `llmrouter` | Jupyter notebook token. |

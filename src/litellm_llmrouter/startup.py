@@ -604,9 +604,38 @@ Examples:
     )
     parser.add_argument("--ssl-keyfile", type=str, help="SSL key file path")
     parser.add_argument("--ssl-certfile", type=str, help="SSL certificate file path")
+    parser.add_argument(
+        "--validate-env",
+        "--check-env",
+        action="store_true",
+        dest="validate_env",
+        default=False,
+        help="Validate environment variables and exit (useful for CI/CD pipelines)",
+    )
 
     # Parse known args and pass through unknown args (for forward compatibility)
     args, unknown = parser.parse_known_args()
+
+    # Handle --validate-env: run validation, print results, and exit
+    if args.validate_env:
+        from litellm_llmrouter.env_validation import validate_environment
+
+        print("🔍 Validating environment variables...")
+        env_result = validate_environment()
+
+        if env_result.errors:
+            print(f"\n❌ {len(env_result.errors)} error(s):")
+            for err in env_result.errors:
+                print(f"   ERROR: {err}")
+        if env_result.warnings:
+            print(f"\n⚠️  {len(env_result.warnings)} warning(s):")
+            for warn in env_result.warnings:
+                print(f"   WARN:  {warn}")
+        if not env_result.errors and not env_result.warnings:
+            print("\n✅ All environment variables look good!")
+
+        # Exit with code 1 if there are errors, 0 otherwise
+        sys.exit(1 if env_result.errors else 0)
 
     if unknown:
         print(f"   Note: Ignoring unknown args: {unknown}")

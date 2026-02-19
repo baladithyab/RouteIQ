@@ -50,6 +50,9 @@ _BOOLEAN_ENV_VARS: tuple[str, ...] = (
     "LLMROUTER_ALLOW_PICKLE_MODELS",
     "LLMROUTER_ENFORCE_SIGNED_MODELS",
     "ROUTEIQ_USE_PLUGIN_STRATEGY",
+    "ROUTEIQ_CENTROID_ROUTING",
+    "ROUTEIQ_CENTROID_WARMUP",
+    "ROUTEIQ_ADMIN_UI_ENABLED",
 )
 
 _VALID_BOOLEAN_VALUES: frozenset[str] = frozenset(
@@ -67,6 +70,14 @@ _PORT_ENV_VARS: tuple[str, ...] = ("REDIS_PORT",)
 # ---------------------------------------------------------------------------
 
 _POSITIVE_INT_ENV_VARS: tuple[str, ...] = ("ROUTEIQ_WORKERS",)
+
+# ---------------------------------------------------------------------------
+# Known enum env vars
+# ---------------------------------------------------------------------------
+
+_VALID_ROUTING_PROFILES: frozenset[str] = frozenset(
+    {"auto", "eco", "premium", "free", "reasoning"}
+)
 
 # ---------------------------------------------------------------------------
 # Placeholder values that shouldn't appear in production admin keys
@@ -110,6 +121,7 @@ def validate_environment() -> ValidationResult:
     _validate_boolean_vars(result)
     _validate_port_vars(result)
     _validate_positive_int_vars(result)
+    _validate_routing_profile(result)
 
     # Summary log
     n_errors = len(result.errors)
@@ -246,3 +258,15 @@ def _validate_positive_int_vars(result: ValidationResult) -> None:
                 )
         except ValueError:
             result.warnings.append(f"{var} value '{value}' is not a valid integer")
+
+
+def _validate_routing_profile(result: ValidationResult) -> None:
+    """Warn if ROUTEIQ_ROUTING_PROFILE is not a recognised profile name."""
+    value = os.environ.get("ROUTEIQ_ROUTING_PROFILE")
+    if value is None or value == "":
+        return
+    if value.lower() not in _VALID_ROUTING_PROFILES:
+        result.warnings.append(
+            f"ROUTEIQ_ROUTING_PROFILE has unexpected value '{value}' "
+            f"(expected one of: {', '.join(sorted(_VALID_ROUTING_PROFILES))})"
+        )
