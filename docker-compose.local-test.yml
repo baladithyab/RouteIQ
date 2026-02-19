@@ -230,6 +230,13 @@ services:
       - S3_ENDPOINT_URL=http://minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
+      # RouteIQ Plugin Strategy & Routing
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=true
+      - ROUTEIQ_WORKERS=1
+      - ROUTEIQ_CENTROID_ROUTING=true
+      - ROUTEIQ_CENTROID_WARMUP=false
+      - ROUTEIQ_ROUTING_PROFILE=auto
+      - ROUTEIQ_ADMIN_UI_ENABLED=true
     # Allow container to access EC2 instance metadata service for AWS credentials
     extra_hosts:
       - "host.docker.internal:host-gateway"

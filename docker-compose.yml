@@ -41,6 +41,11 @@ services:
       # S3/GCS Config Sync (optional)
       - CONFIG_S3_BUCKET=${CONFIG_S3_BUCKET:-}
       - CONFIG_S3_KEY=${CONFIG_S3_KEY:-}
+      # RouteIQ Plugin Strategy & Routing
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=true
+      - ROUTEIQ_WORKERS=2
+      - ROUTEIQ_CENTROID_ROUTING=true
+      - ROUTEIQ_ROUTING_PROFILE=auto
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 30s
