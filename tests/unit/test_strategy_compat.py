@@ -5,7 +5,7 @@ from litellm_llmrouter.strategies import LLMROUTER_STRATEGIES, DEFAULT_ROUTER_HP
 
 
 # Strategies that are RouteIQ-native (not from upstream LLMRouter)
-ROUTEIQ_NATIVE_STRATEGIES = {"custom"}
+ROUTEIQ_NATIVE_STRATEGIES = {"custom", "nadirclaw-centroid"}
 
 # Strategies that exist but have no default hparams (they use no-arg constructors)
 NO_HPARAMS_STRATEGIES = {"r1"}

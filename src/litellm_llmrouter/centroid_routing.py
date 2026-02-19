@@ -30,7 +30,7 @@ Usage::
     # Register in the strategy registry
     from litellm_llmrouter.strategy_registry import get_routing_registry
     registry = get_routing_registry()
-    registry.register("nadirclaw-centroid", get_centroid_strategy())
+    registry.register("llmrouter-nadirclaw-centroid", get_centroid_strategy())
 
 Attribution:
     Ported from NadirClaw's BinaryComplexityClassifier + routing intelligence.
@@ -762,7 +762,7 @@ class CentroidRoutingStrategy:
     @property
     def name(self) -> str:
         """Strategy name for telemetry and registry."""
-        return "nadirclaw-centroid"
+        return "llmrouter-nadirclaw-centroid"
 
     @property
     def version(self) -> Optional[str]:

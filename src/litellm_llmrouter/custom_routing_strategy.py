@@ -60,7 +60,6 @@ try:
     from litellm_llmrouter.centroid_routing import (
         CentroidRoutingStrategy,
         get_centroid_strategy,
-        reset_centroid_strategy,
         warmup_centroid_classifier,
         RoutingProfile,
     )
@@ -497,7 +496,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # Map profile string to RoutingProfile enum
         try:
-            profile = RoutingProfile(profile_str) if profile_str else RoutingProfile.AUTO
+            profile = (
+                RoutingProfile(profile_str) if profile_str else RoutingProfile.AUTO
+            )
         except ValueError:
             logger.warning(
                 "Unknown routing profile '%s', defaulting to 'auto'",
@@ -725,7 +726,7 @@ def install_routeiq_strategy(
 def register_centroid_strategy() -> bool:
     """Register the centroid strategy in the routing registry.
 
-    Makes the centroid strategy available as ``"nadirclaw-centroid"`` in the
+    Makes the centroid strategy available as ``"llmrouter-nadirclaw-centroid"`` in the
     routing registry for direct use or A/B testing.
 
     Auto-registers if ``ROUTEIQ_CENTROID_ROUTING=true`` (default).
@@ -746,8 +747,10 @@ def register_centroid_strategy() -> bool:
 
         registry = get_routing_registry()
         strategy = get_centroid_strategy()
-        registry.register("nadirclaw-centroid", strategy)
-        logger.info("Registered centroid strategy as 'nadirclaw-centroid' in routing registry")
+        registry.register("llmrouter-nadirclaw-centroid", strategy)
+        logger.info(
+            "Registered centroid strategy as 'llmrouter-nadirclaw-centroid' in routing registry"
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to register centroid strategy: {e}")

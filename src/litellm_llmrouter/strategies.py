@@ -484,7 +484,7 @@ LLMROUTER_STRATEGIES = [
     # Cost-aware routers
     "llmrouter-cost-aware",  # CostAwareRoutingStrategy - cheapest adequate model
     # Centroid-based routers
-    "nadirclaw-centroid",  # CentroidRoutingStrategy - zero-config intelligent routing
+    "llmrouter-nadirclaw-centroid",  # CentroidRoutingStrategy - zero-config intelligent routing
 ]
 
 
@@ -554,7 +554,7 @@ DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
         "cost_refresh_interval": 3600,
         "enable_circuit_breaker_filtering": True,
     },
-    "centroid": {
+    "nadirclaw-centroid": {
         "confidence_threshold": 0.06,
         "session_ttl": 1800,
         "profile": "auto",

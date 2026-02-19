@@ -851,9 +851,9 @@ class TestCentroidRoutingStrategy:
         assert result is not None or True  # May be None if no matching deployments
 
     def test_name_property(self):
-        """Strategy name should be 'nadirclaw-centroid'."""
+        """Strategy name should be 'llmrouter-nadirclaw-centroid'."""
         strategy = self._make_strategy()
-        assert strategy.name == "nadirclaw-centroid"
+        assert strategy.name == "llmrouter-nadirclaw-centroid"
 
     def test_version_property(self):
         """Strategy version should be set."""
