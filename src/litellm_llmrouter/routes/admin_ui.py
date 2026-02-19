@@ -103,19 +103,13 @@ def _format_uptime(seconds: float) -> str:
 def _get_feature_flags() -> dict[str, bool]:
     """Get current feature flag states from environment."""
     return {
-        "mcp_gateway": os.environ.get("MCP_GATEWAY_ENABLED", "false").lower()
-        == "true",
-        "a2a_gateway": os.environ.get("A2A_GATEWAY_ENABLED", "false").lower()
-        == "true",
+        "mcp_gateway": os.environ.get("MCP_GATEWAY_ENABLED", "false").lower() == "true",
+        "a2a_gateway": os.environ.get("A2A_GATEWAY_ENABLED", "false").lower() == "true",
         "policy_engine": os.environ.get("POLICY_ENGINE_ENABLED", "false").lower()
         == "true",
-        "centroid_routing": os.environ.get(
-            "ROUTEIQ_CENTROID_ROUTING", "true"
-        ).lower()
+        "centroid_routing": os.environ.get("ROUTEIQ_CENTROID_ROUTING", "true").lower()
         == "true",
-        "plugin_strategy": os.environ.get(
-            "ROUTEIQ_USE_PLUGIN_STRATEGY", "true"
-        ).lower()
+        "plugin_strategy": os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower()
         == "true",
         "admin_ui": os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED", "false").lower()
         == "true",
@@ -180,9 +174,7 @@ def _get_models() -> list[dict[str, str]]:
                     model_name = entry.get("model_name", "unknown")
                     litellm_params = entry.get("litellm_params", {})
                     model_id = litellm_params.get("model", "unknown")
-                    provider = (
-                        model_id.split("/")[0] if "/" in model_id else "unknown"
-                    )
+                    provider = model_id.split("/")[0] if "/" in model_id else "unknown"
                     models.append(
                         {
                             "model_name": model_name,
@@ -227,9 +219,7 @@ async def get_gateway_status():
     )
 
 
-@admin_router.get(
-    "/api/v1/routeiq/routing/stats", response_model=RoutingStatsResponse
-)
+@admin_router.get("/api/v1/routeiq/routing/stats", response_model=RoutingStatsResponse)
 async def get_routing_stats():
     """Get routing decision statistics."""
     strategy_distribution: dict[str, int] = {}
@@ -370,9 +360,7 @@ async def update_routing_config(request: UpdateRoutingConfigRequest):
     return await get_routing_config()
 
 
-@admin_router.get(
-    "/api/v1/routeiq/models", response_model=list[ModelInfoResponse]
-)
+@admin_router.get("/api/v1/routeiq/models", response_model=list[ModelInfoResponse])
 async def get_models():
     """Get configured models with deployment info."""
     models = _get_models()

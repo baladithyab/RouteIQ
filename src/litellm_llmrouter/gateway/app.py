@@ -421,7 +421,9 @@ def _mount_admin_ui(app: FastAPI) -> None:
     possible_paths = [
         Path("/app/ui/dist"),  # Docker production
         Path("ui/dist"),  # Local development
-        Path(__file__).parent.parent.parent.parent / "ui" / "dist",  # Relative to source
+        Path(__file__).parent.parent.parent.parent
+        / "ui"
+        / "dist",  # Relative to source
     ]
 
     ui_dist = None
