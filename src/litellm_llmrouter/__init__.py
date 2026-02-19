@@ -104,7 +104,26 @@ from .custom_routing_strategy import (
     RouteIQRoutingStrategy,
     create_routeiq_strategy,
     install_routeiq_strategy,
+    register_centroid_strategy,
+    CENTROID_ROUTING_AVAILABLE,
 )
+
+# Centroid routing (zero-config intelligent routing)
+try:
+    from .centroid_routing import (
+        CentroidRoutingStrategy,
+        CentroidClassifier,
+        AgenticDetector,
+        ReasoningDetector,
+        SessionCache,
+        RoutingProfile,
+        ClassificationResult,
+        get_centroid_strategy,
+        reset_centroid_strategy,
+        warmup_centroid_classifier,
+    )
+except ImportError:
+    pass  # centroid routing deps not installed
 
 try:
     from importlib.metadata import version as _get_version
@@ -130,6 +149,19 @@ __all__ = [
     "RouteIQRoutingStrategy",
     "create_routeiq_strategy",
     "install_routeiq_strategy",
+    "register_centroid_strategy",
+    "CENTROID_ROUTING_AVAILABLE",
+    # Centroid routing (zero-config intelligent routing)
+    "CentroidRoutingStrategy",
+    "CentroidClassifier",
+    "AgenticDetector",
+    "ReasoningDetector",
+    "SessionCache",
+    "RoutingProfile",
+    "ClassificationResult",
+    "get_centroid_strategy",
+    "reset_centroid_strategy",
+    "warmup_centroid_classifier",
     # Strategies
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",

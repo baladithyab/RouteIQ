@@ -9,6 +9,7 @@ This document covers all available routing strategies in the RouteIQ Gateway.
 
 - [LiteLLM Built-in Strategies](#litellm-built-in-strategies)
 - [LLMRouter ML-Based Strategies](#llmrouter-ml-based-strategies)
+- [Centroid Routing (Zero-Config)](#centroid-routing-zero-config)
 - [A/B Testing & Runtime Hot-Swapping](#ab-testing--runtime-hot-swapping)
 - [Model Artifact Security](#model-artifact-security)
 - [Hot Reloading](#hot-reloading)
@@ -279,6 +280,174 @@ router_settings:
 ```
 
 See [Creating Custom Routers](https://github.com/ulab-uiuc/LLMRouter#-creating-custom-routers) for details.
+
+## Centroid Routing (Zero-Config)
+
+Centroid routing is a NadirClaw-inspired intelligent routing strategy that works **immediately without ML model training**. It uses pre-computed centroid vectors to classify prompts into complexity tiers in approximately **~2ms**, making it ideal as a zero-config default or fallback strategy.
+
+### Overview
+
+Unlike the LLMRouter ML-based strategies above (which require trained models), centroid routing uses pre-computed embedding centroids to perform binary complexity classification via cosine similarity. This provides intelligent routing out of the box:
+
+- **Zero-config**: Works immediately with pre-trained centroid vectors
+- **Fast**: ~2ms classification latency (no GPU required)
+- **Progressive enhancement**: Sits in the fallback chain behind ML strategies
+- **Profile-based**: 5 routing profiles for different cost/quality tradeoffs
+- **Context-aware**: Detects agentic and reasoning patterns in prompts
+- **Session-persistent**: Maintains routing affinity across conversations
+
+### How It Works
+
+```
+Prompt → Embedding → Cosine Similarity → Tier Classification → Model Selection
+                     (vs centroids)       (simple/complex)     (per profile)
+```
+
+1. **Embedding**: The incoming prompt is converted to a dense vector using a sentence-transformer model
+2. **Cosine Similarity**: The embedding is compared against pre-computed centroid vectors for each complexity tier
+3. **Tier Classification**: Based on the cosine distance and confidence threshold, the prompt is classified as `simple` or `complex`
+4. **Profile Application**: The active routing profile determines which models serve each tier
+5. **Model Selection**: A deployment matching the tier is selected from the configured model list
+
+### Progressive Enhancement Chain
+
+Centroid routing integrates into RouteIQ's progressive fallback chain:
+
+```
+Pipeline ML Strategies (llmrouter-knn, etc.)
+        ↓ (if not configured or fails)
+Centroid Routing (~2ms classification)
+        ↓ (if disabled or fails)
+Random Fallback (simple-shuffle)
+```
+
+When `ROUTEIQ_CENTROID_ROUTING=true` (default), centroid routing acts as an intelligent fallback when no ML pipeline strategies are configured. This means RouteIQ provides intelligent routing even in fresh deployments with no trained models.
+
+### Routing Profiles
+
+Five built-in profiles control the cost/quality tradeoff:
+
+| Profile | Description | Simple Tier | Complex Tier |
+|---------|-------------|-------------|--------------|
+| `auto` | Automatic selection based on complexity | Cheap/fast models | Premium models |
+| `eco` | Cost-optimized, upgrades only when necessary | Cheapest available | Mid-tier models |
+| `premium` | Always high quality | Premium models | Premium models |
+| `free` | Free-tier models only | Free models | Free models |
+| `reasoning` | Optimized for math/logic tasks | Standard models | Reasoning-optimized models |
+
+Set the profile via environment variable:
+```bash
+ROUTEIQ_ROUTING_PROFILE=auto  # default
+```
+
+Or via config:
+```yaml
+router_settings:
+  routing_strategy: nadirclaw-centroid
+  routing_strategy_args:
+    profile: eco
+```
+
+### Agentic Detection
+
+The centroid router includes an **AgenticDetector** that identifies tool-use patterns in prompts. When agentic patterns are detected (function calls, tool invocations, multi-step instructions), the router automatically escalates to more capable models that handle tool use well.
+
+Agentic detection uses cumulative scoring across multiple signal types:
+- Tool/function call patterns in message content
+- System prompt indicators for agent-like behavior
+- Multi-step planning language
+
+### Reasoning Detection
+
+A **ReasoningDetector** identifies math, logic, and analytical reasoning tasks using regex-based marker detection. When reasoning markers are found, the router prefers models optimized for step-by-step reasoning (e.g., models with chain-of-thought capabilities).
+
+Detected patterns include:
+- Mathematical expressions and equations
+- Logical operators and proof language
+- Algorithm and data structure references
+- Scientific notation and formulas
+
+### Session Persistence
+
+The **SessionCache** provides in-memory conversation affinity with LRU eviction:
+
+- Routes within a conversation session stick to the same model tier
+- Prevents mid-conversation model switches that could degrade coherence
+- Configurable TTL (default: 1800 seconds / 30 minutes)
+- LRU eviction prevents unbounded memory growth
+
+```yaml
+router_settings:
+  routing_strategy: nadirclaw-centroid
+  routing_strategy_args:
+    session_ttl: 1800  # 30 minutes
+```
+
+### Configuration
+
+#### Zero-Config (Recommended for Getting Started)
+
+No configuration needed. Centroid routing is enabled by default as a fallback:
+
+```bash
+# These are the defaults — you don't need to set them
+ROUTEIQ_CENTROID_ROUTING=true
+ROUTEIQ_ROUTING_PROFILE=auto
+```
+
+#### Explicit Primary Strategy
+
+To use centroid routing as the primary (not just fallback) strategy:
+
+```yaml
+router_settings:
+  routing_strategy: nadirclaw-centroid
+  routing_strategy_args:
+    centroid_dir: models/centroids
+    confidence_threshold: 0.06
+    profile: auto
+    session_ttl: 1800
+    tier_mapping:
+      simple:
+        - gpt-4o-mini
+        - claude-haiku
+      complex:
+        - gpt-4o
+        - claude-sonnet
+```
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_CENTROID_ROUTING` | `true` | Enable centroid routing fallback |
+| `ROUTEIQ_ROUTING_PROFILE` | `auto` | Default routing profile |
+| `ROUTEIQ_CENTROID_WARMUP` | `false` | Pre-warm classifier at startup |
+| `ROUTEIQ_CENTROID_DIR` | `models/centroids` | Directory for centroid `.npy` files |
+| `ROUTEIQ_CONFIDENCE_THRESHOLD` | `0.06` | Classification confidence threshold |
+
+#### Tier Mapping
+
+The `tier_mapping` configuration maps complexity tiers to model deployment names. Model names must match entries in `model_list`:
+
+```yaml
+tier_mapping:
+  simple:           # Low-complexity prompts
+    - gpt-4o-mini   # Fast, cheap
+    - claude-haiku  # Fast, cheap
+  complex:          # High-complexity prompts
+    - gpt-4o        # High quality
+    - claude-sonnet # High quality
+```
+
+If no tier mapping is configured, centroid routing uses heuristics based on model names in the configured `model_list` to auto-assign tiers.
+
+### Performance
+
+- **Classification latency**: ~2ms (CPU only, no GPU required)
+- **Memory footprint**: Minimal — centroid vectors are small numpy arrays
+- **Startup**: Optional pre-warming via `ROUTEIQ_CENTROID_WARMUP=true`
+- **No training required**: Ships with pre-computed centroids
 
 ## Model Artifact Security
 

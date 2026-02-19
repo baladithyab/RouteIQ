@@ -75,6 +75,39 @@ router_settings:
   cache_responses: true
 
 # =============================================================================
+# Centroid Routing (Zero-Config Intelligent Routing)
+# =============================================================================
+# NadirClaw-inspired centroid-based routing that works immediately without
+# ML model training. Uses pre-computed centroid vectors for ~2ms prompt
+# classification into complexity tiers (simple vs complex).
+#
+# Centroid routing is enabled by default as a fallback when no ML strategies
+# (llmrouter-*) are configured. It sits in the progressive enhancement chain:
+#   Pipeline strategies → Centroid (~2ms) → Random fallback
+#
+# To use centroid routing as the primary strategy:
+# routing_strategy: nadirclaw-centroid
+# routing_strategy_args:
+#   centroid_dir: models/centroids       # Directory with .npy centroid files
+#   confidence_threshold: 0.06           # Min cosine distance for classification
+#   profile: auto                        # Routing profile (see below)
+#   session_ttl: 1800                    # Session cache TTL in seconds
+#   tier_mapping:                        # Map tiers to model deployments
+#     simple:
+#       - gpt-4o-mini
+#       - claude-haiku
+#     complex:
+#       - gpt-4o
+#       - claude-sonnet
+#
+# Routing profiles:
+#   auto      - Automatic tier selection based on prompt complexity
+#   eco       - Prefer cheaper models, only upgrade for complex prompts
+#   premium   - Always use high-quality models regardless of complexity
+#   free      - Route to free-tier models only
+#   reasoning - Optimized for math/logic tasks with reasoning detection
+
+# =============================================================================
 # General Settings
 # =============================================================================
 general_settings:
@@ -160,3 +193,10 @@ litellm_settings:
 #   - CONFIG_S3_KEY: S3 key for config file
 #   - CONFIG_HOT_RELOAD: Enable hot reload on config changes (default: false)
 #   - CONFIG_SYNC_INTERVAL: Sync interval in seconds (default: 60)
+#
+# Centroid Routing:
+#   - ROUTEIQ_CENTROID_ROUTING: Enable centroid routing fallback (default: true)
+#   - ROUTEIQ_ROUTING_PROFILE: Default routing profile: auto/eco/premium/free/reasoning (default: auto)
+#   - ROUTEIQ_CENTROID_WARMUP: Pre-warm centroid classifier at startup (default: false)
+#   - ROUTEIQ_CENTROID_DIR: Directory for centroid .npy files (default: models/centroids)
+#   - ROUTEIQ_CONFIDENCE_THRESHOLD: Centroid classification confidence threshold (default: 0.06)

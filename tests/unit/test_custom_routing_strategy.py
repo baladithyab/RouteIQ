@@ -8,10 +8,13 @@ Tests cover:
 - Amplification guard
 - Pipeline routing precedence
 - Direct LLMRouter routing fallback
+- Centroid routing fallback (zero-config intelligent routing)
+- Routing profile support (auto, eco, premium, etc.)
 - Final fallback to first deployment
 - Query extraction helpers
 - Deployment matching (exact and partial)
 - install_routeiq_strategy wiring
+- Centroid strategy registration
 """
 
 from __future__ import annotations
@@ -22,10 +25,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from litellm_llmrouter.custom_routing_strategy import (
+    CENTROID_ROUTING_AVAILABLE,
     MAX_ROUTING_ATTEMPTS,
     RouteIQRoutingStrategy,
+    _resolve_routing_profile,
     create_routeiq_strategy,
     install_routeiq_strategy,
+    register_centroid_strategy,
 )
 
 
@@ -664,3 +670,294 @@ class TestEdgeCases:
 
         # Each request ID only used once, so no amplification error
         assert len(strategy._routing_attempts) == MAX_ROUTING_ATTEMPTS
+
+
+# ======================================================================
+# TestCentroidIntegration
+# ======================================================================
+
+
+class TestCentroidIntegration:
+    """Tests for centroid routing integration in RouteIQRoutingStrategy."""
+
+    def test_centroid_fallback_when_pipeline_and_ml_return_none(self) -> None:
+        """Centroid routing is used when pipeline returns None and no ML strategy."""
+        router = _make_mock_router(
+            model_list=[_DEPLOYMENT_GPT4, _DEPLOYMENT_CLAUDE, _DEPLOYMENT_HAIKU],
+            healthy_deployments=[_DEPLOYMENT_GPT4, _DEPLOYMENT_CLAUDE, _DEPLOYMENT_HAIKU],
+        )
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name=None,  # No ML strategy
+        )
+
+        # Mock centroid strategy to return a specific deployment
+        mock_centroid = MagicMock()
+        mock_centroid.select_deployment.return_value = _DEPLOYMENT_CLAUDE
+        strategy._centroid_strategy = mock_centroid
+        strategy._centroid_initialized = True
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            True,
+        ):
+            result = strategy.get_available_deployment(
+                model="gpt-4",
+                messages=[{"role": "user", "content": "Explain quantum physics"}],
+            )
+
+        assert result is _DEPLOYMENT_CLAUDE
+        mock_centroid.select_deployment.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_centroid_fallback(self) -> None:
+        """Async routing also falls back to centroid when ML returns None."""
+        router = _make_mock_router()
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name=None,
+        )
+
+        mock_centroid = MagicMock()
+        mock_centroid.select_deployment.return_value = _DEPLOYMENT_GPT4
+        strategy._centroid_strategy = mock_centroid
+        strategy._centroid_initialized = True
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            True,
+        ):
+            result = await strategy.async_get_available_deployment(
+                model="gpt-4",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        assert result is _DEPLOYMENT_GPT4
+
+    def test_centroid_not_called_when_ml_succeeds(self) -> None:
+        """Centroid routing is NOT called when ML strategy succeeds."""
+        router = _make_mock_router()
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name="llmrouter-knn",
+        )
+
+        # ML strategy succeeds
+        mock_llmrouter = MagicMock()
+        mock_llmrouter.route_with_observability.return_value = "openai/gpt-4"
+        strategy._strategy_instance = mock_llmrouter
+
+        # Centroid should not be called
+        mock_centroid = MagicMock()
+        strategy._centroid_strategy = mock_centroid
+        strategy._centroid_initialized = True
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ):
+            result = strategy.get_available_deployment(
+                model="gpt-4",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+
+        assert result is not None
+        mock_centroid.select_deployment.assert_not_called()
+
+    def test_centroid_disabled_falls_through_to_fallback(self) -> None:
+        """When centroid is disabled, falls through to first healthy deployment."""
+        router = _make_mock_router()
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name=None,
+        )
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            False,  # Disabled
+        ):
+            result = strategy.get_available_deployment(model="gpt-4")
+
+        # Falls through to first healthy deployment
+        assert result is not None
+        assert result["model_name"] == "gpt-4"
+
+    def test_centroid_unavailable_falls_through(self) -> None:
+        """When centroid is unavailable (import error), falls through gracefully."""
+        router = _make_mock_router()
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name=None,
+        )
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            False,  # Unavailable
+        ):
+            result = strategy.get_available_deployment(model="gpt-4")
+
+        assert result is not None
+        assert result["model_name"] == "gpt-4"
+
+    def test_centroid_exception_falls_through(self) -> None:
+        """When centroid routing raises an exception, falls through gracefully."""
+        router = _make_mock_router()
+        strategy = RouteIQRoutingStrategy(
+            router_instance=router,
+            strategy_name=None,
+        )
+
+        mock_centroid = MagicMock()
+        mock_centroid.select_deployment.side_effect = RuntimeError("centroid broken")
+        strategy._centroid_strategy = mock_centroid
+        strategy._centroid_initialized = True
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            True,
+        ):
+            result = strategy.get_available_deployment(model="gpt-4")
+
+        # Should fall back to first healthy deployment
+        assert result is not None
+        assert result["model_name"] == "gpt-4"
+
+
+# ======================================================================
+# TestRoutingProfile
+# ======================================================================
+
+
+class TestRoutingProfile:
+    """Tests for routing profile resolution."""
+
+    def test_profile_from_request_metadata(self) -> None:
+        """Profile is extracted from request metadata."""
+        result = _resolve_routing_profile(
+            request_kwargs={"metadata": {"routing_profile": "eco"}}
+        )
+        assert result == "eco"
+
+    def test_profile_from_request_metadata_case_insensitive(self) -> None:
+        """Profile from metadata is lowercased."""
+        result = _resolve_routing_profile(
+            request_kwargs={"metadata": {"routing_profile": "PREMIUM"}}
+        )
+        assert result == "premium"
+
+    def test_profile_default_env_var(self) -> None:
+        """Falls back to ROUTEIQ_ROUTING_PROFILE env var."""
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.DEFAULT_ROUTING_PROFILE",
+            "eco",
+        ):
+            result = _resolve_routing_profile(request_kwargs={})
+        assert result == "eco"
+
+    def test_profile_default_auto(self) -> None:
+        """Default profile is 'auto' when no metadata or env var."""
+        result = _resolve_routing_profile(request_kwargs=None)
+        assert result == "auto"
+
+    def test_profile_metadata_takes_precedence(self) -> None:
+        """Request metadata profile overrides env var default."""
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.DEFAULT_ROUTING_PROFILE",
+            "eco",
+        ):
+            result = _resolve_routing_profile(
+                request_kwargs={"metadata": {"routing_profile": "premium"}}
+            )
+        assert result == "premium"
+
+    def test_profile_empty_metadata_uses_default(self) -> None:
+        """Empty metadata falls back to default."""
+        result = _resolve_routing_profile(
+            request_kwargs={"metadata": {}}
+        )
+        assert result == "auto"
+
+
+# ======================================================================
+# TestCentroidRegistration
+# ======================================================================
+
+
+class TestCentroidRegistration:
+    """Tests for register_centroid_strategy function."""
+
+    def test_register_centroid_disabled(self) -> None:
+        """Registration returns False when centroid is disabled."""
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            False,
+        ):
+            assert register_centroid_strategy() is False
+
+    def test_register_centroid_unavailable(self) -> None:
+        """Registration returns False when centroid is unavailable."""
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            False,
+        ):
+            assert register_centroid_strategy() is False
+
+    def test_register_centroid_success(self) -> None:
+        """Registration succeeds when enabled and available."""
+        mock_registry = MagicMock()
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            True,
+        ), patch(
+            "litellm_llmrouter.strategy_registry.get_routing_registry",
+            return_value=mock_registry,
+        ):
+            result = register_centroid_strategy()
+
+        assert result is True
+        # Verify registry.register was called with the correct strategy name
+        mock_registry.register.assert_called_once()
+        call_args = mock_registry.register.call_args
+        assert call_args[0][0] == "nadirclaw-centroid"
+
+    def test_register_centroid_handles_exception(self) -> None:
+        """Registration returns False when registry raises."""
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_ENABLED",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.CENTROID_ROUTING_AVAILABLE",
+            True,
+        ), patch(
+            "litellm_llmrouter.custom_routing_strategy.get_centroid_strategy",
+            side_effect=RuntimeError("registry broken"),
+        ):
+            assert register_centroid_strategy() is False

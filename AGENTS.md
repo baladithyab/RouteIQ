@@ -91,6 +91,8 @@ RouteIQ/
 │   ├── management_classifier.py   # Classifies LiteLLM management endpoints
 │   ├── management_middleware.py   # RBAC/audit middleware for management ops
 │   ├── semantic_cache.py          # Semantic caching for LLM responses
+│   ├── centroid_routing.py        # NadirClaw-inspired centroid-based routing (~2ms)
+│   ├── custom_routing_strategy.py # LiteLLM CustomRoutingStrategyBase plugin adapter
 │   └── __init__.py                # Public API exports
 ├── tests/
 │   ├── conftest.py                # Root conftest: auto-skip integration if stack not running
@@ -136,6 +138,7 @@ RouteIQ/
 ├── plans/                         # Development planning (TG epics, roadmaps)
 │   └── archive/                   # Archived plan files (completed TG epics)
 ├── models/                        # Trained ML models (empty .gitkeep placeholder)
+│   └── centroids/                 # Pre-computed centroid vectors for zero-config routing
 ├── custom_routers/                # Custom routing strategies (empty .gitkeep placeholder)
 ├── reference/litellm/             # Upstream LiteLLM submodule (READ-ONLY)
 ├── pyproject.toml                 # Build config, deps, tool settings
@@ -519,6 +522,9 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_EVALUATOR_ENABLED` | No | Enable LLM-as-judge evaluator plugin |
 | `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Use plugin routing strategy instead of monkey-patch (default: true) |
 | `ROUTEIQ_WORKERS` | No | Number of uvicorn workers (default: 1, multi-worker requires plugin strategy) |
+| `ROUTEIQ_CENTROID_ROUTING` | No | Enable centroid routing fallback (default: true) |
+| `ROUTEIQ_ROUTING_PROFILE` | No | Default routing profile: auto/eco/premium/free/reasoning (default: auto) |
+| `ROUTEIQ_CENTROID_WARMUP` | No | Pre-warm centroid classifier at startup (default: false) |
 
 ## DOCUMENTATION
 

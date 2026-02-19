@@ -55,14 +55,61 @@ except ImportError:  # pragma: no cover – litellm may not be installed in test
             pass
 
 
+# Import centroid routing with graceful fallback
+try:
+    from litellm_llmrouter.centroid_routing import (
+        CentroidRoutingStrategy,
+        get_centroid_strategy,
+        reset_centroid_strategy,
+        warmup_centroid_classifier,
+        RoutingProfile,
+    )
+
+    CENTROID_ROUTING_AVAILABLE = True
+except ImportError:
+    CENTROID_ROUTING_AVAILABLE = False
+
+
 logger = logging.getLogger(__name__)
 
 # Feature flag: Use pipeline routing (enables A/B testing)
 # Set LLMROUTER_USE_PIPELINE=false to disable
 USE_PIPELINE_ROUTING = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
 
+# Feature flag: Enable centroid routing as fallback (zero-config intelligent routing)
+# Set ROUTEIQ_CENTROID_ROUTING=false to disable
+CENTROID_ROUTING_ENABLED = (
+    os.getenv("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
+)
+
+# Default routing profile (auto, eco, premium, free, reasoning)
+DEFAULT_ROUTING_PROFILE = os.getenv("ROUTEIQ_ROUTING_PROFILE", "auto")
+
 # Maximum routing attempts per request to prevent amplification loops
 MAX_ROUTING_ATTEMPTS = 3
+
+
+def _resolve_routing_profile(
+    request_kwargs: Optional[Dict] = None,
+) -> Optional[str]:
+    """Resolve the routing profile from request metadata or env var.
+
+    Args:
+        request_kwargs: Request keyword arguments (may contain metadata).
+
+    Returns:
+        Routing profile string, or None if not configured.
+    """
+    # 1. Check request metadata
+    if request_kwargs:
+        metadata = request_kwargs.get("metadata", {})
+        if isinstance(metadata, dict):
+            profile = metadata.get("routing_profile")
+            if profile:
+                return str(profile).lower()
+
+    # 2. Fall back to env var default
+    return DEFAULT_ROUTING_PROFILE
 
 
 class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
@@ -77,8 +124,13 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
     Features:
     - **ML-based routing** via ``LLMRouterStrategyFamily`` (KNN, SVM, MLP, etc.)
     - **A/B testing** via ``RoutingPipeline`` with deterministic hashing
+    - **Centroid routing fallback** for zero-config intelligent routing (~2ms)
+    - **Routing profiles** (auto, eco, premium, free, reasoning)
     - **Amplification guard** prevents infinite routing loops (max 3 per request)
-    - **Graceful fallback** to first available deployment if ML routing fails
+    - **Graceful fallback** to first available deployment if all routing fails
+
+    Progressive enhancement chain:
+    Pipeline strategies (KNN, SVM, etc.) → Centroid routing (~2ms) → First healthy deployment
 
     Args:
         router_instance: The LiteLLM Router instance (for accessing model_list, etc.)
@@ -102,6 +154,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         self._pipeline: Any = None
         self._pipeline_initialized = False
 
+        # Centroid routing state (lazy-initialized)
+        self._centroid_strategy: Any = None
+        self._centroid_initialized = False
+
     # ------------------------------------------------------------------
     # Public API: LiteLLM CustomRoutingStrategyBase
     # ------------------------------------------------------------------
@@ -121,7 +177,8 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         1. Check amplification guard
         2. Try pipeline routing (A/B testing)
         3. Fall back to direct LLMRouter ML routing
-        4. Fall back to first available deployment
+        4. Fall back to centroid routing (zero-config intelligent routing)
+        5. Fall back to first available deployment
         """
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
@@ -149,7 +206,16 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         except Exception as e:
             logger.warning(f"ML routing failed, falling back: {e}")
 
-        # 4. Fallback to first available deployment
+        # 4. Try centroid routing (zero-config intelligent routing)
+        result = self._route_via_centroid(
+            model=model,
+            messages=messages,
+            request_kwargs=request_kwargs,
+        )
+        if result is not None:
+            return result
+
+        # 5. Fallback to first available deployment
         return self._fallback_deployment(model)
 
     def get_available_deployment(
@@ -191,7 +257,16 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         except Exception as e:
             logger.warning(f"ML routing failed, falling back: {e}")
 
-        # 4. Fallback to first available deployment
+        # 4. Try centroid routing (zero-config intelligent routing)
+        result = self._route_via_centroid(
+            model=model,
+            messages=messages,
+            request_kwargs=request_kwargs,
+        )
+        if result is not None:
+            return result
+
+        # 5. Fallback to first available deployment
         return self._fallback_deployment(model)
 
     # ------------------------------------------------------------------
@@ -338,6 +413,111 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # Match selected model to a deployment dict
         return self._match_deployment(selected_model, model, healthy_deployments)
+
+    # ------------------------------------------------------------------
+    # Internal: Centroid routing (zero-config fallback)
+    # ------------------------------------------------------------------
+
+    def _route_via_centroid(
+        self,
+        model: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """
+        Route using centroid-based classification (zero-config intelligent routing).
+
+        This is the fallback when no ML model is configured. It provides
+        intelligent routing without requiring ML model training, using
+        ~2ms centroid-based prompt classification.
+
+        Args:
+            model: The requested model group name.
+            messages: Chat messages for classification.
+            request_kwargs: Request keyword arguments (may contain routing_profile).
+
+        Returns:
+            Selected deployment dict, or None if centroid routing is unavailable.
+        """
+        if not CENTROID_ROUTING_ENABLED or not CENTROID_ROUTING_AVAILABLE:
+            return None
+
+        try:
+            centroid = self._get_or_create_centroid_strategy(request_kwargs)
+            if centroid is None:
+                return None
+
+            # Build a lightweight routing context for centroid strategy
+            from litellm_llmrouter.strategy_registry import RoutingContext
+
+            context = RoutingContext(
+                router=self._router,
+                model=model,
+                messages=messages,
+                input=None,
+                request_kwargs=request_kwargs,
+            )
+
+            result = centroid.select_deployment(context)
+            if result is not None:
+                logger.debug(
+                    "Centroid routing selected: %s (model=%s)",
+                    result.get("litellm_params", {}).get("model", "unknown"),
+                    model,
+                )
+            return result
+
+        except ImportError:
+            logger.debug("Centroid routing not available (missing dependencies)")
+            return None
+        except Exception as e:
+            logger.warning(f"Centroid routing failed, falling back: {e}")
+            return None
+
+    def _get_or_create_centroid_strategy(
+        self,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Any:
+        """Lazy-load or return the centroid routing strategy.
+
+        Resolves the routing profile from request metadata or env var
+        and creates the centroid strategy with the appropriate profile.
+
+        Args:
+            request_kwargs: Request keyword arguments for profile resolution.
+
+        Returns:
+            CentroidRoutingStrategy instance, or None if unavailable.
+        """
+        if not CENTROID_ROUTING_AVAILABLE:
+            return None
+
+        # Resolve the routing profile for this request
+        profile_str = _resolve_routing_profile(request_kwargs)
+
+        # Map profile string to RoutingProfile enum
+        try:
+            profile = RoutingProfile(profile_str) if profile_str else RoutingProfile.AUTO
+        except ValueError:
+            logger.warning(
+                "Unknown routing profile '%s', defaulting to 'auto'",
+                profile_str,
+            )
+            profile = RoutingProfile.AUTO
+
+        if not self._centroid_initialized:
+            try:
+                self._centroid_strategy = CentroidRoutingStrategy(profile=profile)
+                self._centroid_initialized = True
+            except Exception as e:
+                logger.warning(f"Failed to create centroid strategy: {e}")
+                self._centroid_initialized = True  # Don't retry
+                return None
+        elif self._centroid_strategy is not None:
+            # Update profile per-request (it may change between requests)
+            self._centroid_strategy._profile = profile
+
+        return self._centroid_strategy
 
     # ------------------------------------------------------------------
     # Internal: Helper methods
@@ -501,6 +681,9 @@ def install_routeiq_strategy(
     Calls ``router.set_custom_routing_strategy()`` to wire the strategy
     into the Router's deployment selection path.
 
+    Optionally warms up the centroid classifier for fast first-request latency.
+    Controlled by ``ROUTEIQ_CENTROID_WARMUP=true`` env var.
+
     Args:
         router: LiteLLM Router instance
         strategy_name: Optional ML strategy name (e.g., "llmrouter-knn")
@@ -515,7 +698,8 @@ def install_routeiq_strategy(
         logger.info(
             f"Installed RouteIQ custom routing strategy "
             f"(strategy={strategy_name or 'default'}, "
-            f"pipeline={'enabled' if USE_PIPELINE_ROUTING else 'disabled'})"
+            f"pipeline={'enabled' if USE_PIPELINE_ROUTING else 'disabled'}, "
+            f"centroid={'enabled' if CENTROID_ROUTING_ENABLED and CENTROID_ROUTING_AVAILABLE else 'disabled'})"
         )
     else:
         logger.warning(
@@ -523,4 +707,48 @@ def install_routeiq_strategy(
             "Strategy created but NOT installed — is your LiteLLM version compatible?"
         )
 
+    # Optionally warmup centroid classifier
+    if (
+        os.getenv("ROUTEIQ_CENTROID_WARMUP", "false").lower() == "true"
+        and CENTROID_ROUTING_AVAILABLE
+        and CENTROID_ROUTING_ENABLED
+    ):
+        try:
+            warmup_centroid_classifier()
+            logger.info("Centroid classifier warmed up during strategy installation")
+        except Exception as e:
+            logger.warning(f"Centroid classifier warmup failed: {e}")
+
     return strategy
+
+
+def register_centroid_strategy() -> bool:
+    """Register the centroid strategy in the routing registry.
+
+    Makes the centroid strategy available as ``"nadirclaw-centroid"`` in the
+    routing registry for direct use or A/B testing.
+
+    Auto-registers if ``ROUTEIQ_CENTROID_ROUTING=true`` (default).
+
+    Returns:
+        True if registration succeeded, False otherwise.
+    """
+    if not CENTROID_ROUTING_AVAILABLE:
+        logger.debug("Centroid routing not available (missing imports)")
+        return False
+
+    if not CENTROID_ROUTING_ENABLED:
+        logger.debug("Centroid routing disabled via ROUTEIQ_CENTROID_ROUTING=false")
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        strategy = get_centroid_strategy()
+        registry.register("nadirclaw-centroid", strategy)
+        logger.info("Registered centroid strategy as 'nadirclaw-centroid' in routing registry")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to register centroid strategy: {e}")
+        return False

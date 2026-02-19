@@ -55,15 +55,19 @@ TG-IMPL-E (P2) ─── (no blockers)
   - [x] Legacy monkey-patch preserved as fallback (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`)
 
 ### TG-IMPL-D: NadirClaw Integration `RouteIQ-9m8`
-- **Status**: 🔴 Not Started
+- **Status**: ✅ Done
 - **Priority**: P2 (Medium)
 - **Dependencies**: TG-IMPL-C (plugin arch needed for clean integration)
+- **Completed**: 2026-02-19
 - **Tasks**:
-  - [ ] Implement centroid-based routing strategy
-  - [ ] Add routing profiles (cost-optimized, quality-optimized, balanced)
-  - [ ] Implement prompt-complexity analysis for intelligent model selection
-  - [ ] Add zero-config defaults for common use cases
-  - [ ] Integration tests with real model endpoints
+  - [x] Implement centroid-based routing strategy (`centroid_routing.py` — CentroidRoutingStrategy, CentroidClassifier, AgenticDetector, ReasoningDetector, SessionCache, RoutingProfile)
+  - [x] Add routing profiles (auto, eco, premium, free, reasoning)
+  - [x] Implement prompt-complexity analysis via cosine similarity against centroid vectors (~2ms)
+  - [x] Add zero-config defaults — works immediately with pre-trained centroids
+  - [x] Integration in `custom_routing_strategy.py` — centroid as fallback in progressive enhancement chain
+  - [x] Agentic detection (tool use patterns) and reasoning detection (math/logic markers)
+  - [x] Session persistence for conversation affinity
+  - [x] 76 new tests (60 centroid + 16 integration)
 
 ### TG-IMPL-E: Admin UI MVP `RouteIQ-a5p`
 - **Status**: 🔴 Not Started
@@ -105,7 +109,7 @@ TG-IMPL-E (P2) ─── (no blockers)
 |-------|-------|-----------|
 | 1 (Done) | **TG-IMPL-G** ✅ + **TG-IMPL-B** ✅ | Codebase reduction and documentation cleanup complete |
 | 2 (Done) | **TG-IMPL-A** ✅ + **TG-IMPL-C** ✅ | P0 critical fixes + plugin architecture migration complete |
-| 3 (Now) | **TG-IMPL-E** + **TG-IMPL-D** + **TG-IMPL-F** | Admin UI is independent; after C unblocks D; after A unblocks F |
+| 3 (Now) | **TG-IMPL-E** + **TG-IMPL-D** ✅ + **TG-IMPL-F** | Admin UI is independent; D complete (centroid routing); after A unblocks F |
 
 ## bd Quick Reference
 
