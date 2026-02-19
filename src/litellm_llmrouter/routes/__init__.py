@@ -81,6 +81,7 @@ from . import health as _health_routes  # noqa: E402, F401
 from . import a2a as _a2a_routes  # noqa: E402, F401
 from . import mcp as _mcp_routes  # noqa: E402, F401
 from . import config as _config_routes  # noqa: E402, F401
+from . import admin_ui as _admin_ui_routes  # noqa: E402, F401
 
 # ---- Re-export external routers ----
 
