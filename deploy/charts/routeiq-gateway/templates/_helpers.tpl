@@ -212,4 +212,18 @@ Environment variables for gateway configuration
 - name: LLMROUTER_SSRF_ALLOWLIST_CIDRS
   value: {{ .Values.gateway.ssrf.allowlistCidrs | quote }}
 {{- end }}
+
+# RouteIQ-specific settings
+- name: ROUTEIQ_USE_PLUGIN_STRATEGY
+  value: {{ .Values.routeiq.pluginStrategy.enabled | quote }}
+- name: ROUTEIQ_WORKERS
+  value: {{ .Values.routeiq.workers | quote }}
+- name: ROUTEIQ_CENTROID_ROUTING
+  value: {{ .Values.routeiq.centroidRouting.enabled | quote }}
+- name: ROUTEIQ_CENTROID_WARMUP
+  value: {{ .Values.routeiq.centroidRouting.warmup | quote }}
+- name: ROUTEIQ_ROUTING_PROFILE
+  value: {{ .Values.routeiq.routingProfile | quote }}
+- name: ROUTEIQ_ADMIN_UI_ENABLED
+  value: {{ .Values.routeiq.adminUI.enabled | quote }}
 {{- end }}

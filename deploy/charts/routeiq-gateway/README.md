@@ -84,7 +84,25 @@ The chart configures health probes using the gateway's internal health endpoints
 |-------|----------|---------|
 | Liveness | `/_health/live` | Basic health check (no external deps) |
 | Readiness | `/_health/ready` | Full health check (includes DB/Redis if configured) |
-| Startup | `/_health/live` | Slow-start support (disabled by default) |
+| Startup | `/_health/live` | Slow-start support for model loading (enabled by default, allows up to 5 min) |
+
+### Routing & Strategy
+
+RouteIQ-specific routing and strategy configuration:
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `routeiq.pluginStrategy.enabled` | Use plugin-based routing strategy (recommended) | `true` |
+| `routeiq.workers` | Uvicorn workers per pod (NOT K8s replicas) | `2` |
+| `routeiq.centroidRouting.enabled` | Enable centroid-based routing (~2ms latency) | `true` |
+| `routeiq.centroidRouting.warmup` | Pre-warm centroid classifier at startup | `false` |
+| `routeiq.routingProfile` | Default routing profile: auto/eco/premium/free/reasoning | `"auto"` |
+| `routeiq.adminUI.enabled` | Enable admin UI dashboard at `/ui/` | `false` |
+
+> **Note**: `routeiq.workers` controls per-pod uvicorn workers and is independent of
+> `replicaCount` (K8s pod replicas). Multi-worker mode is safe when
+> `routeiq.pluginStrategy.enabled` is `true` (the default). With the legacy monkey-patch
+> strategy, only 1 worker is supported.
 
 ### Secrets Management
 

@@ -32,7 +32,7 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/baladithyab/litellm-llm-router
   # Tag overrides appVersion from Chart.yaml
-  tag: ""
+  tag: "0.2.0"
   # Digest for immutable image references (takes precedence over tag)
   # Example: sha256:abc123...
   digest: ""
@@ -126,9 +126,9 @@ probes:
     failureThreshold: 3
     successThreshold: 1
   startup:
-    enabled: false
+    enabled: true
     path: /_health/live
-    initialDelaySeconds: 0
+    initialDelaySeconds: 10
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 30
@@ -268,6 +268,32 @@ gateway:
     allowPrivateIps: false
     allowlistHosts: ""
     allowlistCidrs: ""
+
+# -----------------------------------------------------------------------------
+# RouteIQ-specific configuration
+# -----------------------------------------------------------------------------
+# These settings control RouteIQ features beyond the base LiteLLM gateway.
+# Note: workers is per-pod uvicorn workers, NOT K8s pod replicas (replicaCount).
+routeiq:
+  # Plugin-based routing strategy (recommended over legacy monkey-patch)
+  pluginStrategy:
+    enabled: true          # ROUTEIQ_USE_PLUGIN_STRATEGY
+
+  # Number of uvicorn workers per pod (safe with plugin strategy enabled)
+  # This is independent of replicaCount which controls K8s pod replicas
+  workers: 2               # ROUTEIQ_WORKERS
+
+  # Centroid-based routing (~2ms, NadirClaw-inspired)
+  centroidRouting:
+    enabled: true           # ROUTEIQ_CENTROID_ROUTING
+    warmup: false           # ROUTEIQ_CENTROID_WARMUP - Pre-warm classifier at startup
+
+  # Default routing profile: auto/eco/premium/free/reasoning
+  routingProfile: "auto"   # ROUTEIQ_ROUTING_PROFILE
+
+  # Admin UI dashboard at /ui/
+  adminUI:
+    enabled: false          # ROUTEIQ_ADMIN_UI_ENABLED
 
 # -----------------------------------------------------------------------------
 # Secrets configuration
