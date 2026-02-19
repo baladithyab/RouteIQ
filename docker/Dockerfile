@@ -69,7 +69,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && rm -rf /tmp/LLMRouter
 
 # ==============================================================================
-# Stage 2: Runtime - Production image with uv and OTEL support
+# Stage 2: UI Builder (optional) - Build admin UI React SPA
+# ==============================================================================
+FROM node:20-alpine AS ui-builder
+WORKDIR /ui
+# Copy package files first for layer caching
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --production=false
+# Copy source and build
+COPY ui/ ./
+RUN npm run build
+
+# ==============================================================================
+# Stage 3: Runtime - Production image with uv and OTEL support
 # ==============================================================================
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${RUNTIME_DIGEST} AS runtime
 
@@ -158,6 +170,9 @@ COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter
 COPY --chown=litellm:litellm docker/entrypoint.sh /app/entrypoint.sh
 COPY --chown=litellm:litellm config/ /app/config/
 
+# Copy admin UI dist (built in ui-builder stage)
+COPY --from=ui-builder --chown=litellm:litellm /ui/dist /app/ui/dist
+
 # Create directories with proper permissions and cleanup
 RUN mkdir -p /app/models /app/data /app/custom_routers && \
     chown -R litellm:litellm /app && \
@@ -183,6 +198,8 @@ ENV PYTHONUNBUFFERED=1 \
     # Gateway features
     A2A_GATEWAY_ENABLED=false \
     MCP_GATEWAY_ENABLED=false \
+    # Admin UI
+    ROUTEIQ_ADMIN_UI_ENABLED=false \
     # Config sync and hot reload
     CONFIG_HOT_RELOAD=false \
     CONFIG_SYNC_ENABLED=true \

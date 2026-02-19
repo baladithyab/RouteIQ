@@ -101,3 +101,7 @@ temp/
 .ruff_check*.txt
 .ruff_format_check*.txt
 .ruff_format_diff*.txt
+
+# Admin UI build artifacts (also covered by ui/.gitignore)
+ui/node_modules/
+ui/dist/

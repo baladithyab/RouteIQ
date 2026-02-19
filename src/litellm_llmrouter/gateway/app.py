@@ -410,6 +410,43 @@ def _load_plugins_before_routes() -> int:
     return loaded
 
 
+def _mount_admin_ui(app: FastAPI) -> None:
+    """Mount the admin UI static files if enabled and available."""
+    if os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED", "false").lower() != "true":
+        return
+
+    from pathlib import Path
+
+    # Check multiple possible locations for UI dist
+    possible_paths = [
+        Path("/app/ui/dist"),  # Docker production
+        Path("ui/dist"),  # Local development
+        Path(__file__).parent.parent.parent.parent / "ui" / "dist",  # Relative to source
+    ]
+
+    ui_dist = None
+    for path in possible_paths:
+        if path.is_dir() and (path / "index.html").exists():
+            ui_dist = path
+            break
+
+    if ui_dist is None:
+        logger.warning(
+            "ROUTEIQ_ADMIN_UI_ENABLED=true but no UI dist directory found. "
+            "Build the UI with: cd ui && npm run build"
+        )
+        return
+
+    from starlette.staticfiles import StaticFiles
+
+    # Mount static files at /ui/
+    app.mount(
+        "/ui", StaticFiles(directory=str(ui_dist), html=True), name="routeiq-admin-ui"
+    )
+
+    logger.info(f"Admin UI mounted at /ui/ from {ui_dist}")
+
+
 def create_app(
     *,
     apply_patch: bool = True,
@@ -498,6 +535,9 @@ def create_app(
 
     # Step 6: Register routes
     _register_routes(app, include_admin=include_admin_routes)
+
+    # Step 6b: Mount admin UI static files (AFTER routes, so API routes take priority)
+    _mount_admin_ui(app)
 
     # Step 7: Set up plugin lifecycle if enabled
     if enable_plugins:
@@ -614,6 +654,9 @@ def create_standalone_app(
 
     # Register routes
     _register_routes(app, include_admin=include_admin_routes)
+
+    # Mount admin UI static files (AFTER routes, so API routes take priority)
+    _mount_admin_ui(app)
 
     logger.info("Standalone gateway app created")
     return app

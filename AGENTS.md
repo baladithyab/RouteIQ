@@ -525,6 +525,7 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_CENTROID_ROUTING` | No | Enable centroid routing fallback (default: true) |
 | `ROUTEIQ_ROUTING_PROFILE` | No | Default routing profile: auto/eco/premium/free/reasoning (default: auto) |
 | `ROUTEIQ_CENTROID_WARMUP` | No | Pre-warm centroid classifier at startup (default: false) |
+| `ROUTEIQ_ADMIN_UI_ENABLED` | No | Enable admin UI at /ui/ (default: false) |
 
 ## DOCUMENTATION
 
