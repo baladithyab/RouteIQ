@@ -1,0 +1,50 @@
+# RouteIQ Gateway - OpenRouter Configuration
+# =============================================================================
+# Uses OpenRouter as a unified provider for multiple LLM models.
+# OpenRouter provides access to 100+ models through a single API key.
+#
+# Setup:
+#   1. Get an API key at https://openrouter.ai/keys
+#   2. Set OPENROUTER_API_KEY environment variable
+#
+# Usage with docker examples:
+#   cd examples/docker/basic && cp .env.example .env && docker compose up -d
+# =============================================================================
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openrouter/openai/gpt-4o-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: claude-3-haiku
+    litellm_params:
+      model: openrouter/anthropic/claude-3-haiku
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: openrouter/google/gemini-2.0-flash-001
+      api_key: os.environ/OPENROUTER_API_KEY
+
+# =============================================================================
+# Router Settings
+# =============================================================================
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  retry_after: 5
+  timeout: 600
+  cache_responses: true
+
+# =============================================================================
+# General Settings
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# =============================================================================
+# LiteLLM Settings
+# =============================================================================
+litellm_settings:
+  set_verbose: false

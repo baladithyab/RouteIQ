@@ -1,3 +1,7 @@
+# =============================================================================
+# NOTE: Organized example configurations are available in examples/docker/
+#   - examples/docker/full-stack/     → This setup reorganized with OpenRouter
+# =============================================================================
 # HA Stack Observability Overlay
 # Adds OpenTelemetry support to the HA deployment for Gate 8 validation
 #

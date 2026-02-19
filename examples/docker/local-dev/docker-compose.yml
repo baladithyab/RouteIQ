@@ -1,0 +1,240 @@
+# RouteIQ Gateway - Local Development Setup
+# =============================================================================
+# Full development environment simulating production AWS services:
+#   - PostgreSQL (simulates RDS/Aurora)
+#   - Redis (simulates ElastiCache)
+#   - Jaeger (simulates X-Ray/CloudWatch tracing)
+#   - MinIO (simulates S3)
+#   - MLflow (simulates SageMaker experiment tracking)
+#   - Gateway with all features enabled
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Minimal (gateway only):
+#   docker compose up litellm-gateway
+#
+# Access points:
+#   - Gateway:      http://localhost:4010
+#   - Jaeger UI:    http://localhost:16686
+#   - MinIO Console: http://localhost:9001
+#   - MLflow UI:    http://localhost:5050
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # PostgreSQL - Simulates Amazon RDS / Aurora
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: routeiq-dev-postgres
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: litellm
+    ports:
+      - "5432:5432"
+    volumes:
+      - dev_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # Redis - Simulates ElastiCache
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: routeiq-dev-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - dev_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # Jaeger - Simulates AWS X-Ray / CloudWatch Tracing
+  # ==========================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: routeiq-dev-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # MinIO - Simulates Amazon S3
+  # ==========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: routeiq-dev-minio
+    ports:
+      - "9000:9000"    # MinIO API
+      - "9001:9001"    # MinIO Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - dev_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - routeiq-network
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: routeiq-dev-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/mlflow --ignore-existing;
+      mc mb myminio/llmrouter-models --ignore-existing;
+      mc mb myminio/litellm-config --ignore-existing;
+      mc anonymous set download myminio/mlflow;
+      exit 0;
+      "
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # MLflow - Simulates SageMaker experiment tracking
+  # ==========================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.0
+    container_name: routeiq-dev-mlflow
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "5050:5050"
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - dev_mlflow_data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --artifacts-destination s3://mlflow/artifacts
+      --host 0.0.0.0
+      --port 5050
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5050/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # RouteIQ Gateway - Full-featured development instance
+  # ==========================================================================
+  litellm-gateway:
+    build:
+      context: ../../../
+      dockerfile: docker/Dockerfile.local
+    container_name: routeiq-dev-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "4010:4000"
+    volumes:
+      - ../../../config:/app/config:ro
+      - ../../../models:/app/models:ro
+      - ../../../custom_routers:/app/custom_routers:ro
+    environment:
+      # Core settings
+      - LITELLM_CONFIG_PATH=/app/config/config.openrouter.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-local-dev-admin-key}
+      - ADMIN_API_KEYS=${ADMIN_API_KEY:-local-dev-admin-key},${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      # OpenRouter API Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # Database & Cache
+      - DATABASE_URL=postgresql://litellm:testpassword@postgres:5432/litellm
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Gateway Features - ALL ENABLED for development
+      - A2A_GATEWAY_ENABLED=true
+      - MCP_GATEWAY_ENABLED=true
+      - LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true
+      - LLMROUTER_OUTBOUND_ALLOW_PRIVATE=true
+      - STORE_MODEL_IN_DB=true
+      # LLMRouter Settings
+      - LLMROUTER_MODELS_PATH=/app/models
+      - LLMROUTER_HOT_RELOAD=true
+      - LLMROUTER_RELOAD_INTERVAL=30
+      # Config Sync & Hot Reload
+      - CONFIG_HOT_RELOAD=true
+      - CONFIG_SYNC_ENABLED=true
+      - CONFIG_SYNC_INTERVAL=30
+      # OpenTelemetry / Jaeger Tracing
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=litellm-gateway
+      - OTEL_TRACES_EXPORTER=otlp
+      # MLflow Integration
+      - MLFLOW_TRACKING_URI=http://mlflow:5050
+      # MinIO/S3 for config storage
+      - S3_ENDPOINT_URL=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      # RouteIQ Settings
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=true
+      - ROUTEIQ_WORKERS=1
+      - ROUTEIQ_CENTROID_ROUTING=true
+      - ROUTEIQ_CENTROID_WARMUP=false
+      - ROUTEIQ_ROUTING_PROFILE=auto
+      - ROUTEIQ_ADMIN_UI_ENABLED=true
+    command: ["--config", "/app/config/config.openrouter.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - routeiq-network
+
+volumes:
+  dev_postgres_data:
+  dev_redis_data:
+  dev_minio_data:
+  dev_mlflow_data:
+
+networks:
+  routeiq-network:
+    driver: bridge

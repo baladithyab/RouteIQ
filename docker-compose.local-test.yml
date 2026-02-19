@@ -1,4 +1,8 @@
 # =============================================================================
+# NOTE: Organized example configurations are available in examples/docker/
+#   - examples/docker/local-dev/      → This setup reorganized with OpenRouter
+# =============================================================================
+# =============================================================================
 # LiteLLM + LLMRouter - Local Testing Setup
 # =============================================================================
 # This docker-compose file simulates a production AWS environment locally.

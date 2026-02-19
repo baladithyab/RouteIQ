@@ -1,3 +1,11 @@
+# =============================================================================
+# NOTE: Organized example configurations are available in examples/docker/
+#   - examples/docker/basic/          → Simplest setup with OpenRouter
+#   - examples/docker/ha/             → High availability with PostgreSQL + Redis
+#   - examples/docker/observability/  → With OpenTelemetry + Jaeger tracing
+#   - examples/docker/full-stack/     → HA + Observability + all features
+#   - examples/docker/local-dev/      → Full development environment
+# =============================================================================
 # LiteLLM + LLMRouter - Basic Docker Compose Setup
 # For production HA setup, use docker-compose.ha.yml
 #

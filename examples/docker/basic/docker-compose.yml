@@ -1,0 +1,59 @@
+# RouteIQ Gateway - Basic Setup
+# =============================================================================
+# Simplest setup with a single gateway instance using OpenRouter.
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# For more complex setups, see:
+#   - ../ha/              - High availability with PostgreSQL + Redis + Nginx
+#   - ../observability/   - With OpenTelemetry + Jaeger tracing
+#   - ../full-stack/      - HA + Observability combined
+#   - ../local-dev/       - Full development environment
+# =============================================================================
+
+services:
+  litellm-gateway:
+    build:
+      context: ../../../
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: routeiq-basic
+    ports:
+      - "4000:4000"
+    volumes:
+      - ../../../config:/app/config:ro
+      - ../../../models:/app/models:ro
+      - ../../../custom_routers:/app/custom_routers:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.openrouter.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      # OpenRouter API Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # RouteIQ Settings
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=${ROUTEIQ_USE_PLUGIN_STRATEGY:-true}
+      - ROUTEIQ_CENTROID_ROUTING=${ROUTEIQ_CENTROID_ROUTING:-true}
+      - ROUTEIQ_ROUTING_PROFILE=${ROUTEIQ_ROUTING_PROFILE:-auto}
+      - ROUTEIQ_WORKERS=${ROUTEIQ_WORKERS:-2}
+      # Gateway Features (disabled by default in basic setup)
+      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
+      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+networks:
+  routeiq-network:
+    driver: bridge

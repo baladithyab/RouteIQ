@@ -1,4 +1,8 @@
 # =============================================================================
+# TEST INFRASTRUCTURE: This file is used by CI/test scripts.
+# For user-facing examples, see examples/docker/
+# =============================================================================
+# =============================================================================
 # Streaming Performance Gate - Docker Compose
 # =============================================================================
 # Minimal compose file for TG10.5 streaming TTFB and cadence validation.

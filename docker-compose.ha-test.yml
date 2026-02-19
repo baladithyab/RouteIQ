@@ -1,3 +1,7 @@
+# =============================================================================
+# TEST INFRASTRUCTURE: This file is used by CI/test scripts.
+# For user-facing examples, see examples/docker/
+# =============================================================================
 # LiteLLM + LLMRouter - High Availability Test Setup
 # This is a test variant of docker-compose.ha.yml with default credentials
 # for CI/CD testing. DO NOT USE IN PRODUCTION.

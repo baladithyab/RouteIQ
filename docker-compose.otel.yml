@@ -1,3 +1,8 @@
+# =============================================================================
+# NOTE: Organized example configurations are available in examples/docker/
+#   - examples/docker/observability/  → This setup reorganized with OpenRouter
+#   - examples/docker/full-stack/     → HA + Observability combined
+# =============================================================================
 # LiteLLM + LLMRouter with Jaeger Tracing
 # OTEL setup for local development and E2E testing (TG4.2)
 #

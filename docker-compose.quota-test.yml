@@ -1,4 +1,8 @@
 # =============================================================================
+# TEST INFRASTRUCTURE: This file is used by CI/test scripts.
+# For user-facing examples, see examples/docker/
+# =============================================================================
+# =============================================================================
 # Quota Enforcement Test - Docker Compose
 # =============================================================================
 # Minimal compose file for TG3.1 quota enforcement integration testing.

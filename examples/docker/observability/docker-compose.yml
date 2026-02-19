@@ -1,0 +1,73 @@
+# RouteIQ Gateway - Observability Setup
+# =============================================================================
+# Single gateway with OpenTelemetry tracing via Jaeger.
+# Perfect for development and debugging request flows.
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Access points:
+#   - Gateway:   http://localhost:4001
+#   - Jaeger UI: http://localhost:16686
+# =============================================================================
+
+services:
+  litellm-gateway:
+    build:
+      context: ../../../
+      dockerfile: docker/Dockerfile.local
+    container_name: routeiq-otel-gateway
+    ports:
+      - "4001:4000"
+    volumes:
+      - ../../../config:/app/config:ro
+      - ../../../models:/app/models:ro
+    environment:
+      - LITELLM_CONFIG_PATH=/app/config/config.openrouter.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      # OpenRouter API Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # OpenTelemetry Configuration
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_TRACES_SAMPLER=always_on
+      # Router decision telemetry
+      - LLMROUTER_ROUTER_CALLBACK_ENABLED=true
+      # RouteIQ Settings
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=true
+      - ROUTEIQ_CENTROID_ROUTING=true
+      - ROUTEIQ_ROUTING_PROFILE=auto
+    depends_on:
+      - jaeger
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: routeiq-otel-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+networks:
+  routeiq-network:
+    driver: bridge

@@ -1,28 +1,38 @@
+# RouteIQ Gateway - Full Stack Setup (HA + Observability)
 # =============================================================================
-# NOTE: Organized example configurations are available in examples/docker/
-#   - examples/docker/ha/             → This setup reorganized with OpenRouter
-#   - examples/docker/full-stack/     → HA + Observability combined
-# =============================================================================
-# LiteLLM + LLMRouter - High Availability Production Setup
-# Includes: PostgreSQL, Redis, multiple gateway instances
+# Production-grade deployment with:
+#   - PostgreSQL for persistent storage
+#   - Redis for caching and distributed state
+#   - Two gateway replicas with leader election
+#   - Nginx load balancer with streaming support
+#   - Jaeger for distributed tracing
+#   - MCP and A2A gateways enabled
 #
-# SECURITY: Before running, set required secrets in your environment:
-#   export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
-#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+# Quick start:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Access points:
+#   - Load balancer: http://localhost:8080
+#   - Gateway 1:     http://localhost:4000
+#   - Gateway 2:     http://localhost:4001
+#   - Jaeger UI:     http://localhost:16686
+#   - PostgreSQL:    localhost:5432
+# =============================================================================
 
 services:
   # ==========================================================================
-  # PostgreSQL - Persistent storage for LiteLLM
+  # PostgreSQL - Persistent storage
   # ==========================================================================
   postgres:
     image: postgres:16-alpine
-    container_name: litellm-postgres
+    container_name: routeiq-full-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-litellm}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm_password}
       POSTGRES_DB: ${POSTGRES_DB:-litellm}
     ports:
-      - "5432:5432"  # Exposed for HA integration tests (leader election queries)
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,14 +42,14 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - litellm-network
+      - routeiq-network
 
   # ==========================================================================
   # Redis - Caching and distributed state
   # ==========================================================================
   redis:
     image: redis:7-alpine
-    container_name: litellm-redis
+    container_name: routeiq-full-redis
     command: >
       redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
       --requirepass ${REDIS_PASSWORD:-changeme}
@@ -52,71 +62,84 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - litellm-network
+      - routeiq-network
 
   # ==========================================================================
-  # LiteLLM + LLMRouter Gateway (Primary)
+  # Jaeger - Distributed Tracing
+  # ==========================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: routeiq-full-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # Gateway Replica 1 (Primary)
   # ==========================================================================
   litellm-gateway-1:
     build:
-      context: .
+      context: ../../../
       dockerfile: docker/Dockerfile
     image: ghcr.io/baladithyab/litellm-llm-router:latest
-    container_name: litellm-gateway-1
+    container_name: routeiq-full-gateway-1
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     ports:
       - "4000:4000"
     volumes:
-      - ./config:/app/config:ro
-      - ./models:/app/models:ro
-      - ./custom_routers:/app/custom_routers:ro
+      - ../../../config:/app/config:ro
+      - ../../../models:/app/models:ro
+      - ../../../custom_routers:/app/custom_routers:ro
     environment:
-      - LITELLM_CONFIG_PATH=/app/config/config.yaml
-      # SECURITY: LITELLM_MASTER_KEY is REQUIRED - no default provided
-      # Generate with: openssl rand -hex 32
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY environment variable is required}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD environment variable is required}@postgres:5432/${POSTGRES_DB:-litellm}
+      - LITELLM_CONFIG_PATH=/app/config/config.openrouter.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      # Database & Cache
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
-      # LLM Provider API Keys
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - AZURE_API_KEY=${AZURE_API_KEY:-}
-      # LLMRouter Settings
-      - LLMROUTER_MODELS_PATH=/app/models
-      - LLMROUTER_HOT_RELOAD=true
-      - LLMROUTER_RELOAD_INTERVAL=300
+      # OpenRouter API Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # OpenTelemetry
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway-1
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_ENABLED=true
       # HA Mode - Leader Election
       - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
       - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-30}
       - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-10}
-      # Gateway Features (A2A, MCP)
-      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
-      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
+      # Gateway Features - All enabled
+      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-true}
+      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-true}
+      - MCP_TRACING_ENABLED=true
       - STORE_MODEL_IN_DB=${STORE_MODEL_IN_DB:-true}
       # Config Sync & Hot Reload
       - CONFIG_HOT_RELOAD=${CONFIG_HOT_RELOAD:-true}
       - CONFIG_SYNC_ENABLED=${CONFIG_SYNC_ENABLED:-true}
       - CONFIG_SYNC_INTERVAL=${CONFIG_SYNC_INTERVAL:-60}
-      # S3/GCS Config Sync (optional)
-      - CONFIG_S3_BUCKET=${CONFIG_S3_BUCKET:-}
-      - CONFIG_S3_KEY=${CONFIG_S3_KEY:-}
-      - LLMROUTER_MODEL_S3_BUCKET=${LLMROUTER_MODEL_S3_BUCKET:-}
-      - LLMROUTER_MODEL_S3_KEY=${LLMROUTER_MODEL_S3_KEY:-}
-      # AWS Credentials (if using S3)
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
-      # RouteIQ Plugin Strategy & Routing
+      # RouteIQ Settings
       - ROUTEIQ_USE_PLUGIN_STRATEGY=true
       - ROUTEIQ_WORKERS=2
       - ROUTEIQ_CENTROID_ROUTING=true
       - ROUTEIQ_ROUTING_PROFILE=auto
+      - ROUTEIQ_ADMIN_UI_ENABLED=${ROUTEIQ_ADMIN_UI_ENABLED:-true}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 30s
@@ -130,71 +153,67 @@ services:
           cpus: "1.0"
     restart: unless-stopped
     networks:
-      - litellm-network
+      - routeiq-network
 
   # ==========================================================================
-  # LiteLLM + LLMRouter Gateway (Replica for HA)
+  # Gateway Replica 2
   # ==========================================================================
   litellm-gateway-2:
     build:
-      context: .
+      context: ../../../
       dockerfile: docker/Dockerfile
     image: ghcr.io/baladithyab/litellm-llm-router:latest
-    container_name: litellm-gateway-2
+    container_name: routeiq-full-gateway-2
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     ports:
       - "4001:4000"
     volumes:
-      - ./config:/app/config:ro
-      - ./models:/app/models:ro
-      - ./custom_routers:/app/custom_routers:ro
+      - ../../../config:/app/config:ro
+      - ../../../models:/app/models:ro
+      - ../../../custom_routers:/app/custom_routers:ro
     environment:
-      - LITELLM_CONFIG_PATH=/app/config/config.yaml
-      # SECURITY: LITELLM_MASTER_KEY is REQUIRED - no default provided
-      # Generate with: openssl rand -hex 32
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY environment variable is required}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD environment variable is required}@postgres:5432/${POSTGRES_DB:-litellm}
+      - LITELLM_CONFIG_PATH=/app/config/config.openrouter.yaml
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-test-master-key-change-me}
+      # Database & Cache
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:-litellm_password}@postgres:5432/${POSTGRES_DB:-litellm}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
-      # LLM Provider API Keys
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - AZURE_API_KEY=${AZURE_API_KEY:-}
-      # LLMRouter Settings
-      - LLMROUTER_MODELS_PATH=/app/models
-      - LLMROUTER_HOT_RELOAD=true
-      - LLMROUTER_RELOAD_INTERVAL=300
+      # OpenRouter API Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # OpenTelemetry
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=litellm-gateway-2
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+      - OTEL_ENABLED=true
       # HA Mode - Leader Election
       - LLMROUTER_HA_MODE=${LLMROUTER_HA_MODE:-leader_election}
       - LLMROUTER_CONFIG_SYNC_LEASE_SECONDS=${LLMROUTER_CONFIG_SYNC_LEASE_SECONDS:-30}
       - LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS=${LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS:-10}
-      # Gateway Features (A2A, MCP) - same as gateway-1 for HA consistency
-      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
-      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
+      # Gateway Features - All enabled
+      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-true}
+      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-true}
+      - MCP_TRACING_ENABLED=true
       - STORE_MODEL_IN_DB=${STORE_MODEL_IN_DB:-true}
       # Config Sync & Hot Reload
       - CONFIG_HOT_RELOAD=${CONFIG_HOT_RELOAD:-true}
       - CONFIG_SYNC_ENABLED=${CONFIG_SYNC_ENABLED:-true}
       - CONFIG_SYNC_INTERVAL=${CONFIG_SYNC_INTERVAL:-60}
-      # S3/GCS Config Sync (optional)
-      - CONFIG_S3_BUCKET=${CONFIG_S3_BUCKET:-}
-      - CONFIG_S3_KEY=${CONFIG_S3_KEY:-}
-      - LLMROUTER_MODEL_S3_BUCKET=${LLMROUTER_MODEL_S3_BUCKET:-}
-      - LLMROUTER_MODEL_S3_KEY=${LLMROUTER_MODEL_S3_KEY:-}
-      # AWS Credentials (if using S3)
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
-      # RouteIQ Plugin Strategy & Routing
+      # RouteIQ Settings
       - ROUTEIQ_USE_PLUGIN_STRATEGY=true
       - ROUTEIQ_WORKERS=2
       - ROUTEIQ_CENTROID_ROUTING=true
       - ROUTEIQ_ROUTING_PROFILE=auto
+      - ROUTEIQ_ADMIN_UI_ENABLED=${ROUTEIQ_ADMIN_UI_ENABLED:-true}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
       interval: 30s
@@ -208,24 +227,21 @@ services:
           cpus: "1.0"
     restart: unless-stopped
     networks:
-      - litellm-network
+      - routeiq-network
 
   # ==========================================================================
   # Nginx Load Balancer (SSE-aware)
   # ==========================================================================
   nginx:
     image: nginx:alpine
-    container_name: litellm-nginx
+    container_name: routeiq-full-nginx
     depends_on:
       - litellm-gateway-1
       - litellm-gateway-2
     ports:
       - "8080:80"
     volumes:
-      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
-    environment:
-      # SSE proxy settings (disable buffering for streaming)
-      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx
+      - ../../../config/nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
       interval: 30s
@@ -233,12 +249,12 @@ services:
       retries: 3
     restart: unless-stopped
     networks:
-      - litellm-network
+      - routeiq-network
 
 volumes:
   postgres_data:
   redis_data:
 
 networks:
-  litellm-network:
+  routeiq-network:
     driver: bridge
