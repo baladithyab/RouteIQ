@@ -29,6 +29,44 @@ The plugin system is designed around specific capabilities. Plugins must declare
 | `AUTH_PROVIDER` | Custom authentication logic | Alpha |
 | `STORAGE_BACKEND` | Custom storage for state/config | Alpha |
 
+## Built-in Plugins
+
+RouteIQ ships with 13 built-in plugins in [`gateway/plugins/`](../src/litellm_llmrouter/gateway/plugins/). These are organized by category:
+
+### Safety & Guardrails
+
+| Plugin | Description | Enable Via |
+|--------|-------------|------------|
+| [`content_filter.py`](../src/litellm_llmrouter/gateway/plugins/content_filter.py) | Content filtering plugin for blocking harmful content. Inspects requests and responses against configurable content policies. | `LLMROUTER_PLUGINS=...content_filter.ContentFilterPlugin` |
+| [`pii_guard.py`](../src/litellm_llmrouter/gateway/plugins/pii_guard.py) | PII detection and redaction. Scans messages for personally identifiable information (SSN, email, phone, etc.) and redacts or blocks before forwarding to LLM providers. | `LLMROUTER_PLUGINS=...pii_guard.PIIGuardPlugin` |
+| [`prompt_injection_guard.py`](../src/litellm_llmrouter/gateway/plugins/prompt_injection_guard.py) | Prompt injection detection. Analyzes user inputs for common prompt injection patterns and blocks suspicious requests. | `LLMROUTER_PLUGINS=...prompt_injection_guard.PromptInjectionGuardPlugin` |
+| [`llamaguard_plugin.py`](../src/litellm_llmrouter/gateway/plugins/llamaguard_plugin.py) | LlamaGuard safety classification. Uses Meta's LlamaGuard model to classify inputs and outputs for safety violations across multiple harm categories. | `LLMROUTER_PLUGINS=...llamaguard_plugin.LlamaGuardPlugin` |
+| [`guardrails_base.py`](../src/litellm_llmrouter/gateway/plugins/guardrails_base.py) | Base class for guardrail plugins. Provides the common interface and utilities that all guardrail-type plugins extend. Not typically loaded directly. | Used as base class for other guardrail plugins |
+
+### Cost & Caching
+
+| Plugin | Description | Enable Via |
+|--------|-------------|------------|
+| [`cost_tracker.py`](../src/litellm_llmrouter/gateway/plugins/cost_tracker.py) | Per-request cost tracking and aggregation. Calculates and records the cost of each LLM call based on token usage and model pricing. Emits cost metrics via OpenTelemetry. | `LLMROUTER_PLUGINS=...cost_tracker.CostTrackerPlugin` |
+| [`cache_plugin.py`](../src/litellm_llmrouter/gateway/plugins/cache_plugin.py) | Response caching plugin. Caches LLM responses to reduce latency and cost for repeated or similar queries. Supports configurable TTL and cache key strategies. | `LLMROUTER_PLUGINS=...cache_plugin.CachePlugin` |
+
+### Skills & Evaluation
+
+| Plugin | Description | Enable Via |
+|--------|-------------|------------|
+| [`skills_discovery.py`](../src/litellm_llmrouter/gateway/plugins/skills_discovery.py) | Anthropic Computer Use, Bash, and Text Editor skill execution. Registers and manages Anthropic's tool-use skills (computer, bash, text_editor) as MCP-compatible tools. | `LLMROUTER_PLUGINS=...skills_discovery.SkillsDiscoveryPlugin` |
+| [`evaluator.py`](../src/litellm_llmrouter/gateway/plugins/evaluator.py) | LLM-as-judge evaluation plugin. Provides the base evaluator framework for scoring MCP tool invocations and A2A agent calls. Emits OTEL metrics for observability. | `ROUTEIQ_EVALUATOR_ENABLED=true` |
+| [`upskill_evaluator.py`](../src/litellm_llmrouter/gateway/plugins/upskill_evaluator.py) | Combined skill + evaluation plugin. Reference implementation that demonstrates basic success/failure scoring with optional upskill CLI integration. | `LLMROUTER_PLUGINS=...upskill_evaluator.UpskillEvaluatorPlugin` + `ROUTEIQ_EVALUATOR_ENABLED=true` |
+
+### Cloud Integrations
+
+| Plugin | Description | Enable Via |
+|--------|-------------|------------|
+| [`bedrock_agentcore_mcp.py`](../src/litellm_llmrouter/gateway/plugins/bedrock_agentcore_mcp.py) | AWS Bedrock AgentCore MCP integration. Bridges AWS Bedrock AgentCore agents with the MCP gateway, enabling Bedrock-hosted agents to be discovered and invoked via MCP protocol. | `LLMROUTER_PLUGINS=...bedrock_agentcore_mcp.BedrockAgentCoreMCPPlugin` |
+| [`bedrock_guardrails.py`](../src/litellm_llmrouter/gateway/plugins/bedrock_guardrails.py) | AWS Bedrock Guardrails plugin. Integrates with AWS Bedrock Guardrails service for content moderation, topic avoidance, and sensitive information filtering using AWS-managed guardrail configurations. | `LLMROUTER_PLUGINS=...bedrock_guardrails.BedrockGuardrailsPlugin` |
+
+> **Note**: Built-in plugins use the full module path for loading, e.g., `litellm_llmrouter.gateway.plugins.cost_tracker.CostTrackerPlugin`. The abbreviated paths in the table above use `...` for brevity.
+
 ## Quick Start
 
 ### 1. Create a Plugin
@@ -350,6 +388,52 @@ Plugins are loaded in this order:
 4. **Dependency resolution**: Topological sort + priority
 5. **Startup**: Call `startup()` in resolved order
 6. **Shutdown**: Call `shutdown()` in reverse order
+
+## Plugin Architecture
+
+The plugin system uses two complementary hook mechanisms to integrate plugins at different layers of the request lifecycle.
+
+### Plugin Callback Bridge
+
+The [`plugin_callback_bridge.py`](../src/litellm_llmrouter/gateway/plugin_callback_bridge.py) bridges plugins with LiteLLM's internal callback system, operating at the **LLM call level**:
+
+| Hook | When It Fires | Use Case |
+|------|--------------|----------|
+| `on_llm_pre_call(model, messages, kwargs)` | Before a request is sent to the LLM provider | Modify prompts, add metadata, enforce guardrails |
+| `on_llm_success(model, response, kwargs)` | After a successful LLM response is received | Score responses, track costs, cache results |
+| `on_llm_failure(model, exception, kwargs)` | After an LLM request fails | Log errors, trigger fallback logic, update circuit breakers |
+
+The callback bridge registers itself as a LiteLLM callback handler, so plugin hooks fire inside the LiteLLM request lifecycle. This allows plugins to inspect and modify requests/responses at the LLM API call level, before and after the actual provider round-trip.
+
+### Plugin Middleware
+
+The [`plugin_middleware.py`](../src/litellm_llmrouter/gateway/plugin_middleware.py) handles plugin hooks at the **HTTP request level**, running as FastAPI middleware:
+
+| Hook | When It Fires | Use Case |
+|------|--------------|----------|
+| `on_request(request)` | Before the FastAPI route handler executes | Request validation, rate limiting, header injection |
+| `on_response(request, response)` | After the FastAPI route handler completes | Response transformation, logging, metrics |
+
+The middleware wraps the entire HTTP request/response cycle, firing before the route handler and after the response is generated.
+
+### Callback Bridge vs. Middleware
+
+Understanding when each hook fires is important for plugin design:
+
+```
+HTTP Request
+  └─► Plugin Middleware: on_request()        ← HTTP layer
+        └─► FastAPI Route Handler
+              └─► LiteLLM Router
+                    └─► Callback Bridge: on_llm_pre_call()  ← LLM call layer
+                          └─► LLM Provider API call
+                    └─► Callback Bridge: on_llm_success()   ← LLM call layer
+        └─► Plugin Middleware: on_response()  ← HTTP layer
+HTTP Response
+```
+
+- **Use callback bridge hooks** when you need to interact with LLM-specific data (model names, token counts, prompt content, completion responses)
+- **Use middleware hooks** when you need to interact with HTTP-level concerns (headers, status codes, request paths, authentication tokens)
 
 ## Best Practices
 

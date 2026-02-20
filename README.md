@@ -18,10 +18,12 @@ Cloud-native General AI Gateway with pluggable ML routing intelligence and end-t
 
 **RouteIQ Gateway** is a production-grade, cloud-native **General AI Gateway** that extends [LiteLLM Proxy](https://github.com/BerriAI/litellm) with ML-based routing intelligence. It serves as a unified control plane for all AI interactions -- LLMs, Agents (A2A), Tools (MCP), and Skills -- while adding:
 
+- **Zero-Config Intelligent Routing**: Centroid-based routing provides ~2ms classification out of the box with routing profiles (auto, eco, premium, free, reasoning). No ML model training required.
 - **Intelligent Routing**: 18+ ML strategies (KNN, MLP, SVM, ELO, hybrid, etc.) that learn from your traffic
 - **MLOps Pipeline**: End-to-end tooling to collect telemetry, train routing models, and deploy them with hot-reload
 - **Enterprise Hardening**: RBAC, quotas, audit logging, policy engine, SSRF protection, circuit breakers
 - **Cloud-Native**: Helm charts, HA with leader election, graceful shutdown, health probes, OpenTelemetry
+- **Admin UI**: Built-in admin interface at `/ui/` (enable with `ROUTEIQ_ADMIN_UI_ENABLED=true`)
 
 ## Gateway Surfaces
 
@@ -92,6 +94,8 @@ Multi-replica with Redis, PostgreSQL, and Nginx load balancing:
 docker compose -f docker-compose.ha.yml up -d
 ```
 
+> **Note**: Deployment examples have been reorganized into `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
+
 ### 3. With Observability (OTel + Jaeger)
 
 Full trace visualization with Jaeger:
@@ -115,7 +119,7 @@ RouteIQ is designed for cloud-native deployment:
 
 - **Docker**: Multi-stage production images on GHCR (non-root, read-only filesystem)
 - **Kubernetes**: Helm chart with HPA, PDB, NetworkPolicy, IRSA support (`deploy/charts/`)
-- **Docker Compose**: Variants for dev, HA, observability, testing
+- **Docker Compose**: Variants for dev, HA, observability, testing (see [`examples/docker/`](examples/docker/))
 - **Health Probes**: `/_health/live` (liveness) and `/_health/ready` (readiness with dependency checks)
 - **Config Management**: YAML files, S3/GCS sync with ETag change detection, hot-reload
 
@@ -137,6 +141,7 @@ See the [Deployment Guide](docs/deployment.md) for production checklist.
 
 | Strategy | Algorithm |
 |----------|-----------|
+| `centroid` | Zero-config ~2ms routing using pre-computed centroids (no model required) |
 | `llmrouter-knn` | K-Nearest Neighbors (embedding similarity) |
 | `llmrouter-mlp` | Multi-Layer Perceptron neural network |
 | `llmrouter-svm` | Support Vector Machine |
@@ -151,6 +156,8 @@ See the [Deployment Guide](docs/deployment.md) for production checklist.
 | `llmrouter-custom` | User-defined routing logic |
 
 Strategies support **A/B testing** with deterministic hash-based assignment and **hot-reload** for zero-downtime model updates.
+
+> **Plugin Strategy** (default): `ROUTEIQ_USE_PLUGIN_STRATEGY=true` uses a `CustomRoutingStrategyBase` adapter enabling multi-worker deployments via `ROUTEIQ_WORKERS`. Legacy monkey-patch mode (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`) is limited to 1 worker.
 
 See [Routing Strategies](docs/routing-strategies.md) for details.
 
@@ -182,6 +189,24 @@ general_settings:
 
 See [Configuration Guide](docs/configuration.md) for all options.
 
+> **Tip**: `config/config.openrouter.yaml` provides a pre-configured setup for easy testing with [OpenRouter](https://openrouter.ai/). Copy it and add your API key to get started quickly.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LITELLM_MASTER_KEY` | — | Master API key for admin access |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | `true` | Use plugin routing strategy instead of monkey-patch (enables multi-worker) |
+| `ROUTEIQ_WORKERS` | `1` | Number of uvicorn workers (requires plugin strategy) |
+| `ROUTEIQ_CENTROID_ROUTING` | `true` | Enable centroid routing fallback |
+| `ROUTEIQ_ROUTING_PROFILE` | `auto` | Default routing profile: auto/eco/premium/free/reasoning |
+| `ROUTEIQ_ADMIN_UI_ENABLED` | `false` | Enable admin UI at `/ui/` |
+| `MCP_GATEWAY_ENABLED` | `false` | Enable MCP gateway |
+| `A2A_GATEWAY_ENABLED` | `false` | Enable A2A gateway |
+| `OTEL_ENABLED` | `true` | Enable OpenTelemetry |
+
+See [`.env.example`](.env.example) for the full list.
+
 ## Security
 
 Security is a first-class concern:
@@ -212,7 +237,7 @@ See [Security Guide](docs/security.md) for details.
 | [Plugins](docs/plugins.md) | Plugin system guide |
 | [Security](docs/security.md) | Security considerations |
 | [Observability](docs/observability.md) | OpenTelemetry setup |
-| [High Availability](docs/high-availability.md) | HA configuration |
+| [High Availability](docs/tutorials/ha-quickstart.md) | HA configuration |
 
 ## Contributing
 

@@ -16,6 +16,8 @@
 
 ## Core Features
 
+> **Zero-Config Intelligent Routing** — Centroid-based routing provides ~2ms classification out of the box with routing profiles (auto, eco, premium, free, reasoning). No ML model training required. See [Routing Strategies](routing-strategies.md) for details.
+
 | Document | Description |
 |----------|-------------|
 | [Routing Strategies](routing-strategies.md) | ML-based routing: KNN, MLP, SVM, ELO, MF, hybrid, and custom strategies |
@@ -26,6 +28,8 @@
 | [Vector Stores](vector-stores.md) | Vector store integration for RAG and semantic search |
 
 ## Deployment
+
+> **Docker Examples**: The [`examples/docker/`](../examples/docker/) directory contains ready-to-use deployment scenarios (basic, HA, observability, full-stack, local-dev), each with its own `docker-compose.yml`, `.env.example`, and `README.md`.
 
 | Document | Description |
 |----------|-------------|

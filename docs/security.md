@@ -92,6 +92,72 @@ Client-facing error responses are sanitized to prevent information leakage:
 | 500 | `internal_error` | Unexpected server error |
 | 503 | (readiness detail) | Dependency health check failed |
 
+## Role-Based Access Control (RBAC)
+
+RouteIQ Gateway provides role-based access control via [`rbac.py`](../src/litellm_llmrouter/rbac.py) for fine-grained authorization of API endpoints.
+
+RBAC assigns roles (e.g., `admin`, `user`, `viewer`) to API keys and enforces access policies based on those roles. It integrates with the management middleware ([`management_middleware.py`](../src/litellm_llmrouter/management_middleware.py)) for endpoint-level authorization, ensuring that only appropriately privileged users can access sensitive operations like configuration changes, model management, and agent registration.
+
+Key features:
+- **Role assignment**: API keys are mapped to roles via configuration
+- **Endpoint-level authorization**: Each endpoint declares its required role
+- **Integration with management middleware**: The [`management_classifier.py`](../src/litellm_llmrouter/management_classifier.py) classifies LiteLLM management endpoints so the middleware can enforce RBAC policies on upstream operations
+- **Fail-closed by default**: Requests without a valid role assignment are denied
+
+## Policy Engine
+
+RouteIQ Gateway includes an OPA-style policy engine via [`policy_engine.py`](../src/litellm_llmrouter/policy_engine.py) that evaluates pre-request policies to allow or deny traffic at the ASGI middleware layer.
+
+**Configuration:**
+
+```bash
+# Enable the policy engine
+POLICY_ENGINE_ENABLED=true
+
+# Path to the policy configuration file
+POLICY_CONFIG_PATH=config/policy.example.yaml
+```
+
+**Evaluation context** — the policy engine evaluates each request against:
+- **Subject**: The authenticated user/key identity
+- **Route**: The target API endpoint path
+- **Model**: The requested model (for inference endpoints)
+- **Headers**: Request headers
+- **Source IP**: The client's IP address
+
+**Policy modes:**
+- **Fail-open** (default): If the policy engine encounters an error during evaluation, the request is allowed through. This prevents policy misconfigurations from causing outages.
+- **Fail-closed**: If enabled, any policy evaluation error results in the request being denied. Use this in high-security environments where safety is preferred over availability.
+
+**Example policy rules** are provided in [`config/policy.example.yaml`](../config/policy.example.yaml).
+
+## Audit Logging
+
+RouteIQ Gateway provides structured audit logging via [`audit.py`](../src/litellm_llmrouter/audit.py) for tracking security-relevant operations.
+
+Audit events are emitted for:
+- Authentication attempts (success and failure)
+- Control-plane operations (config changes, model management)
+- Policy engine decisions (allow/deny with context)
+- MCP server and A2A agent registration/deregistration
+
+Audit logs support two output modes:
+- **File-based logging**: Structured audit events written to a log file for offline analysis
+- **Structured event logging**: Machine-readable event objects that can be forwarded to SIEM systems or observability platforms
+
+Each audit event includes the request ID, timestamp, actor identity, action performed, and outcome for full traceability.
+
+## Secret Scrubbing
+
+All error logs in RouteIQ Gateway are scrubbed of sensitive values before being emitted to prevent accidental secret leakage. The [`auth._scrub_secrets()`](../src/litellm_llmrouter/auth.py) function automatically redacts:
+
+- API keys and bearer tokens
+- Database connection strings
+- Cloud provider credentials
+- Any values matching known secret patterns
+
+This applies to all log output, including error responses logged server-side, middleware error handling, and plugin error paths. Combined with the [Error Response Sanitization](#error-response-sanitization) for client-facing responses, this ensures secrets are never exposed in either logs or API responses.
+
 ## SSRF Protection
 
 Server-Side Request Forgery (SSRF) is a major risk for gateways that proxy requests. RouteIQ Gateway includes built-in SSRF guards with a **secure-by-default (fail-closed)** policy.

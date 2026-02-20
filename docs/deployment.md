@@ -68,27 +68,105 @@ docker run -p 4000:4000 \
 
 ## Docker Compose
 
-We provide several Docker Compose configurations for different use cases.
+We provide several Docker Compose configurations for different deployment scenarios, organized under `examples/docker/`:
 
-### Standard (Development)
-For local development and testing.
+| Scenario | Path | Description |
+|----------|------|-------------|
+| **Basic** | `examples/docker/basic/` | Minimal single-container setup |
+| **High Availability** | `examples/docker/ha/` | Multi-replica with Redis + Postgres + Nginx |
+| **Observability** | `examples/docker/observability/` | OTel Collector + Jaeger for tracing/metrics |
+| **Full Stack** | `examples/docker/full-stack/` | HA + Observability combined |
+| **Local Dev** | `examples/docker/local-dev/` | Local development with hot-reload |
+
+Each scenario includes its own `docker-compose.yml`, `.env.example`, and `README.md`.
+
+### Quick Start Examples
 
 ```bash
-docker compose up -d
+# Basic single-container
+cd examples/docker/basic && docker compose up -d
+
+# High Availability (Redis + Postgres + Nginx)
+cd examples/docker/ha && docker compose up -d
+
+# Observability (OTel Collector + Jaeger)
+cd examples/docker/observability && docker compose up -d
+
+# Full Stack (HA + Observability)
+cd examples/docker/full-stack && docker compose up -d
+
+# Local Development (hot-reload)
+cd examples/docker/local-dev && docker compose up -d
 ```
 
-### High Availability (HA)
-Includes Redis for caching/rate-limiting and PostgreSQL for data persistence.
+> **Legacy**: The root-level `docker-compose.yml`, `docker-compose.ha.yml`, and `docker-compose.otel.yml` files are still available but may be removed in a future release. Prefer the `examples/docker/` layouts for new deployments.
+
+## Worker Configuration
+
+The `ROUTEIQ_WORKERS` environment variable controls the number of uvicorn workers (default: `1`).
+
+### Plugin Strategy (Default — Multi-Worker Safe)
+
+When `ROUTEIQ_USE_PLUGIN_STRATEGY=true` (the default), RouteIQ registers routing logic via a `CustomRoutingStrategyBase` adapter (`custom_routing_strategy.py`). This approach is compatible with multiple workers because `os.fork()` preserves the installed strategy state.
 
 ```bash
-docker compose -f docker-compose.ha.yml up -d
+# Production: 4 workers with the plugin strategy (default)
+ROUTEIQ_USE_PLUGIN_STRATEGY=true  # default, can be omitted
+ROUTEIQ_WORKERS=4
 ```
 
-### Observability (OTEL)
-Includes Jaeger and Prometheus for tracing and metrics.
+### Legacy Monkey-Patch Mode (Single Worker Only)
+
+When `ROUTEIQ_USE_PLUGIN_STRATEGY=false`, RouteIQ monkey-patches `litellm.Router` at runtime. This **requires exactly 1 worker** because `os.execvp()` would replace the process and lose the patches.
 
 ```bash
-docker compose -f docker-compose.otel.yml up -d
+# Legacy mode: must use 1 worker
+ROUTEIQ_USE_PLUGIN_STRATEGY=false
+ROUTEIQ_WORKERS=1  # only valid value in legacy mode
+```
+
+### Recommendations
+
+| Environment | Workers | Strategy |
+|-------------|---------|----------|
+| Development | 1 | Either |
+| Production (small) | 2–4 | Plugin (default) |
+| Production (large) | 4–8+ | Plugin (default) |
+
+## Admin UI
+
+Set `ROUTEIQ_ADMIN_UI_ENABLED=true` to enable a built-in admin UI accessible at `/ui/`. This provides a web-based interface for monitoring and managing the gateway.
+
+```yaml
+environment:
+  - ROUTEIQ_ADMIN_UI_ENABLED=true
+```
+
+## Centroid Routing Deployment
+
+Centroid routing provides intelligent, zero-config model routing with ~2ms latency. It is enabled by default (`ROUTEIQ_CENTROID_ROUTING=true`) and requires `numpy` (included in default dependencies).
+
+### Routing Profiles
+
+Set `ROUTEIQ_ROUTING_PROFILE` to control default routing behavior:
+
+| Profile | Description |
+|---------|-------------|
+| `auto` (default) | Balanced cost/quality routing |
+| `eco` | Prefer lower-cost models |
+| `premium` | Prefer highest-quality models |
+| `free` | Prefer free-tier models |
+| `reasoning` | Prefer models with reasoning capabilities |
+
+### Custom Centroid Vectors
+
+Pre-computed centroid `.npy` files can optionally be placed in `models/centroids/` for custom centroid vectors. If no custom vectors are present, built-in defaults are used.
+
+```yaml
+environment:
+  - ROUTEIQ_CENTROID_ROUTING=true       # default
+  - ROUTEIQ_ROUTING_PROFILE=auto        # default
+  - ROUTEIQ_CENTROID_WARMUP=false       # set true to pre-warm at startup
 ```
 
 ## Kubernetes
@@ -134,7 +212,7 @@ spec:
               mountPath: /app/config
           readinessProbe:
             httpGet:
-              path: /health/ready
+              path: /_health/ready
               port: 4000
             initialDelaySeconds: 5
             periodSeconds: 10

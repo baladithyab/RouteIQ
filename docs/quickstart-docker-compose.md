@@ -48,7 +48,7 @@ export LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 Run the default Docker Compose configuration:
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 This starts the `litellm-llmrouter` service on port **4000**.
@@ -58,7 +58,7 @@ This starts the `litellm-llmrouter` service on port **4000**.
 Check the health endpoint:
 
 ```bash
-curl http://localhost:4000/health
+curl http://localhost:4000/_health/ready
 # Expected: {"status":"healthy", ...}
 ```
 
@@ -90,6 +90,10 @@ The default setup mounts `./config/config.yaml` to the container. You can modify
 | `LLMROUTER_HOT_RELOAD` | Enable hot reloading of routing models. | `true` |
 | `A2A_GATEWAY_ENABLED` | Enable Agent-to-Agent gateway. | `false` |
 | `MCP_GATEWAY_ENABLED` | Enable MCP gateway. | `false` |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | Use plugin routing strategy instead of monkey-patch. | `true` |
+| `ROUTEIQ_CENTROID_ROUTING` | Enable centroid routing fallback. | `true` |
+| `ROUTEIQ_ROUTING_PROFILE` | Default routing profile: auto/eco/premium/free/reasoning. | `auto` |
+| `ROUTEIQ_WORKERS` | Number of uvicorn workers (multi-worker requires plugin strategy). | `1` |
 
 ### Security Defaults
 
@@ -102,3 +106,24 @@ The default setup mounts `./config/config.yaml` to the container. You can modify
 - **Need reliability?** Switch to the [High Availability Setup](tutorials/ha-quickstart.md).
 - **Need visibility?** Add the [Observability Stack](tutorials/observability-quickstart.md).
 - **Configuration:** See the [Configuration Guide](configuration.md).
+
+### Centroid Routing
+
+Centroid routing provides intelligent model routing out of the box with no ML model training required (~2ms latency). Routing profiles control model selection behavior:
+
+- **auto** (default) — Balanced cost/quality routing
+- **eco** — Prefer lower-cost models
+- **premium** — Prefer highest-quality models
+- **free** — Prefer free-tier models
+- **reasoning** — Prefer models with reasoning capabilities
+
+Set the profile via `ROUTEIQ_ROUTING_PROFILE=eco` (or any profile above).
+
+### More Deployment Scenarios
+
+The `examples/docker/` directory contains ready-to-use Docker Compose setups for different deployment scenarios: basic, HA (high availability), observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [Deployment Guide](deployment.md) for details.
+
+> **Tip:** For easy testing with OpenRouter, use the pre-configured `config/config.openrouter.yaml`:
+> ```bash
+> docker compose up -d  # with LITELLM_CONFIG_PATH=config/config.openrouter.yaml in your .env
+> ```

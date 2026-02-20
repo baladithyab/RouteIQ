@@ -84,11 +84,26 @@ RouteIQ/
 │   ├── gateway/              # App factory, plugin system
 │   │   ├── app.py            # Composition root (create_app)
 │   │   ├── plugin_manager.py # Plugin lifecycle management
-│   │   └── plugins/          # Built-in plugins
+│   │   ├── plugin_callback_bridge.py # Bridge between plugins and LiteLLM callbacks
+│   │   ├── plugin_middleware.py # Plugin middleware integration
+│   │   └── plugins/          # Built-in plugins (13 total)
 │   ├── startup.py            # CLI entry point
-│   ├── routes.py             # FastAPI routes
+│   ├── routes/               # FastAPI routes (package)
+│   │   ├── __init__.py       # Re-exports all routers + feature flags
+│   │   ├── health.py         # Health/readiness probes
+│   │   ├── a2a.py            # A2A agent routes
+│   │   ├── mcp.py            # MCP gateway routes
+│   │   ├── config.py         # Config/admin routes
+│   │   ├── models.py         # Model management routes
+│   │   └── admin_ui.py       # Admin UI mount
 │   ├── strategies.py         # ML routing strategies (18+)
 │   ├── strategy_registry.py  # A/B testing, routing pipeline
+│   ├── centroid_routing.py   # Zero-config centroid-based routing (~2ms)
+│   ├── custom_routing_strategy.py # LiteLLM CustomRoutingStrategyBase plugin adapter
+│   ├── semantic_cache.py     # Semantic caching for LLM responses
+│   ├── conversation_affinity.py # Conversation-based routing affinity
+│   ├── management_classifier.py # Classifies LiteLLM management endpoints
+│   ├── management_middleware.py # RBAC/audit middleware for management ops
 │   ├── mcp_gateway.py        # MCP protocol gateway
 │   ├── a2a_gateway.py        # Agent-to-Agent gateway
 │   ├── observability.py      # OpenTelemetry integration
@@ -228,10 +243,15 @@ Development follows a Task Group pattern with quality gates:
 
 ### New API Endpoint
 
-1. Add route in `src/litellm_llmrouter/routes.py` (choose the right router)
+1. Add route in the appropriate sub-module under `src/litellm_llmrouter/routes/`:
+   - [`health.py`](src/litellm_llmrouter/routes/health.py) for health/readiness endpoints
+   - [`a2a.py`](src/litellm_llmrouter/routes/a2a.py) for A2A agent endpoints
+   - [`mcp.py`](src/litellm_llmrouter/routes/mcp.py) for MCP gateway endpoints
+   - [`config.py`](src/litellm_llmrouter/routes/config.py) for config/admin endpoints
+   - [`models.py`](src/litellm_llmrouter/routes/models.py) for model management endpoints
 2. Add Pydantic models for request/response
 3. Add auth dependency (`admin_api_key_auth` or `user_api_key_auth`)
-4. Register router in `gateway/app.py` if using a new router
+4. Register router in `gateway/app.py` `_register_routes()` if using a new router
 5. Add unit test in `tests/unit/`
 6. Update `docs/api-reference.md`
 
@@ -244,6 +264,10 @@ Development follows a Task Group pattern with quality gates:
 | `docker-compose.otel.yml` | Observability with Jaeger | Debugging traces |
 | `docker-compose.local-test.yml` | Full local dev stack | Running integration tests |
 | `docker-compose.ha-otel.yml` | HA + Observability | Full production simulation |
+| `docker-compose.ha-test.yml` | HA integration testing | Testing HA failover scenarios |
+| `docker-compose.quota-test.yml` | Quota enforcement testing | Testing per-team/key quotas |
+| `docker-compose.streaming-perf.yml` | Streaming performance testing | Benchmarking streaming throughput |
+| `examples/docker/` | Reorganized deployment scenarios | Quick-start for basic, ha, observability, full-stack, local-dev |
 
 ## Security
 

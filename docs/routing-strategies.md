@@ -14,6 +14,7 @@ This document covers all available routing strategies in the RouteIQ Gateway.
 - [Model Artifact Security](#model-artifact-security)
 - [Hot Reloading](#hot-reloading)
 - [Training Custom Models](#training-custom-models)
+- [Plugin Strategy Adapter](#plugin-strategy-adapter)
 
 ## LiteLLM Built-in Strategies
 
@@ -425,6 +426,7 @@ router_settings:
 | `ROUTEIQ_CENTROID_WARMUP` | `false` | Pre-warm classifier at startup |
 | `ROUTEIQ_CENTROID_DIR` | `models/centroids` | Directory for centroid `.npy` files |
 | `ROUTEIQ_CONFIDENCE_THRESHOLD` | `0.06` | Classification confidence threshold |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | `true` | Use plugin routing strategy adapter instead of monkey-patch (see [Plugin Strategy Adapter](#plugin-strategy-adapter)) |
 
 #### Tier Mapping
 
@@ -490,7 +492,7 @@ The gateway will automatically detect model file changes and reload.
 ## Training Custom Models
 
 - [MLOps Training Guide](mlops-training.md) - Full training pipeline with Docker
-- [Training from Observability Data](observability-training.md) - Use Jaeger/Tempo/CloudWatch traces
+- [Training from Observability Data](observability.md) - Use Jaeger/Tempo/CloudWatch traces for model improvement
 - [LLMRouter Data Pipeline](https://github.com/ulab-uiuc/LLMRouter#-preparing-training-data) - Official data preparation guide
 
 ## A/B Testing & Runtime Hot-Swapping
@@ -658,3 +660,42 @@ The registry and pipeline are thread-safe:
 - Selection operations don't block on writes
 
 All configuration updates trigger registered callbacks for integration with admin endpoints or monitoring systems.
+
+## Plugin Strategy Adapter
+
+The `RouteIQRoutingStrategy` class in [`custom_routing_strategy.py`](../src/litellm_llmrouter/custom_routing_strategy.py) is the runtime glue between RouteIQ's routing logic (centroid routing + ML strategies) and LiteLLM's `CustomRoutingStrategyBase` plugin interface.
+
+### How It Works
+
+When `ROUTEIQ_USE_PLUGIN_STRATEGY=true` (the default), the gateway registers `RouteIQRoutingStrategy` as a proper LiteLLM routing plugin instead of monkey-patching `litellm.Router`. This adapter:
+
+1. **Receives routing requests** from LiteLLM's `Router` via the `CustomRoutingStrategyBase` interface
+2. **Delegates to centroid routing** for zero-config intelligent routing (~2ms)
+3. **Delegates to trained ML models** (KNN, MLP, SVM, ELO, MF, etc.) when configured
+4. **Falls back gracefully** through the progressive enhancement chain if the primary strategy is unavailable
+
+### Multi-Worker Deployments
+
+The plugin strategy is the key enabler for multi-worker deployments:
+
+- **Plugin strategy** (`ROUTEIQ_USE_PLUGIN_STRATEGY=true`, default): Uses `os.fork()` to spawn workers, which preserves the installed strategy state. Multiple workers can be configured via `ROUTEIQ_WORKERS`.
+- **Legacy monkey-patch** (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`): Patches `litellm.Router` at import time. Limited to **1 worker** because `os.execvp()` would replace the process and lose all patches.
+
+```bash
+# Production: plugin strategy with multiple workers
+ROUTEIQ_USE_PLUGIN_STRATEGY=true   # default
+ROUTEIQ_WORKERS=4
+
+# Legacy: monkey-patch mode (single worker only)
+ROUTEIQ_USE_PLUGIN_STRATEGY=false
+ROUTEIQ_WORKERS=1
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | `true` | Use the `CustomRoutingStrategyBase` adapter instead of monkey-patching |
+| `ROUTEIQ_WORKERS` | `1` | Number of uvicorn workers (multi-worker requires plugin strategy) |
+
+When the plugin strategy is active, the adapter is registered during app startup in [`gateway/app.py`](../src/litellm_llmrouter/gateway/app.py) and integrates seamlessly with all other routing features (A/B testing, hot-swapping, telemetry).
