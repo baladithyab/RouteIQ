@@ -71,7 +71,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ==============================================================================
 # Stage 2: UI Builder (optional) - Build admin UI React SPA
 # ==============================================================================
-FROM node:20-alpine AS ui-builder
+FROM node:25-alpine AS ui-builder
 WORKDIR /ui
 # Copy package files first for layer caching
 COPY ui/package.json ui/package-lock.json ./
