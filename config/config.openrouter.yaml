@@ -35,13 +35,14 @@ router_settings:
   num_retries: 2
   retry_after: 5
   timeout: 600
-  cache_responses: true
+  cache_responses: false
 
 # =============================================================================
 # General Settings
 # =============================================================================
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  allow_requests_on_db_unavailable: true
 
 # =============================================================================
 # LiteLLM Settings

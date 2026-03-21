@@ -6,6 +6,10 @@
 				"hooks": [
 					{
 						"type": "command",
+						"command": "if tmux list-sessions >/dev/null 2>&1; then for v in AWS_BEARER_TOKEN_BEDROCK CLAUDE_CODE_USE_BEDROCK ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS DISABLE_TELEMETRY DO_NOT_TRACK CLAUDE_CODE_DISABLE_TELEMETRY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC STATSIG_DISABLED; do val=$(printenv \"$v\" 2>/dev/null); if [ -n \"$val\" ]; then tmux set-environment -g \"$v\" \"$val\" 2>/dev/null || true; fi; done; fi"
+					},
+					{
+						"type": "command",
 						"command": "ov prime --agent orchestrator"
 					}
 				]

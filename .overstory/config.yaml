@@ -7,14 +7,14 @@ project:
   canonicalBranch: main
   qualityGates:
     - name: Tests
-      command: bun test
-      description: all tests must pass
+      command: uv run pytest tests/unit/ -x -q
+      description: all unit tests must pass
     - name: Lint
-      command: bun run lint
-      description: zero errors
+      command: uv run ruff check src/ tests/
+      description: zero lint errors
     - name: Typecheck
-      command: bun run typecheck
-      description: no TypeScript errors
+      command: uv run mypy src/litellm_llmrouter/ --ignore-missing-imports
+      description: no type errors
 agents:
   manifestPath: .overstory/agent-manifest.json
   baseDir: .overstory/agent-defs

@@ -15,11 +15,9 @@
 
 services:
   litellm-gateway:
-    build:
-      context: ../../../
-      dockerfile: docker/Dockerfile
-    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    image: routeiq:latest
     container_name: routeiq-basic
+    command: ["--config", "/app/config/config.openrouter.yaml", "--port", "4000"]
     ports:
       - "4000:4000"
     volumes:
@@ -35,7 +33,11 @@ services:
       - ROUTEIQ_USE_PLUGIN_STRATEGY=${ROUTEIQ_USE_PLUGIN_STRATEGY:-true}
       - ROUTEIQ_CENTROID_ROUTING=${ROUTEIQ_CENTROID_ROUTING:-true}
       - ROUTEIQ_ROUTING_PROFILE=${ROUTEIQ_ROUTING_PROFILE:-auto}
-      - ROUTEIQ_WORKERS=${ROUTEIQ_WORKERS:-2}
+      - ROUTEIQ_WORKERS=${ROUTEIQ_WORKERS:-1}
+      # Admin API Keys (for RouteIQ control plane endpoints)
+      - ADMIN_API_KEYS=${ADMIN_API_KEYS:-}
+      # Observability (disable in basic setup - no collector)
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       # Gateway Features (disabled by default in basic setup)
       - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
       - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
