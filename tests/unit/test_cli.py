@@ -239,13 +239,18 @@ class TestStartCommand:
                         os.environ.pop("LITELLM_CONFIG_PATH", None)
 
     def test_start_workers_argument(self):
-        """routeiq start --workers 4 should include workers in sys.argv."""
+        """routeiq start --workers 4 should set ROUTEIQ_WORKERS env var."""
         with patch("sys.argv", ["routeiq", "start", "--workers", "4"]):
             with patch("litellm_llmrouter.startup.main") as mock_startup:
-                main()
-                # sys.argv should have been rewritten to include --workers
-                assert "--workers" in sys.argv
-                assert "4" in sys.argv
+                original = os.environ.get("ROUTEIQ_WORKERS")
+                try:
+                    main()
+                    assert os.environ.get("ROUTEIQ_WORKERS") == "4"
+                finally:
+                    if original is not None:
+                        os.environ["ROUTEIQ_WORKERS"] = original
+                    else:
+                        os.environ.pop("ROUTEIQ_WORKERS", None)
 
 
 # ============================================================================
@@ -257,19 +262,31 @@ class TestArgParsing:
     """Test CLI argument parsing edge cases."""
 
     def test_start_default_port(self):
-        """Default port should be 4000."""
+        """Default port should be 4000 (set via LITELLM_PORT env var)."""
         with patch("sys.argv", ["routeiq", "start"]):
             with patch("litellm_llmrouter.startup.main"):
-                main()
-                assert "--port" in sys.argv
-                port_idx = sys.argv.index("--port")
-                assert sys.argv[port_idx + 1] == "4000"
+                original = os.environ.get("LITELLM_PORT")
+                try:
+                    main()
+                    assert os.environ.get("LITELLM_PORT") == "4000"
+                finally:
+                    if original is not None:
+                        os.environ["LITELLM_PORT"] = original
+                    else:
+                        os.environ.pop("LITELLM_PORT", None)
 
     def test_start_default_config(self):
-        """Default config should be config/config.yaml."""
+        """Default config should be config/config.yaml (set via LITELLM_CONFIG_PATH env var)."""
         with patch("sys.argv", ["routeiq", "start"]):
             with patch("litellm_llmrouter.startup.main"):
-                main()
-                assert "--config" in sys.argv
-                config_idx = sys.argv.index("--config")
-                assert sys.argv[config_idx + 1] == "config/config.yaml"
+                original = os.environ.get("LITELLM_CONFIG_PATH")
+                try:
+                    # Remove any existing value so setdefault can set it
+                    os.environ.pop("LITELLM_CONFIG_PATH", None)
+                    main()
+                    assert os.environ.get("LITELLM_CONFIG_PATH") == "config/config.yaml"
+                finally:
+                    if original is not None:
+                        os.environ["LITELLM_CONFIG_PATH"] = original
+                    else:
+                        os.environ.pop("LITELLM_CONFIG_PATH", None)

@@ -371,7 +371,11 @@ class SubQueryExecutor:
         """
         if self._parallel and len(sub_queries) > 1:
             tasks = [self._execute_one(sq, **base_kwargs) for sq in sub_queries]
-            await asyncio.gather(*tasks, return_exceptions=False)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    sub_queries[i].error = str(result)
+                    sub_queries[i].response = None
         else:
             for sq in sub_queries:
                 await self._execute_one(sq, **base_kwargs)
@@ -609,12 +613,13 @@ class AgenticPipelinePlugin(GatewayPlugin):
         self._init_metrics(context)
 
         logger.info(
-            "Agentic pipeline enabled: "
-            f"model={self._orchestrator_model}, "
-            f"threshold={self._threshold}, "
-            f"max_sub={self._max_subqueries}, "
-            f"parallel={self._parallel}, "
-            f"timeout={self._timeout}s"
+            "Agentic pipeline enabled: model=%s, threshold=%s, "
+            "max_sub=%s, parallel=%s, timeout=%ss",
+            self._orchestrator_model,
+            self._threshold,
+            self._max_subqueries,
+            self._parallel,
+            self._timeout,
         )
 
     async def shutdown(
@@ -670,13 +675,17 @@ class AgenticPipelinePlugin(GatewayPlugin):
         complexity = self._detector.score(messages)
         if complexity < self._threshold:
             logger.debug(
-                f"Complexity {complexity:.2f} below threshold {self._threshold} — pass through"
+                "Complexity %.2f below threshold %s — pass through",
+                complexity,
+                self._threshold,
             )
             self._set_span_attributes(active=False, complexity=complexity)
             return None
 
         logger.info(
-            f"Complexity {complexity:.2f} >= {self._threshold} — activating pipeline"
+            "Complexity %.2f >= %s — activating pipeline",
+            complexity,
+            self._threshold,
         )
 
         # Run full pipeline
@@ -757,8 +766,9 @@ class AgenticPipelinePlugin(GatewayPlugin):
             result.aggregation_hint = hint
             result.orchestrator_tokens += decompose_tokens
             logger.info(
-                f"Decomposed into {len(sub_queries)} sub-queries "
-                f"(decompose tokens: {decompose_tokens})"
+                "Decomposed into %d sub-queries (decompose tokens: %d)",
+                len(sub_queries),
+                decompose_tokens,
             )
         except Exception as exc:
             logger.error(f"Decomposition failed: {exc}", exc_info=True)
@@ -791,8 +801,10 @@ class AgenticPipelinePlugin(GatewayPlugin):
 
         successful = [sq for sq in result.sub_queries if sq.response]
         logger.info(
-            f"Executed {len(result.sub_queries)} sub-queries: "
-            f"{len(successful)} succeeded, {result.error_count} failed"
+            "Executed %d sub-queries: %d succeeded, %d failed",
+            len(result.sub_queries),
+            len(successful),
+            result.error_count,
         )
 
         # If all sub-queries failed, bail out
@@ -817,7 +829,7 @@ class AgenticPipelinePlugin(GatewayPlugin):
             result.final_response = final_text
             result.orchestrator_tokens += agg_tokens
             result.total_tokens += result.orchestrator_tokens
-            logger.info(f"Aggregation complete (aggregate tokens: {agg_tokens})")
+            logger.info("Aggregation complete (aggregate tokens: %d)", agg_tokens)
         except Exception as exc:
             logger.error(f"Aggregation failed: {exc}", exc_info=True)
             result.error_count += 1
@@ -893,7 +905,7 @@ class AgenticPipelinePlugin(GatewayPlugin):
                 description="Total tokens consumed by the pipeline (inc. orchestrator)",
             )
         except Exception as exc:
-            logger.warning(f"Failed to initialise OTel metrics: {exc}")
+            logger.warning("Failed to initialise OTel metrics: %s", exc)
 
     def _record_telemetry(self, result: PipelineResult) -> None:
         """Record OTel metrics for a completed pipeline run."""

@@ -58,6 +58,12 @@ from litellm_llmrouter.gateway.plugin_manager import (
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+__all__ = [
+    "ContextOptimizer",
+    "ContextOptimizerPlugin",
+    "OptimizeResult",
+]
+
 logger = logging.getLogger("litellm_llmrouter.plugins.context_optimizer")
 
 # Regex for fenced code blocks (``` or ~~~, with optional language tag)
@@ -338,7 +344,7 @@ class ContextOptimizer:
                     if saved > 0:
                         parts[start:end] = list(compact)
                         total_saved += saved
-                except (json.JSONDecodeError, ValueError, TypeError):
+                except json.JSONDecodeError, ValueError, TypeError:
                     pass
 
             text_minified = "".join(parts)
@@ -393,7 +399,7 @@ class ContextOptimizer:
                 candidate = text_clean[start:end]
                 try:
                     parsed = json.loads(candidate)
-                except (json.JSONDecodeError, ValueError, TypeError):
+                except json.JSONDecodeError, ValueError, TypeError:
                     continue
 
                 if not isinstance(parsed, dict):

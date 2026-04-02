@@ -66,17 +66,10 @@ logger = logging.getLogger(__name__)
 # LLM API Path Registry
 # =============================================================================
 
-LLM_API_PATHS: dict[str, str] = {
-    "/v1/chat/completions": "chat_completion",
-    "/chat/completions": "chat_completion",
-    "/v1/responses": "responses",
-    "/responses": "responses",
-    "/openai/v1/responses": "responses",
-    "/v1/embeddings": "embedding",
-    "/embeddings": "embedding",
-    "/v1/completions": "completion",
-    "/completions": "completion",
-}
+from litellm_llmrouter.telemetry_contracts import LLM_API_PATHS
+
+# Re-export for backwards compatibility
+__all_llm_api_paths = LLM_API_PATHS
 """Maps LLM API request paths to their API type identifier."""
 
 
@@ -724,7 +717,7 @@ class PolicyMiddleware:
         if body_bytes:
             try:
                 parsed_body = json.loads(body_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except json.JSONDecodeError, UnicodeDecodeError:
                 parsed_body = None
 
         context = self._build_context(scope, api_type=api_type, parsed_body=parsed_body)

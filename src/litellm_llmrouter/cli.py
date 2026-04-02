@@ -13,6 +13,10 @@ Usage::
 import argparse
 import sys
 
+__all__ = [
+    "main",
+]
+
 
 def main():
     """Entry point for the ``routeiq`` CLI."""
@@ -78,12 +82,13 @@ def _cmd_start(args: argparse.Namespace) -> None:
     import os
 
     os.environ.setdefault("LITELLM_CONFIG_PATH", args.config)
+    os.environ["LITELLM_PORT"] = str(args.port)
+    os.environ["ROUTEIQ_WORKERS"] = str(args.workers)
 
     from litellm_llmrouter.startup import main as startup_main
 
-    sys.argv = ["routeiq", "--config", args.config, "--port", str(args.port)]
-    if args.workers > 1:
-        sys.argv.extend(["--workers", str(args.workers)])
+    # Don't mutate sys.argv — pass config via env vars that startup.main() reads:
+    #   LITELLM_CONFIG_PATH (--config), LITELLM_PORT (--port), ROUTEIQ_WORKERS (--workers)
     startup_main()
 
 

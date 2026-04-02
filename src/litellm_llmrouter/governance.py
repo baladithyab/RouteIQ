@@ -585,7 +585,12 @@ class GovernanceEngine:
             if redis is None:
                 return None
 
-            # Workspace-scoped spend key (monthly bucket)
+            # Workspace-scoped spend key (epoch-aligned ~30-day bucket).
+            # Note: Budget periods are aligned to Unix epoch 30-day windows
+            # (2,592,000 seconds), NOT calendar months.  This means budget
+            # resets occur at fixed intervals from epoch, not on the 1st of
+            # each month.  This is intentional for simplicity and consistency
+            # across timezones.
             bucket = int(time.time() // 2_592_000)  # ~30 day buckets
             scope = ctx.workspace_id or ctx.key_id or "global"
             key = f"governance:spend:{scope}:{bucket}"

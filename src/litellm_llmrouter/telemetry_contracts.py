@@ -700,6 +700,25 @@ class GenAIAttributes:
     AGENT_DESCRIPTION = "gen_ai.agent.description"
 
 
+# =============================================================================
+# Shared LLM API Path Patterns
+# =============================================================================
+
+# Shared LLM API path patterns used by policy engine and telemetry.
+# Canonical source — import from here instead of defining locally.
+LLM_API_PATHS: Dict[str, str] = {
+    "/v1/chat/completions": "chat_completion",
+    "/chat/completions": "chat_completion",
+    "/v1/responses": "responses",
+    "/responses": "responses",
+    "/openai/v1/responses": "responses",
+    "/v1/embeddings": "embedding",
+    "/embeddings": "embedding",
+    "/v1/completions": "completion",
+    "/completions": "completion",
+}
+
+
 # Mapping from legacy RouteIQ/router.* attribute names to GenAI convention names.
 # Used during the transition period to emit both old and new attribute names.
 LEGACY_TO_GENAI_ATTR_MAP: Dict[str, str] = {

@@ -34,6 +34,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+__all__ = [
+    "R1Result",
+    "RouterR1",
+    "RoutingStep",
+    "get_router_r1",
+    "reset_router_r1",
+]
+
 logger = logging.getLogger("litellm_llmrouter.router_r1")
 
 
@@ -161,6 +169,12 @@ class RouterR1:
         for iteration in range(self._max_iterations):
             step = RoutingStep(iteration=iteration)
             iter_start = time.monotonic()
+
+            # Safety check: stop if messages have grown too large
+            total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+            if total_chars > 100_000:  # ~25K tokens, safety limit
+                logger.warning("R1 messages exceed 100K chars, stopping iterations")
+                break
 
             try:
                 # Get router's reasoning

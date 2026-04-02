@@ -18,7 +18,7 @@ We take the security of this project seriously. If you discover a security vulne
 1. **Do NOT create a public GitHub issue** for security vulnerabilities.
 
 2. **Send a private report** using one of the following methods:
-   - **Preferred**: Use [GitHub's private vulnerability reporting](https://github.com/YOUR_ORG/litellm-llm-router/security/advisories/new)
+   - **Preferred**: Use [GitHub's private vulnerability reporting](https://github.com/routeiq/routeiq/security/advisories/new)
    - **Alternative**: Email security concerns to the maintainers (see repository maintainer contacts)
 
 3. **Include the following information**:

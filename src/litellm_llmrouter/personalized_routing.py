@@ -50,9 +50,6 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-_PREFERENCE_DIM = int(os.getenv("ROUTEIQ_PREFERENCE_DIM", "128"))
-_LEARNING_RATE = float(os.getenv("ROUTEIQ_PREFERENCE_LEARNING_RATE", "0.1"))
-_DECAY_PER_DAY = float(os.getenv("ROUTEIQ_PREFERENCE_DECAY", "0.99"))
 _REDIS_KEY_PREFIX = "routeiq:pref:"
 _REDIS_TTL_DAYS = 90
 
@@ -399,8 +396,11 @@ class PreferenceStore:
             if pref.last_updated > 0:
                 days_elapsed = (now - pref.last_updated) / 86400.0
                 if days_elapsed > 0:
-                    decay = _DECAY_PER_DAY**days_elapsed
-                    pref.preference_vector = pref.preference_vector * decay
+                    _decay_per_day = float(
+                        os.getenv("ROUTEIQ_PREFERENCE_DECAY", "0.99")
+                    )
+                    decay_factor = _decay_per_day**days_elapsed
+                    pref.preference_vector = pref.preference_vector * decay_factor
 
             # Apply EMA update
             pref.preference_vector = (
@@ -748,9 +748,23 @@ def get_personalized_router() -> Optional[PersonalizedRouter]:
         return None
 
     try:
+        from litellm_llmrouter.settings import get_settings
+
+        settings = get_settings()
+        dim = getattr(getattr(settings, "routing", None), "personalized_dim", 128)
+        lr = getattr(
+            getattr(settings, "routing", None), "personalized_learning_rate", 0.1
+        )
+        decay = getattr(getattr(settings, "routing", None), "personalized_decay", 0.99)
+    except Exception:
+        dim = int(os.getenv("ROUTEIQ_PREFERENCE_DIM", "128"))
+        lr = float(os.getenv("ROUTEIQ_PREFERENCE_LEARNING_RATE", "0.1"))
+        decay = float(os.getenv("ROUTEIQ_PREFERENCE_DECAY", "0.99"))
+
+    try:
         _router = PersonalizedRouter(
-            dim=_PREFERENCE_DIM,
-            learning_rate=_LEARNING_RATE,
+            dim=dim,
+            learning_rate=lr,
         )
         return _router
     except Exception as e:

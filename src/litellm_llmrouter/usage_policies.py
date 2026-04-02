@@ -51,6 +51,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
@@ -666,7 +667,8 @@ class UsagePolicyEngine:
         parts: list[str] = []
         for dim in policy.group_by:
             val = self._resolve_context_value(context, dim) or "__none__"
-            parts.append(f"{dim}={val}")
+            # URL-encode to prevent delimiter injection
+            parts.append(f"{dim}={quote(str(val), safe='')}")
         return "|".join(parts)
 
     @staticmethod

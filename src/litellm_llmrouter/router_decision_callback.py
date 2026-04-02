@@ -55,16 +55,8 @@ OVERRIDE_STRATEGY_NAME = os.getenv(
 # =============================================================================
 
 # Maps all LLM API endpoint paths to their operation type.
-# Used by both the middleware and callback to detect instrumented requests.
-LLM_API_PATHS: Dict[str, str] = {
-    "/v1/chat/completions": "chat_completion",
-    "/chat/completions": "chat_completion",
-    "/v1/responses": "responses",
-    "/responses": "responses",
-    "/openai/v1/responses": "responses",
-    "/v1/embeddings": "embedding",
-    "/v1/completions": "completion",
-}
+# Imported from the canonical source in telemetry_contracts.
+from litellm_llmrouter.telemetry_contracts import LLM_API_PATHS  # noqa: E402
 
 
 # =============================================================================

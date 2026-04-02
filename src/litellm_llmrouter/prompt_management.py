@@ -289,6 +289,15 @@ class PromptManager:
         prompt.active_version = new_version_num
         prompt.updated_at = now
 
+        # Prune old versions to bound memory usage
+        max_versions = 100
+        if len(prompt.versions) > max_versions:
+            # Keep oldest (v1) + newest max_versions-1
+            sorted_versions = sorted(prompt.versions.keys())
+            to_remove = sorted_versions[1 : -max_versions + 1]
+            for v in to_remove:
+                del prompt.versions[v]
+
         # Update optional metadata fields if provided
         if description is not None:
             prompt.description = description
@@ -504,12 +513,28 @@ class PromptManager:
 
         return messages, model_override, meta
 
-    def _select_version(self, prompt: PromptDefinition) -> int:
-        """Select version based on A/B test weights or active version."""
+    def _select_version(
+        self, prompt: PromptDefinition, request_id: Optional[str] = None
+    ) -> int:
+        """Select version based on A/B test weights or active version.
+
+        If *request_id* is provided, uses hash-based deterministic assignment
+        (same request always gets the same version). Otherwise uses random
+        selection, which means repeated calls for the same logical request
+        may return different versions (non-deterministic).
+        """
         if not prompt.ab_enabled or not prompt.ab_versions:
             return prompt.active_version
 
-        r = random.random()
+        if request_id:
+            # Deterministic: hash(request_id) for consistent assignment
+            import hashlib
+
+            h = int(hashlib.md5(request_id.encode()).hexdigest()[:8], 16)
+            r = (h % 10000) / 10000.0
+        else:
+            r = random.random()
+
         cumulative = 0.0
         for ver, weight in sorted(prompt.ab_versions.items()):
             cumulative += weight

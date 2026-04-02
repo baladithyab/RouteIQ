@@ -26,6 +26,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Union
 
+from fastapi import HTTPException
+
 # Import CustomRoutingStrategyBase with graceful fallback for test environments
 try:
     from litellm.types.router import CustomRoutingStrategyBase
@@ -197,6 +199,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         Async routing method called by LiteLLM's Router.
 
         Order of operations:
+        0. Governance enforcement (budget, rate limit, model access)
         1. Check amplification guard
         2. Try pipeline routing (A/B testing)
         3. Fall back to direct LLMRouter ML routing
@@ -204,6 +207,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         5. Fall back to centroid routing (zero-config intelligent routing)
         6. Fall back to first available deployment
         """
+        # 0. Governance enforcement (before routing)
+        await self._enforce_governance(model, request_kwargs)
+
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
 
@@ -264,6 +270,8 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         Same logic as the async version but uses synchronous calls.
         Note: Personalized routing is skipped in sync path because the
         preference store requires async Redis operations.
+        Note: Governance enforcement is skipped in sync path because the
+        governance engine requires async operations.
         """
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
@@ -302,6 +310,77 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # 5. Fallback to first available deployment
         return self._fallback_deployment(model)
+
+    # ------------------------------------------------------------------
+    # Internal: Governance enforcement
+    # ------------------------------------------------------------------
+
+    async def _enforce_governance(
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+    ) -> None:
+        """Enforce governance rules (budget, rate limit, model access) before routing.
+
+        Extracts the API key from ``request_kwargs`` and calls the governance
+        engine's ``enforce()`` method.  On violation, ``HTTPException`` is raised
+        and propagated to the caller, short-circuiting routing entirely.
+
+        When governance is not configured for the key (no key governance rules
+        registered), the request passes through (fail-open).
+
+        If governance enforcement itself fails (import error, unexpected
+        exception), the request passes through and the failure is logged at
+        debug level.
+
+        Args:
+            model: The requested model name.
+            request_kwargs: Request keyword arguments containing api_key and metadata.
+        """
+        if not request_kwargs:
+            return
+
+        # Extract the API key from the various places LiteLLM may put it
+        api_key = request_kwargs.get("api_key") or request_kwargs.get(
+            "litellm_params", {}
+        ).get("api_key")
+        if not api_key:
+            metadata = request_kwargs.get("metadata", {})
+            if isinstance(metadata, dict):
+                api_key = metadata.get("api_key")
+        if not api_key:
+            return
+
+        try:
+            from litellm_llmrouter.governance import get_governance_engine
+
+            engine = get_governance_engine()
+
+            # Fast path: if no governance rules are registered at all, skip
+            if not engine._key_governance and not engine._workspaces:
+                return
+
+            ctx = await engine.enforce(api_key, model)
+
+            # Store governance context in metadata for downstream use
+            metadata = request_kwargs.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                request_kwargs["metadata"] = metadata
+
+            metadata["_governance_ctx"] = {
+                "workspace_id": ctx.workspace_id,
+                "effective_profile": ctx.effective_routing_profile,
+            }
+
+            # If governance specifies a routing profile, propagate it
+            if ctx.effective_routing_profile:
+                metadata["_routing_profile"] = ctx.effective_routing_profile
+
+        except HTTPException:
+            raise  # Budget/rate limit/model access denied — propagate
+        except Exception as exc:
+            logger.debug("Governance check skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Internal: Amplification guard
