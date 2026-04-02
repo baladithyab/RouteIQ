@@ -233,7 +233,10 @@ def _configure_middleware(app: FastAPI) -> None:
     from starlette.middleware.cors import CORSMiddleware
 
     from ..auth import RequestIDMiddleware
-    from ..router_decision_callback import register_router_decision_middleware
+    from ..router_decision_callback import (
+        register_router_decision_middleware,
+        ROUTEIQ_RESPONSE_HEADERS,
+    )
     from .plugin_middleware import PluginMiddleware
 
     # CORS middleware - configurable via ROUTEIQ_CORS_ORIGINS
@@ -259,6 +262,7 @@ def _configure_middleware(app: FastAPI) -> None:
         allow_credentials=_parse_cors_credentials(),
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=ROUTEIQ_RESPONSE_HEADERS,
     )
     logger.debug("Added CORSMiddleware (origins=%s)", cors_origins)
 

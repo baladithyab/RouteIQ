@@ -72,9 +72,23 @@ LLM_API_PATHS: Dict[str, str] = {
 # =============================================================================
 
 
+# Custom header names for routing transparency
+HEADER_ROUTEIQ_MODEL = "X-RouteIQ-Model"
+HEADER_ROUTEIQ_TIER = "X-RouteIQ-Tier"
+HEADER_ROUTEIQ_STRATEGY = "X-RouteIQ-Strategy"
+
+# All custom RouteIQ headers (for CORS expose_headers)
+ROUTEIQ_RESPONSE_HEADERS = [
+    HEADER_ROUTEIQ_MODEL,
+    HEADER_ROUTEIQ_TIER,
+    HEADER_ROUTEIQ_STRATEGY,
+]
+
+
 class RouterDecisionMiddleware:
     """
-    Raw ASGI middleware that emits TG4.1 router decision span attributes.
+    Raw ASGI middleware that emits TG4.1 router decision span attributes
+    and injects ``X-RouteIQ-*`` routing transparency headers into responses.
 
     Uses the raw ASGI pattern (same as BackpressureMiddleware) instead of
     BaseHTTPMiddleware, which buffers the entire response and breaks streaming.
@@ -82,6 +96,11 @@ class RouterDecisionMiddleware:
     This middleware intercepts LLM API requests and emits router.*
     span attributes BEFORE the LLM API call happens. It also increments
     gateway.request.total and gateway.routing.strategy.usage metrics.
+
+    Response headers:
+        - ``X-RouteIQ-Model``: The model selected by the router.
+        - ``X-RouteIQ-Tier``: The complexity tier (simple/complex/reasoning).
+        - ``X-RouteIQ-Strategy``: The routing strategy that made the decision.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -111,8 +130,78 @@ class RouterDecisionMiddleware:
         # Increment gateway metrics
         self._increment_metrics(path)
 
+        # Resolve routing context for response headers
+        model, tier, strategy = self._resolve_routing_context()
+
+        # Wrap send to inject X-RouteIQ-* headers into response
+        async def send_with_routing_headers(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                if model:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_MODEL.lower().encode("latin-1"),
+                            model.encode("latin-1"),
+                        )
+                    )
+                if tier:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_TIER.lower().encode("latin-1"),
+                            tier.encode("latin-1"),
+                        )
+                    )
+                if strategy:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_STRATEGY.lower().encode("latin-1"),
+                            strategy.encode("latin-1"),
+                        )
+                    )
+                message = {**message, "headers": headers}
+            await send(message)
+
         # Pass through to the next ASGI app (streaming-safe)
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, send_with_routing_headers)
+
+    def _resolve_routing_context(self) -> tuple:
+        """Resolve the current routing context for response headers.
+
+        Inspects the LiteLLM router (if available) to determine the
+        model, tier, and strategy that will handle the current request.
+
+        Returns:
+            Tuple of ``(model, tier, strategy)`` strings. Empty strings
+            for values that cannot be determined.
+        """
+        strategy = OVERRIDE_STRATEGY_NAME or "litellm-builtin"
+        model = ""
+        tier = ""
+
+        try:
+            from litellm.proxy.proxy_server import llm_router
+
+            if llm_router is not None:
+                model_list = getattr(llm_router, "model_list", []) or []
+                if model_list:
+                    first_model = model_list[0]
+                    model = first_model.get("litellm_params", {}).get("model", "")
+        except Exception:
+            pass
+
+        # Derive tier heuristic from model name
+        if model:
+            model_lower = model.lower()
+            simple_indicators = ["mini", "nano", "haiku", "flash", "small", "light"]
+            reasoning_indicators = ["o1", "o3", "o4", "reasoner"]
+            if any(ind in model_lower for ind in reasoning_indicators):
+                tier = "reasoning"
+            elif any(ind in model_lower for ind in simple_indicators):
+                tier = "simple"
+            else:
+                tier = "complex"
+
+        return model, tier, strategy
 
     def _emit_router_telemetry(self, path: str) -> None:
         """

@@ -49,7 +49,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -71,41 +71,104 @@ except ImportError:
 
 # Model context windows (tokens) — from NadirClaw MODEL_REGISTRY + litellm.model_cost
 MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
+    # GPT-4o family
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gpt-4-turbo": 128_000,
-    "gpt-3.5-turbo": 16_385,
+    # GPT-4.1 family
+    "gpt-4.1": 1_050_000,
+    "gpt-4.1-mini": 1_050_000,
+    "gpt-4.1-nano": 1_050_000,
+    # GPT-5 family
+    "gpt-5": 400_000,
+    "gpt-5-mini": 400_000,
+    "gpt-5.2": 400_000,
+    "gpt-5.4": 1_050_000,
+    # o-series
     "o1": 200_000,
     "o1-mini": 128_000,
     "o3-mini": 200_000,
+    "o4-mini": 200_000,
+    # Claude 3.x
     "claude-3-5-sonnet-20241022": 200_000,
     "claude-3-5-haiku-20241022": 200_000,
     "claude-3-opus-20240229": 200_000,
     "claude-sonnet-4-20250514": 200_000,
+    # Claude 4.x
+    "claude-opus-4-6-20250918": 200_000,
+    "claude-sonnet-4-5-20250929": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+    # Gemini
     "gemini-2.0-flash": 1_048_576,
     "gemini-2.5-pro-preview-05-06": 1_048_576,
     "gemini-1.5-pro": 2_097_152,
+    "gemini-3-flash-preview": 1_000_000,
+    # DeepSeek
     "deepseek-chat": 128_000,
     "deepseek-reasoner": 128_000,
 }
 
 # Cost per million tokens (USD) — from NadirClaw + litellm.model_cost
 MODEL_COSTS: Dict[str, Dict[str, float]] = {
+    # GPT-4o family
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    # GPT-4.1 family
+    "gpt-4.1": {"input": 2.00, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
+    # GPT-5 family
+    "gpt-5": {"input": 1.25, "output": 10.00},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
+    "gpt-5.2": {"input": 1.75, "output": 14.00},
+    "gpt-5.4": {"input": 2.00, "output": 16.00},
+    # o-series
     "o1": {"input": 15.00, "output": 60.00},
     "o1-mini": {"input": 1.10, "output": 4.40},
     "o3-mini": {"input": 1.10, "output": 4.40},
+    "o4-mini": {"input": 1.10, "output": 4.40},
+    # Claude 3.x
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
     "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    # Claude 4.x
+    "claude-opus-4-6-20250918": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    # Gemini
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
     "gemini-2.5-pro-preview-05-06": {"input": 1.25, "output": 10.00},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
+    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
+    # DeepSeek
     "deepseek-chat": {"input": 0.27, "output": 1.10},
     "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+}
+
+# Models with vision/image understanding capability
+VISION_CAPABLE_MODELS: Set[str] = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.2",
+    "gpt-5.4",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-6-20250918",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-1.5-pro",
+    "gemini-3-flash-preview",
 }
 
 
@@ -982,6 +1045,24 @@ class CentroidRoutingStrategy:
                         deployment = alt_deployment
                         tier = alt_tier
 
+        # Vision check: if the request contains image/vision content and
+        # the selected model lacks vision capability, swap to the cheapest
+        # vision-capable model in the same tier.
+        if deployment is not None and self._detect_vision_content(full_messages):
+            dep_model = deployment.get("litellm_params", {}).get("model", "")
+            is_vision = any(
+                vm in dep_model or dep_model in vm for vm in VISION_CAPABLE_MODELS
+            )
+            if not is_vision:
+                vision_dep = self._find_cheapest_vision_model(tier, deployments)
+                if vision_dep is not None:
+                    logger.info(
+                        "Vision swap: %s → %s (vision content detected)",
+                        dep_model,
+                        vision_dep.get("litellm_params", {}).get("model", ""),
+                    )
+                    deployment = vision_dep
+
         # Cache result
         if deployment is not None:
             model_name = deployment.get("litellm_params", {}).get("model", "")
@@ -1051,6 +1132,96 @@ class CentroidRoutingStrategy:
             candidates[0].get("litellm_params", {}).get("model", ""),
         )
         return candidates[0]
+
+    @staticmethod
+    def _detect_vision_content(messages: List[Dict[str, Any]]) -> bool:
+        """Detect if messages contain image/vision content.
+
+        Checks for ``image_url`` or ``image`` content parts in multi-modal
+        messages, and for base64-encoded image data in text parts.
+
+        Args:
+            messages: List of message dicts.
+
+        Returns:
+            True if vision content is detected.
+        """
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") in ("image_url", "image"):
+                            return True
+                        if (
+                            part.get("type") == "text"
+                            and "base64" in str(part.get("text", ""))[:100]
+                        ):
+                            return True
+        return False
+
+    @staticmethod
+    def _find_cheapest_vision_model(
+        tier: str, deployments: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Find the cheapest vision-capable model in the given tier.
+
+        Iterates through deployments, filters to those whose model name
+        matches a key in :data:`VISION_CAPABLE_MODELS`, and returns the
+        one with the lowest input cost.
+
+        Args:
+            tier: Current routing tier (``"simple"`` or ``"complex"``).
+            deployments: List of healthy deployment dicts.
+
+        Returns:
+            Deployment dict for the cheapest vision model, or ``None``.
+        """
+        simple_indicators = ["mini", "nano", "haiku", "flash", "small", "light"]
+
+        vision_candidates: List[Tuple[float, Dict[str, Any]]] = []
+        for dep in deployments:
+            model = dep.get("litellm_params", {}).get("model", "")
+            # Check if any VISION_CAPABLE_MODELS key matches
+            is_vision = False
+            for vm in VISION_CAPABLE_MODELS:
+                if vm in model or model in vm:
+                    is_vision = True
+                    break
+            if not is_vision:
+                continue
+
+            # Tier-match: simple tier prefers mini/flash/haiku models
+            model_lower = model.lower()
+            is_simple = any(ind in model_lower for ind in simple_indicators)
+            if tier == "simple" and not is_simple:
+                continue
+            if tier == "complex" and is_simple:
+                continue
+
+            cost = MODEL_COSTS.get(model, {}).get("input", 999.0)
+            # Also try partial match on cost lookup
+            if cost == 999.0:
+                for cost_key, cost_val in MODEL_COSTS.items():
+                    if cost_key in model or model in cost_key:
+                        cost = cost_val.get("input", 999.0)
+                        break
+            vision_candidates.append((cost, dep))
+
+        if not vision_candidates:
+            # Relax tier constraint — take any vision model
+            for dep in deployments:
+                model = dep.get("litellm_params", {}).get("model", "")
+                for vm in VISION_CAPABLE_MODELS:
+                    if vm in model or model in vm:
+                        cost = MODEL_COSTS.get(model, {}).get("input", 999.0)
+                        vision_candidates.append((cost, dep))
+                        break
+
+        if vision_candidates:
+            vision_candidates.sort(key=lambda x: x[0])
+            return vision_candidates[0][1]
+        return None
 
     def _extract_prompt(
         self, messages: List[Dict[str, Any]]
