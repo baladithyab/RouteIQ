@@ -396,9 +396,88 @@ def init_a2a_tracing_if_enabled(app):
             print(f"⚠️ A2A gateway tracing initialization failed: {e}")
 
 
+def _use_own_app() -> bool:
+    """Return True when ADR-0012 own-app mode is requested."""
+    return os.getenv("ROUTEIQ_OWN_APP", "false").lower() in ("true", "1", "yes")
+
+
+def _run_gateway_app(config_path: str, host: str, port: int, **kwargs):
+    """Run RouteIQ in ADR-0012 own-app mode.
+
+    RouteIQ owns the FastAPI application and its lifespan.  LiteLLM is
+    mounted as a sub-application at ``/v1/``.  All startup and shutdown
+    logic is handled by ``_routeiq_lifespan`` — no ``app.state`` lambda
+    hacks.
+
+    Args:
+        config_path: Path to the LiteLLM config file
+        host: Host to bind to
+        port: Port to listen on
+        **kwargs: Additional arguments passed to uvicorn
+    """
+    import uvicorn
+
+    from litellm_llmrouter.gateway import create_gateway_app
+
+    app = create_gateway_app(
+        config_path=config_path,
+        mount_litellm=True,
+        include_admin_routes=True,
+        enable_plugins=True,
+        enable_resilience=True,
+    )
+
+    # A2A tracing is registered eagerly because it instruments LiteLLM's
+    # built-in /a2a/* routes which live on the mounted sub-app.
+    init_a2a_tracing_if_enabled(app)
+
+    # SIGTERM is handled by the lifespan's shutdown path — the drain
+    # manager, plugin shutdown, and resource cleanup all live there.
+    # We still register a thin handler so SIGTERM reaches uvicorn's
+    # server.shutdown() path (K8s sends SIGTERM before SIGKILL).
+    _original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_handler(signum, frame):
+        """Signal the lifespan to shut down via uvicorn's loop."""
+        logger.info("SIGTERM received — lifespan shutdown will handle cleanup")
+        if callable(_original_sigterm):
+            _original_sigterm(signum, frame)
+        elif _original_sigterm == signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    workers = kwargs.get("workers", 1)
+    uvicorn_config = {
+        "app": app,
+        "host": host,
+        "port": port,
+        "log_level": kwargs.get("log_level", "info"),
+        "access_log": kwargs.get("access_log", True),
+        "workers": workers,
+    }
+    if kwargs.get("ssl_keyfile"):
+        uvicorn_config["ssl_keyfile"] = kwargs["ssl_keyfile"]
+    if kwargs.get("ssl_certfile"):
+        uvicorn_config["ssl_certfile"] = kwargs["ssl_certfile"]
+
+    print(
+        f"🚀 Starting RouteIQ Gateway on {host}:{port} "
+        f"(workers: {workers}, mode: own-app / ADR-0012)"
+    )
+    print("   RouteIQ routes: /, LiteLLM proxy: /v1/")
+    uvicorn.run(**uvicorn_config)
+
+
 def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs):
     """
     Run LiteLLM proxy in-process using uvicorn.
+
+    When ``ROUTEIQ_OWN_APP=true``, delegates to :func:`_run_gateway_app`
+    which uses the ADR-0012 ``create_gateway_app()`` factory.  Otherwise
+    uses the legacy ``create_app()`` path where LiteLLM owns the FastAPI
+    instance.
 
     This is the preferred method because it preserves our monkey-patches
     to LiteLLM's Router class. Using os.execvp() would replace the process
@@ -413,6 +492,11 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         port: Port to listen on
         **kwargs: Additional arguments passed to uvicorn
     """
+    # ---- ADR-0012: RouteIQ-owned app mode ----
+    if _use_own_app():
+        return _run_gateway_app(config_path, host, port, **kwargs)
+
+    # ---- Legacy path: LiteLLM owns the FastAPI app ----
     import uvicorn
 
     # Set environment variables that LiteLLM expects
@@ -423,15 +507,19 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
 
     # Import gateway factory AFTER setting env vars
     # The factory applies the patch explicitly before importing litellm
-    from litellm_llmrouter.gateway import create_app
+    import warnings
 
-    # Create and configure the app using the composition root
-    # This applies the patch, adds middleware, and registers routes
-    app = create_app(
-        apply_patch=True,
-        include_admin_routes=True,
-        enable_plugins=True,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from litellm_llmrouter.gateway import create_app
+
+        # Create and configure the app using the composition root
+        # This applies the patch, adds middleware, and registers routes
+        app = create_app(
+            apply_patch=True,
+            include_admin_routes=True,
+            enable_plugins=True,
+        )
 
     # Get LiteLLM's initialize function
     from litellm.proxy.proxy_server import initialize
@@ -512,14 +600,26 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     except RuntimeError:
         asyncio.run(run_service_probes())
 
-    print("✅ LLMRouter routes registered with LiteLLM")
+    # ---- OIDC / SSO initialization ----
+    oidc_config = None
+    if hasattr(app.state, "llmrouter_oidc_setup"):
+        oidc_config = app.state.llmrouter_oidc_setup()
+        if oidc_config and oidc_config.enabled:
+            print("✅ OIDC/SSO integration initialized")
+        else:
+            logger.debug("OIDC/SSO integration is disabled")
+
+    print("✅ LLMRouter routes registered with LiteLLM (legacy mode)")
     print("   ├── /_health/* (K8s probes, unauthenticated)")
     print("   ├── /config/services (service discovery, unauthenticated)")
     print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
     print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
-    print("   └── /router/*, /config/* (hot reload, auth-protected)")
+    print("   ├── /router/*, /config/* (hot reload, auth-protected)")
+    if oidc_config and oidc_config.enabled:
+        print("   ├── /sso/login, /sso/callback (OIDC SSO)")
+        print("   ├── /auth/token-exchange, /auth/userinfo (OIDC auth)")
     print(
-        "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
+        "   └── Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
     )
 
     # Register SIGTERM handler to trigger graceful drain before uvicorn shuts down.
@@ -535,6 +635,9 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         async def _shutdown_sequence():
             if hasattr(app.state, "graceful_shutdown"):
                 await app.state.graceful_shutdown()
+            # Reset OIDC state
+            if hasattr(app.state, "llmrouter_oidc_shutdown"):
+                app.state.llmrouter_oidc_shutdown()
             # Close database connection pool
             if hasattr(app.state, "llmrouter_db_pool_shutdown"):
                 await app.state.llmrouter_db_pool_shutdown()
@@ -597,6 +700,7 @@ def main():
         LITELLM_CONFIG_PATH  Default config path if --config not provided
         ROUTEIQ_WORKERS      Number of uvicorn workers (overrides --workers)
         ROUTEIQ_USE_PLUGIN_STRATEGY  Enable plugin strategy mode (default: true)
+        ROUTEIQ_OWN_APP      Use RouteIQ-owned FastAPI app — ADR-0012 (default: false)
     """
     import argparse
 
@@ -698,7 +802,13 @@ Examples:
         "yes",
     )
 
+    own_app = _use_own_app()
+
     print("🚀 Starting RouteIQ Gateway...")
+    if own_app:
+        print("   App mode: own-app (ADR-0012 — RouteIQ owns FastAPI, LiteLLM at /v1/)")
+    else:
+        print("   App mode: legacy (LiteLLM owns FastAPI, RouteIQ layers on top)")
     if use_plugin:
         print(
             "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"

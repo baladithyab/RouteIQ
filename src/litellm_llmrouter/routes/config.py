@@ -13,47 +13,11 @@ import dataclasses
 
 from ..auth import get_request_id, sanitize_error_response
 from ..rbac import requires_permission, PERMISSION_SYSTEM_CONFIG_RELOAD
-from ..audit import audit_log, AuditAction, AuditOutcome, AuditWriteError
+from ..audit import AuditAction, AuditOutcome
 from ..hot_reload import get_hot_reload_manager
 from ..config_sync import get_sync_manager, get_config_sync_status
 from .models import ReloadRequest
-from . import admin_router, llmrouter_router, health_router
-
-
-async def _handle_audit_write(
-    action: AuditAction,
-    resource_type: str,
-    resource_id: str | None,
-    outcome: AuditOutcome,
-    rbac_info: dict | None,
-    request_id: str,
-    outcome_reason: str | None = None,
-):
-    """
-    Handle audit write with fail-closed mode support.
-
-    If fail-closed mode is enabled and audit write fails, raises 503.
-    Otherwise, failure is logged and the request continues.
-    """
-    try:
-        await audit_log(
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            outcome=outcome,
-            outcome_reason=outcome_reason,
-            actor_info=rbac_info,
-        )
-    except AuditWriteError:
-        # Fail-closed: reject the request with 503
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "audit_log_unavailable",
-                "message": "Cannot process request: audit logging is unavailable and fail-closed mode is enabled",
-                "request_id": request_id,
-            },
-        )
+from . import admin_router, llmrouter_router, health_router, handle_audit_write
 
 
 # =============================================================================
@@ -79,7 +43,7 @@ async def reload_config(
         result = manager.reload_config(force_sync=force_sync)
 
         # Audit log the success
-        await _handle_audit_write(
+        await handle_audit_write(
             AuditAction.CONFIG_RELOAD,
             "config",
             "llmrouter",
@@ -114,7 +78,7 @@ async def reload_config_2(
         result = manager.reload_config(force_sync=force_sync)
 
         # Audit log the success
-        await _handle_audit_write(
+        await handle_audit_write(
             AuditAction.CONFIG_RELOAD,
             "config",
             "hot_reload",
@@ -172,7 +136,7 @@ async def flush_cache(
     count = await manager.flush(prefix=prefix)
 
     # Audit log the flush
-    await _handle_audit_write(
+    await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
         "cache",
         prefix or "all",

@@ -15,47 +15,11 @@ from fastapi import Depends, HTTPException
 from ..a2a_gateway import A2AError
 from ..auth import get_request_id, sanitize_error_response
 from ..rbac import requires_permission, PERMISSION_A2A_AGENT_WRITE
-from ..audit import audit_log, AuditAction, AuditOutcome, AuditWriteError
+from ..audit import AuditAction, AuditOutcome
 from ..mcp_gateway import MCPTransport
 from ..url_security import validate_outbound_url_async, SSRFBlockedError
 from .models import AgentRegistration
-from . import admin_router, llmrouter_router
-
-
-async def _handle_audit_write(
-    action: AuditAction,
-    resource_type: str,
-    resource_id: str | None,
-    outcome: AuditOutcome,
-    rbac_info: dict | None,
-    request_id: str,
-    outcome_reason: str | None = None,
-):
-    """
-    Handle audit write with fail-closed mode support.
-
-    If fail-closed mode is enabled and audit write fails, raises 503.
-    Otherwise, failure is logged and the request continues.
-    """
-    try:
-        await audit_log(
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            outcome=outcome,
-            outcome_reason=outcome_reason,
-            actor_info=rbac_info,
-        )
-    except AuditWriteError:
-        # Fail-closed: reject the request with 503
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "audit_log_unavailable",
-                "message": "Cannot process request: audit logging is unavailable and fail-closed mode is enabled",
-                "request_id": request_id,
-            },
-        )
+from . import admin_router, llmrouter_router, handle_audit_write
 
 
 # Read-only endpoint - user auth is sufficient
@@ -202,7 +166,7 @@ async def register_a2a_agent_convenience(
         global_agent_registry.register_agent(agent_config=agent_response)
 
         # Audit log the success
-        await _handle_audit_write(
+        await handle_audit_write(
             AuditAction.A2A_AGENT_CREATE,
             "a2a_agent",
             agent_id,
@@ -260,7 +224,7 @@ async def unregister_a2a_agent_convenience(
             global_agent_registry.deregister_agent(agent_name=agent.agent_name)
 
             # Audit log the success
-            await _handle_audit_write(
+            await handle_audit_write(
                 AuditAction.A2A_AGENT_DELETE,
                 "a2a_agent",
                 agent_id,
@@ -281,7 +245,7 @@ async def unregister_a2a_agent_convenience(
             global_agent_registry.deregister_agent(agent_name=agent_id)
 
             # Audit log the success
-            await _handle_audit_write(
+            await handle_audit_write(
                 AuditAction.A2A_AGENT_DELETE,
                 "a2a_agent",
                 agent_id,

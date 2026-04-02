@@ -29,7 +29,7 @@ Usage:
     app.include_router(admin_router)  # Admin auth-protected control-plane routes
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
@@ -37,6 +37,7 @@ from ..auth import (
     admin_api_key_auth,
     RequestIDMiddleware,
 )
+from ..audit import audit_log, AuditAction, AuditOutcome, AuditWriteError
 
 # ---- Router definitions (must be defined BEFORE sub-module imports) ----
 
@@ -62,6 +63,46 @@ admin_router = APIRouter(
 # Legacy alias for backwards compatibility (deprecated - use health_router + llmrouter_router + admin_router)
 router = llmrouter_router
 
+
+# ---- Shared audit utility (used by a2a, mcp, config route modules) ----
+
+
+async def handle_audit_write(
+    action: AuditAction,
+    resource_type: str,
+    resource_id: str | None,
+    outcome: AuditOutcome,
+    rbac_info: dict | None,
+    request_id: str,
+    outcome_reason: str | None = None,
+):
+    """
+    Handle audit write with fail-closed mode support.
+
+    If fail-closed mode is enabled and audit write fails, raises 503.
+    Otherwise, failure is logged and the request continues.
+    """
+    try:
+        await audit_log(
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            outcome=outcome,
+            outcome_reason=outcome_reason,
+            actor_info=rbac_info,
+        )
+    except AuditWriteError:
+        # Fail-closed: reject the request with 503
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "audit_log_unavailable",
+                "message": "Cannot process request: audit logging is unavailable and fail-closed mode is enabled",
+                "request_id": request_id,
+            },
+        )
+
+
 # ---- Import sub-modules (registers routes on the routers above) ----
 
 from . import health as _health_routes  # noqa: E402, F401
@@ -86,6 +127,7 @@ __all__ = [
     "admin_router",
     "router",
     "RequestIDMiddleware",
+    "handle_audit_write",
     # Pydantic models
     "AgentRegistration",
     "ServerRegistration",
