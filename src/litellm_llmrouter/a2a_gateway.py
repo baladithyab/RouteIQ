@@ -85,6 +85,7 @@ except ImportError:
 # Feature Flags for Streaming Behavior
 # =============================================================================
 
+
 # A2A_RAW_STREAMING_ENABLED: When true, uses raw byte streaming (aiter_bytes)
 # for true passthrough semantics. When false (default), uses line-buffered
 # streaming (aiter_lines) for backward compatibility.
@@ -93,12 +94,30 @@ except ImportError:
 # to enable raw streaming passthrough after validation in staging.
 #
 # Toggle: Set environment variable A2A_RAW_STREAMING_ENABLED=true to enable.
-A2A_RAW_STREAMING_ENABLED = (
-    os.getenv("A2A_RAW_STREAMING_ENABLED", "false").lower() == "true"
-)
+def _resolve_a2a_streaming_settings() -> tuple[bool, int]:
+    # A2A_* env vars don't have ROUTEIQ_ prefix, so pydantic-settings
+    # won't auto-populate them.  Check env vars directly, then fall
+    # back to the typed settings model for any overrides set via
+    # ROUTEIQ_A2A__RAW_STREAMING_ENABLED.
+    env_enabled = os.getenv("A2A_RAW_STREAMING_ENABLED")
+    env_chunk = os.getenv("A2A_RAW_STREAMING_CHUNK_SIZE")
+    if env_enabled is not None or env_chunk is not None:
+        return (
+            (env_enabled or "false").lower() == "true",
+            int(env_chunk or "8192"),
+        )
+    try:
+        from litellm_llmrouter.settings import get_settings
 
-# Default chunk size for raw streaming (8KB balances latency vs overhead)
-A2A_RAW_STREAMING_CHUNK_SIZE = int(os.getenv("A2A_RAW_STREAMING_CHUNK_SIZE", "8192"))
+        s = get_settings().a2a
+        return s.raw_streaming_enabled, s.raw_streaming_chunk_size
+    except Exception:
+        return False, 8192
+
+
+A2A_RAW_STREAMING_ENABLED, A2A_RAW_STREAMING_CHUNK_SIZE = (
+    _resolve_a2a_streaming_settings()
+)
 
 # =============================================================================
 # Header Preservation for Streaming Responses
@@ -210,14 +229,31 @@ class StreamingResponseMeta:
 # A2A Task Model and State Machine (A2A Spec Compliance)
 # =============================================================================
 
+
 # Default TTL for tasks in memory (1 hour)
-A2A_TASK_TTL_SECONDS = int(os.getenv("A2A_TASK_TTL_SECONDS", "3600"))
+def _resolve_a2a_task_settings() -> tuple[int, int, int]:
+    # A2A_* env vars don't have ROUTEIQ_ prefix — check directly first.
+    env_ttl = os.getenv("A2A_TASK_TTL_SECONDS")
+    env_max = os.getenv("A2A_TASK_STORE_MAX_TASKS")
+    env_rate = os.getenv("A2A_TASK_RATE_LIMIT")
+    if any(v is not None for v in (env_ttl, env_max, env_rate)):
+        return (
+            int(env_ttl or "3600"),
+            int(env_max or "10000"),
+            int(env_rate or "100"),
+        )
+    try:
+        from litellm_llmrouter.settings import get_settings
 
-# Maximum tasks in store (prevent memory exhaustion DoS)
-A2A_TASK_STORE_MAX_TASKS = int(os.getenv("A2A_TASK_STORE_MAX_TASKS", "10000"))
+        s = get_settings().a2a
+        return s.task_ttl_seconds, s.task_store_max_tasks, s.task_rate_limit
+    except Exception:
+        return 3600, 10000, 100
 
-# Per-agent rate limit: max task creates per minute
-A2A_TASK_RATE_LIMIT = int(os.getenv("A2A_TASK_RATE_LIMIT", "100"))
+
+A2A_TASK_TTL_SECONDS, A2A_TASK_STORE_MAX_TASKS, A2A_TASK_RATE_LIMIT = (
+    _resolve_a2a_task_settings()
+)
 
 
 class TaskState(str, Enum):
@@ -656,7 +692,17 @@ class A2AGateway:
         self._lock = threading.RLock()
 
         self.agents: dict[str, A2AAgent] = {}
-        self.enabled = os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true"
+        # A2A_GATEWAY_ENABLED doesn't have ROUTEIQ_ prefix — check env first.
+        env_enabled = os.getenv("A2A_GATEWAY_ENABLED")
+        if env_enabled is not None:
+            self.enabled = env_enabled.lower() == "true"
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                self.enabled = get_settings().a2a.enabled
+            except Exception:
+                self.enabled = False
         self.task_store = A2ATaskStore()
 
     def is_enabled(self) -> bool:

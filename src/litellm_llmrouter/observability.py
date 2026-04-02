@@ -478,11 +478,23 @@ def _build_sampler_from_type(
 
 def get_routeiq_resource_attributes() -> dict[str, str]:
     """Return OTel resource attributes from RouteIQ env vars."""
-    return {
-        "service.name": os.getenv("ROUTEIQ_SERVICE_NAME", "routeiq"),
-        "deployment.environment": os.getenv("ROUTEIQ_DEPLOYMENT_ENV", "default"),
-        "routeiq.metrics.namespace": os.getenv("ROUTEIQ_METRICS_NAMESPACE", "RouteIQ"),
-    }
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        otel_s = get_settings().otel
+        return {
+            "service.name": otel_s.resource_service_name,
+            "deployment.environment": otel_s.deployment_env,
+            "routeiq.metrics.namespace": otel_s.metrics_namespace,
+        }
+    except Exception:
+        return {
+            "service.name": os.getenv("ROUTEIQ_SERVICE_NAME", "routeiq"),
+            "deployment.environment": os.getenv("ROUTEIQ_DEPLOYMENT_ENV", "default"),
+            "routeiq.metrics.namespace": os.getenv(
+                "ROUTEIQ_METRICS_NAMESPACE", "RouteIQ"
+            ),
+        }
 
 
 class ObservabilityManager:
@@ -528,9 +540,19 @@ class ObservabilityManager:
         self.service_name = service_name
         self.service_version = service_version
         self.deployment_environment = deployment_environment
-        self.otlp_endpoint = otlp_endpoint or os.getenv(
-            "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
-        )
+        if otlp_endpoint:
+            self.otlp_endpoint = otlp_endpoint
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                self.otlp_endpoint = (
+                    get_settings().otel.endpoint or "http://localhost:4317"
+                )
+            except Exception:
+                self.otlp_endpoint = os.getenv(
+                    "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
+                )
         self.enable_traces = enable_traces
         self.enable_logs = enable_logs
         self.enable_metrics = enable_metrics

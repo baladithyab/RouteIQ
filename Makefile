@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
-.PHONY: help setup dev test test-all lint fix typecheck docker-up docker-down docker-build docker-build-slim clean validate-config
+.PHONY: help setup dev test test-all lint fix typecheck docker-up docker-down docker-build docker-build-slim clean validate-config docs docs-serve
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -52,3 +52,9 @@ clean: ## Clean build artifacts
 
 validate-config: ## Validate config files
 	uv run python -c "from litellm_llmrouter.settings import GatewaySettings; s = GatewaySettings(); print(f'Settings loaded: {len(s.model_fields)} fields')"
+
+docs: ## Build documentation site
+	uv run mkdocs build
+
+docs-serve: ## Serve documentation locally
+	uv run mkdocs serve -a 0.0.0.0:8000

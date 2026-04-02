@@ -189,18 +189,23 @@ class TestCreateGatewayApp:
 
 
 class TestApplyPatchSafely:
-    """Test the _apply_patch_safely function."""
+    """Test the _apply_patch_safely function (legacy stub)."""
 
-    def test_apply_patch_safely_is_idempotent(self):
-        """Test that _apply_patch_safely can be called multiple times."""
+    def test_apply_patch_safely_returns_false(self):
+        """_apply_patch_safely is a legacy stub that always returns False."""
         from litellm_llmrouter.gateway.app import _apply_patch_safely
-        from litellm_llmrouter import is_patch_applied
 
-        # Call multiple times
+        # The legacy monkey-patch module was removed; this stub returns False
         result1 = _apply_patch_safely()
         result2 = _apply_patch_safely()
 
-        # Both should succeed
-        assert result1 is True
-        assert result2 is True
-        assert is_patch_applied() is True
+        assert result1 is False
+        assert result2 is False
+
+    def test_is_patch_applied_backward_compat(self):
+        """is_patch_applied() exists for backward compat."""
+        from litellm_llmrouter import is_patch_applied
+
+        # Should return a bool without raising
+        result = is_patch_applied()
+        assert isinstance(result, bool)

@@ -128,29 +128,38 @@ class ResilienceConfig:
     @classmethod
     def from_env(cls) -> "ResilienceConfig":
         """Load configuration from environment variables."""
-        max_concurrent_str = os.getenv("ROUTEIQ_MAX_CONCURRENT_REQUESTS", "0")
-        drain_timeout_str = os.getenv(
-            "ROUTEIQ_DRAIN_TIMEOUT_SECONDS", str(DEFAULT_DRAIN_TIMEOUT_SECONDS)
-        )
-
         try:
-            max_concurrent = int(max_concurrent_str)
-        except ValueError:
-            logger.warning(
-                f"Invalid ROUTEIQ_MAX_CONCURRENT_REQUESTS value '{max_concurrent_str}', using default 0"
-            )
-            max_concurrent = 0
+            from litellm_llmrouter.settings import get_settings
 
-        try:
-            drain_timeout = float(drain_timeout_str)
-        except ValueError:
-            logger.warning(
-                f"Invalid ROUTEIQ_DRAIN_TIMEOUT_SECONDS value '{drain_timeout_str}', using default {DEFAULT_DRAIN_TIMEOUT_SECONDS}"
+            s = get_settings().resilience
+            max_concurrent = s.max_concurrent_requests
+            drain_timeout = s.drain_timeout_seconds
+            extra_excluded_str = s.backpressure_excluded_paths
+        except Exception:
+            max_concurrent_str = os.getenv("ROUTEIQ_MAX_CONCURRENT_REQUESTS", "0")
+            drain_timeout_str = os.getenv(
+                "ROUTEIQ_DRAIN_TIMEOUT_SECONDS", str(DEFAULT_DRAIN_TIMEOUT_SECONDS)
             )
-            drain_timeout = DEFAULT_DRAIN_TIMEOUT_SECONDS
+
+            try:
+                max_concurrent = int(max_concurrent_str)
+            except ValueError:
+                logger.warning(
+                    f"Invalid ROUTEIQ_MAX_CONCURRENT_REQUESTS value '{max_concurrent_str}', using default 0"
+                )
+                max_concurrent = 0
+
+            try:
+                drain_timeout = float(drain_timeout_str)
+            except ValueError:
+                logger.warning(
+                    f"Invalid ROUTEIQ_DRAIN_TIMEOUT_SECONDS value '{drain_timeout_str}', using default {DEFAULT_DRAIN_TIMEOUT_SECONDS}"
+                )
+                drain_timeout = DEFAULT_DRAIN_TIMEOUT_SECONDS
+
+            extra_excluded_str = os.getenv("ROUTEIQ_BACKPRESSURE_EXCLUDED_PATHS", "")
 
         # Additional excluded paths from env
-        extra_excluded_str = os.getenv("ROUTEIQ_BACKPRESSURE_EXCLUDED_PATHS", "")
         extra_excluded = frozenset(
             p.strip() for p in extra_excluded_str.split(",") if p.strip()
         )
@@ -1258,10 +1267,18 @@ def compute_model_health_summary(
 # Per-Provider Circuit Breaker Support
 # =============================================================================
 
+
 # Feature flag: opt-in per-provider circuit breakers for LLM HTTP calls
-PROVIDER_CB_ENABLED = (
-    os.getenv("ROUTEIQ_PROVIDER_CB_ENABLED", "false").lower() == "true"
-)
+def _resolve_provider_cb_enabled() -> bool:
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().resilience.provider_circuit_breaker_enabled
+    except Exception:
+        return os.getenv("ROUTEIQ_PROVIDER_CB_ENABLED", "false").lower() == "true"
+
+
+PROVIDER_CB_ENABLED = _resolve_provider_cb_enabled()
 
 
 def _notify_circuit_breaker_change(provider_name: str, breaker: CircuitBreaker) -> None:

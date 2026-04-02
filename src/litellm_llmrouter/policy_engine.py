@@ -108,19 +108,42 @@ def extract_model_from_body(body: dict[str, Any], api_type: str | None) -> str |
 
 def is_policy_engine_enabled() -> bool:
     """Check if policy engine is enabled."""
-    env_val = os.getenv("POLICY_ENGINE_ENABLED", "false").lower().strip()
-    return env_val in ("true", "1", "yes", "on")
+    # POLICY_ENGINE_ENABLED doesn't have ROUTEIQ_ prefix — check env first.
+    env_val = os.getenv("POLICY_ENGINE_ENABLED")
+    if env_val is not None:
+        return env_val.lower().strip() in ("true", "1", "yes", "on")
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().policy.enabled
+    except Exception:
+        return False
 
 
 def is_policy_fail_closed() -> bool:
     """Check if policy engine uses fail-closed mode."""
-    env_val = os.getenv("POLICY_ENGINE_FAIL_MODE", "open").lower().strip()
-    return env_val == "closed"
+    env_val = os.getenv("POLICY_ENGINE_FAIL_MODE")
+    if env_val is not None:
+        return env_val.lower().strip() == "closed"
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().policy.fail_mode.value == "closed"
+    except Exception:
+        return False
 
 
 def get_policy_config_path() -> str | None:
     """Get the path to policy configuration file."""
-    return os.getenv("POLICY_CONFIG_PATH")
+    env_val = os.getenv("POLICY_CONFIG_PATH")
+    if env_val is not None:
+        return env_val
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().policy.config_path
+    except Exception:
+        return None
 
 
 # =============================================================================

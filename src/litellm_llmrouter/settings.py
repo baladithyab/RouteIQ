@@ -191,6 +191,18 @@ class OTelSettings(BaseModel):
         le=1.0,
         description="Trace sampling rate (0.0 = none, 1.0 = all).",
     )
+    resource_service_name: str = Field(
+        "routeiq",
+        description="OTel resource attribute service.name for RouteIQ metrics.",
+    )
+    deployment_env: str = Field(
+        "default",
+        description="OTel resource attribute deployment.environment.",
+    )
+    metrics_namespace: str = Field(
+        "RouteIQ",
+        description="Namespace prefix for RouteIQ metrics.",
+    )
 
     @field_validator("endpoint")
     @classmethod
@@ -479,6 +491,15 @@ class QuotaSettings(BaseModel):
         None,
         description="JSON-encoded quota limits per team/key.",
     )
+    default_spend_per_1k_tokens: float = Field(
+        0.002,
+        ge=0.0,
+        description="Default USD cost per 1K tokens when LiteLLM cost is unavailable.",
+    )
+    cost_reconciliation_enabled: bool = Field(
+        True,
+        description="Enable post-response cost reconciliation.",
+    )
 
 
 class MCPSettings(BaseModel):
@@ -510,7 +531,10 @@ class MCPSettings(BaseModel):
 class A2ASettings(BaseModel):
     """A2A (Agent-to-Agent) gateway configuration.
 
-    Env vars: ``A2A_GATEWAY_ENABLED``, ``A2A_BASE_URL``.
+    Env vars: ``A2A_GATEWAY_ENABLED``, ``A2A_BASE_URL``,
+    ``A2A_RAW_STREAMING_ENABLED``, ``A2A_RAW_STREAMING_CHUNK_SIZE``,
+    ``A2A_TASK_TTL_SECONDS``, ``A2A_TASK_STORE_MAX_TASKS``,
+    ``A2A_TASK_RATE_LIMIT``.
     """
 
     enabled: bool = Field(
@@ -520,6 +544,30 @@ class A2ASettings(BaseModel):
     base_url: str = Field(
         "",
         description="Base URL for A2A agent communications.",
+    )
+    raw_streaming_enabled: bool = Field(
+        False,
+        description="Use raw byte streaming (aiter_bytes) for true passthrough.",
+    )
+    raw_streaming_chunk_size: int = Field(
+        8192,
+        ge=1024,
+        description="Chunk size in bytes for raw streaming mode.",
+    )
+    task_ttl_seconds: int = Field(
+        3600,
+        ge=60,
+        description="TTL in seconds for A2A tasks in memory.",
+    )
+    task_store_max_tasks: int = Field(
+        10000,
+        ge=100,
+        description="Maximum tasks in the A2A task store.",
+    )
+    task_rate_limit: int = Field(
+        100,
+        ge=1,
+        description="Per-agent rate limit: max task creates per minute.",
     )
 
 
@@ -746,6 +794,37 @@ class CacheSettings(BaseModel):
         ge=0.0,
         le=2.0,
         description="Max temperature for cacheability.",
+    )
+
+
+class RouterR1Settings(BaseModel):
+    """Router-R1 iterative reasoning router configuration.
+
+    Implements the Router-R1 concept (NeurIPS 2025) natively using RouteIQ's
+    own LLM proxy as both the reasoning engine and routing pool.
+
+    Env vars: ``ROUTEIQ_ROUTER_R1_ENABLED``, ``ROUTEIQ_ROUTER_R1_MODEL``,
+    ``ROUTEIQ_ROUTER_R1_MAX_ITERATIONS``, ``ROUTEIQ_ROUTER_R1_TIMEOUT``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable the Router-R1 iterative reasoning router.",
+    )
+    model: str = Field(
+        "gpt-4o-mini",
+        description="LLM model used as the reasoning/routing agent.",
+    )
+    max_iterations: int = Field(
+        3,
+        ge=1,
+        le=10,
+        description="Maximum reasoning iterations per query.",
+    )
+    timeout: float = Field(
+        30.0,
+        ge=1.0,
+        description="Timeout in seconds per iteration.",
     )
 
 
@@ -1020,6 +1099,10 @@ class GatewaySettings(BaseSettings):
     eval_pipeline: EvalPipelineSettings = Field(
         default_factory=EvalPipelineSettings,
         description="Evaluation feedback loop pipeline settings.",
+    )
+    router_r1: RouterR1Settings = Field(
+        default_factory=RouterR1Settings,
+        description="Router-R1 iterative reasoning router settings.",
     )
 
     # ------------------------------------------------------------------

@@ -1,0 +1,95 @@
+site_name: RouteIQ Gateway
+site_description: Cloud-Native AI Gateway with Intelligent Routing
+site_url: https://routeiq.dev
+repo_url: https://github.com/routeiq/routeiq
+repo_name: routeiq/routeiq
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Start: getting-started/quickstart.md
+    - Installation: getting-started/installation.md
+    - Configuration: getting-started/configuration.md
+  - Features:
+    - Intelligent Routing: features/routing.md
+    - MCP Gateway: features/mcp-gateway.md
+    - A2A Protocol: features/a2a-gateway.md
+    - Skills Gateway: features/skills-gateway.md
+    - Context Optimization: features/context-optimizer.md
+    - Prompt Management: features/prompt-management.md
+  - Governance:
+    - Overview: governance/overview.md
+    - Workspaces: governance/workspaces.md
+    - Usage Policies: governance/usage-policies.md
+    - Guardrails: governance/guardrails.md
+    - Identity (OIDC/SSO): governance/identity.md
+  - Operations:
+    - Deployment: operations/deployment.md
+    - Observability: operations/observability.md
+    - Helm Chart: operations/helm.md
+    - Docker: operations/docker.md
+    - Security: operations/security.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - ADRs: architecture/adrs.md
+  - API Reference:
+    - Gateway API: api/gateway.md
+    - Governance API: api/governance.md
+    - Routing API: api/routing.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_liners: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - tables
+  - attr_list
+  - def_list
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - autorefs
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/routeiq/routeiq

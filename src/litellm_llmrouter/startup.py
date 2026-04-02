@@ -727,7 +727,6 @@ def main():
     """
     import argparse
 
-    from litellm_llmrouter import is_patch_applied  # no-op stub (always False)
 
     parser = argparse.ArgumentParser(
         description="RouteIQ Gateway",

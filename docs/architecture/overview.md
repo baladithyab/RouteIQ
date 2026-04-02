@@ -1,22 +1,12 @@
-# RouteIQ Gateway Architecture
+# Architecture Overview
 
-> **Attribution**:
-> RouteIQ is built on top of upstream [LiteLLM](https://github.com/BerriAI/litellm) for proxy/API compatibility and [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) for ML routing.
+RouteIQ Gateway is a high-performance, cloud-native AI Gateway built on
+[LiteLLM](https://github.com/BerriAI/litellm) and [LLMRouter](https://github.com/ulab-uiuc/LLMRouter).
 
-**RouteIQ Gateway** is designed as a high-performance, cloud-native AI Gateway that sits between your applications and LLM providers.
+## Two-Plane Architecture
 
-## High-Level Overview
-
-RouteIQ is organized as two logical planes:
-
-1.  **Data Plane (Gateway Runtime)**: The in-path serving component that receives API traffic and forwards it to LLM providers.
-2.  **Control Plane (Management + Delivery)**: The out-of-path systems that configure the gateway and deliver routing models/configuration.
-
-Within the **Data Plane**, a **Routing Intelligence Layer** executes routing decisions for each request using pluggable strategies.
-
-A closed-loop MLOps workflow connects the planes: **telemetry → train → registry → rollout**.
-
-## Component Diagram
+1. **Data Plane (Gateway Runtime)** - In-path serving component for API traffic
+2. **Control Plane (Management + Delivery)** - Out-of-path config and model delivery
 
 ```mermaid
 graph TD
@@ -33,14 +23,13 @@ graph TD
     Auth --> RIL
     RIL -->|Select model| Proxy
     Proxy -->|Forward| Providers[LLM Providers]
-
-    Telemetry -->|Traces and logs| Obs[Trace and Log Store]
+    Telemetry -->|Traces and logs| Obs[Trace Store]
 
     subgraph CP[Control Plane]
-        Config[Config and Policy Source]
+        Config[Config Source]
         Train[Training Jobs]
-        Registry[Model Registry and Artifact Store]
-        Rollout[Rollout and Delivery]
+        Registry[Model Registry]
+        Rollout[Rollout Delivery]
     end
 
     Obs --> Train
@@ -52,36 +41,40 @@ graph TD
 
 ## Key Components
 
-### 1. Data Plane: LiteLLM Proxy + RouteIQ Extensions
+### Data Plane
 
-Built on top of LiteLLM, the data plane provides:
+- **Unified API**: OpenAI-compatible proxy (inherited from LiteLLM)
+- **Protocol Translation**: Bedrock, Vertex AI, Azure, etc.
+- **Gateway Surfaces**: MCP, A2A, Skills endpoints
+- **Plugin System**: 13 built-in plugins with lifecycle management
 
-- **Unified API**: OpenAI-compatible proxy surface (largely inherited from upstream LiteLLM).
-- **Protocol Translation**: Converts requests for Bedrock, Vertex, etc.
-- **Gateway Surfaces**: MCP, A2A, Skills, and OpenAI-compatible vector store endpoints.
-  - **Note**: External VectorDB integrations (Pinecone, Weaviate, etc.) are not implemented in this repository yet.
+### Routing Intelligence Layer
 
-### 2. Routing Intelligence Layer (in the Data Plane)
+- **Static Strategies**: round-robin, fallback (LiteLLM-native)
+- **ML Strategies**: 18+ `llmrouter-*` strategies
+- **Centroid Routing**: Zero-config ~2ms classification
+- **A/B Testing**: Runtime strategy hot-swapping
 
-The routing layer is the decision engine that runs inline with serving traffic. It supports:
+### Control Plane
 
-- **Static Strategies**: round-robin, fallback, etc. (LiteLLM-native)
-- **ML Strategies**: `llmrouter-*` strategies that load a trained model artifact for inference-time selection
-- **Pluggability**: custom strategies can be added as Python modules and enabled via configuration
-- **Artifact Safety**: loading pickle-based sklearn models is disabled by default and requires explicit opt-in (`LLMROUTER_ALLOW_PICKLE_MODELS=true`).
+- **Configuration Management**: YAML-based, hot-reloadable
+- **Artifact Registry**: S3/MinIO for trained routing models
+- **Rollout Delivery**: Rolling deploys or sync sidecars
 
-### 3. Control Plane (Configuration + Model Delivery)
+### Closed-Loop MLOps
 
-The control plane is intentionally decoupled from request serving. Typical responsibilities include:
+- **Collect**: OTel traces/logs from data plane
+- **Train**: Offline jobs produce routing artifacts
+- **Deploy**: New artifacts rolled out, routing layer reloads
 
-- **Configuration Management**: declare model lists, policies, and routing strategy settings.
-- **Artifact Registry**: store trained routing artifacts (e.g., S3/MinIO or MLflow-managed storage).
-- **Rollout Delivery**: distribute new config/models to the data plane via rolling deploys, mounted volumes, or sync sidecars.
+## Middleware Stack
 
-### 4. Closed-Loop MLOps (Telemetry → Train → Registry → Rollout)
+Request processing order (innermost to outermost):
 
-A continuous improvement loop:
-
-- **Collect**: OTel traces/logs and outcome signals are emitted by the data plane.
-- **Train**: offline jobs produce new routing artifacts.
-- **Deploy**: new artifacts are rolled out to the data plane; the routing layer reloads when local artifacts change.
+1. **Backpressure** - Concurrent request limiting
+2. **CORS** - Cross-origin resource sharing
+3. **RequestID** - Correlation ID assignment
+4. **Policy Engine** - OPA-style allow/deny evaluation
+5. **Management RBAC** - Admin endpoint protection
+6. **Plugin Middleware** - Plugin-injected middleware
+7. **Router Decision** - Telemetry span attributes

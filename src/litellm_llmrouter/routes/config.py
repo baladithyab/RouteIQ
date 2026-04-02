@@ -1821,6 +1821,104 @@ async def get_model_quality(
     }
 
 
+# =============================================================================
+# Router-R1 Endpoint
+# =============================================================================
+
+
+@llmrouter_router.post("/api/v1/routeiq/routing/r1")
+async def route_via_r1(request: Request):
+    """Execute a query through the Router-R1 reasoning pipeline.
+
+    This is a research/evaluation endpoint -- not for hot-path production use.
+    The Router-R1 iteratively reasons about which model to route sub-queries to,
+    using the configured router model as the reasoning agent.
+
+    Accepts a JSON body with:
+    - ``query`` (str, required): The user's query.
+    - ``system_message`` (str, optional): System context for the router.
+
+    Returns the final answer, execution trace, token usage, and latency.
+    Requires user API key authentication.
+    """
+    from ..router_r1 import get_router_r1
+
+    router = get_router_r1()
+    if router is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "router_r1_disabled",
+                "message": (
+                    "Router-R1 is not enabled. "
+                    "Set ROUTEIQ_ROUTER_R1_ENABLED=true to enable."
+                ),
+            },
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_json",
+                "message": "Request body must be valid JSON.",
+            },
+        )
+
+    query = body.get("query")
+    if not query or not isinstance(query, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_field",
+                "message": "'query' is required and must be a string.",
+            },
+        )
+
+    system_message = body.get("system_message")
+
+    # Get model deployments from LiteLLM router
+    try:
+        from litellm.proxy.proxy_server import llm_router
+
+        deployments = getattr(llm_router, "model_list", []) if llm_router else []
+    except Exception:
+        deployments = []
+
+    result = await router.route(
+        query=query,
+        deployments=deployments,
+        system_message=system_message,
+    )
+
+    return {
+        "answer": result.answer,
+        "router_model": result.router_model,
+        "total_iterations": result.total_iterations,
+        "total_tokens": result.total_tokens,
+        "total_latency_ms": round(result.total_latency_ms, 1),
+        "models_used": result.models_used,
+        "steps": [
+            {
+                "iteration": s.iteration,
+                "think": s.think,
+                "routed_model": s.routed_model,
+                "routed_query": s.routed_query,
+                "result_preview": (
+                    s.result[:200] + "..."
+                    if s.result and len(s.result) > 200
+                    else s.result
+                ),
+                "latency_ms": round(s.latency_ms, 1),
+                "tokens_used": s.tokens_used,
+            }
+            for s in result.steps
+        ],
+    }
+
+
 @admin_router.post("/api/v1/routeiq/eval/push-feedback")
 async def push_eval_feedback(
     rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
