@@ -2,9 +2,8 @@
 Unit tests for multi-worker support via ROUTEIQ_WORKERS.
 
 Tests cover the ``resolve_worker_count()`` function in ``startup.py`` which:
-- Reads ROUTEIQ_WORKERS env var and ROUTEIQ_USE_PLUGIN_STRATEGY
-- Allows multi-worker only when plugin strategy is active (default)
-- Forces workers=1 in legacy monkey-patch mode with a warning
+- Reads ROUTEIQ_WORKERS env var
+- Always allows multi-worker (plugin strategy is the only routing path)
 - Handles invalid values gracefully (non-integer, zero, negative)
 - Respects CLI --workers as a fallback when env var is not set
 
@@ -93,54 +92,46 @@ class TestResolveWorkerCountPluginMode:
 
 
 # ======================================================================
-# TestResolveWorkerCount — legacy monkey-patch mode
+# TestResolveWorkerCount — ROUTEIQ_USE_PLUGIN_STRATEGY is ignored
 # ======================================================================
 
 
-class TestResolveWorkerCountLegacyMode:
-    """Tests for resolve_worker_count in legacy monkey-patch mode."""
+class TestResolveWorkerCountPluginStrategyIgnored:
+    """Verify that ROUTEIQ_USE_PLUGIN_STRATEGY does not restrict worker count.
 
-    def test_legacy_mode_forces_one_worker(self, monkeypatch) -> None:
-        """When plugin strategy is off and workers=4, force 1."""
+    Legacy monkey-patch mode has been removed.  The plugin strategy
+    (RouteIQRoutingStrategy) is always used, so worker count is never
+    capped.  Setting ``ROUTEIQ_USE_PLUGIN_STRATEGY=false`` is a no-op
+    for worker resolution.
+    """
+
+    def test_false_flag_does_not_restrict_workers(self, monkeypatch) -> None:
+        """ROUTEIQ_USE_PLUGIN_STRATEGY=false does NOT force workers=1."""
         monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
         monkeypatch.setenv("ROUTEIQ_WORKERS", "4")
         workers = resolve_worker_count()
-        assert workers == 1
+        assert workers == 4
 
-    def test_legacy_mode_warns_on_multi_worker(self, monkeypatch, caplog) -> None:
-        """A warning is logged when user requests >1 workers in legacy mode."""
+    def test_false_flag_with_cli_workers(self, monkeypatch) -> None:
+        """CLI --workers is respected even when flag is false."""
         monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
-        monkeypatch.setenv("ROUTEIQ_WORKERS", "4")
-        with caplog.at_level(logging.WARNING):
-            workers = resolve_worker_count()
-        assert workers == 1
-        assert any(
-            "legacy monkey-patch mode" in record.message for record in caplog.records
-        )
+        workers = resolve_worker_count(cli_workers=4)
+        assert workers == 4
 
-    def test_legacy_mode_no_warning_when_one_worker(self, monkeypatch, caplog) -> None:
-        """No warning when workers=1 in legacy mode (no override needed)."""
+    def test_false_flag_default_is_one(self, monkeypatch) -> None:
+        """Default is still 1 when no workers env or CLI arg is given."""
+        monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
+        workers = resolve_worker_count()
+        assert workers == 1
+
+    def test_false_flag_single_worker_no_warning(self, monkeypatch, caplog) -> None:
+        """No legacy warning emitted for single worker."""
         monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
         monkeypatch.setenv("ROUTEIQ_WORKERS", "1")
         with caplog.at_level(logging.WARNING):
             workers = resolve_worker_count()
         assert workers == 1
-        # Should not have the "requested but legacy" warning
-        assert not any(
-            "Forcing workers=1" in record.message for record in caplog.records
-        )
-
-    def test_legacy_mode_default_is_one(self, monkeypatch) -> None:
-        """Default in legacy mode is 1 without env var."""
-        monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
-        workers = resolve_worker_count()
-        assert workers == 1
-
-    def test_legacy_mode_cli_ignored(self, monkeypatch) -> None:
-        """CLI --workers is also overridden in legacy mode."""
-        monkeypatch.setenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "false")
-        workers = resolve_worker_count(cli_workers=4)
-        assert workers == 1
+        assert not any("legacy" in record.message.lower() for record in caplog.records)
 
 
 # ======================================================================

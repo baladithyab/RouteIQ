@@ -657,12 +657,18 @@ class TestQuotaConfig:
 
     def test_config_from_env_enabled(self):
         """Config enabled via environment."""
+        from litellm_llmrouter.settings import reset_settings
+
         env = {
             "ROUTEIQ_QUOTA_ENABLED": "true",
             "ROUTEIQ_QUOTA_FAIL_MODE": "closed",
+            # pydantic-settings uses nested delimiter for sub-models
+            "ROUTEIQ_QUOTA__ENABLED": "true",
+            "ROUTEIQ_QUOTA__FAIL_MODE": "closed",
         }
 
         with patch.dict(os.environ, env, clear=True):
+            reset_settings()
             config = QuotaConfig.from_env()
 
             assert config.enabled is True
@@ -670,6 +676,8 @@ class TestQuotaConfig:
 
     def test_config_from_env_with_limits(self):
         """Config with JSON limits."""
+        from litellm_llmrouter.settings import reset_settings
+
         limits_json = json.dumps(
             [
                 {"metric": "requests", "window": "minute", "limit": 60},
@@ -680,9 +688,12 @@ class TestQuotaConfig:
         env = {
             "ROUTEIQ_QUOTA_ENABLED": "true",
             "ROUTEIQ_QUOTA_LIMITS_JSON": limits_json,
+            "ROUTEIQ_QUOTA__ENABLED": "true",
+            "ROUTEIQ_QUOTA__LIMITS_JSON": limits_json,
         }
 
         with patch.dict(os.environ, env, clear=True):
+            reset_settings()
             config = QuotaConfig.from_env()
 
             assert len(config.limits) == 2
@@ -693,12 +704,17 @@ class TestQuotaConfig:
 
     def test_config_from_env_invalid_json(self):
         """Invalid JSON is handled gracefully."""
+        from litellm_llmrouter.settings import reset_settings
+
         env = {
             "ROUTEIQ_QUOTA_ENABLED": "true",
             "ROUTEIQ_QUOTA_LIMITS_JSON": "not valid json",
+            "ROUTEIQ_QUOTA__ENABLED": "true",
+            "ROUTEIQ_QUOTA__LIMITS_JSON": "not valid json",
         }
 
         with patch.dict(os.environ, env, clear=True):
+            reset_settings()
             config = QuotaConfig.from_env()
 
             # Should still work, just with empty limits
@@ -745,9 +761,19 @@ class TestQuotaGuard:
     @pytest.mark.asyncio
     async def test_quota_guard_excluded_path(self, mock_request: MagicMock):
         """Guard passes through for excluded paths."""
+        from litellm_llmrouter.settings import reset_settings
+
         mock_request.url.path = "/_health/live"
 
-        with patch.dict(os.environ, {"ROUTEIQ_QUOTA_ENABLED": "true"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {
+                "ROUTEIQ_QUOTA_ENABLED": "true",
+                "ROUTEIQ_QUOTA__ENABLED": "true",
+            },
+            clear=True,
+        ):
+            reset_settings()
             reset_quota_enforcer()
             result = await quota_guard(mock_request)
 
@@ -758,6 +784,7 @@ class TestQuotaGuard:
     async def test_quota_guard_exceeds_limit(self, mock_request: MagicMock):
         """Guard raises 429 when quota exceeded."""
         from fastapi import HTTPException
+        from litellm_llmrouter.settings import reset_settings
 
         limits_json = json.dumps(
             [
@@ -767,9 +794,12 @@ class TestQuotaGuard:
         env = {
             "ROUTEIQ_QUOTA_ENABLED": "true",
             "ROUTEIQ_QUOTA_LIMITS_JSON": limits_json,
+            "ROUTEIQ_QUOTA__ENABLED": "true",
+            "ROUTEIQ_QUOTA__LIMITS_JSON": limits_json,
         }
 
         with patch.dict(os.environ, env, clear=True):
+            reset_settings()
             reset_quota_enforcer()
             enforcer = get_quota_enforcer()
 
@@ -798,6 +828,8 @@ class TestQuotaGuard:
     @pytest.mark.asyncio
     async def test_quota_guard_parses_request_body(self, mock_request: MagicMock):
         """Guard parses request body for token estimation."""
+        from litellm_llmrouter.settings import reset_settings
+
         body_data = {
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "Hello"}],
@@ -818,11 +850,14 @@ class TestQuotaGuard:
         env = {
             "ROUTEIQ_QUOTA_ENABLED": "true",
             "ROUTEIQ_QUOTA_LIMITS_JSON": limits_json,
+            "ROUTEIQ_QUOTA__ENABLED": "true",
+            "ROUTEIQ_QUOTA__LIMITS_JSON": limits_json,
             "REDIS_HOST": "localhost",
             "REDIS_PORT": "6379",
         }
 
         with patch.dict(os.environ, env, clear=True):
+            reset_settings()
             reset_quota_enforcer()
             enforcer = get_quota_enforcer()
 
@@ -1145,6 +1180,8 @@ class TestReconcileSpend:
     @pytest.mark.asyncio
     async def test_reconcile_feature_flag_disabled(self):
         """Reconciliation is skipped when feature flag is disabled."""
+        from litellm_llmrouter.settings import reset_settings
+
         config = QuotaConfig(
             enabled=True,
             limits=[
@@ -1161,8 +1198,14 @@ class TestReconcileSpend:
         enforcer._repository = mock_repo
 
         with patch.dict(
-            os.environ, {"ROUTEIQ_COST_RECONCILIATION_ENABLED": "false"}, clear=False
+            os.environ,
+            {
+                "ROUTEIQ_COST_RECONCILIATION_ENABLED": "false",
+                "ROUTEIQ_QUOTA__COST_RECONCILIATION_ENABLED": "false",
+            },
+            clear=False,
         ):
+            reset_settings()
             result = await enforcer.reconcile_spend(
                 subject="team:eng",
                 actual_cost=0.05,

@@ -184,7 +184,9 @@ class TestModelArtifactVerifier:
         """Test artifact verification succeeds when manifest not required."""
         from litellm_llmrouter.model_artifacts import ModelArtifactVerifier
 
-        verifier = ModelArtifactVerifier(manifest_path=None)
+        # Explicitly disable enforce_signed since the default changed to True
+        # in ADR-0006 (security hardening)
+        verifier = ModelArtifactVerifier(manifest_path=None, enforce_signed=False)
 
         # Should not raise when require_manifest=False (default)
         result = verifier.verify_artifact(temp_model_file, require_manifest=False)
@@ -458,8 +460,14 @@ class TestSafeActivationRollback:
     """Test safe model activation with rollback on failure."""
 
     @pytest.fixture
-    def mock_pickle_allowed(self):
-        """Temporarily allow pickle loading for tests."""
+    def mock_pickle_allowed(self, monkeypatch):
+        """Temporarily allow pickle loading for tests.
+
+        Also disables ENFORCE_SIGNED_MODELS since these unit tests use ad-hoc
+        pickle files without manifests.  The enforcement default changed to True
+        in ADR-0006 (security hardening).
+        """
+        monkeypatch.setenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "false")
         with (
             patch("litellm_llmrouter.strategies.ALLOW_PICKLE_MODELS", True),
             patch("litellm_llmrouter.strategies.ENFORCE_SIGNED_MODELS", False),
@@ -1286,7 +1294,7 @@ class TestInferenceKNNRouterStrictMode:
 
             assert "PICKLE_SIGNATURE_REQUIRED" in str(exc_info.value)
 
-    def test_allowlist_allows_loading(self, valid_model_file):
+    def test_allowlist_allows_loading(self, valid_model_file, monkeypatch):
         """Test that allowlisted hashes allow loading in strict mode."""
         from litellm_llmrouter.strategies import InferenceKNNRouter
 
@@ -1295,6 +1303,9 @@ class TestInferenceKNNRouterStrictMode:
         with open(valid_model_file, "rb") as f:
             sha256_hash.update(f.read())
         model_hash = sha256_hash.hexdigest()
+
+        # Disable enforce_signed via env var so the global verifier picks it up
+        monkeypatch.setenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "false")
 
         with (
             patch("litellm_llmrouter.strategies.ALLOW_PICKLE_MODELS", True),

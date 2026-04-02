@@ -138,14 +138,19 @@ class TestResilienceConfig:
     def test_config_from_env(self):
         """Test loading config from environment variables."""
         from litellm_llmrouter.resilience import ResilienceConfig
+        from litellm_llmrouter.settings import reset_settings
 
         with patch.dict(
             "os.environ",
             {
                 "ROUTEIQ_MAX_CONCURRENT_REQUESTS": "100",
                 "ROUTEIQ_DRAIN_TIMEOUT_SECONDS": "60",
+                # pydantic-settings nested delimiter format
+                "ROUTEIQ_RESILIENCE__MAX_CONCURRENT_REQUESTS": "100",
+                "ROUTEIQ_RESILIENCE__DRAIN_TIMEOUT_SECONDS": "60",
             },
         ):
+            reset_settings()
             config = ResilienceConfig.from_env()
 
             assert config.max_concurrent_requests == 100

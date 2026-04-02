@@ -507,7 +507,9 @@ class TestCrossFieldValidation:
             pickle_warnings = [x for x in w if "pickle" in str(x.message).lower()]
             assert len(pickle_warnings) == 0
 
-    def test_multi_workers_legacy_mode_warns(self):
+    def test_multi_workers_legacy_mode_no_warn(self):
+        """Legacy monkey-patch mode has been removed; use_plugin_strategy=False
+        is silently ignored (always True), so no worker warning is emitted."""
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             GatewaySettings(
@@ -515,7 +517,7 @@ class TestCrossFieldValidation:
                 routing=RoutingSettings(use_plugin_strategy=False),
             )
             worker_warnings = [x for x in w if "workers" in str(x.message).lower()]
-            assert len(worker_warnings) >= 1
+            assert len(worker_warnings) == 0
 
     def test_multi_workers_plugin_mode_no_warning(self):
         with warnings.catch_warnings(record=True) as w:
