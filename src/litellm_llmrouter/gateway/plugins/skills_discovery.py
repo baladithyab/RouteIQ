@@ -149,7 +149,7 @@ class SkillsStore:
                 str(resolved_target).startswith(str(resolved_base) + os.sep)
                 or resolved_target == resolved_base
             )
-        except OSError, ValueError:
+        except (OSError, ValueError):
             return False
 
     def _get_dir_mtime(self) -> float:

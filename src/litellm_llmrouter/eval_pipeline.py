@@ -28,7 +28,7 @@ import json
 import logging
 import random
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -136,6 +136,8 @@ class EvalJudge:
             )
             content = resp.choices[0].message.content
             scores_raw = json.loads(content)
+            if not isinstance(scores_raw, dict):
+                return {}
             # Normalize to 0-1
             return {
                 k: min(max(v / 5.0, 0.0), 1.0)
@@ -249,15 +251,16 @@ class EvalPipeline:
         batch_size: int = 10,
         feedback_interval: int = 300,
         feedback_callbacks: Optional[List[Callable]] = None,
+        max_pending: int = 1000,
     ):
         self._sample_rate = sample_rate
         self._batch_size = batch_size
         self._feedback_interval = feedback_interval
         self._judge = EvalJudge(judge_model)
         self._tracker = ModelQualityTracker()
-        self._pending_samples: List[EvalSample] = []
+        self.__max_pending = max_pending
+        self._pending_samples: deque = deque(maxlen=max_pending)
         self._evaluated_samples: List[EvalSample] = []
-        self._max_pending = 1000
         self._max_evaluated = 10000
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -265,6 +268,17 @@ class EvalPipeline:
         self._total_collected = 0
         self._total_evaluated = 0
         self._last_feedback_time: Optional[float] = None
+
+    @property
+    def _max_pending(self) -> int:
+        """Maximum pending samples (synced with deque maxlen)."""
+        return self.__max_pending
+
+    @_max_pending.setter
+    def _max_pending(self, value: int) -> None:
+        self.__max_pending = value
+        # Recreate deque with new maxlen, preserving existing items
+        self._pending_samples = deque(self._pending_samples, maxlen=value)
 
     @property
     def tracker(self) -> ModelQualityTracker:
@@ -288,8 +302,6 @@ class EvalPipeline:
         Args:
             sample: The evaluation sample to enqueue.
         """
-        if len(self._pending_samples) >= self._max_pending:
-            self._pending_samples.pop(0)
         self._pending_samples.append(sample)
         self._total_collected += 1
 
@@ -306,8 +318,10 @@ class EvalPipeline:
         if not self._pending_samples:
             return 0
 
-        batch = self._pending_samples[: self._batch_size]
-        self._pending_samples = self._pending_samples[self._batch_size :]
+        batch = [
+            self._pending_samples.popleft()
+            for _ in range(min(self._batch_size, len(self._pending_samples)))
+        ]
 
         results = await self._judge.evaluate_batch(batch)
 
@@ -480,7 +494,7 @@ class EvalPipeline:
         source = (
             self._evaluated_samples
             if evaluated_only
-            else self._evaluated_samples + self._pending_samples
+            else self._evaluated_samples + list(self._pending_samples)
         )
 
         if model:
@@ -586,7 +600,8 @@ def reset_eval_pipeline() -> None:
     cross-test contamination.
     """
     global _pipeline
-    if _pipeline is not None and _pipeline._running:
-        # Best-effort stop — tests should await stop() explicitly
-        logger.debug("Resetting eval pipeline (was running)")
+    if _pipeline is not None:
+        if _pipeline._task is not None and not _pipeline._task.done():
+            _pipeline._task.cancel()
+        _pipeline._running = False
     _pipeline = None

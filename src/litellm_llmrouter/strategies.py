@@ -1540,7 +1540,7 @@ class InferenceELORouter:
                 # JSON format — safe by default
                 with open(self.ratings_path, "r") as f:
                     new_ratings = json.load(f)
-        except PickleSecurityError, json.JSONDecodeError:
+        except (PickleSecurityError, json.JSONDecodeError):
             raise
         except Exception as e:
             raise ModelLoadError(

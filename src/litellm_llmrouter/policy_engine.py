@@ -724,7 +724,7 @@ class PolicyMiddleware:
         if body_bytes:
             try:
                 parsed_body = json.loads(body_bytes)
-            except json.JSONDecodeError, UnicodeDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 parsed_body = None
 
         context = self._build_context(scope, api_type=api_type, parsed_body=parsed_body)

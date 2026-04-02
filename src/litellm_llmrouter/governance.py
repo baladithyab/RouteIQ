@@ -339,6 +339,14 @@ class GovernanceEngine:
 
         # Cache and return
         self._cache[key_id] = (time.time(), ctx)
+
+        # Evict oldest 10% if cache exceeds max size
+        _MAX_CACHE_SIZE = 10_000
+        if len(self._cache) > _MAX_CACHE_SIZE:
+            entries = sorted(self._cache.items(), key=lambda x: x[1][0])
+            for key, _ in entries[: _MAX_CACHE_SIZE // 10]:
+                del self._cache[key]
+
         return ctx
 
     # -- Enforcement Checks -------------------------------------------------
@@ -538,11 +546,16 @@ class GovernanceEngine:
         """
         if pattern == "*":
             return True
+        # Exact match (case-insensitive) — handles pattern-to-pattern comparison
+        if model.lower() == pattern.lower():
+            return True
         if pattern.startswith("@"):
-            # Provider prefix: @anthropic/* -> check if "anthropic" is in
-            # the model name (handles "anthropic/claude-3-opus", etc.)
-            provider = pattern[1:].split("/")[0]
-            return provider.lower() in model.lower()
+            # Provider prefix: @anthropic/* -> match models with provider prefix
+            provider = pattern[1:].split("/")[0].lower()
+            model_lower = model.lower()
+            return model_lower.startswith(provider + "/") or model_lower.startswith(
+                provider + "-"
+            )
         return fnmatch.fnmatch(model.lower(), pattern.lower())
 
     # -- Internal Helpers ---------------------------------------------------

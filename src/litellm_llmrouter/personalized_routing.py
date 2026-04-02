@@ -674,8 +674,9 @@ class PersonalizedRouter:
         if norm > 0:
             vec /= norm
 
-        # Cache for future lookups
-        self._model_embeddings[model_name] = vec
+        # Cache for future lookups (bounded to prevent memory leak)
+        if len(self._model_embeddings) < 1000:
+            self._model_embeddings[model_name] = vec
         return vec
 
     def _get_fuzzy_quality(self, model_name: str) -> float:

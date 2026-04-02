@@ -583,7 +583,7 @@ class GuardrailPolicyEngine:
 
         try:
             parsed = json.loads(content)
-        except json.JSONDecodeError, TypeError:
+        except (json.JSONDecodeError, TypeError):
             if must_be_json:
                 return GuardrailResult(
                     guardrail_id=policy.guardrail_id,
@@ -814,7 +814,7 @@ class GuardrailPolicyEngine:
 
         try:
             requested_int = int(requested)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return GuardrailResult(
                 guardrail_id=policy.guardrail_id,
                 guardrail_name=policy.name,

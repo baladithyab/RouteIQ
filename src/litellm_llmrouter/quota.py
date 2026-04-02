@@ -692,7 +692,7 @@ class QuotaEnforcer:
                         "output_cost_per_token", 0
                     )
                     return input_cost + output_cost
-        except ImportError, Exception:
+        except (ImportError, Exception):
             pass
 
         # Fall back to default multiplier
@@ -985,7 +985,7 @@ def _emit_reconciliation_metrics(
             metrics.reconciliation_count.add(
                 1, {"subject": subject, "direction": direction}
             )
-    except ImportError, Exception:
+    except (ImportError, Exception):
         pass
 
 
@@ -1118,7 +1118,7 @@ async def quota_guard(request: Request) -> QuotaGuardResult:
                 body = json.loads(body_bytes)
                 request.state._parsed_body = body
                 model = body.get("model")
-    except json.JSONDecodeError, Exception:
+    except (json.JSONDecodeError, Exception):
         pass
 
     all_results: list[QuotaCheckResult] = []
@@ -1235,6 +1235,6 @@ def add_quota_span_attributes(
                 span.set_attribute(f"{prefix}.current", check.current)
                 span.set_attribute(f"{prefix}.limit", check.limit)
                 span.set_attribute(f"{prefix}.allowed", check.allowed)
-    except ImportError, Exception:
+    except (ImportError, Exception):
         # OpenTelemetry not available or span error - fail silently
         pass

@@ -126,6 +126,22 @@ def _reset_all_singletons():
 
     reset_router_r1()
 
+    from litellm_llmrouter.guardrail_policies import reset_guardrail_policy_engine
+
+    reset_guardrail_policy_engine()
+
+    from litellm_llmrouter.eval_pipeline import reset_eval_pipeline
+
+    reset_eval_pipeline()
+
+    from litellm_llmrouter.personalized_routing import reset_personalized_router
+
+    reset_personalized_router()
+
+    from litellm_llmrouter.prompt_management import reset_prompt_manager
+
+    reset_prompt_manager()
+
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for
     # when the pool is not initialized, so skipping it is safe.

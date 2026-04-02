@@ -47,7 +47,9 @@ RouteIQ/
 │   │       ├── guardrails_base.py # Base guardrails plugin class
 │   │       ├── llamaguard_plugin.py # LlamaGuard safety plugin
 │   │       ├── pii_guard.py       # PII detection/redaction plugin
-│   │       └── prompt_injection_guard.py # Prompt injection detection plugin
+│   │       ├── prompt_injection_guard.py # Prompt injection detection plugin
+│   │       ├── context_optimizer.py   # Context optimization (30-70% savings)
+│   │       └── agentic_pipeline.py    # Agentic multi-round routing
 │   ├── startup.py                 # Entry point: python -m litellm_llmrouter.startup
 │   ├── routes/                    # FastAPI routers (package)
 │   │   ├── __init__.py            # Re-exports all routers + feature flags
@@ -93,6 +95,14 @@ RouteIQ/
 │   ├── oidc.py                    # OIDC/SSO authentication integration
 │   ├── settings.py                # Canonical settings (Pydantic) — use get_settings()
 │   ├── service_discovery.py       # Service discovery probing at startup
+│   ├── governance.py              # Workspace isolation & API key governance
+│   ├── usage_policies.py          # Dynamic usage/rate limit policies (CRUD)
+│   ├── guardrail_policies.py      # Guardrail policy engine (14 check types)
+│   ├── personalized_routing.py    # Per-user preference learning
+│   ├── prompt_management.py       # Prompt versioning & A/B testing
+│   ├── eval_pipeline.py           # LLM-as-judge evaluation feedback loop
+│   ├── router_r1.py               # Router-R1 iterative reasoning
+│   ├── cli.py                     # CLI entry point (routeiq command)
 │   └── __init__.py                # Public API exports
 ├── tests/
 │   ├── conftest.py                # Root conftest: auto-skip integration if stack not running
@@ -141,6 +151,8 @@ RouteIQ/
 ├── models/                        # Trained ML models (empty .gitkeep placeholder)
 │   └── centroids/                 # Pre-computed centroid vectors for zero-config routing
 ├── custom_routers/                # Custom routing strategies (empty .gitkeep placeholder)
+├── packages/
+│   └── routeiq-routing/           # Standalone pip package for ML routing
 ├── reference/litellm/             # Upstream LiteLLM submodule (READ-ONLY)
 ├── pyproject.toml                 # Build config, deps, tool settings
 ├── lefthook.yml                   # Git hooks (pre-commit, pre-push, post-commit)
@@ -537,6 +549,12 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_OIDC_ENABLED` | No | Enable OIDC/SSO authentication (default: false) |
 | `ROUTEIQ_OIDC_ISSUER_URL` | No | OIDC provider discovery URL |
 | `ROUTEIQ_OWN_APP` | No | Use RouteIQ-owned FastAPI app (default: false) |
+| `ROUTEIQ_CONTEXT_OPTIMIZE` | No | Context optimization mode (off/safe/aggressive) |
+| `ROUTEIQ_EVAL_PIPELINE` | No | Enable evaluation feedback loop |
+| `ROUTEIQ_PROMPT_MANAGEMENT` | No | Enable prompt management |
+| `ROUTEIQ_ROUTER_R1_ENABLED` | No | Enable Router-R1 reasoning |
+| `ROUTEIQ_AGENTIC_PIPELINE` | No | Enable agentic multi-round routing |
+| `ROUTEIQ_PERSONALIZED_ROUTING` | No | Enable personalized routing |
 
 > **Canonical settings source**: All settings are defined in `src/litellm_llmrouter/settings.py`
 > using Pydantic. Access via `get_settings()` at runtime.
@@ -559,7 +577,8 @@ Development follows a Task Group pattern with quality gates:
 | [`docs/mlops-training.md`](docs/mlops-training.md) | MLOps training loop |
 | [`docs/rr-workflow.md`](docs/rr-workflow.md) | Remote push workflow |
 | [`docs/aws-production-guide.md`](docs/aws-production-guide.md) | AWS production deployment guide |
-| [`docs/adr/README.md`](docs/adr/README.md) | Architecture Decision Records index |
+| [`docs/adr/README.md`](docs/adr/README.md) | Architecture Decision Records index (21 ADRs) |
+| [`mkdocs.yml`](mkdocs.yml) | Documentation site configuration |
 | [`plans/v1.0-rearchitecture-plan.md`](plans/v1.0-rearchitecture-plan.md) | v1.0 rearchitecture roadmap |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 
