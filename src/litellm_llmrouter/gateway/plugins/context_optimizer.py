@@ -776,7 +776,36 @@ class ContextOptimizerPlugin(GatewayPlugin):
         Reads ``ROUTEIQ_CONTEXT_OPTIMIZE``, ``ROUTEIQ_CONTEXT_OPTIMIZE_MAX_TURNS``,
         and ``ROUTEIQ_CONTEXT_OPTIMIZE_KEEP_LAST`` to configure the optimizer engine.
         """
-        mode = os.environ.get("ROUTEIQ_CONTEXT_OPTIMIZE", "off").lower().strip()
+        # ROUTEIQ_CONTEXT_OPTIMIZE doesn't match the pydantic-settings env path
+        # (ROUTEIQ_CONTEXT_OPTIMIZER__MODE), so check env vars first with
+        # settings as defaults.
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            co_cfg = get_settings().context_optimizer
+        except Exception:
+            co_cfg = None
+
+        mode = (
+            os.environ.get(
+                "ROUTEIQ_CONTEXT_OPTIMIZE",
+                co_cfg.mode if co_cfg else "off",
+            )
+            .lower()
+            .strip()
+        )
+        max_turns = int(
+            os.environ.get(
+                "ROUTEIQ_CONTEXT_OPTIMIZE_MAX_TURNS",
+                str(co_cfg.max_turns if co_cfg else 40),
+            )
+        )
+        keep_last = int(
+            os.environ.get(
+                "ROUTEIQ_CONTEXT_OPTIMIZE_KEEP_LAST",
+                str(co_cfg.keep_last if co_cfg else 20),
+            )
+        )
 
         if mode == "off":
             logger.info(
@@ -790,9 +819,6 @@ class ContextOptimizerPlugin(GatewayPlugin):
                 "Invalid ROUTEIQ_CONTEXT_OPTIMIZE=%r, falling back to 'safe'", mode
             )
             mode = "safe"
-
-        max_turns = int(os.environ.get("ROUTEIQ_CONTEXT_OPTIMIZE_MAX_TURNS", "40"))
-        keep_last = int(os.environ.get("ROUTEIQ_CONTEXT_OPTIMIZE_KEEP_LAST", "20"))
 
         if keep_last >= max_turns:
             logger.warning(

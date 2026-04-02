@@ -874,24 +874,34 @@ class PluginManager:
         """
         settings: dict[str, Any] = {}
 
-        # Gateway feature flags
-        settings["mcp_gateway_enabled"] = (
-            os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true"
-        )
-        settings["a2a_gateway_enabled"] = (
-            os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true"
-        )
-        settings["otel_enabled"] = os.getenv("OTEL_ENABLED", "true").lower() != "false"
-        settings["policy_engine_enabled"] = (
-            os.getenv("POLICY_ENGINE_ENABLED", "false").lower() == "true"
-        )
+        # Try to use get_settings() for feature flags, fall back to os.getenv
+        try:
+            from litellm_llmrouter.settings import get_settings
 
-        # Config paths
-        settings["config_path"] = os.getenv("LITELLM_CONFIG_PATH", "")
-        settings["policy_config_path"] = os.getenv("POLICY_CONFIG_PATH", "")
-
-        # Service info
-        settings["service_name"] = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
+            gw = get_settings()
+            settings["mcp_gateway_enabled"] = gw.mcp.enabled
+            settings["a2a_gateway_enabled"] = gw.a2a.enabled
+            settings["otel_enabled"] = gw.otel.enabled
+            settings["policy_engine_enabled"] = gw.policy.enabled
+            settings["config_path"] = gw.litellm_config_path or ""
+            settings["policy_config_path"] = gw.policy.config_path or ""
+            settings["service_name"] = gw.otel.service_name
+        except Exception:
+            settings["mcp_gateway_enabled"] = (
+                os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true"
+            )
+            settings["a2a_gateway_enabled"] = (
+                os.getenv("A2A_GATEWAY_ENABLED", "false").lower() == "true"
+            )
+            settings["otel_enabled"] = (
+                os.getenv("OTEL_ENABLED", "true").lower() != "false"
+            )
+            settings["policy_engine_enabled"] = (
+                os.getenv("POLICY_ENGINE_ENABLED", "false").lower() == "true"
+            )
+            settings["config_path"] = os.getenv("LITELLM_CONFIG_PATH", "")
+            settings["policy_config_path"] = os.getenv("POLICY_CONFIG_PATH", "")
+            settings["service_name"] = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
 
         # Plugin-specific settings (prefixed with ROUTEIQ_PLUGIN_)
         for key, value in os.environ.items():
@@ -969,7 +979,12 @@ class PluginManager:
         # Create context
         self._context = self._create_context()
 
-        startup_timeout = float(os.getenv("ROUTEIQ_PLUGIN_STARTUP_TIMEOUT", "30"))
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            startup_timeout = get_settings().plugins.startup_timeout
+        except Exception:
+            startup_timeout = float(os.getenv("ROUTEIQ_PLUGIN_STARTUP_TIMEOUT", "30"))
 
         for plugin in sorted_plugins:
             if plugin.name in self._quarantined:

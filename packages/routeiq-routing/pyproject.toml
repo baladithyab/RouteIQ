@@ -6,13 +6,13 @@ requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = [
     "numpy>=1.24",
-    "litellm>=1.80",
 ]
 
 [project.optional-dependencies]
 knn = ["sentence-transformers>=2.2", "scikit-learn>=1.3"]
 ml = ["torch>=2.0"]
-all = ["routeiq-routing[knn,ml]"]
+litellm = ["litellm>=1.80"]
+all = ["routeiq-routing[knn,ml,litellm]"]
 
 [project.entry-points."litellm.custom_routing_strategy"]
 routeiq-centroid = "routeiq_routing.centroid:CentroidRoutingStrategy"

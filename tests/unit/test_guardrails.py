@@ -750,7 +750,11 @@ class TestBedrockGuardrailsPlugin:
         }
         plugin._client = mock_client
 
-        result = await plugin.evaluate("How to make dangerous stuff")
+        # Patch boto3 import inside evaluate() so it doesn't fail and
+        # replace the pre-set mock client with a real boto3 client.
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.evaluate("How to make dangerous stuff")
 
         assert result["action"] == "BLOCKED"
         assert len(result["outputs"]) == 1
@@ -774,7 +778,9 @@ class TestBedrockGuardrailsPlugin:
         }
         plugin._client = mock_client
 
-        result = await plugin.evaluate("What is the weather?")
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.evaluate("What is the weather?")
 
         assert result["action"] == "NONE"
         assert result["outputs"] == []
@@ -792,7 +798,9 @@ class TestBedrockGuardrailsPlugin:
         }
         plugin._client = mock_client
 
-        result = await plugin.evaluate("My SSN is 123-45-6789.")
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.evaluate("My SSN is 123-45-6789.")
 
         assert result["action"] == "ANONYMIZED"
 
@@ -820,7 +828,9 @@ class TestBedrockGuardrailsPlugin:
         mock_client.apply_guardrail.side_effect = RuntimeError("API timeout")
         plugin._client = mock_client
 
-        result = await plugin.evaluate("test content")
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.evaluate("test content")
 
         assert result["action"] == "NONE"
         assert "error" in result["reason"]
@@ -840,8 +850,10 @@ class TestBedrockGuardrailsPlugin:
         plugin._client = mock_client
 
         messages = [{"role": "user", "content": "dangerous content"}]
-        with pytest.raises(GuardrailBlockError) as exc_info:
-            await plugin.on_llm_pre_call("gpt-4", messages, {})
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            with pytest.raises(GuardrailBlockError) as exc_info:
+                await plugin.on_llm_pre_call("gpt-4", messages, {})
         assert exc_info.value.guardrail_name == "bedrock-guardrails"
         assert exc_info.value.category == "bedrock"
         assert exc_info.value.score == 1.0
@@ -859,7 +871,9 @@ class TestBedrockGuardrailsPlugin:
         plugin._client = mock_client
 
         messages = [{"role": "user", "content": "Hello world"}]
-        result = await plugin.on_llm_pre_call("gpt-4", messages, {})
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.on_llm_pre_call("gpt-4", messages, {})
         assert result is None
 
     @pytest.mark.asyncio
@@ -908,7 +922,9 @@ class TestBedrockGuardrailsPlugin:
                 ],
             }
         ]
-        result = await plugin.on_llm_pre_call("gpt-4", messages, {})
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = await plugin.on_llm_pre_call("gpt-4", messages, {})
         assert result is None
         # Verify the text was extracted and sent to Bedrock
         call_args = mock_client.apply_guardrail.call_args
@@ -954,10 +970,12 @@ class TestBedrockGuardrailsPlugin:
         plugin._client = mock_client
 
         bridge = PluginCallbackBridge([plugin])
-        with pytest.raises(GuardrailBlockError):
-            await bridge.async_log_pre_api_call(
-                "gpt-4", [{"role": "user", "content": "bad content"}], {}
-            )
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            with pytest.raises(GuardrailBlockError):
+                await bridge.async_log_pre_api_call(
+                    "gpt-4", [{"role": "user", "content": "bad content"}], {}
+                )
 
 
 # ===========================================================================

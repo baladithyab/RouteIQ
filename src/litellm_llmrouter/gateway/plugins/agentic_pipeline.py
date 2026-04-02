@@ -546,26 +546,57 @@ class AgenticPipelinePlugin(GatewayPlugin):
     async def startup(
         self, app: "FastAPI", context: PluginContext | None = None
     ) -> None:
-        enabled = os.environ.get("ROUTEIQ_AGENTIC_PIPELINE", "false").lower() == "true"
+        # ROUTEIQ_AGENTIC_* env vars don't match pydantic-settings paths, so
+        # check env vars first with settings as defaults.
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            ap_cfg = get_settings().agentic_pipeline
+        except Exception:
+            ap_cfg = None
+
+        enabled = (
+            os.environ.get(
+                "ROUTEIQ_AGENTIC_PIPELINE",
+                str(ap_cfg.enabled).lower() if ap_cfg else "false",
+            ).lower()
+            == "true"
+        )
+        self._orchestrator_model = os.environ.get(
+            "ROUTEIQ_AGENTIC_ORCHESTRATOR_MODEL",
+            ap_cfg.orchestrator_model if ap_cfg else "gpt-4o-mini",
+        )
+        self._threshold = float(
+            os.environ.get(
+                "ROUTEIQ_AGENTIC_COMPLEXITY_THRESHOLD",
+                str(ap_cfg.complexity_threshold if ap_cfg else 0.6),
+            )
+        )
+        self._max_subqueries = int(
+            os.environ.get(
+                "ROUTEIQ_AGENTIC_MAX_SUBQUERIES",
+                str(ap_cfg.max_subqueries if ap_cfg else 4),
+            )
+        )
+        self._parallel = (
+            os.environ.get(
+                "ROUTEIQ_AGENTIC_PARALLEL",
+                str(ap_cfg.parallel).lower() if ap_cfg else "true",
+            ).lower()
+            == "true"
+        )
+        self._timeout = float(
+            os.environ.get(
+                "ROUTEIQ_AGENTIC_TIMEOUT",
+                str(ap_cfg.timeout if ap_cfg else 30),
+            )
+        )
+
         if not enabled:
             logger.info(
                 "Agentic pipeline plugin disabled (ROUTEIQ_AGENTIC_PIPELINE!=true)"
             )
             return
-
-        self._orchestrator_model = os.environ.get(
-            "ROUTEIQ_AGENTIC_ORCHESTRATOR_MODEL", "gpt-4o-mini"
-        )
-        self._threshold = float(
-            os.environ.get("ROUTEIQ_AGENTIC_COMPLEXITY_THRESHOLD", "0.6")
-        )
-        self._max_subqueries = int(
-            os.environ.get("ROUTEIQ_AGENTIC_MAX_SUBQUERIES", "4")
-        )
-        self._parallel = (
-            os.environ.get("ROUTEIQ_AGENTIC_PARALLEL", "true").lower() == "true"
-        )
-        self._timeout = float(os.environ.get("ROUTEIQ_AGENTIC_TIMEOUT", "30"))
 
         self._enabled = True
         self._detector = ComplexityDetector()

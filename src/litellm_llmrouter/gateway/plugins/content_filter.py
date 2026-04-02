@@ -206,20 +206,44 @@ class ContentFilterPlugin(GatewayPlugin):
     async def startup(
         self, app: "FastAPI", context: PluginContext | None = None
     ) -> None:
-        """Load configuration from environment variables."""
-        self._enabled = os.getenv("CONTENT_FILTER_ENABLED", "false").lower() == "true"
+        """Load configuration from environment variables, with settings fallback."""
+        # These env vars are NOT ROUTEIQ_-prefixed, so read them directly
+        # and fall back to settings for defaults.
+        env_enabled = os.getenv("CONTENT_FILTER_ENABLED")
+        if env_enabled is not None:
+            self._enabled = env_enabled.lower() == "true"
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                self._enabled = get_settings().content_filter.enabled
+            except Exception:
+                self._enabled = False
+
         if not self._enabled:
             logger.info("Content filter plugin disabled (CONTENT_FILTER_ENABLED=false)")
             return
 
-        self._default_threshold = float(os.getenv("CONTENT_FILTER_THRESHOLD", "0.7"))
-        self._default_action = os.getenv("CONTENT_FILTER_ACTION", "block").lower()
+        try:
+            from litellm_llmrouter.settings import get_settings
 
-        # Parse active categories
-        categories_str = os.getenv(
-            "CONTENT_FILTER_CATEGORIES",
-            "violence,hate_speech,sexual,self_harm,illegal_activity",
-        )
+            cf_cfg = get_settings().content_filter
+            self._default_threshold = float(
+                os.getenv("CONTENT_FILTER_THRESHOLD", str(cf_cfg.threshold))
+            )
+            self._default_action = os.getenv(
+                "CONTENT_FILTER_ACTION", cf_cfg.action
+            ).lower()
+            categories_str = os.getenv("CONTENT_FILTER_CATEGORIES", cf_cfg.categories)
+        except Exception:
+            self._default_threshold = float(
+                os.getenv("CONTENT_FILTER_THRESHOLD", "0.7")
+            )
+            self._default_action = os.getenv("CONTENT_FILTER_ACTION", "block").lower()
+            categories_str = os.getenv(
+                "CONTENT_FILTER_CATEGORIES",
+                "violence,hate_speech,sexual,self_harm,illegal_activity",
+            )
         active_categories = {c.strip() for c in categories_str.split(",") if c.strip()}
 
         for cat in active_categories:

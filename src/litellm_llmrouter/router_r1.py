@@ -292,12 +292,43 @@ def get_router_r1() -> Optional[RouterR1]:
         return _router
     import os
 
-    if os.environ.get("ROUTEIQ_ROUTER_R1_ENABLED", "false").lower() != "true":
+    # ROUTEIQ_ROUTER_R1_* env vars don't match pydantic-settings paths,
+    # so check env vars first with settings as defaults.
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        r1_cfg = get_settings().router_r1
+    except Exception:
+        r1_cfg = None
+
+    env_enabled = os.environ.get("ROUTEIQ_ROUTER_R1_ENABLED")
+    if env_enabled is not None:
+        enabled = env_enabled.lower() == "true"
+    elif r1_cfg is not None:
+        enabled = r1_cfg.enabled
+    else:
+        enabled = False
+
+    if not enabled:
         return None
+
     _router = RouterR1(
-        router_model=os.environ.get("ROUTEIQ_ROUTER_R1_MODEL", "gpt-4o-mini"),
-        max_iterations=int(os.environ.get("ROUTEIQ_ROUTER_R1_MAX_ITERATIONS", "3")),
-        timeout_per_iteration=float(os.environ.get("ROUTEIQ_ROUTER_R1_TIMEOUT", "30")),
+        router_model=os.environ.get(
+            "ROUTEIQ_ROUTER_R1_MODEL",
+            r1_cfg.model if r1_cfg else "gpt-4o-mini",
+        ),
+        max_iterations=int(
+            os.environ.get(
+                "ROUTEIQ_ROUTER_R1_MAX_ITERATIONS",
+                str(r1_cfg.max_iterations if r1_cfg else 3),
+            )
+        ),
+        timeout_per_iteration=float(
+            os.environ.get(
+                "ROUTEIQ_ROUTER_R1_TIMEOUT",
+                str(r1_cfg.timeout if r1_cfg else 30),
+            )
+        ),
     )
     return _router
 

@@ -268,13 +268,21 @@ class ModelArtifactVerifier:
         self.hmac_secret = hmac_secret or os.environ.get("LLMROUTER_MODEL_HMAC_SECRET")
 
         # Determine enforcement mode
+        # LLMROUTER_ENFORCE_SIGNED_MODELS is NOT ROUTEIQ_-prefixed, so check
+        # env var first, then settings, then default.
         if enforce_signed is not None:
             self.enforce_signed = enforce_signed
         else:
-            env_enforce = os.environ.get(
-                "LLMROUTER_ENFORCE_SIGNED_MODELS", "true"
-            ).lower()
-            self.enforce_signed = env_enforce == "true"
+            env_enforce = os.environ.get("LLMROUTER_ENFORCE_SIGNED_MODELS")
+            if env_enforce is not None:
+                self.enforce_signed = env_enforce.lower() == "true"
+            else:
+                try:
+                    from litellm_llmrouter.settings import get_settings
+
+                    self.enforce_signed = get_settings().security.enforce_signed_models
+                except Exception:
+                    self.enforce_signed = True
 
         self._manifest: Optional[ModelManifest] = None
         self._manifest_lock = threading.RLock()
@@ -801,17 +809,36 @@ class ModelActivationManager:
         self._staged_model_path: Optional[str] = None
 
         # Strict pickle mode configuration
+        # LLMROUTER_STRICT_PICKLE_MODE is NOT ROUTEIQ_-prefixed.
         if strict_pickle_mode is not None:
             self.strict_pickle_mode = strict_pickle_mode
         else:
-            env_strict = os.environ.get("LLMROUTER_STRICT_PICKLE_MODE", "false").lower()
-            self.strict_pickle_mode = env_strict == "true"
+            env_strict = os.environ.get("LLMROUTER_STRICT_PICKLE_MODE")
+            if env_strict is not None:
+                self.strict_pickle_mode = env_strict.lower() == "true"
+            else:
+                try:
+                    from litellm_llmrouter.settings import get_settings
+
+                    self.strict_pickle_mode = get_settings().security.strict_pickle_mode
+                except Exception:
+                    self.strict_pickle_mode = False
 
         # Pickle allowlist (explicit SHA256 hashes that bypass signature requirement)
+        # LLMROUTER_PICKLE_ALLOWLIST is NOT ROUTEIQ_-prefixed.
         if pickle_allowlist is not None:
             self.pickle_allowlist = set(pickle_allowlist)
         else:
-            allowlist_str = os.environ.get("LLMROUTER_PICKLE_ALLOWLIST", "")
+            env_allowlist = os.environ.get("LLMROUTER_PICKLE_ALLOWLIST")
+            if env_allowlist is not None:
+                allowlist_str = env_allowlist
+            else:
+                try:
+                    from litellm_llmrouter.settings import get_settings
+
+                    allowlist_str = get_settings().security.pickle_allowlist or ""
+                except Exception:
+                    allowlist_str = ""
             self.pickle_allowlist = (
                 set(h.strip() for h in allowlist_str.split(",") if h.strip())
                 if allowlist_str

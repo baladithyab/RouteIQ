@@ -105,7 +105,15 @@ def get_ha_mode() -> str:
     Returns:
         HA mode string: 'single' or 'leader_election'
     """
+    # LLMROUTER_HA_MODE is NOT ROUTEIQ_-prefixed, so check env var first.
     mode = os.getenv("LLMROUTER_HA_MODE", "").lower().strip()
+    if not mode:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            mode = get_settings().ha.mode.lower().strip()
+        except Exception:
+            pass
     if mode in (HA_MODE_SINGLE, HA_MODE_LEADER_ELECTION):
         return mode
 
@@ -156,14 +164,22 @@ def detect_leader_election_backend() -> LeaderElectionBackend:
     """Auto-detect the best leader election backend.
 
     Priority:
-    1. ``ROUTEIQ_LEADER_ELECTION_BACKEND`` env var (explicit override)
+    1. ``ROUTEIQ_LEADER_ELECTION_BACKEND`` env var / settings (explicit override)
     2. Kubernetes if running in a pod (detected via ``KUBERNETES_SERVICE_HOST``)
     3. Redis if ``REDIS_HOST`` is configured
     4. PostgreSQL if ``DATABASE_URL`` is configured
     5. None (single-instance mode)
     """
-    # 1. Explicit override
+    # 1. Explicit override — env var first, settings fallback
     explicit = os.getenv("ROUTEIQ_LEADER_ELECTION_BACKEND", "").strip().lower()
+    if not explicit:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            explicit = get_settings().ha.leader_election_backend.strip().lower()
+        except Exception:
+            pass
+
     if explicit:
         try:
             return LeaderElectionBackend(explicit)
@@ -177,12 +193,28 @@ def detect_leader_election_backend() -> LeaderElectionBackend:
     if os.getenv("KUBERNETES_SERVICE_HOST"):
         return LeaderElectionBackend.KUBERNETES
 
-    # 3. Redis
-    if os.getenv("REDIS_HOST"):
+    # 3. Redis — check settings then env var
+    redis_configured = False
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        redis_configured = get_settings().redis_configured
+    except Exception:
+        redis_configured = bool(os.getenv("REDIS_HOST"))
+
+    if redis_configured:
         return LeaderElectionBackend.REDIS
 
-    # 4. PostgreSQL
-    if os.getenv("DATABASE_URL"):
+    # 4. PostgreSQL — check settings then env var
+    pg_configured = False
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        pg_configured = get_settings().postgres_configured
+    except Exception:
+        pg_configured = bool(os.getenv("DATABASE_URL"))
+
+    if pg_configured:
         return LeaderElectionBackend.POSTGRES
 
     # 5. Single-instance

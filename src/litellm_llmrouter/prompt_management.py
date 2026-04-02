@@ -611,8 +611,13 @@ def reset_prompt_manager() -> None:
 
 def is_prompt_management_enabled() -> bool:
     """Check if prompt management feature is enabled."""
-    return os.getenv("ROUTEIQ_PROMPT_MANAGEMENT", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().prompt_management.enabled
+    except Exception:
+        return os.getenv("ROUTEIQ_PROMPT_MANAGEMENT", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )

@@ -828,6 +828,156 @@ class RouterR1Settings(BaseModel):
     )
 
 
+class ContextOptimizerSettings(BaseModel):
+    """Context optimizer plugin configuration.
+
+    Reduces LLM input tokens by 30-70% using deterministic, lossless transforms.
+
+    Env vars: ``ROUTEIQ_CONTEXT_OPTIMIZE``,
+    ``ROUTEIQ_CONTEXT_OPTIMIZE_MAX_TURNS``,
+    ``ROUTEIQ_CONTEXT_OPTIMIZE_KEEP_LAST``.
+    """
+
+    mode: str = Field(
+        "off",
+        description="Optimization mode: off, safe, or aggressive.",
+    )
+    max_turns: int = Field(
+        40,
+        ge=1,
+        description="Trim conversations with more turns than this.",
+    )
+    keep_last: int = Field(
+        20,
+        ge=1,
+        description="Keep this many recent turns after trimming.",
+    )
+
+
+class EvaluatorSettings(BaseModel):
+    """Evaluator plugin configuration.
+
+    Env vars: ``ROUTEIQ_EVALUATOR_ENABLED``, ``ROUTEIQ_EVALUATOR_PLUGINS``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable evaluator hooks for post-invocation scoring.",
+    )
+    plugins: str = Field(
+        "",
+        description="Comma-separated list of evaluator plugin paths.",
+    )
+
+
+class ContentFilterSettings(BaseModel):
+    """Content/toxicity filter plugin configuration.
+
+    Env vars: ``CONTENT_FILTER_ENABLED``, ``CONTENT_FILTER_THRESHOLD``,
+    ``CONTENT_FILTER_ACTION``, ``CONTENT_FILTER_CATEGORIES``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable content/toxicity filtering.",
+    )
+    threshold: float = Field(
+        0.7,
+        ge=0.0,
+        le=1.0,
+        description="Default score threshold for category violations.",
+    )
+    action: str = Field(
+        "block",
+        description="Default action: block, warn, or log.",
+    )
+    categories: str = Field(
+        "violence,hate_speech,sexual,self_harm,illegal_activity",
+        description="Comma-separated list of active filter categories.",
+    )
+
+
+class AgenticPipelineSettings(BaseModel):
+    """Agentic multi-round routing pipeline configuration.
+
+    Decomposes complex queries into sub-queries, routes independently,
+    and aggregates responses.
+
+    Env vars: ``ROUTEIQ_AGENTIC_PIPELINE``,
+    ``ROUTEIQ_AGENTIC_ORCHESTRATOR_MODEL``,
+    ``ROUTEIQ_AGENTIC_COMPLEXITY_THRESHOLD``,
+    ``ROUTEIQ_AGENTIC_MAX_SUBQUERIES``,
+    ``ROUTEIQ_AGENTIC_PARALLEL``,
+    ``ROUTEIQ_AGENTIC_TIMEOUT``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable the agentic multi-round routing pipeline.",
+    )
+    orchestrator_model: str = Field(
+        "gpt-4o-mini",
+        description="Model for decompose/aggregate orchestration.",
+    )
+    complexity_threshold: float = Field(
+        0.6,
+        ge=0.0,
+        le=1.0,
+        description="Queries above this complexity score get decomposed.",
+    )
+    max_subqueries: int = Field(
+        4,
+        ge=1,
+        le=10,
+        description="Maximum decomposition fan-out.",
+    )
+    parallel: bool = Field(
+        True,
+        description="Execute sub-queries in parallel.",
+    )
+    timeout: float = Field(
+        30.0,
+        ge=1.0,
+        description="Per sub-query timeout in seconds.",
+    )
+
+
+class PromptManagementSettings(BaseModel):
+    """Prompt management & versioning configuration.
+
+    Env var: ``ROUTEIQ_PROMPT_MANAGEMENT``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable prompt management and versioning.",
+    )
+
+
+class CostTrackerSettings(BaseModel):
+    """Cost tracker plugin configuration.
+
+    Env var: ``COST_TRACKER_ENABLED``.
+    """
+
+    enabled: bool = Field(
+        True,
+        description="Enable per-request LLM cost tracking.",
+    )
+
+
+class SkillsDiscoverySettings(BaseModel):
+    """Skills discovery plugin configuration.
+
+    Env var: ``ROUTEIQ_SKILLS_DIR``.
+    """
+
+    skills_dir: Optional[str] = Field(
+        None,
+        description="Directory to load skills from (default: ./skills or ./docs/skills).",
+    )
+
+
 class EvalPipelineSettings(BaseModel):
     """Evaluation pipeline configuration.
 
@@ -1103,6 +1253,34 @@ class GatewaySettings(BaseSettings):
     router_r1: RouterR1Settings = Field(
         default_factory=RouterR1Settings,
         description="Router-R1 iterative reasoning router settings.",
+    )
+    context_optimizer: ContextOptimizerSettings = Field(
+        default_factory=ContextOptimizerSettings,
+        description="Context optimizer plugin settings.",
+    )
+    evaluator: EvaluatorSettings = Field(
+        default_factory=EvaluatorSettings,
+        description="Evaluator plugin settings.",
+    )
+    content_filter: ContentFilterSettings = Field(
+        default_factory=ContentFilterSettings,
+        description="Content/toxicity filter settings.",
+    )
+    agentic_pipeline: AgenticPipelineSettings = Field(
+        default_factory=AgenticPipelineSettings,
+        description="Agentic multi-round routing pipeline settings.",
+    )
+    prompt_management: PromptManagementSettings = Field(
+        default_factory=PromptManagementSettings,
+        description="Prompt management and versioning settings.",
+    )
+    cost_tracker: CostTrackerSettings = Field(
+        default_factory=CostTrackerSettings,
+        description="Cost tracker plugin settings.",
+    )
+    skills_discovery: SkillsDiscoverySettings = Field(
+        default_factory=SkillsDiscoverySettings,
+        description="Skills discovery plugin settings.",
     )
 
     # ------------------------------------------------------------------
