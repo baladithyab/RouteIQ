@@ -488,8 +488,33 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     except RuntimeError:
         asyncio.run(run_plugin_startup())
 
+    # ---- Service Discovery: probe external services and log status ----
+    async def run_service_probes():
+        try:
+            from litellm_llmrouter.service_discovery import (
+                probe_all_services,
+                get_feature_availability,
+                format_service_status_table,
+            )
+
+            services = await probe_all_services()
+            features = get_feature_availability(services)
+            table = format_service_status_table(services, features)
+            print(table)
+        except ImportError as e:
+            logger.debug(f"Service discovery not available: {e}")
+        except Exception as e:
+            logger.warning(f"Service discovery failed: {e}")
+            print(f"⚠️ Service discovery failed: {e}")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(run_service_probes())
+    except RuntimeError:
+        asyncio.run(run_service_probes())
+
     print("✅ LLMRouter routes registered with LiteLLM")
     print("   ├── /_health/* (K8s probes, unauthenticated)")
+    print("   ├── /config/services (service discovery, unauthenticated)")
     print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
     print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
     print("   └── /router/*, /config/* (hot reload, auth-protected)")

@@ -296,6 +296,57 @@ routeiq:
     enabled: false          # ROUTEIQ_ADMIN_UI_ENABLED
 
 # -----------------------------------------------------------------------------
+# External services (plug-in mode)
+# -----------------------------------------------------------------------------
+# When deploying RouteIQ alongside managed services (RDS, ElastiCache, etc.),
+# configure these sections. Leave empty to disable the corresponding feature.
+# RouteIQ degrades gracefully — unconfigured services simply disable features.
+# Check /config/services at runtime to see which services are connected.
+
+# External PostgreSQL (enables persistence, DB-backed keys, teams)
+# Set postgresql.enabled=false in a sub-chart scenario and configure here
+externalPostgresql:
+  # Host of your managed PostgreSQL (e.g., mydb.abc123.rds.amazonaws.com)
+  host: ""
+  port: 5432
+  database: "litellm"
+  username: "routeiq"
+  # K8s secret containing the password
+  existingSecret: ""         # Secret name
+  existingSecretKey: "password"  # Key within the secret
+  # SSL mode: disable, allow, prefer, require, verify-ca, verify-full
+  sslMode: "require"
+
+# External Redis (enables caching, HA leader election, rate limiting)
+externalRedis:
+  # Host of your managed Redis (e.g., mycluster.abc123.cache.amazonaws.com)
+  host: ""
+  port: 6379
+  # K8s secret containing the password
+  existingSecret: ""
+  existingSecretKey: "password"
+  db: 0
+  # Enable TLS/SSL for Redis connections
+  ssl: false
+
+# External OTel Collector (enables distributed tracing and metrics export)
+externalOtel:
+  # OTLP endpoint (e.g., http://otel-collector.monitoring:4317)
+  endpoint: ""
+  # Protocol: grpc or http
+  protocol: "grpc"
+
+# OIDC / SSO Configuration (enables single sign-on for admin UI)
+oidc:
+  enabled: false
+  # OIDC issuer URL (e.g., https://your-tenant.auth0.com/)
+  issuerUrl: ""
+  clientId: ""
+  # K8s secret containing the client_secret
+  existingSecret: ""
+  existingSecretKey: "oidc-client-secret"
+
+# -----------------------------------------------------------------------------
 # Secrets configuration
 # -----------------------------------------------------------------------------
 # Secrets can be provided via:

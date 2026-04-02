@@ -226,4 +226,61 @@ Environment variables for gateway configuration
   value: {{ .Values.routeiq.routingProfile | quote }}
 - name: ROUTEIQ_ADMIN_UI_ENABLED
   value: {{ .Values.routeiq.adminUI.enabled | quote }}
+
+# External PostgreSQL
+{{- if .Values.externalPostgresql.host }}
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+{{- if .Values.externalPostgresql.existingSecret }}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.externalPostgresql.existingSecret }}
+      key: {{ .Values.externalPostgresql.existingSecretKey | default "password" }}
+{{- end }}
+{{- end }}
+
+# External Redis
+{{- if .Values.externalRedis.host }}
+- name: REDIS_HOST
+  value: {{ .Values.externalRedis.host | quote }}
+- name: REDIS_PORT
+  value: {{ .Values.externalRedis.port | quote }}
+- name: REDIS_DB
+  value: {{ .Values.externalRedis.db | quote }}
+- name: REDIS_SSL
+  value: {{ .Values.externalRedis.ssl | quote }}
+{{- if .Values.externalRedis.existingSecret }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.externalRedis.existingSecret }}
+      key: {{ .Values.externalRedis.existingSecretKey | default "password" }}
+{{- end }}
+{{- end }}
+
+# External OTel Collector
+{{- if .Values.externalOtel.endpoint }}
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: {{ .Values.externalOtel.endpoint | quote }}
+- name: OTEL_EXPORTER_OTLP_PROTOCOL
+  value: {{ .Values.externalOtel.protocol | default "grpc" | quote }}
+{{- end }}
+
+# OIDC / SSO
+{{- if .Values.oidc.enabled }}
+- name: ROUTEIQ_OIDC_ENABLED
+  value: "true"
+- name: ROUTEIQ_OIDC_ISSUER_URL
+  value: {{ .Values.oidc.issuerUrl | quote }}
+- name: ROUTEIQ_OIDC_CLIENT_ID
+  value: {{ .Values.oidc.clientId | quote }}
+{{- if .Values.oidc.existingSecret }}
+- name: ROUTEIQ_OIDC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.oidc.existingSecret }}
+      key: {{ .Values.oidc.existingSecretKey | default "oidc-client-secret" }}
+{{- end }}
+{{- end }}
 {{- end }}

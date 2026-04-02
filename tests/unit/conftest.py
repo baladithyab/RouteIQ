@@ -102,6 +102,10 @@ def _reset_all_singletons():
 
     reset_centroid_strategy()
 
+    from litellm_llmrouter.service_discovery import reset_service_discovery
+
+    reset_service_discovery()
+
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for
     # when the pool is not initialized, so skipping it is safe.

@@ -13,6 +13,7 @@ dependencies = [
     # Core application framework
     "fastapi>=0.109.0",
     "pydantic>=2.5.0",
+    "pydantic-settings>=2.2.0",
     "httpx>=0.26.0",
     # LiteLLM core (provides Router, logging, etc.)
     # Note: Using litellm without [proxy] extra due to strict pinned dependencies in proxy extra

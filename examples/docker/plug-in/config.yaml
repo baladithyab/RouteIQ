@@ -1,0 +1,23 @@
+# =============================================================================
+# RouteIQ Gateway — Minimal Config for Plug-In Mode
+# =============================================================================
+# Customize the model_list to match your LLM provider setup.
+# See docs/configuration.md for all options.
+
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+general_settings:
+  master_key: env/LITELLM_MASTER_KEY

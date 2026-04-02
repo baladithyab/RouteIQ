@@ -258,6 +258,24 @@ async def readiness_probe():
     return response
 
 
+@health_router.get("/config/services")
+async def service_status():
+    """Return status of all external services and feature availability.
+
+    This unauthenticated endpoint reports which external services are
+    reachable and which features are available based on service status.
+    Useful for operators to understand the gateway's current capabilities.
+    """
+    from ..service_discovery import probe_all_services, get_feature_availability
+
+    services = await probe_all_services()
+    features = get_feature_availability(services)
+    return {
+        "services": {name: status.to_dict() for name, status in services.items()},
+        "features": features,
+    }
+
+
 @health_router.get("/_health/models")
 async def model_health():
     """Per-model health detail. Unauthenticated."""

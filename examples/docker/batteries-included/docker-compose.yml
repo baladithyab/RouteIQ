@@ -1,0 +1,188 @@
+# =============================================================================
+# RouteIQ Gateway — Batteries-Included Mode
+# =============================================================================
+# Full stack deployment with all services bundled:
+#   - PostgreSQL 16 for persistent storage
+#   - Redis 7 for caching and HA state
+#   - OTel Collector (contrib) for telemetry
+#   - Jaeger for trace visualization
+#   - RouteIQ Gateway with all features enabled
+#
+# For production, replace these bundled services with managed equivalents
+# (RDS, ElastiCache, Datadog/Grafana) and switch to the plug-in example.
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Access points:
+#   - RouteIQ Gateway: http://localhost:4000
+#   - Admin UI:        http://localhost:4000/ui/
+#   - Jaeger UI:       http://localhost:16686
+#   - Service Status:  http://localhost:4000/config/services
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # PostgreSQL — Persistent storage for API keys, teams, model configs
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: routeiq-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-routeiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-routeiq_local}
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-routeiq}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # Redis — Response caching, rate limiting, leader election
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: routeiq-redis
+    command: >-
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-routeiq_local}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-routeiq_local}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # OTel Collector — Receives traces/metrics from the gateway, exports to Jaeger
+  # ==========================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: routeiq-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "8888:8888"    # Collector metrics
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # Jaeger — Distributed trace storage and UI
+  # ==========================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: routeiq-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    ports:
+      - "16686:16686"  # Jaeger UI
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+  # ==========================================================================
+  # RouteIQ Gateway — The AI gateway with all features enabled
+  # ==========================================================================
+  routeiq:
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: routeiq-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+    environment:
+      # --- Core ---
+      LITELLM_CONFIG_PATH: /app/config/config.yaml
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}"
+
+      # --- LLM Provider Keys ---
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+
+      # --- PostgreSQL (bundled) ---
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-routeiq}:${POSTGRES_PASSWORD:-routeiq_local}@postgres:5432/${POSTGRES_DB:-litellm}"
+      STORE_MODEL_IN_DB: "true"
+
+      # --- Redis (bundled) ---
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-routeiq_local}"
+
+      # --- OTel (bundled collector → Jaeger) ---
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_SERVICE_NAME: routeiq-gateway
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: none
+      OTEL_ENABLED: "true"
+
+      # --- RouteIQ Settings ---
+      ROUTEIQ_USE_PLUGIN_STRATEGY: "true"
+      ROUTEIQ_WORKERS: "2"
+      ROUTEIQ_CENTROID_ROUTING: "true"
+      ROUTEIQ_ROUTING_PROFILE: auto
+      ROUTEIQ_ADMIN_UI_ENABLED: "true"
+
+      # --- Gateway Features ---
+      A2A_GATEWAY_ENABLED: "true"
+      MCP_GATEWAY_ENABLED: "true"
+
+      # --- Config ---
+      CONFIG_HOT_RELOAD: "true"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  routeiq-network:
+    driver: bridge
