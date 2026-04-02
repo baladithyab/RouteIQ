@@ -176,7 +176,9 @@ class ManagementMiddleware:
                     admin_key = (
                         _extract_bearer_token(auth_header) if auth_header else ""
                     )
-                if admin_key and admin_key in admin_keys:
+                from litellm_llmrouter.auth import _constant_time_contains
+
+                if admin_key and _constant_time_contains(admin_key, admin_keys):
                     return None  # Admin bypass
         except Exception:
             pass

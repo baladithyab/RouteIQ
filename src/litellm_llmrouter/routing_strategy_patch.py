@@ -1,34 +1,38 @@
 """
-LiteLLM Router Strategy Patch
-==============================
+LiteLLM Router Strategy Patch (DEPRECATED)
+============================================
 
-This module patches LiteLLM's Router class to accept `llmrouter-*` routing strategies.
-It must be imported BEFORE any Router initialization occurs.
+.. deprecated:: 0.3.0
+    This module is **deprecated** in favour of the plugin-based routing strategy in
+    ``custom_routing_strategy.py``, which uses LiteLLM's official
+    ``CustomRoutingStrategyBase`` API instead of monkey-patching.
 
-The patch works by:
-1. Monkey-patching the routing_strategy_init() method to accept llmrouter-* prefixed strategies
-2. Registering custom routing strategy handlers that delegate to LLMRouterStrategyFamily
-3. Integrating with RoutingPipeline for A/B testing support and telemetry
+    The plugin strategy is enabled by default (``ROUTEIQ_USE_PLUGIN_STRATEGY=true``)
+    and provides the same capabilities (ML routing, A/B testing, centroid fallback)
+    without modifying LiteLLM internals.
 
-This approach is necessary because LiteLLM validates routing_strategy against a fixed enum
-at runtime (see router.py lines 719-736), and we cannot extend Python enums at runtime.
+    **Migration**: Remove calls to ``patch_litellm_router()`` from your startup code.
+    The gateway factory (``create_app()``) handles routing strategy installation
+    automatically via ``install_routeiq_strategy()``.
+
+    This module is retained solely for backward compatibility with deployments that
+    explicitly set ``ROUTEIQ_USE_PLUGIN_STRATEGY=false``.  It will be removed in a
+    future major release.
+
+Legacy behaviour (when ROUTEIQ_USE_PLUGIN_STRATEGY=false):
+1. Monkey-patches the routing_strategy_init() method to accept llmrouter-* prefixed strategies
+2. Registers custom routing strategy handlers that delegate to LLMRouterStrategyFamily
+3. Integrates with RoutingPipeline for A/B testing support and telemetry
 
 Version Compatibility:
 - Tested with litellm >= 1.50.0
 - The patch checks for method signature compatibility
-
-Usage:
-    # Import this module before creating any Router instances:
-    import litellm_llmrouter.routing_strategy_patch
-
-    # Or explicitly call:
-    from litellm_llmrouter.routing_strategy_patch import patch_litellm_router
-    patch_litellm_router()
 """
 
 import functools
 import logging
 import os
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
@@ -444,11 +448,30 @@ def patch_litellm_router() -> bool:
     """
     Apply the patch to LiteLLM's Router class.
 
+    .. deprecated:: 0.3.0
+        Use ``install_routeiq_strategy()`` from ``custom_routing_strategy.py`` instead.
+        Set ``ROUTEIQ_USE_PLUGIN_STRATEGY=true`` (the default) to use the plugin-based
+        routing strategy without monkey-patching.
+
     Returns:
         True if patch was applied successfully, False otherwise.
     """
     global _patch_applied, _original_routing_strategy_init
     global _original_get_available_deployment, _original_async_get_available_deployment
+
+    warnings.warn(
+        "patch_litellm_router() is deprecated and will be removed in a future release. "
+        "Use the plugin-based routing strategy instead "
+        "(ROUTEIQ_USE_PLUGIN_STRATEGY=true, which is the default). "
+        "See custom_routing_strategy.py for the replacement.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    logger.warning(
+        "DEPRECATED: patch_litellm_router() called. "
+        "Prefer ROUTEIQ_USE_PLUGIN_STRATEGY=true (default) which uses "
+        "LiteLLM's official CustomRoutingStrategyBase API instead of monkey-patching."
+    )
 
     if _patch_applied:
         logger.debug("LiteLLM Router patch already applied")
@@ -509,11 +532,22 @@ def unpatch_litellm_router() -> bool:
     """
     Remove the patch from LiteLLM's Router class.
 
+    .. deprecated:: 0.3.0
+        This function is deprecated along with ``patch_litellm_router()``.
+
     Returns:
         True if unpatch was successful, False otherwise.
     """
     global _patch_applied, _original_routing_strategy_init
     global _original_get_available_deployment, _original_async_get_available_deployment
+
+    warnings.warn(
+        "unpatch_litellm_router() is deprecated and will be removed in a future release. "
+        "The plugin-based routing strategy (ROUTEIQ_USE_PLUGIN_STRATEGY=true) does not "
+        "require patching/unpatching.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     if not _patch_applied:
         logger.debug("LiteLLM Router patch not applied, nothing to unpatch")

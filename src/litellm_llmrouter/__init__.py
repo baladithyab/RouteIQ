@@ -12,17 +12,22 @@ Features:
 - S3/GCS config sync with hot reload
 - ETag-based change detection for efficient syncing
 - Runtime A/B testing via strategy registry and routing pipeline
+- Centroid routing for zero-config intelligent routing (~2ms)
 
-Usage:
-    from litellm_llmrouter import register_llmrouter_strategies, patch_litellm_router
+Recommended Usage (Plugin Strategy — default):
+    from litellm_llmrouter import install_routeiq_strategy
 
-    # Apply the router patch BEFORE creating any Router instances
-    # This is explicit and idempotent (safe to call multiple times)
-    patch_litellm_router()
+    # After creating a LiteLLM Router instance:
+    install_routeiq_strategy(router, strategy_name="llmrouter-knn")
 
-    # Log available LLMRouter strategies (activated via the patch above,
-    # NOT registered in a separate registry despite the function name)
-    register_llmrouter_strategies()
+    # Or use the gateway factory which handles everything automatically:
+    from litellm_llmrouter.gateway import create_app
+    app = create_app()
+
+Legacy Usage (DEPRECATED — monkey-patch approach):
+    # Only used when ROUTEIQ_USE_PLUGIN_STRATEGY=false
+    from litellm_llmrouter import patch_litellm_router
+    patch_litellm_router()  # emits DeprecationWarning
 
 A/B Testing:
     from litellm_llmrouter import get_routing_registry, get_routing_pipeline
@@ -33,19 +38,22 @@ A/B Testing:
 
 Note:
     Importing this module does NOT apply any monkey patches automatically.
-    You must call patch_litellm_router() explicitly from your startup code.
-    For convenience, use the gateway.create_app() factory which handles this.
+    The gateway factory (``create_app()``) handles routing strategy installation.
+    The plugin strategy (``ROUTEIQ_USE_PLUGIN_STRATEGY=true``) is the default
+    and recommended path. The legacy monkey-patch is deprecated.
 
 Build: Migrated CI to uv for faster package management (2026-01-26)
 """
 
-# Routing strategy patch - NOT auto-applied on import
-# Call patch_litellm_router() explicitly from startup
+# Legacy routing strategy patch — DEPRECATED.
+# Prefer the plugin-based strategy in custom_routing_strategy.py
+# (ROUTEIQ_USE_PLUGIN_STRATEGY=true, the default).
+# These exports are retained for backward compatibility only.
 from .routing_strategy_patch import (
-    patch_litellm_router,
-    unpatch_litellm_router,
-    is_patch_applied,
-    is_pipeline_routing_enabled,
+    patch_litellm_router,  # deprecated — use install_routeiq_strategy() instead
+    unpatch_litellm_router,  # deprecated
+    is_patch_applied,  # deprecated — plugin strategy doesn't use patches
+    is_pipeline_routing_enabled,  # deprecated
 )
 
 from .strategies import (
@@ -133,7 +141,8 @@ except Exception:
     __version__ = "0.2.0"  # fallback if not installed as package
 
 __all__ = [
-    # Router patch (for llmrouter-* strategies)
+    # Router patch — DEPRECATED (retained for backward compatibility)
+    # Prefer RouteIQRoutingStrategy / install_routeiq_strategy() instead.
     "patch_litellm_router",
     "unpatch_litellm_router",
     "is_patch_applied",

@@ -1,0 +1,79 @@
+# RouteIQ Gateway - Slim Build
+# =============================================================================
+# Minimal gateway image (~500MB) with centroid routing (zero-config, ~2ms).
+# Excludes KNN/PyTorch/sentence-transformers (~1GB+) and Prisma/DB layer.
+#
+# Quick start:
+#   cp .env.example .env
+#   # Edit .env with your API keys
+#   docker compose up -d
+#
+# What's included:
+#   - RouteIQ gateway core with centroid routing
+#   - OpenTelemetry instrumentation
+#   - Cloud provider SDKs (AWS, GCP, Azure)
+#   - A2A protocol, hot reload, OIDC auth
+#
+# What's excluded:
+#   - KNN/ML routing strategies (PyTorch, sentence-transformers)
+#   - Admin UI (React SPA)
+#   - Direct database access (Prisma)
+#
+# For the full-featured image, see: ../basic/ or ../full-stack/
+# =============================================================================
+
+services:
+  routeiq:
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile
+      args:
+        ROUTEIQ_EXTRAS: "otel,cloud,a2a,hotreload,oidc"
+        BUILD_UI: "false"
+        INSTALL_LLMROUTER: "false"
+    image: routeiq:slim
+    container_name: routeiq-slim
+    ports:
+      - "4000:4000"
+    environment:
+      # SECURITY: Set a real master key in production
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-routeiq-dev-key}
+      # LLM Provider API Keys (set in .env)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # Centroid routing: zero-config, ~2ms latency
+      - ROUTEIQ_CENTROID_ROUTING=true
+      - ROUTEIQ_ROUTING_PROFILE=${ROUTEIQ_ROUTING_PROFILE:-auto}
+      # Plugin strategy (required for multi-worker)
+      - ROUTEIQ_USE_PLUGIN_STRATEGY=true
+      - ROUTEIQ_WORKERS=${ROUTEIQ_WORKERS:-1}
+      # Admin API Keys (for control plane endpoints)
+      - ADMIN_API_KEYS=${ADMIN_API_KEYS:-}
+      # Gateway features
+      - A2A_GATEWAY_ENABLED=${A2A_GATEWAY_ENABLED:-false}
+      - MCP_GATEWAY_ENABLED=${MCP_GATEWAY_ENABLED:-false}
+      # Observability (configure OTEL_EXPORTER_OTLP_ENDPOINT to enable)
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-routeiq-slim}
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+networks:
+  routeiq-network:
+    driver: bridge

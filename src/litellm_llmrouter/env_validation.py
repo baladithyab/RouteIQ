@@ -45,8 +45,6 @@ _BOOLEAN_ENV_VARS: tuple[str, ...] = (
     "A2A_GATEWAY_ENABLED",
     "CONFIG_HOT_RELOAD",
     "POLICY_ENGINE_ENABLED",
-    "MCP_SSE_TRANSPORT_ENABLED",
-    "MCP_PROTOCOL_PROXY_ENABLED",
     "LLMROUTER_ALLOW_PICKLE_MODELS",
     "LLMROUTER_ENFORCE_SIGNED_MODELS",
     "ROUTEIQ_USE_PLUGIN_STRATEGY",
@@ -122,6 +120,7 @@ def validate_environment() -> ValidationResult:
     _validate_port_vars(result)
     _validate_positive_int_vars(result)
     _validate_routing_profile(result)
+    _validate_pickle_security(result)
 
     # Summary log
     n_errors = len(result.errors)
@@ -270,3 +269,27 @@ def _validate_routing_profile(result: ValidationResult) -> None:
             f"ROUTEIQ_ROUTING_PROFILE has unexpected value '{value}' "
             f"(expected one of: {', '.join(sorted(_VALID_ROUTING_PROFILES))})"
         )
+
+
+def _validate_pickle_security(result: ValidationResult) -> None:
+    """Warn when pickle loading is enabled without signed-model enforcement.
+
+    Allowing pickle model loading (``LLMROUTER_ALLOW_PICKLE_MODELS=true``)
+    without requiring signed models (``LLMROUTER_ENFORCE_SIGNED_MODELS=true``)
+    creates a code-execution risk because arbitrary pickle payloads would be
+    loaded without cryptographic verification.
+    """
+    allow_pickle = os.environ.get("LLMROUTER_ALLOW_PICKLE_MODELS", "").lower().strip()
+    enforce_signed = (
+        os.environ.get("LLMROUTER_ENFORCE_SIGNED_MODELS", "").lower().strip()
+    )
+
+    if allow_pickle in ("true", "1", "yes"):
+        if enforce_signed not in ("true", "1", "yes"):
+            result.warnings.append(
+                "LLMROUTER_ALLOW_PICKLE_MODELS is enabled but "
+                "LLMROUTER_ENFORCE_SIGNED_MODELS is not set to 'true'. "
+                "This allows loading unverified pickle models which is a "
+                "code-execution risk. Set LLMROUTER_ENFORCE_SIGNED_MODELS=true "
+                "to require cryptographic verification of model artifacts."
+            )

@@ -701,7 +701,7 @@ class PolicyMiddleware:
         if body_bytes:
             try:
                 parsed_body = json.loads(body_bytes)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except json.JSONDecodeError, UnicodeDecodeError:
                 parsed_body = None
 
         context = self._build_context(scope, api_type=api_type, parsed_body=parsed_body)
@@ -820,7 +820,6 @@ class PolicyMiddleware:
         body = {
             "error": "policy_denied",
             "message": decision.reason or "Request denied by policy",
-            "policy_name": decision.policy_name,
             "request_id": decision.request_id,
         }
 

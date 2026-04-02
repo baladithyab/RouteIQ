@@ -184,6 +184,18 @@ wheels = [
 ]
 
 [[package]]
+name = "authlib"
+version = "1.6.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/af/98/00d3dd826d46959ad8e32af2dbb2398868fd9fd0683c26e56d0789bd0e68/authlib-1.6.9.tar.gz", hash = "sha256:d8f2421e7e5980cc1ddb4e32d3f5fa659cfaf60d8eaf3281ebed192e4ab74f04", size = 165134, upload-time = "2026-03-02T07:44:01.998Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/23/b65f568ed0c22f1efacb744d2db1a33c8068f384b8c9b482b52ebdbc3ef6/authlib-1.6.9-py2.py3-none-any.whl", hash = "sha256:f08b4c14e08f0861dc18a32357b33fbcfd2ea86cfe3fe149484b4d764c4a0ac3", size = 244197, upload-time = "2026-03-02T07:44:00.307Z" },
+]
+
+[[package]]
 name = "azure-core"
 version = "1.38.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2119,11 +2131,9 @@ name = "routeiq"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "a2a-sdk" },
     { name = "aiofiles" },
     { name = "apscheduler" },
     { name = "backoff" },
-    { name = "boto3" },
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "fastapi-sso" },
@@ -2139,15 +2149,20 @@ dependencies = [
     { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "redis" },
-    { name = "watchdog" },
     { name = "websockets" },
 ]
 
 [package.optional-dependencies]
+a2a = [
+    { name = "a2a-sdk" },
+]
 all = [
+    { name = "a2a-sdk" },
     { name = "asyncpg" },
+    { name = "authlib" },
     { name = "azure-identity" },
     { name = "black" },
+    { name = "boto3" },
     { name = "google-cloud-aiplatform" },
     { name = "hypothesis" },
     { name = "mypy" },
@@ -2162,12 +2177,14 @@ all = [
     { name = "ruff" },
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+    { name = "watchdog" },
 ]
 callbacks = [
     { name = "langfuse" },
 ]
 cloud = [
     { name = "azure-identity" },
+    { name = "boto3" },
     { name = "google-cloud-aiplatform" },
 ]
 db = [
@@ -2182,9 +2199,15 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+hotreload = [
+    { name = "watchdog" },
+]
 knn = [
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+]
+oidc = [
+    { name = "authlib" },
 ]
 otel = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -2194,8 +2217,11 @@ otel = [
     { name = "opentelemetry-instrumentation-requests" },
 ]
 prod = [
+    { name = "a2a-sdk" },
     { name = "asyncpg" },
+    { name = "authlib" },
     { name = "azure-identity" },
+    { name = "boto3" },
     { name = "google-cloud-aiplatform" },
     { name = "langfuse" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -2206,6 +2232,7 @@ prod = [
     { name = "prisma" },
     { name = "scikit-learn" },
     { name = "sentence-transformers" },
+    { name = "watchdog" },
 ]
 
 [package.dev-dependencies]
@@ -2223,14 +2250,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", specifier = ">=0.2.0" },
+    { name = "a2a-sdk", marker = "extra == 'a2a'", specifier = ">=0.2.0" },
     { name = "aiofiles", specifier = ">=23.0.0" },
     { name = "apscheduler", specifier = ">=3.10.0" },
     { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.29.0" },
+    { name = "authlib", marker = "extra == 'oidc'", specifier = ">=1.5.0" },
     { name = "azure-identity", marker = "extra == 'cloud'", specifier = ">=1.15.0" },
     { name = "backoff", specifier = ">=2.0.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=26.1.0" },
-    { name = "boto3", specifier = ">=1.42.32" },
+    { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.42.32" },
     { name = "email-validator", specifier = ">=2.0.0" },
     { name = "fastapi", specifier = ">=0.109.0" },
     { name = "fastapi-sso", specifier = ">=0.16.0" },
@@ -2258,15 +2286,15 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.0.0" },
-    { name = "routeiq", extras = ["db", "otel", "cloud", "callbacks", "knn"], marker = "extra == 'prod'" },
-    { name = "routeiq", extras = ["dev", "db", "otel", "cloud", "knn"], marker = "extra == 'all'" },
+    { name = "routeiq", extras = ["db", "otel", "cloud", "callbacks", "knn", "a2a", "hotreload", "oidc"], marker = "extra == 'prod'" },
+    { name = "routeiq", extras = ["dev", "db", "otel", "cloud", "knn", "a2a", "hotreload", "oidc"], marker = "extra == 'all'" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.13" },
     { name = "scikit-learn", marker = "extra == 'knn'", specifier = ">=1.3.0" },
     { name = "sentence-transformers", marker = "extra == 'knn'", specifier = ">=5.2.0" },
-    { name = "watchdog", specifier = ">=3.0.0" },
+    { name = "watchdog", marker = "extra == 'hotreload'", specifier = ">=3.0.0" },
     { name = "websockets", specifier = ">=15.0.0" },
 ]
-provides-extras = ["dev", "db", "otel", "cloud", "callbacks", "knn", "prod", "all"]
+provides-extras = ["dev", "db", "otel", "cloud", "a2a", "hotreload", "oidc", "callbacks", "knn", "prod", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2635,6 +2663,8 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/f4/39/590742415c3030551944edc2ddc273ea1fdfe8ffb2780992e824f1ebee98/torch-2.10.0-3-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:b1d5e2aba4eb7f8e87fbe04f86442887f9167a35f092afe4c237dfcaaef6e328", size = 915632474, upload-time = "2026-03-11T14:15:13.666Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/8e/34949484f764dde5b222b7fe3fede43e4a6f0da9d7f8c370bb617d629ee2/torch-2.10.0-3-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:0228d20b06701c05a8f978357f657817a4a63984b0c90745def81c18aedfa591", size = 915523882, upload-time = "2026-03-11T14:14:46.311Z" },
     { url = "https://files.pythonhosted.org/packages/4f/93/716b5ac0155f1be70ed81bacc21269c3ece8dba0c249b9994094110bfc51/torch-2.10.0-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:bf0d9ff448b0218e0433aeb198805192346c4fd659c852370d5cc245f602a06a", size = 79464992, upload-time = "2026-01-21T16:23:05.162Z" },
     { url = "https://files.pythonhosted.org/packages/69/2b/51e663ff190c9d16d4a8271203b71bc73a16aa7619b9f271a69b9d4a936b/torch-2.10.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:233aed0659a2503b831d8a67e9da66a62c996204c0bba4f4c442ccc0c68a3f60", size = 146018567, upload-time = "2026-01-21T16:22:23.393Z" },
     { url = "https://files.pythonhosted.org/packages/5e/cd/4b95ef7f293b927c283db0b136c42be91c8ec6845c44de0238c8c23bdc80/torch-2.10.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:682497e16bdfa6efeec8cde66531bc8d1fbbbb4d8788ec6173c089ed3cc2bfe5", size = 915721646, upload-time = "2026-01-21T16:21:16.983Z" },

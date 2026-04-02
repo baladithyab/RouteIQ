@@ -31,6 +31,7 @@ Configuration:
     control-plane endpoints will deny all requests (fail-closed).
 """
 
+import hmac as _hmac_module
 import logging
 import os
 import re
@@ -42,6 +43,27 @@ from fastapi import HTTPException, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
+
+# Regex for validating client-provided request IDs
+_VALID_REQUEST_ID = re.compile(r"^[a-zA-Z0-9\-_.]{1,128}$")
+
+
+def _constant_time_contains(candidate: str, valid_keys: set[str]) -> bool:
+    """
+    Check whether *candidate* is in *valid_keys* using constant-time comparison.
+
+    A naive ``candidate in valid_keys`` leaks timing information that can be
+    exploited to brute-force API keys one character at a time.  This helper
+    iterates **all** valid keys and uses :func:`hmac.compare_digest` for each
+    comparison so that the total time is independent of which (if any) key
+    matches.
+    """
+    found = False
+    for key in valid_keys:
+        if _hmac_module.compare_digest(candidate, key):
+            found = True
+    return found
+
 
 # ============================================================================
 # RouteIQ Key Prefix Support
@@ -301,6 +323,23 @@ async def admin_api_key_auth(request: Request) -> dict:
 
     # Check if admin auth is enabled
     if not _is_admin_auth_enabled():
+        # Only allow disabling admin auth outside of production
+        routeiq_env = os.getenv("ROUTEIQ_ENV", "").lower().strip()
+        if routeiq_env == "production":
+            logger.error(
+                "ADMIN_AUTH_ENABLED=false is forbidden in production "
+                "(ROUTEIQ_ENV=production) — denying request",
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "admin_auth_disabled_in_production",
+                    "message": "Admin auth cannot be disabled in production.",
+                    "request_id": request_id,
+                },
+            )
+
         logger.warning(
             "Admin auth disabled via ADMIN_AUTH_ENABLED=false",
             extra={"request_id": request_id},
@@ -349,7 +388,7 @@ async def admin_api_key_auth(request: Request) -> dict:
             },
         )
 
-    if admin_key not in admin_keys:
+    if not _constant_time_contains(admin_key, admin_keys):
         logger.warning(
             "Invalid admin API key in request",
             extra={"request_id": request_id, "path": str(request.url.path)},
@@ -438,7 +477,9 @@ class RequestIDMiddleware:
                 request_id = header_value.decode("latin-1").strip()
                 break
 
-        if not request_id:
+        # Validate client-provided request ID; generate a fresh one if missing
+        # or if the value contains unexpected characters (injection defence).
+        if not request_id or not _VALID_REQUEST_ID.match(request_id):
             request_id = str(uuid.uuid4())
 
         # Set in context for access throughout request handling

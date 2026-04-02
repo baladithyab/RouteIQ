@@ -21,10 +21,22 @@
 # - Health checks for orchestrators
 #
 # Build args:
-#   PYTHON_VERSION  - Python version (default: 3.14)
-#   UV_VERSION      - uv package manager version (default: 0.9)
-#   LITELLM_VERSION - LiteLLM version (default: 1.80.15)
-#   LLMROUTER_COMMIT - LLMRouter git commit hash
+#   PYTHON_VERSION    - Python version (default: 3.14)
+#   UV_VERSION        - uv package manager version (default: 0.9)
+#   LITELLM_VERSION   - LiteLLM version (default: 1.81.3)
+#   LLMROUTER_COMMIT  - LLMRouter git commit hash
+#   ROUTEIQ_EXTRAS    - Comma-separated pip extras (default: "prod")
+#   BUILD_UI          - Build and include admin UI (default: "true")
+#   INSTALL_LLMROUTER - Build and install LLMRouter wheel (default: "true")
+#
+# Build variants:
+#   Full (default):
+#     docker build -f docker/Dockerfile .
+#   Slim (~500MB, no KNN/PyTorch/Prisma):
+#     docker build -f docker/Dockerfile \
+#       --build-arg ROUTEIQ_EXTRAS="otel,cloud,a2a,hotreload,oidc" \
+#       --build-arg BUILD_UI=false \
+#       --build-arg INSTALL_LLMROUTER=false .
 #
 # Reproducible Builds:
 #   This Dockerfile uses uv.lock for deterministic dependency resolution.
@@ -38,6 +50,17 @@ ARG LITELLM_VERSION=1.81.3
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
 # ==============================================================================
+# Configurable build variants
+# ==============================================================================
+# ROUTEIQ_EXTRAS: pip extras to install. "prod" includes everything.
+#   Slim variant: "otel,cloud,a2a,hotreload,oidc" (no knn, no db/Prisma)
+ARG ROUTEIQ_EXTRAS="prod"
+# BUILD_UI: set to "false" to skip the admin UI React build stage
+ARG BUILD_UI="true"
+# INSTALL_LLMROUTER: set to "false" to skip LLMRouter wheel (not needed without KNN)
+ARG INSTALL_LLMROUTER="true"
+
+# ==============================================================================
 # Base image digests for reproducibility
 # To update: docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
 # ==============================================================================
@@ -47,10 +70,12 @@ ARG RUNTIME_DIGEST=sha256:f37be263fb880ce4ed918e487d84576462fb4fafa934dbd08d216a
 # ==============================================================================
 # Stage 1: Builder - Clone repos and build wheels with uv
 # ==============================================================================
+# Skipped entirely when INSTALL_LLMROUTER=false (slim builds)
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm@${BUILDER_DIGEST} AS builder
 
 ARG LLMROUTER_COMMIT
 ARG LITELLM_VERSION
+ARG INSTALL_LLMROUTER
 
 WORKDIR /build
 
@@ -60,25 +85,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 
 # Clone and build LLMRouter wheel from GitHub at pinned commit
 # All git operations and cleanup in single RUN to prevent .git in layer
+# When INSTALL_LLMROUTER=false, create empty /wheels dir and skip build
 RUN --mount=type=cache,target=/root/.cache/uv \
-    git clone --depth 1 https://github.com/ulab-uiuc/LLMRouter.git /tmp/LLMRouter \
-    && cd /tmp/LLMRouter \
-    && git fetch --depth 1 origin ${LLMROUTER_COMMIT} \
-    && git checkout ${LLMROUTER_COMMIT} \
-    && uv build --wheel --out-dir /wheels \
-    && rm -rf /tmp/LLMRouter
+    mkdir -p /wheels && \
+    if [ "${INSTALL_LLMROUTER}" = "true" ]; then \
+        git clone --depth 1 https://github.com/ulab-uiuc/LLMRouter.git /tmp/LLMRouter \
+        && cd /tmp/LLMRouter \
+        && git fetch --depth 1 origin ${LLMROUTER_COMMIT} \
+        && git checkout ${LLMROUTER_COMMIT} \
+        && uv build --wheel --out-dir /wheels \
+        && rm -rf /tmp/LLMRouter; \
+    else \
+        echo "Skipping LLMRouter build (INSTALL_LLMROUTER=false)"; \
+    fi
 
 # ==============================================================================
 # Stage 2: UI Builder (optional) - Build admin UI React SPA
 # ==============================================================================
+# When BUILD_UI=false, this stage still runs but produces an empty /ui/dist.
+# Docker BuildKit may skip unused stages, but we keep this safe either way.
 FROM node:20-alpine AS ui-builder
+ARG BUILD_UI
 WORKDIR /ui
 # Copy package files first for layer caching
 COPY ui/package.json ui/package-lock.json ./
-RUN npm ci --production=false
+RUN if [ "${BUILD_UI}" = "true" ]; then npm ci --production=false; fi
 # Copy source and build
 COPY ui/ ./
-RUN npm run build
+RUN if [ "${BUILD_UI}" = "true" ]; then \
+        npm run build; \
+    else \
+        mkdir -p /ui/dist && echo '<!DOCTYPE html><html><body>UI not included in slim build</body></html>' > /ui/dist/index.html; \
+    fi
 
 # ==============================================================================
 # Stage 3: Runtime - Production image with uv and OTEL support
@@ -89,6 +127,9 @@ ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
 ARG BUILD_DATE
 ARG VCS_REF
+ARG ROUTEIQ_EXTRAS
+ARG BUILD_UI
+ARG INSTALL_LLMROUTER
 
 # OCI Image Labels (https://github.com/opencontainers/image-spec)
 LABEL org.opencontainers.image.source="https://github.com/baladithyab/litellm-llm-router"
@@ -112,13 +153,15 @@ WORKDIR /app
 
 # Install minimal runtime dependencies in single layer (cleanup in same RUN)
 # Note: build-essential installed temporarily for uvloop compilation, then removed
-# Note: libatomic1 needed for Prisma/Node.js on slim images
+# Note: libatomic1 needed for Prisma/Node.js on slim images (skip for slim builds without db)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     ca-certificates \
     tini \
-    libatomic1 \
+    && if echo "${ROUTEIQ_EXTRAS}" | grep -qE '(prod|db)'; then \
+        apt-get install -y --no-install-recommends libatomic1; \
+    fi \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* /root/.cache
 
 # Copy wheels from builder (can be cleaned after install)
@@ -134,16 +177,20 @@ COPY src/ /app/src/
 # Install all Python dependencies using uv pip install --system
 # --system: Install to system Python (not a venv) so packages are available at runtime
 # UV_EXTRA_INDEX_URL: Use CPU-only PyTorch to avoid shipping ~3GB CUDA libraries
-# Order: wheels → uv pip install with all production extras → remove build tools
+# ROUTEIQ_EXTRAS controls which optional dependencies are installed:
+#   "prod" (default) = all production extras including KNN/PyTorch/Prisma
+#   "otel,cloud,a2a,hotreload,oidc" = slim variant without KNN/Prisma
+# INSTALL_LLMROUTER controls whether the LLMRouter wheel is installed
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    # Install LLMRouter wheel first (not in lockfile, built from source at pinned commit)
-    uv pip install --system /wheels/*.whl || true \
-    # Install project dependencies with production extras
+    # Install LLMRouter wheel if built (not in lockfile, built from source at pinned commit)
+    if [ "${INSTALL_LLMROUTER}" = "true" ] && ls /wheels/*.whl 1>/dev/null 2>&1; then \
+        uv pip install --system /wheels/*.whl; \
+    fi \
+    # Install project dependencies with configured extras
     # --system ensures packages go to system Python, not a venv
-    # All OTEL packages are included via the 'otel' extra
     && cd /app && UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    uv pip install --system -e ".[prod,db,otel,cloud,callbacks,knn]" \
+    uv pip install --system -e ".[${ROUTEIQ_EXTRAS}]" \
     # Cleanup wheels and temp files
     && rm -rf /wheels \
     # Remove build-essential (no longer needed after compilation)
@@ -153,17 +200,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Pre-generate Prisma client and fix permissions on LiteLLM directories
 # This is done as root to avoid runtime permission errors
 # Security: Use least-privilege permissions instead of 777
-RUN SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
-    if [ -f "$SCHEMA_PATH" ]; then \
-    echo "Generating Prisma client from $SCHEMA_PATH..." && \
-    python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
-    fi && \
-    # Fix permissions on LiteLLM directories that need write access at runtime
-    # Using least-privilege: litellm user owns directories with 755 (rwxr-xr-x)
-    chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
-    chmod -R 755 /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
-    chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true && \
-    chmod -R 755 /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true
+# Skipped when db extra is not installed (slim builds without Prisma)
+RUN if echo "${ROUTEIQ_EXTRAS}" | grep -qE '(prod|db)'; then \
+        SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
+        if [ -f "$SCHEMA_PATH" ]; then \
+            echo "Generating Prisma client from $SCHEMA_PATH..." && \
+            python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
+        fi && \
+        # Fix permissions on LiteLLM directories that need write access at runtime
+        # Using least-privilege: litellm user owns directories with 755 (rwxr-xr-x)
+        chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
+        chmod -R 755 /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
+        chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true && \
+        chmod -R 755 /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true; \
+    else \
+        echo "Skipping Prisma generation (db extra not installed)"; \
+    fi
 
 # Copy application files (after dependencies for better layer caching)
 COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter
@@ -171,6 +223,7 @@ COPY --chown=litellm:litellm docker/entrypoint.sh /app/entrypoint.sh
 COPY --chown=litellm:litellm config/ /app/config/
 
 # Copy admin UI dist (built in ui-builder stage)
+# In slim builds (BUILD_UI=false), this copies a placeholder index.html
 COPY --from=ui-builder --chown=litellm:litellm /ui/dist /app/ui/dist
 
 # Create directories with proper permissions and cleanup

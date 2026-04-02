@@ -40,6 +40,7 @@ from .auth import (
     _extract_bearer_token,
     _load_admin_api_keys,
     _is_admin_auth_enabled,
+    _constant_time_contains,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,7 +225,7 @@ async def _try_admin_auth(request: Request) -> dict[str, Any] | None:
         auth_header = request.headers.get(AUTHORIZATION_HEADER, "")
         admin_key = _extract_bearer_token(auth_header) or ""
 
-    if admin_key and admin_key in admin_keys:
+    if admin_key and _constant_time_contains(admin_key, admin_keys):
         return {"admin_key": admin_key, "is_admin": True}
 
     return None

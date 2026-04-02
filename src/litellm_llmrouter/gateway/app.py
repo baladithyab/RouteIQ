@@ -47,6 +47,8 @@ from ..http_client_pool import (
     startup_http_client_pool,
     shutdown_http_client_pool,
 )
+from ..redis_pool import close_async_redis_client
+from ..database import close_db_pool
 from ..policy_engine import add_policy_middleware
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,10 @@ def _apply_patch_safely() -> bool:
     """
     Apply the LiteLLM router patch idempotently.
 
+    .. deprecated:: 0.3.0
+        This function calls the deprecated ``patch_litellm_router()``.
+        It is only used when ``ROUTEIQ_USE_PLUGIN_STRATEGY=false`` (legacy mode).
+
     Returns:
         True if patch is applied (either now or was already applied)
     """
@@ -89,11 +95,16 @@ def _apply_patch_safely() -> bool:
         logger.debug("LiteLLM router patch already applied")
         return True
 
+    logger.warning(
+        "Applying DEPRECATED legacy monkey-patch. "
+        "Set ROUTEIQ_USE_PLUGIN_STRATEGY=true (the default) to use the "
+        "plugin-based routing strategy instead."
+    )
     result = patch_litellm_router()
     if result:
-        logger.info("LiteLLM router patch applied successfully")
+        logger.info("Legacy LiteLLM router patch applied successfully")
     else:
-        logger.warning("Failed to apply LiteLLM router patch")
+        logger.warning("Failed to apply legacy LiteLLM router patch")
 
     return result
 
@@ -207,17 +218,6 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         admin_router,
         health_router,
         llmrouter_router,
-        mcp_parity_router,
-        mcp_parity_admin_router,
-        mcp_rest_router,
-        mcp_proxy_router,
-        oauth_callback_router,
-        mcp_jsonrpc_router,
-        mcp_sse_router,
-        MCP_OAUTH_ENABLED,
-        MCP_PROTOCOL_PROXY_ENABLED,
-        MCP_SSE_TRANSPORT_ENABLED,
-        MCP_SSE_LEGACY_MODE,
     )
 
     # Health router - unauthenticated K8s probes
@@ -225,6 +225,7 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     logger.debug("Registered health_router")
 
     # LLMRouter routes - user auth protected
+    # Includes MCP gateway REST endpoints (/llmrouter/mcp/*)
     app.include_router(llmrouter_router, prefix="")
     logger.debug("Registered llmrouter_router")
 
@@ -233,49 +234,8 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         app.include_router(admin_router, prefix="")
         logger.debug("Registered admin_router")
 
-    # MCP Parity Layer - upstream-compatible aliases
-    # User-accessible parity endpoints (read operations)
-    app.include_router(mcp_parity_router, prefix="")
-    logger.debug("Registered mcp_parity_router (upstream-compatible /v1/mcp/*)")
-
-    # Admin parity endpoints (write operations)
-    if include_admin:
-        app.include_router(mcp_parity_admin_router, prefix="")
-        logger.debug(
-            "Registered mcp_parity_admin_router (upstream-compatible /v1/mcp/* admin)"
-        )
-
-    # MCP REST API (/mcp-rest/*) - upstream-compatible
-    app.include_router(mcp_rest_router, prefix="")
-    logger.debug("Registered mcp_rest_router (upstream-compatible /mcp-rest/*)")
-
-    # MCP Native JSON-RPC surface (/mcp) - for Claude Desktop / IDE MCP clients
-    # This provides native MCP protocol (JSON-RPC 2.0 over HTTP)
-    app.include_router(mcp_jsonrpc_router, prefix="")
-    logger.debug("Registered mcp_jsonrpc_router (native MCP JSON-RPC at /mcp)")
-
-    # MCP SSE Transport (/mcp/sse) - for real-time streaming events
-    # Conditionally enabled based on feature flags
-    if MCP_SSE_TRANSPORT_ENABLED and not MCP_SSE_LEGACY_MODE:
-        app.include_router(mcp_sse_router, prefix="")
-        logger.info(
-            "Registered mcp_sse_router (SSE transport at /mcp/sse, "
-            "MCP_SSE_TRANSPORT_ENABLED=true, MCP_SSE_LEGACY_MODE=false)"
-        )
-    else:
-        logger.debug(
-            f"Skipped mcp_sse_router (MCP_SSE_TRANSPORT_ENABLED={MCP_SSE_TRANSPORT_ENABLED}, "
-            f"MCP_SSE_LEGACY_MODE={MCP_SSE_LEGACY_MODE})"
-        )
-
-    # Feature-flagged routers
-    if MCP_PROTOCOL_PROXY_ENABLED and include_admin:
-        app.include_router(mcp_proxy_router, prefix="")
-        logger.info("Registered mcp_proxy_router (MCP_PROTOCOL_PROXY_ENABLED=true)")
-
-    if MCP_OAUTH_ENABLED:
-        app.include_router(oauth_callback_router, prefix="")
-        logger.info("Registered oauth_callback_router (MCP_OAUTH_ENABLED=true)")
+    # Note: MCP parity layer, JSON-RPC, and SSE transport routers have been
+    # removed. These are now provided natively by LiteLLM.
 
 
 async def _run_plugin_startup(app: FastAPI) -> None:
@@ -575,6 +535,14 @@ def create_app(
     app.state.llmrouter_http_pool_shutdown = _shutdown_http_client_pool
     logger.debug("HTTP client pool lifecycle hooks attached")
 
+    # Step 9: Set up database pool shutdown hook
+    app.state.llmrouter_db_pool_shutdown = close_db_pool
+    logger.debug("Database connection pool shutdown hook attached")
+
+    # Step 10: Set up Redis client shutdown hook
+    app.state.llmrouter_redis_shutdown = close_async_redis_client
+    logger.debug("Redis client shutdown hook attached")
+
     logger.info("Gateway app created and configured")
     return app
 
@@ -631,6 +599,10 @@ def create_standalone_app(
                 await drain_manager.wait_for_drain()
             if enable_plugins:
                 await _run_plugin_shutdown(app)
+            # Close database connection pool
+            await close_db_pool()
+            # Close Redis client singleton
+            await close_async_redis_client()
             # Shutdown HTTP client pool
             await _shutdown_http_client_pool()
 

@@ -272,7 +272,7 @@ class ModelArtifactVerifier:
             self.enforce_signed = enforce_signed
         else:
             env_enforce = os.environ.get(
-                "LLMROUTER_ENFORCE_SIGNED_MODELS", "false"
+                "LLMROUTER_ENFORCE_SIGNED_MODELS", "true"
             ).lower()
             self.enforce_signed = env_enforce == "true"
 

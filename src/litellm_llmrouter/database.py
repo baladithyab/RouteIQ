@@ -3,7 +3,7 @@ Database Module for A2A and MCP Persistence
 ============================================
 
 Provides database persistence for A2A agents and MCP servers using PostgreSQL.
-Uses asyncpg for async database operations.
+Uses asyncpg for async database operations with shared connection pooling.
 
 Database Schema:
 - a2a_agents: Stores A2A agent registrations
@@ -11,12 +11,19 @@ Database Schema:
 - mcp_tools: Stores MCP tool definitions
 - mcp_resources: Stores MCP resource definitions
 - audit_logs: Stores control-plane audit logs
+
+Connection Pooling:
+- All database operations share a single asyncpg.Pool instance
+- Pool is lazily initialized on first use (get_db_pool())
+- Pool is closed during gateway shutdown (close_db_pool())
+- Thread-safe initialization via asyncio.Lock
 """
 
+import asyncio
 import os
 import uuid
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from dataclasses import dataclass, field
 
 from litellm._logging import verbose_proxy_logger
@@ -35,6 +42,95 @@ def get_database_url() -> str | None:
 def is_database_configured() -> bool:
     """Check if database is configured."""
     return get_database_url() is not None
+
+
+# =============================================================================
+# Shared Connection Pool
+# =============================================================================
+
+_pool = None  # Optional[asyncpg.Pool]
+_pool_lock = asyncio.Lock()
+
+
+async def get_db_pool(db_url: Optional[str] = None):
+    """
+    Get or create the shared database connection pool.
+
+    Uses double-checked locking to ensure only one pool is created
+    even under concurrent access. The pool is lazily initialized on
+    first call.
+
+    Args:
+        db_url: Optional database URL override. Falls back to DATABASE_URL env var.
+
+    Returns:
+        asyncpg.Pool instance, or None if no database is configured or asyncpg
+        is not installed.
+    """
+    global _pool
+    if _pool is not None:
+        return _pool
+
+    async with _pool_lock:
+        if _pool is not None:  # Double-check after acquiring lock
+            return _pool
+
+        url = db_url or os.environ.get("DATABASE_URL")
+        if not url:
+            return None
+
+        try:
+            import asyncpg
+
+            _pool = await asyncpg.create_pool(
+                url,
+                min_size=2,
+                max_size=10,
+                command_timeout=30,
+                # SSL enforcement when available
+                ssl="prefer",
+            )
+            verbose_proxy_logger.info(
+                "Database connection pool created (min=2, max=10)"
+            )
+            return _pool
+        except ImportError:
+            verbose_proxy_logger.warning(
+                "asyncpg not installed, database pool not available"
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to create database pool: {e}")
+            return None
+
+
+async def close_db_pool() -> None:
+    """
+    Close the shared database connection pool.
+
+    Call during gateway shutdown to cleanly release all connections.
+    Safe to call multiple times or when no pool exists.
+    """
+    global _pool
+    if _pool is not None:
+        try:
+            await _pool.close()
+            verbose_proxy_logger.info("Database connection pool closed")
+        except Exception as e:
+            verbose_proxy_logger.error(f"Error closing database pool: {e}")
+        finally:
+            _pool = None
+
+
+def reset_db_pool() -> None:
+    """
+    Reset pool reference for testing.
+
+    Does NOT close the pool — use close_db_pool() for that.
+    This is intended for unit tests that need to reset module-level state.
+    """
+    global _pool
+    _pool = None
 
 
 # =============================================================================
@@ -239,11 +335,12 @@ class A2AAgentRepository:
     async def _persist_to_db(self, agent: A2AAgentDB) -> None:
         """Persist agent to PostgreSQL database."""
         try:
-            import asyncpg
             import json
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return
+            async with pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO a2a_agents (
@@ -273,21 +370,18 @@ class A2AAgentRepository:
                     agent.created_at,
                     agent.updated_at,
                 )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB persist")
         except Exception as e:
             verbose_proxy_logger.error(f"A2A DB: Error persisting agent: {e}")
 
     async def _load_from_db(self, agent_id: str) -> A2AAgentDB | None:
         """Load agent from PostgreSQL database."""
         try:
-            import asyncpg
             import json
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return None
+            async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT * FROM a2a_agents WHERE agent_id = $1",
                     agent_id,
@@ -308,10 +402,6 @@ class A2AAgentRepository:
                         created_at=row["created_at"],
                         updated_at=row["updated_at"],
                     )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB load")
         except Exception as e:
             verbose_proxy_logger.error(f"A2A DB: Error loading agent: {e}")
         return None
@@ -319,18 +409,14 @@ class A2AAgentRepository:
     async def _delete_from_db(self, agent_id: str) -> None:
         """Delete agent from PostgreSQL database."""
         try:
-            import asyncpg
-
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return
+            async with pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM a2a_agents WHERE agent_id = $1",
                     agent_id,
                 )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB delete")
         except Exception as e:
             verbose_proxy_logger.error(f"A2A DB: Error deleting agent: {e}")
 
@@ -369,24 +455,23 @@ async def run_migrations() -> None:
         return
 
     try:
-        import asyncpg
-
-        conn = await asyncpg.connect(db_url)
-        try:
+        pool = await get_db_pool(db_url)
+        if pool is None:
+            verbose_proxy_logger.warning(
+                "Database pool not available, skipping migrations"
+            )
+            return
+        async with pool.acquire() as conn:
             await conn.execute(A2A_AGENTS_TABLE_SQL)
             await conn.execute(A2A_ACTIVITY_TABLE_SQL)
             await conn.execute(MCP_SERVERS_TABLE_SQL)
             verbose_proxy_logger.info("A2A DB: Migrations completed successfully")
-        finally:
-            await conn.close()
 
         # Run audit log migrations
         from .audit import run_audit_migrations
 
         await run_audit_migrations()
 
-    except ImportError:
-        verbose_proxy_logger.warning("asyncpg not installed, skipping migrations")
     except Exception as e:
         verbose_proxy_logger.error(f"A2A DB: Error running migrations: {e}")
 
@@ -581,10 +666,10 @@ class A2AActivityTracker:
     async def _persist_activity_to_db(self, activity: A2AAgentActivity) -> None:
         """Persist activity to PostgreSQL database."""
         try:
-            import asyncpg
-
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return
+            async with pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO a2a_agent_activity (
@@ -604,12 +689,6 @@ class A2AActivityTracker:
                     activity.success_count,
                     activity.error_count,
                 )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning(
-                "asyncpg not installed, skipping activity persist"
-            )
         except Exception as e:
             verbose_proxy_logger.error(f"A2A DB: Error persisting activity: {e}")
 
@@ -827,11 +906,12 @@ class MCPServerRepository:
     async def _persist_to_db(self, server: MCPServerDB) -> None:
         """Persist server to PostgreSQL database."""
         try:
-            import asyncpg
             import json
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return
+            async with pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO mcp_servers (
@@ -866,21 +946,18 @@ class MCPServerRepository:
                     server.created_at,
                     server.updated_at,
                 )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB persist")
         except Exception as e:
             verbose_proxy_logger.error(f"MCP DB: Error persisting server: {e}")
 
     async def _load_from_db(self, server_id: str) -> MCPServerDB | None:
         """Load server from PostgreSQL database."""
         try:
-            import asyncpg
             import json
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return None
+            async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT * FROM mcp_servers WHERE server_id = $1",
                     server_id,
@@ -903,10 +980,6 @@ class MCPServerRepository:
                         created_at=row["created_at"],
                         updated_at=row["updated_at"],
                     )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB load")
         except Exception as e:
             verbose_proxy_logger.error(f"MCP DB: Error loading server: {e}")
         return None
@@ -914,18 +987,14 @@ class MCPServerRepository:
     async def _delete_from_db(self, server_id: str) -> None:
         """Delete server from PostgreSQL database."""
         try:
-            import asyncpg
-
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return
+            async with pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM mcp_servers WHERE server_id = $1",
                     server_id,
                 )
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("asyncpg not installed, skipping DB delete")
         except Exception as e:
             verbose_proxy_logger.error(f"MCP DB: Error deleting server: {e}")
 
@@ -972,3 +1041,4 @@ def reset_database_singletons() -> None:
     _a2a_repository = None
     _a2a_activity_tracker = None
     _mcp_repository = None
+    reset_db_pool()

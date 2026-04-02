@@ -1,12 +1,19 @@
 """
-Tests for the LiteLLM Router strategy patch.
+Tests for the LiteLLM Router strategy patch (DEPRECATED).
 
-These tests verify that:
+These tests verify that the legacy monkey-patch module still works for
+backward compatibility. The preferred routing path is now the plugin-based
+strategy in ``custom_routing_strategy.py`` (``ROUTEIQ_USE_PLUGIN_STRATEGY=true``).
+
+Tests verify:
 1. Importing litellm_llmrouter does NOT auto-apply the patch
-2. Patches can be applied explicitly via patch_litellm_router()
+2. Patches can be applied explicitly via patch_litellm_router() (with deprecation warning)
 3. llmrouter-* strategies are accepted by LiteLLM's Router after patching
 4. Standard strategies still work as expected
+5. Deprecation warnings are emitted when using patch functions
 """
+
+import warnings
 
 import pytest
 
@@ -15,8 +22,14 @@ try:
     import litellm  # noqa: F401
 
     LITELLM_AVAILABLE = True
-except (ImportError, ValueError):
+except ImportError, ValueError:
     LITELLM_AVAILABLE = False
+
+
+# All tests in this module exercise the deprecated legacy patch.
+# Suppress DeprecationWarning noise so tests stay readable; individual
+# tests that verify warning emission use pytest.warns() explicitly.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 class TestImportBehavior:
@@ -44,6 +57,40 @@ class TestImportBehavior:
             or "NOTE: Patch is NOT applied automatically on import" in source
         )
 
+    def test_module_is_marked_deprecated(self):
+        """Test that the module docstring indicates deprecation."""
+        from litellm_llmrouter import routing_strategy_patch
+
+        assert "DEPRECATED" in (routing_strategy_patch.__doc__ or "")
+
+    def test_patch_emits_deprecation_warning(self):
+        """Test that patch_litellm_router() emits a DeprecationWarning."""
+        from litellm_llmrouter import patch_litellm_router
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            patch_litellm_router()
+
+        deprecation_msgs = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_msgs) >= 1
+        assert "deprecated" in str(deprecation_msgs[0].message).lower()
+
+    def test_unpatch_emits_deprecation_warning(self):
+        """Test that unpatch_litellm_router() emits a DeprecationWarning."""
+        from litellm_llmrouter import unpatch_litellm_router
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            unpatch_litellm_router()
+
+        deprecation_msgs = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_msgs) >= 1
+        assert "deprecated" in str(deprecation_msgs[0].message).lower()
+
     def test_patch_is_explicit_and_idempotent(self):
         """Test that patch_litellm_router() is explicit and idempotent."""
         from litellm_llmrouter import patch_litellm_router, is_patch_applied
@@ -61,7 +108,7 @@ class TestImportBehavior:
 
 @pytest.mark.skipif(not LITELLM_AVAILABLE, reason="litellm package not installed")
 class TestRoutingStrategyPatch:
-    """Test the routing strategy patch module."""
+    """Test the legacy routing strategy patch module (backward compatibility)."""
 
     @pytest.fixture(autouse=True)
     def apply_patch(self):
@@ -226,13 +273,13 @@ class TestRoutingStrategyPatch:
 
 
 class TestPatchFunctions:
-    """Test the patch/unpatch functions."""
+    """Test the legacy patch/unpatch functions (backward compatibility)."""
 
     def test_is_patch_applied(self):
         """Test is_patch_applied returns correct status after explicit patch."""
         from litellm_llmrouter import is_patch_applied, patch_litellm_router
 
-        # Apply patch explicitly
+        # Apply patch explicitly (deprecated but still functional)
         patch_litellm_router()
         assert is_patch_applied() is True
 

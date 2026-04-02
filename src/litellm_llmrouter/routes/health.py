@@ -127,19 +127,24 @@ async def readiness_probe():
             is_degraded = True
         else:
             try:
-                # Import here to avoid circular imports and optional dependency
-                import asyncpg
+                from litellm_llmrouter.database import get_db_pool
 
-                # Use short timeout for health check
-                conn = await asyncio.wait_for(
-                    asyncpg.connect(db_url, timeout=2.0),
+                # Use shared pool for health check — tests pool + DB connectivity
+                pool = await asyncio.wait_for(
+                    get_db_pool(db_url),
                     timeout=2.0,
                 )
-                await asyncio.wait_for(conn.execute("SELECT 1"), timeout=1.0)
-                await conn.close()
-                checks["database"] = {"status": "healthy"}
-                # Record success in circuit breaker
-                await db_breaker.record_success()
+                if pool is None:
+                    checks["database"] = {
+                        "status": "skipped",
+                        "reason": "database pool not available",
+                    }
+                else:
+                    async with pool.acquire() as conn:
+                        await asyncio.wait_for(conn.execute("SELECT 1"), timeout=1.0)
+                    checks["database"] = {"status": "healthy"}
+                    # Record success in circuit breaker
+                    await db_breaker.record_success()
             except asyncio.TimeoutError:
                 await db_breaker.record_failure("connection timeout")
                 checks["database"] = {

@@ -68,7 +68,6 @@ def _reset_all_singletons():
     from litellm_llmrouter.policy_engine import reset_policy_engine
     from litellm_llmrouter.quota import reset_quota_enforcer
     from litellm_llmrouter.audit import reset_audit_repository
-    from litellm_llmrouter.mcp_jsonrpc import reset_sessions
     from litellm_llmrouter.conversation_affinity import reset_affinity_tracker
     from litellm_llmrouter.gateway.plugin_manager import reset_plugin_manager
     from litellm_llmrouter.gateway.plugin_middleware import reset_plugin_middleware
@@ -80,7 +79,6 @@ def _reset_all_singletons():
         reset_artifact_verifier,
     )
     from litellm_llmrouter.leader_election import reset_leader_election
-    from litellm_llmrouter.mcp_sse_transport import reset_sse_sessions
 
     reset_routing_singletons()
     reset_mcp_gateway()
@@ -90,7 +88,6 @@ def _reset_all_singletons():
     reset_policy_engine()
     reset_quota_enforcer()
     reset_audit_repository()
-    reset_sessions()
     reset_affinity_tracker()
     reset_plugin_manager()
     reset_plugin_middleware()
@@ -100,7 +97,6 @@ def _reset_all_singletons():
     reset_activation_manager()
     reset_artifact_verifier()
     reset_leader_election()
-    reset_sse_sessions()
 
     from litellm_llmrouter.centroid_routing import reset_centroid_strategy
 

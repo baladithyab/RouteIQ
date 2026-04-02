@@ -253,18 +253,18 @@ class LeaderElection:
             return False
 
         try:
-            import asyncpg
+            from .database import get_db_pool
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                verbose_proxy_logger.warning(
+                    "Leader election: Database pool not available"
+                )
+                return False
+            async with pool.acquire() as conn:
                 await conn.execute(LEADER_ELECTION_TABLE_SQL)
                 verbose_proxy_logger.debug("Leader election: Table created/verified")
                 return True
-            finally:
-                await conn.close()
-        except ImportError:
-            verbose_proxy_logger.warning("Leader election: asyncpg not installed")
-            return False
         except Exception as e:
             verbose_proxy_logger.error(f"Leader election: Error creating table: {e}")
             return False
@@ -291,11 +291,18 @@ class LeaderElection:
             return True
 
         try:
-            import asyncpg
             from datetime import timedelta
+            from .database import get_db_pool
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                verbose_proxy_logger.warning(
+                    "Leader election: Database pool not available, assuming single instance"
+                )
+                self._is_leader = True
+                return True
+
+            async with pool.acquire() as conn:
                 now = datetime.now(timezone.utc)
                 expires_at = now + timedelta(seconds=self.lease_seconds)
 
@@ -356,16 +363,6 @@ class LeaderElection:
 
                     return False
 
-            finally:
-                await conn.close()
-
-        except ImportError:
-            verbose_proxy_logger.warning(
-                "Leader election: asyncpg not installed, assuming single instance"
-            )
-            self._is_leader = True
-            return True
-
         except Exception as e:
             self._last_renewal_error = str(e)
             verbose_proxy_logger.error(f"Leader election: Error acquiring lease: {e}")
@@ -400,10 +397,14 @@ class LeaderElection:
             return True
 
         try:
-            import asyncpg
+            from .database import get_db_pool
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                self._is_leader = False
+                return True
+
+            async with pool.acquire() as conn:
                 # Only delete if we hold the lease
                 result = await conn.execute(
                     """
@@ -425,9 +426,6 @@ class LeaderElection:
                     self._on_leadership_change(False)
 
                 return "DELETE 1" in result
-
-            finally:
-                await conn.close()
 
         except Exception as e:
             verbose_proxy_logger.error(f"Leader election: Error releasing lease: {e}")
@@ -452,10 +450,13 @@ class LeaderElection:
             return None
 
         try:
-            import asyncpg
+            from .database import get_db_pool
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return None
+
+            async with pool.acquire() as conn:
                 now = datetime.now(timezone.utc)
                 row = await conn.fetchrow(
                     """
@@ -476,9 +477,6 @@ class LeaderElection:
                         is_leader=row["holder_id"] == self.holder_id,
                     )
                 return None
-
-            finally:
-                await conn.close()
 
         except Exception as e:
             verbose_proxy_logger.error(f"Leader election: Error getting leader: {e}")

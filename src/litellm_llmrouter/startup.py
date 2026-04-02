@@ -112,18 +112,32 @@ def run_leader_migrations_if_enabled():
 def register_strategies():
     """Log available LLMRouter strategies.
 
-    Strategies are activated at request time via the monkey-patch in
-    ``routing_strategy_patch.py``, not through a runtime registry.
-    This helper calls :func:`register_llmrouter_strategies` to enumerate
-    and log the available strategy names at startup.
+    Enumerates and logs the available strategy names at startup.
+    When using the plugin strategy (default), strategies are activated via
+    ``RouteIQRoutingStrategy`` (``custom_routing_strategy.py``).
+    When using the legacy monkey-patch (deprecated), strategies are activated
+    via ``routing_strategy_patch.py``.
     """
+    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
     try:
         from litellm_llmrouter.strategies import register_llmrouter_strategies
 
         strategies = register_llmrouter_strategies()
-        print(
-            f"✅ {len(strategies)} LLMRouter strategies available (activated via routing_strategy_patch)"
-        )
+        if use_plugin:
+            print(
+                f"✅ {len(strategies)} LLMRouter strategies available "
+                f"(activated via plugin strategy — RouteIQRoutingStrategy)"
+            )
+        else:
+            print(
+                f"✅ {len(strategies)} LLMRouter strategies available "
+                f"(activated via legacy monkey-patch — DEPRECATED)"
+            )
         return strategies
     except ImportError as e:
         print(f"⚠️ Could not load strategies: {e}")
@@ -155,8 +169,7 @@ def install_plugin_routing_strategy(app):
     use_plugin = getattr(app.state, "use_plugin_strategy", False)
     if not use_plugin:
         logger.debug(
-            "Plugin routing strategy not active — "
-            "using legacy monkey-patch approach"
+            "Plugin routing strategy not active — using legacy monkey-patch approach"
         )
         return False
 
@@ -493,14 +506,24 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     def _sigterm_handler(signum, frame):
         """Trigger DrainManager drain on SIGTERM, then delegate to uvicorn."""
         logger.info("SIGTERM received, starting graceful drain...")
-        if hasattr(app.state, "graceful_shutdown"):
-            import asyncio
 
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(app.state.graceful_shutdown())
-            except RuntimeError:
-                asyncio.run(app.state.graceful_shutdown())
+        async def _shutdown_sequence():
+            if hasattr(app.state, "graceful_shutdown"):
+                await app.state.graceful_shutdown()
+            # Close database connection pool
+            if hasattr(app.state, "llmrouter_db_pool_shutdown"):
+                await app.state.llmrouter_db_pool_shutdown()
+            # Close Redis singleton client
+            if hasattr(app.state, "llmrouter_redis_shutdown"):
+                await app.state.llmrouter_redis_shutdown()
+
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_shutdown_sequence())
+        except RuntimeError:
+            asyncio.run(_shutdown_sequence())
         # Delegate to uvicorn's original signal handler
         if callable(_original_sigterm):
             _original_sigterm(signum, frame)
@@ -643,10 +666,25 @@ Examples:
     # Resolve worker count (env var overrides CLI, legacy mode forces 1)
     workers = resolve_worker_count(cli_workers=args.workers)
 
-    print("🚀 Starting RouteIQ Gateway...")
-    print(
-        f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
+    # Determine routing mode for display
+    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+        "true",
+        "1",
+        "yes",
     )
+
+    print("🚀 Starting RouteIQ Gateway...")
+    if use_plugin:
+        print(
+            "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"
+        )
+    else:
+        print(
+            "   Routing: legacy monkey-patch (DEPRECATED — set ROUTEIQ_USE_PLUGIN_STRATEGY=true to upgrade)"
+        )
+        print(
+            f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
+        )
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
     print(f"   Port: {args.port}")
