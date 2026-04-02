@@ -114,6 +114,14 @@ def _reset_all_singletons():
 
     reset_oidc()
 
+    from litellm_llmrouter.governance import reset_governance_engine
+
+    reset_governance_engine()
+
+    from litellm_llmrouter.usage_policies import reset_usage_policy_engine
+
+    reset_usage_policy_engine()
+
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for
     # when the pool is not initialized, so skipping it is safe.

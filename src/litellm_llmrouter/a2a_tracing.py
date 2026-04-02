@@ -60,7 +60,7 @@ except ImportError:
 # Tracer name for A2A operations
 TRACER_NAME = "litellm.a2a_gateway"
 
-# Span attribute names (following OTel semantic conventions where applicable)
+# Legacy span attribute names (backward compatibility)
 ATTR_A2A_AGENT_ID = "a2a.agent.id"
 ATTR_A2A_AGENT_NAME = "a2a.agent.name"
 ATTR_A2A_AGENT_URL = "a2a.agent.url"
@@ -75,6 +75,10 @@ ATTR_HTTP_URL = "http.url"
 ATTR_HTTP_ROUTE = "http.route"
 ATTR_HTTP_TARGET = "http.target"
 ATTR_HTTP_STATUS_CODE = "http.status_code"
+
+# GenAI Semantic Convention attribute names (ADR-0019)
+# See: litellm_llmrouter.telemetry_contracts.GenAIAttributes
+_GENAI_AGENT_NAME = "gen_ai.agent.name"
 
 
 def get_tracer() -> Any:
@@ -332,7 +336,7 @@ class StreamingSpan:
         # Make it the current span
         self._token = trace.use_span(self._span, end_on_exit=False).__enter__()
 
-        # Set initial attributes
+        # Set initial attributes (legacy a2a.* + GenAI convention)
         self._span.set_attribute(ATTR_A2A_AGENT_ID, self._agent_id)
         self._span.set_attribute(ATTR_A2A_AGENT_NAME, self._agent_name)
         self._span.set_attribute(ATTR_A2A_AGENT_URL, self._agent_url)
@@ -340,6 +344,8 @@ class StreamingSpan:
         self._span.set_attribute(ATTR_A2A_STREAM, True)
         self._span.set_attribute(ATTR_HTTP_METHOD, "POST")
         self._span.set_attribute(ATTR_HTTP_URL, self._agent_url)
+        # ADR-0019: GenAI semantic convention attribute
+        self._span.set_attribute(_GENAI_AGENT_NAME, self._agent_name)
 
         if self._message_id is not None:
             self._span.set_attribute(ATTR_A2A_MESSAGE_ID, str(self._message_id))
@@ -630,6 +636,7 @@ def trace_agent_send(
 
     # Use start_as_current_span to ensure span is active and exported
     with tracer.start_as_current_span(f"a2a.agent.send/{agent_id}") as span:
+        # Legacy a2a.* attributes (backward compatibility)
         span.set_attribute(ATTR_A2A_AGENT_ID, agent_id)
         span.set_attribute(ATTR_A2A_AGENT_NAME, agent_name)
         span.set_attribute(ATTR_A2A_AGENT_URL, agent_url)
@@ -637,6 +644,8 @@ def trace_agent_send(
         span.set_attribute(ATTR_A2A_STREAM, False)
         span.set_attribute(ATTR_HTTP_METHOD, "POST")
         span.set_attribute(ATTR_HTTP_URL, agent_url)
+        # ADR-0019: GenAI semantic convention attribute
+        span.set_attribute(_GENAI_AGENT_NAME, agent_name)
 
         if message_id is not None:
             span.set_attribute(ATTR_A2A_MESSAGE_ID, str(message_id))

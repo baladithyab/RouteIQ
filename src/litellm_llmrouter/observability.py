@@ -124,6 +124,11 @@ def set_router_decision_attributes(
     telemetry as first-class span attributes, enabling analysis of routing
     decisions in tracing backends (Jaeger, Tempo, etc.).
 
+    **Dual-emit (ADR-0019)**: Emits both the legacy ``router.*`` attributes
+    and the new ``gen_ai.routeiq.*`` / ``gen_ai.*`` attributes so existing
+    dashboards continue to work while new GenAI-aware backends get standard
+    attribute names.
+
     Args:
         span: The OpenTelemetry span to add attributes to
         strategy: Routing strategy name (e.g., 'knn', 'mlp', 'random')
@@ -149,11 +154,16 @@ def set_router_decision_attributes(
                 outcome="success",
             )
     """
+    from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
     if not span or not span.is_recording():
         return
 
+    # --- Legacy router.* attributes (backward compatibility) ---
     if strategy is not None:
         span.set_attribute(ROUTER_STRATEGY_ATTR, strategy)
+        # ADR-0019: also emit under gen_ai.routeiq.* namespace
+        span.set_attribute(GA.ROUTEIQ_STRATEGY, strategy)
 
     if model_selected is not None:
         span.set_attribute(ROUTER_MODEL_SELECTED_ATTR, model_selected)
@@ -184,6 +194,8 @@ def set_router_decision_attributes(
 
     if fallback_triggered is not None:
         span.set_attribute(ROUTER_FALLBACK_TRIGGERED_ATTR, fallback_triggered)
+        # ADR-0019: also emit under gen_ai.routeiq.* namespace
+        span.set_attribute(GA.ROUTEIQ_FALLBACK, fallback_triggered)
 
 
 def set_genai_attributes(
@@ -195,13 +207,19 @@ def set_genai_attributes(
     operation_name: Optional[str] = None,
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
     finish_reasons: Optional[list[str]] = None,
+    response_id: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> None:
     """
     Set GenAI semantic convention span attributes on the given span.
 
     These attributes follow the OpenTelemetry GenAI Semantic Conventions
-    (https://opentelemetry.io/docs/specs/semconv/gen-ai/).
+    (https://opentelemetry.io/docs/specs/semconv/gen-ai/) and use the
+    constants defined in :class:`~litellm_llmrouter.telemetry_contracts.GenAIAttributes`.
 
     Args:
         span: The OpenTelemetry span to add attributes to.
@@ -211,31 +229,53 @@ def set_genai_attributes(
         operation_name: Operation type (e.g., 'chat_completion', 'embedding').
         input_tokens: Number of input/prompt tokens used.
         output_tokens: Number of output/completion tokens used.
+        total_tokens: Total tokens used (input + output).
         finish_reasons: List of finish reasons from the response.
+        response_id: Response identifier from the provider.
+        temperature: Sampling temperature from the request.
+        max_tokens: Maximum tokens requested.
+        top_p: Top-p (nucleus) sampling parameter.
     """
+    from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
     if not span or not span.is_recording():
         return
 
     if system is not None:
-        span.set_attribute("gen_ai.system", system)
+        span.set_attribute(GA.SYSTEM, system)
 
     if request_model is not None:
-        span.set_attribute("gen_ai.request.model", request_model)
+        span.set_attribute(GA.REQUEST_MODEL, request_model)
 
     if response_model is not None:
-        span.set_attribute("gen_ai.response.model", response_model)
+        span.set_attribute(GA.RESPONSE_MODEL, response_model)
 
     if operation_name is not None:
-        span.set_attribute("gen_ai.operation.name", operation_name)
+        span.set_attribute(GA.OPERATION_NAME, operation_name)
 
     if input_tokens is not None:
-        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+        span.set_attribute(GA.USAGE_INPUT_TOKENS, input_tokens)
 
     if output_tokens is not None:
-        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+        span.set_attribute(GA.USAGE_OUTPUT_TOKENS, output_tokens)
+
+    if total_tokens is not None:
+        span.set_attribute(GA.USAGE_TOTAL_TOKENS, total_tokens)
 
     if finish_reasons is not None:
-        span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
+        span.set_attribute(GA.RESPONSE_FINISH_REASONS, finish_reasons)
+
+    if response_id is not None:
+        span.set_attribute(GA.RESPONSE_ID, response_id)
+
+    if temperature is not None:
+        span.set_attribute(GA.REQUEST_TEMPERATURE, temperature)
+
+    if max_tokens is not None:
+        span.set_attribute(GA.REQUEST_MAX_TOKENS, max_tokens)
+
+    if top_p is not None:
+        span.set_attribute(GA.REQUEST_TOP_P, top_p)
 
 
 def _is_sdk_tracer_provider(provider: Any) -> bool:
@@ -498,12 +538,15 @@ class ObservabilityManager:
         self._sampler = sampler if sampler is not None else _get_sampler_from_env()
 
         # Create resource with service identification
+        # ADR-0019: Include gen_ai.system at the resource level so every
+        # span emitted by this service carries the provider hint.
         self.resource = Resource.create(
             {
                 SERVICE_NAME: self.service_name,
                 SERVICE_VERSION: self.service_version,
                 "deployment.environment": self.deployment_environment,
                 "service.namespace": "ai-gateway",
+                "gen_ai.system": "routeiq",
             }
         )
 
@@ -590,8 +633,8 @@ class ObservabilityManager:
             except Exception as e:
                 logger.error(f"Failed to add OTLP span processor: {e}", exc_info=True)
 
-        # Get tracer for this module
-        self._tracer = trace.get_tracer(__name__, self.service_version)
+        # Get tracer for this module — use a GenAI-convention-friendly name
+        self._tracer = trace.get_tracer("gen_ai.routeiq", self.service_version)
 
         logger.info(f"Tracing initialized with OTLP endpoint: {self.otlp_endpoint}")
 
@@ -656,8 +699,8 @@ class ObservabilityManager:
             metrics.set_meter_provider(self._meter_provider)
             logger.info("Created new MeterProvider")
 
-        # Get meter for this module
-        self._meter = metrics.get_meter(__name__, self.service_version)
+        # Get meter for this module — use a GenAI-convention-friendly name
+        self._meter = metrics.get_meter("gen_ai.routeiq", self.service_version)
 
         # Initialize the central metrics instrument registry
         try:

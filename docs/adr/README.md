@@ -37,6 +37,7 @@ Each ADR follows the standard format:
 | [0017](0017-leverage-litellm-upstream.md) | Leverage LiteLLM Upstream Capabilities | Accepted | 2026-04-02 |
 | [0018](0018-disaggregated-ui.md) | Support Disaggregated UI Deployment | Accepted | 2026-04-02 |
 | [0019](0019-otel-genai-conventions.md) | Adopt OpenTelemetry GenAI Semantic Conventions | Proposed | 2026-04-02 |
+| [0020](0020-governance-layer.md) | Governance Layer — Workspace Isolation & Dynamic Policies | Accepted | 2026-04-02 |
 
 ## Lifecycle
 

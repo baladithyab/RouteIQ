@@ -171,6 +171,191 @@ VISION_CAPABLE_MODELS: Set[str] = {
     "gemini-3-flash-preview",
 }
 
+# Model capabilities — used for capability-based routing
+# When a request requires a specific capability, only route to models that have it
+MODEL_CAPABILITIES: Dict[str, Set[str]] = {
+    # GPT-4o family
+    "gpt-4o": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4o-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4-turbo": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    # GPT-4.1 family
+    "gpt-4.1": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4.1-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4.1-nano": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    # GPT-5 family
+    "gpt-5": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gpt-5-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-5.2": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gpt-5.4": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    # Claude family
+    "claude-3-5-sonnet-20241022": {"text", "vision", "function_calling", "streaming"},
+    "claude-3-5-haiku-20241022": {"text", "vision", "function_calling", "streaming"},
+    "claude-3-opus-20240229": {"text", "vision", "function_calling", "streaming"},
+    "claude-sonnet-4-20250514": {
+        "text",
+        "vision",
+        "function_calling",
+        "streaming",
+        "computer_use",
+    },
+    "claude-opus-4-6-20250918": {
+        "text",
+        "vision",
+        "function_calling",
+        "streaming",
+        "reasoning",
+    },
+    # Gemini family
+    "gemini-2.0-flash": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+    },
+    "gemini-2.5-pro-preview-05-06": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gemini-3-flash-preview": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+    },
+    # DeepSeek
+    "deepseek-chat": {"text", "function_calling", "json_mode", "streaming"},
+    "deepseek-reasoner": {"text", "streaming", "reasoning"},
+    # o-series
+    "o1": {"text", "reasoning"},
+    "o1-mini": {"text", "reasoning"},
+    "o3-mini": {"text", "reasoning", "function_calling"},
+    "o4-mini": {"text", "reasoning", "function_calling"},
+}
+
+
+def detect_required_capabilities(request_data: Dict[str, Any]) -> Set[str]:
+    """Detect what capabilities a request requires based on its content.
+
+    Inspects messages for vision content, tool/function calls, json_mode,
+    streaming, and reasoning indicators.
+
+    Args:
+        request_data: The incoming request data dict (OpenAI-compatible format).
+
+    Returns:
+        Set of capability strings required by this request.
+    """
+    caps: Set[str] = {"text"}  # Always need text
+
+    messages = request_data.get("messages", [])
+
+    # Vision detection
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "image_url",
+                    "image",
+                ):
+                    caps.add("vision")
+                    break
+
+    # Function calling
+    if request_data.get("tools") or request_data.get("functions"):
+        caps.add("function_calling")
+
+    # JSON mode
+    if request_data.get("response_format", {}).get("type") == "json_object":
+        caps.add("json_mode")
+
+    # Streaming
+    if request_data.get("stream", False):
+        caps.add("streaming")
+
+    return caps
+
+
+def filter_by_capabilities(
+    deployments: List[Dict[str, Any]],
+    required: Set[str],
+) -> List[Dict[str, Any]]:
+    """Filter deployments to only those whose models have all required capabilities.
+
+    If no deployments match after filtering, falls back to the original list
+    to avoid routing failures.
+
+    Args:
+        deployments: List of deployment dicts.
+        required: Set of required capability strings.
+
+    Returns:
+        Filtered list of deployments, or the original list if none match.
+    """
+    if not required or required == {"text"}:
+        return deployments  # No filtering needed
+
+    filtered = []
+    for dep in deployments:
+        model_name = dep.get("model_name", "") or dep.get("litellm_params", {}).get(
+            "model", ""
+        )
+        # Look up capabilities (fuzzy match)
+        model_caps = _get_model_capabilities(model_name)
+        if required.issubset(model_caps):
+            filtered.append(dep)
+
+    return filtered if filtered else deployments  # Fall back to all if none match
+
+
+def _get_model_capabilities(model_name: str) -> Set[str]:
+    """Get capabilities for a model, with fuzzy matching.
+
+    Tries exact match first, then substring matching against known models.
+    Falls back to ``{"text", "streaming"}`` if no match is found.
+
+    Args:
+        model_name: The model identifier string.
+
+    Returns:
+        Set of capability strings for the model.
+    """
+    caps = MODEL_CAPABILITIES.get(model_name)
+    if caps:
+        return caps
+    # Fuzzy match
+    for key, val in MODEL_CAPABILITIES.items():
+        if key in model_name or model_name in key:
+            return val
+    return {"text", "streaming"}  # Safe default
+
 
 def estimate_token_count(messages: List[Dict[str, Any]]) -> int:
     """Estimate token count from messages (~4 chars per token heuristic)."""
@@ -942,6 +1127,11 @@ class CentroidRoutingStrategy:
         if not prompt:
             return self._fallback_deployment(context)
 
+        # Detect required capabilities from the request
+        request_data = context.request_kwargs or {}
+        request_data_with_messages = {**request_data, "messages": full_messages}
+        required_caps = detect_required_capabilities(request_data_with_messages)
+
         # Check session cache
         session_key = SessionCache._make_key(system_message, prompt)
         cached = self._session_cache.get(session_key)
@@ -953,9 +1143,10 @@ class CentroidRoutingStrategy:
                 cached_model,
                 cached_tier,
             )
-            deployment = self._match_tier_to_deployment(
-                cached_tier, self._get_healthy_deployments(context)
-            )
+            deployments = self._get_healthy_deployments(context)
+            # Filter by capabilities before tier matching
+            deployments = filter_by_capabilities(deployments, required_caps)
+            deployment = self._match_tier_to_deployment(cached_tier, deployments)
             if deployment is not None:
                 return deployment
 
@@ -1010,6 +1201,18 @@ class CentroidRoutingStrategy:
 
         # Match tier to deployment
         deployments = self._get_healthy_deployments(context)
+
+        # Filter by required capabilities BEFORE tier matching
+        if required_caps and required_caps != {"text"}:
+            pre_filter_count = len(deployments)
+            deployments = filter_by_capabilities(deployments, required_caps)
+            if len(deployments) < pre_filter_count:
+                logger.debug(
+                    "Capability filter: %d→%d deployments (required=%s)",
+                    pre_filter_count,
+                    len(deployments),
+                    required_caps,
+                )
 
         # For eco profile, sort deployments by estimated cost (cheapest first)
         if self._profile == RoutingProfile.ECO:

@@ -232,8 +232,10 @@ class RouterDecisionMiddleware:
                 fallback_triggered=False,
             )
 
-            # GenAI semantic convention attributes
-            span.set_attribute("gen_ai.operation.name", operation_name)
+            # GenAI semantic convention attributes (ADR-0019)
+            from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
+            span.set_attribute(GA.OPERATION_NAME, operation_name)
 
             # Try to resolve the system (provider) from the router config
             try:
@@ -252,7 +254,7 @@ class RouterDecisionMiddleware:
                         if not provider and "/" in litellm_model:
                             provider = litellm_model.split("/")[0]
                         if provider:
-                            span.set_attribute("gen_ai.system", provider)
+                            span.set_attribute(GA.SYSTEM, provider)
             except Exception:
                 pass
 
@@ -434,13 +436,15 @@ class RouterDecisionCallback:
             fallback_triggered=bool(metadata.get("fallback")),
         )
 
-        # Set gen_ai.* span attributes (GenAI Semantic Conventions)
-        span.set_attribute("gen_ai.request.model", model)
+        # Set gen_ai.* span attributes (GenAI Semantic Conventions — ADR-0019)
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
+        span.set_attribute(GA.REQUEST_MODEL, model)
         # Extract provider from litellm_params if available
         litellm_params = kwargs.get("litellm_params", {}) or {}
         provider = litellm_params.get("custom_llm_provider", "")
         if provider:
-            span.set_attribute("gen_ai.system", provider)
+            span.set_attribute(GA.SYSTEM, provider)
 
         logger.debug(
             f"Emitted router telemetry: model={model}, strategy={strategy}, "
@@ -507,9 +511,11 @@ class RouterDecisionCallback:
                 if reason:
                     finish_reasons.append(str(reason))
 
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
         attrs = {
-            "gen_ai.request.model": model,
-            "gen_ai.system": provider,
+            GA.REQUEST_MODEL: model,
+            GA.SYSTEM: provider,
         }
 
         gm = get_gateway_metrics()
@@ -540,15 +546,20 @@ class RouterDecisionCallback:
             # Decrement active gauge
             gm.request_active.add(-1, {"model": model})
 
-        # Set gen_ai.* span attributes on the current span
+        # Set gen_ai.* span attributes on the current span (ADR-0019)
         span = trace.get_current_span()
         if span and span.is_recording():
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            span.set_attribute(GA.USAGE_INPUT_TOKENS, input_tokens)
+            span.set_attribute(GA.USAGE_OUTPUT_TOKENS, output_tokens)
+            total_tokens = input_tokens + output_tokens
+            if total_tokens > 0:
+                span.set_attribute(GA.USAGE_TOTAL_TOKENS, total_tokens)
             if hasattr(response_obj, "model") and response_obj.model:
-                span.set_attribute("gen_ai.response.model", response_obj.model)
+                span.set_attribute(GA.RESPONSE_MODEL, response_obj.model)
+            if hasattr(response_obj, "id") and response_obj.id:
+                span.set_attribute(GA.RESPONSE_ID, response_obj.id)
             if finish_reasons:
-                span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
+                span.set_attribute(GA.RESPONSE_FINISH_REASONS, finish_reasons)
 
     def log_failure_event(
         self,
@@ -607,10 +618,12 @@ class RouterDecisionCallback:
             # Decrement active gauge
             gm.request_active.add(-1, {"model": model})
 
-        # Set gen_ai.response.finish_reasons = ["error"] on the span
+        # Set gen_ai.response.finish_reasons = ["error"] on the span (ADR-0019)
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
         span = trace.get_current_span()
         if span and span.is_recording():
-            span.set_attribute("gen_ai.response.finish_reasons", ["error"])
+            span.set_attribute(GA.RESPONSE_FINISH_REASONS, ["error"])
 
     async def async_log_pre_api_call(
         self,

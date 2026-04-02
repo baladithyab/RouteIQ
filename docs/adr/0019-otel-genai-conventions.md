@@ -1,6 +1,6 @@
 # ADR-0019: Adopt OpenTelemetry GenAI Semantic Conventions
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

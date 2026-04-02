@@ -632,7 +632,7 @@ def extract_router_decision_from_span_event(
 
         return event
 
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except json.JSONDecodeError, KeyError, TypeError:
         # Invalid payload, return None for backward compatibility
         return None
 
@@ -640,3 +640,73 @@ def extract_router_decision_from_span_event(
 # Span event name constant for consumers
 ROUTER_DECISION_EVENT_NAME = CONTRACT_FULL_NAME
 ROUTER_DECISION_PAYLOAD_KEY = f"{CONTRACT_NAME}.payload"
+
+
+# =============================================================================
+# OTel GenAI Semantic Convention Attribute Constants (ADR-0019)
+# =============================================================================
+
+
+class GenAIAttributes:
+    """OTel GenAI Semantic Convention attribute names.
+
+    These constants define the standard attribute names specified by the
+    OpenTelemetry GenAI Semantic Conventions:
+    https://opentelemetry.io/docs/specs/semconv/gen-ai/
+
+    Using these constants ensures consistent, standards-compliant attribute
+    names across all RouteIQ telemetry emission points. Observability
+    backends (Datadog, Grafana, Jaeger, etc.) use these names for their
+    GenAI-specific views and dashboards.
+    """
+
+    # --- Provider identification ---
+    SYSTEM = "gen_ai.system"
+
+    # --- Request attributes ---
+    REQUEST_MODEL = "gen_ai.request.model"
+    REQUEST_TEMPERATURE = "gen_ai.request.temperature"
+    REQUEST_MAX_TOKENS = "gen_ai.request.max_tokens"
+    REQUEST_TOP_P = "gen_ai.request.top_p"
+
+    # --- Response attributes ---
+    RESPONSE_MODEL = "gen_ai.response.model"
+    RESPONSE_ID = "gen_ai.response.id"
+    RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
+
+    # --- Usage attributes ---
+    USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
+    USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+    USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
+
+    # --- Operation ---
+    OPERATION_NAME = "gen_ai.operation.name"
+
+    # --- RouteIQ extensions (custom namespace) ---
+    ROUTEIQ_STRATEGY = "gen_ai.routeiq.strategy"
+    ROUTEIQ_TIER = "gen_ai.routeiq.tier"
+    ROUTEIQ_PROFILE = "gen_ai.routeiq.profile"
+    ROUTEIQ_CONTEXT_TOKENS_SAVED = "gen_ai.routeiq.context_tokens_saved"
+    ROUTEIQ_VISION_SWAP = "gen_ai.routeiq.vision_swap"
+    ROUTEIQ_FALLBACK = "gen_ai.routeiq.fallback_used"
+
+    # --- MCP tool attributes ---
+    TOOL_NAME = "gen_ai.tool.name"
+    TOOL_DESCRIPTION = "gen_ai.tool.description"
+    TOOL_MCP_SERVER = "gen_ai.tool.mcp.server"
+
+    # --- Agent attributes ---
+    AGENT_NAME = "gen_ai.agent.name"
+    AGENT_DESCRIPTION = "gen_ai.agent.description"
+
+
+# Mapping from legacy RouteIQ/router.* attribute names to GenAI convention names.
+# Used during the transition period to emit both old and new attribute names.
+LEGACY_TO_GENAI_ATTR_MAP: Dict[str, str] = {
+    "router.strategy": GenAIAttributes.ROUTEIQ_STRATEGY,
+    "router.model_selected": GenAIAttributes.RESPONSE_MODEL,
+    "router.fallback_triggered": GenAIAttributes.ROUTEIQ_FALLBACK,
+    "mcp.tool.name": GenAIAttributes.TOOL_NAME,
+    "mcp.server.name": GenAIAttributes.TOOL_MCP_SERVER,
+    "a2a.agent.name": GenAIAttributes.AGENT_NAME,
+}
