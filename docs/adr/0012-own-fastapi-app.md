@@ -1,6 +1,6 @@
 # ADR-0012: RouteIQ Owns Its FastAPI Application
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

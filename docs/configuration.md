@@ -587,9 +587,6 @@ This section provides a complete reference of all environment variables supporte
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_GATEWAY_ENABLED` | `false` | Enable MCP gateway (JSON-RPC, SSE, REST surfaces). |
-| `MCP_SSE_TRANSPORT_ENABLED` | `false` | Enable MCP SSE transport at `/mcp/sse`. Requires `MCP_GATEWAY_ENABLED`. |
-| `MCP_SSE_LEGACY_MODE` | `false` | Enable MCP SSE legacy mode for older clients. |
-| `MCP_PROTOCOL_PROXY_ENABLED` | `false` | Enable MCP protocol-level proxy at `/mcp-proxy/*` (admin-only). |
 | `MCP_OAUTH_ENABLED` | `false` | Enable MCP OAuth support. |
 | `LLMROUTER_ENABLE_MCP_TOOL_INVOCATION` | `false` | Enable MCP remote tool invocation. **Security sensitive** — only enable in trusted environments. |
 | `MCP_HA_SYNC_ENABLED` | `false` | MCP registry sync via Redis for multi-replica deployments. |

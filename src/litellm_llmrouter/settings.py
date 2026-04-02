@@ -460,9 +460,7 @@ class MCPSettings(BaseModel):
     """MCP (Model Context Protocol) gateway configuration.
 
     Env vars: ``MCP_GATEWAY_ENABLED``, ``LLMROUTER_ENABLE_MCP_TOOL_INVOCATION``,
-    ``MCP_HA_SYNC_ENABLED``, ``MCP_SYNC_INTERVAL``,
-    ``MCP_SSE_TRANSPORT_ENABLED``, ``MCP_SSE_LEGACY_MODE``,
-    ``MCP_PROTOCOL_PROXY_ENABLED``, ``MCP_OAUTH_ENABLED``.
+    ``MCP_HA_SYNC_ENABLED``, ``MCP_SYNC_INTERVAL``, ``MCP_OAUTH_ENABLED``.
     """
 
     enabled: bool = Field(False, description="Enable the MCP gateway.")
@@ -480,12 +478,6 @@ class MCPSettings(BaseModel):
         5.0,
         ge=1.0,
         description="Interval (seconds) for HA registry sync.",
-    )
-    sse_transport_enabled: bool = Field(False, description="Enable MCP SSE transport.")
-    sse_legacy_mode: bool = Field(False, description="Enable legacy SSE mode.")
-    protocol_proxy_enabled: bool = Field(
-        False,
-        description="Enable MCP protocol-level proxy (admin only).",
     )
     oauth_enabled: bool = Field(False, description="Enable OAuth for MCP.")
 

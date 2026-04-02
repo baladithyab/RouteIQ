@@ -24,7 +24,12 @@ from . import admin_router
 _start_time = time.time()
 
 # Version
-_VERSION = "0.2.0"
+try:
+    from importlib.metadata import version as _get_pkg_version
+
+    _VERSION = _get_pkg_version("routeiq")
+except Exception:
+    _VERSION = "0.0.0-dev"
 
 
 # --- Pydantic Models ---

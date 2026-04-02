@@ -109,7 +109,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          .venv/bin/python -m pytest tests/test_strategies.py -v --tb=short
+          .venv/bin/python -m pytest tests/unit/ -v --tb=short
         env:
           PYTHONPATH: src
 

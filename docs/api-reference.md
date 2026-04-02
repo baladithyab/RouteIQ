@@ -411,12 +411,6 @@ RouteIQ Gateway provides upstream-compatible endpoint aliases that match LiteLLM
 | `/v1/mcp/server/oauth/{server_id}/register` | POST | OAuth client registration |
 | `/mcp/oauth/callback` | GET | OAuth callback handler |
 
-### Protocol Proxy (Feature-Flagged: `MCP_PROTOCOL_PROXY_ENABLED=true`)
-
-| Path | HTTP Method | Description |
-|------|-------------|-------------|
-| `/mcp/{server_id}/*` | * | Proxy to registered MCP server |
-
 ## Skills Gateway Endpoints
 
 > See [Skills Gateway Guide](skills-gateway.md) for full details.

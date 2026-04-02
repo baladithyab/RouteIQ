@@ -34,7 +34,7 @@ Provides compatibility with the upstream LiteLLM API contract. Use this if you a
 
 ### 3. Native MCP Protocol (`/mcp/*`)
 **Status: Experimental / In-Progress**
-Exposes native MCP endpoints (JSON-RPC over SSE or HTTP) for direct connection by MCP clients like Claude Desktop. This surface is feature-flagged via `MCP_PROTOCOL_PROXY_ENABLED`.
+Exposes native MCP endpoints (JSON-RPC over SSE or HTTP) for direct connection by MCP clients like Claude Desktop. This surface is provided by LiteLLM's native MCP implementation.
 
 > **Note on Anthropic Skills:**
 > If you are looking for Anthropic's "Computer Use" or "Bash" skills, those are distinct from MCP. See the [Skills Gateway Guide](skills-gateway.md) for details. We support both protocols.
