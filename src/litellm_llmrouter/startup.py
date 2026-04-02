@@ -452,13 +452,25 @@ def init_a2a_tracing_if_enabled(app):
 
 
 def _use_own_app() -> bool:
-    """Return True when ADR-0012 own-app mode is requested.
+    """Return True when ADR-0012 own-app mode is active.
 
-    Note: ``ROUTEIQ_OWN_APP`` is not yet modelled in :class:`GatewaySettings`
-    because it controls *which* factory to call (i.e., it must be read
-    before the app — and therefore the settings singleton — is created).
+    Own-app mode is the **default** since v0.3.  Set
+    ``ROUTEIQ_OWN_APP=false`` to fall back to the legacy path where
+    LiteLLM owns the FastAPI instance.
+
+    Note: This flag is read *before* the settings singleton is created
+    (it controls which factory to call), so it also consults
+    ``GatewaySettings.own_app`` as a fallback.
     """
-    return os.getenv("ROUTEIQ_OWN_APP", "false").lower() in ("true", "1", "yes")
+    raw = os.getenv("ROUTEIQ_OWN_APP")
+    if raw is not None:
+        return raw.lower() in ("true", "1", "yes")
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().own_app
+    except Exception:
+        return True  # default: own-app mode
 
 
 def _run_gateway_app(config_path: str, host: str, port: int, **kwargs):
@@ -669,7 +681,9 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         else:
             logger.debug("OIDC/SSO integration is disabled")
 
-    print("✅ LLMRouter routes registered with LiteLLM (legacy mode)")
+    print(
+        "✅ LLMRouter routes registered with LiteLLM (legacy mode — set ROUTEIQ_OWN_APP=true to upgrade)"
+    )
     print("   ├── /_health/* (K8s probes, unauthenticated)")
     print("   ├── /config/services (service discovery, unauthenticated)")
     print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
@@ -760,7 +774,7 @@ def main():
         LITELLM_CONFIG_PATH  Default config path if --config not provided
         ROUTEIQ_WORKERS      Number of uvicorn workers (overrides --workers)
         ROUTEIQ_USE_PLUGIN_STRATEGY  Enable plugin strategy mode (default: true)
-        ROUTEIQ_OWN_APP      Use RouteIQ-owned FastAPI app — ADR-0012 (default: false)
+        ROUTEIQ_OWN_APP      Use RouteIQ-owned FastAPI app — ADR-0012 (default: true)
     """
     import argparse
 
@@ -873,7 +887,9 @@ Examples:
     if own_app:
         print("   App mode: own-app (ADR-0012 — RouteIQ owns FastAPI, LiteLLM at /v1/)")
     else:
-        print("   App mode: legacy (LiteLLM owns FastAPI, RouteIQ layers on top)")
+        print(
+            "   App mode: legacy (LiteLLM owns FastAPI — opt-in via ROUTEIQ_OWN_APP=false)"
+        )
     if use_plugin:
         print(
             "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"

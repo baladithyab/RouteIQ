@@ -134,6 +134,29 @@ imagePullSecrets:
 {{- end }}
 
 {{/*
+Database-only environment variables (for init containers like db-migrate)
+*/}}
+{{- define "routeiq-gateway.databaseEnv" -}}
+{{- if .Values.externalPostgresql.host }}
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+{{- if .Values.externalPostgresql.existingSecret }}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.externalPostgresql.existingSecret }}
+      key: {{ .Values.externalPostgresql.existingSecretKey | default "password" }}
+{{- end }}
+{{- else if .Values.secrets.values.DATABASE_URL }}
+- name: DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "routeiq-gateway.secretName" . }}
+      key: DATABASE_URL
+{{- end }}
+{{- end }}
+
+{{/*
 Environment variables for gateway configuration
 */}}
 {{- define "routeiq-gateway.envVars" -}}
@@ -226,6 +249,26 @@ Environment variables for gateway configuration
   value: {{ .Values.routeiq.routingProfile | quote }}
 - name: ROUTEIQ_ADMIN_UI_ENABLED
   value: {{ .Values.routeiq.adminUI.enabled | quote }}
+
+# Leader election
+{{- if .Values.routeiq.leaderElection.enabled }}
+- name: LLMROUTER_HA_MODE
+  value: "leader_election"
+{{- if .Values.routeiq.leaderElection.backend }}
+- name: ROUTEIQ_LEADER_ELECTION_BACKEND
+  value: {{ .Values.routeiq.leaderElection.backend | quote }}
+{{- end }}
+{{- end }}
+
+# Pod identity for leader election (Downward API)
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+- name: POD_NAMESPACE
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.namespace
 
 # External PostgreSQL
 {{- if .Values.externalPostgresql.host }}

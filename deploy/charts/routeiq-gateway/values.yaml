@@ -295,6 +295,14 @@ routeiq:
   adminUI:
     enabled: false          # ROUTEIQ_ADMIN_UI_ENABLED
 
+  # Leader election configuration
+  # Auto-detects backend: K8s Lease API > Redis > PostgreSQL > None
+  leaderElection:
+    enabled: false          # LLMROUTER_HA_MODE=leader_election
+    # Explicit backend override (empty = auto-detect):
+    # kubernetes, redis, postgres, none
+    backend: ""             # ROUTEIQ_LEADER_ELECTION_BACKEND
+
 # -----------------------------------------------------------------------------
 # External services (plug-in mode)
 # -----------------------------------------------------------------------------
@@ -536,6 +544,28 @@ terminationGracePeriodSeconds: 30
 # Priority class
 # -----------------------------------------------------------------------------
 priorityClassName: ""
+
+# -----------------------------------------------------------------------------
+# Database migrations init container
+# -----------------------------------------------------------------------------
+# Runs database migrations before the main container starts.
+# Only active when postgresql is configured (externalPostgresql.host or
+# DATABASE_URL in secrets).
+migrations:
+  enabled: true
+  # Command to run for migrations. Uses the same image as the gateway.
+  command:
+    - python
+    - "-c"
+    - "from litellm_llmrouter.database import run_migrations; import asyncio; asyncio.run(run_migrations())"
+  # Resources for the init container (typically less than the main container)
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 
 # -----------------------------------------------------------------------------
 # Init containers (optional)

@@ -727,7 +727,8 @@ class CacheSettings(BaseModel):
 class HASettings(BaseModel):
     """High-availability and leader election configuration.
 
-    Env vars: ``LLMROUTER_HA_MODE``, ``ROUTEIQ_LEADER_MIGRATIONS``.
+    Env vars: ``LLMROUTER_HA_MODE``, ``ROUTEIQ_LEADER_MIGRATIONS``,
+    ``ROUTEIQ_LEADER_ELECTION_BACKEND``.
     """
 
     mode: str = Field(
@@ -737,6 +738,14 @@ class HASettings(BaseModel):
     leader_migrations: bool = Field(
         False,
         description="Run DB migrations via leader election at startup.",
+    )
+    leader_election_backend: str = Field(
+        "",
+        description=(
+            "Explicit leader election backend override: "
+            "kubernetes, redis, postgres, none.  "
+            "When empty, auto-detected from environment."
+        ),
     )
 
 
@@ -805,6 +814,14 @@ class GatewaySettings(BaseSettings):
     skip_env_validation: bool = Field(
         False,
         description="Skip advisory env validation at startup.",
+    )
+    own_app: bool = Field(
+        True,
+        description=(
+            "Use RouteIQ-owned FastAPI app (ADR-0012).  "
+            "Set to false to fall back to legacy mode where LiteLLM "
+            "owns the FastAPI instance."
+        ),
     )
 
     # ------------------------------------------------------------------

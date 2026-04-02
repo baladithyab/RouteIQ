@@ -127,6 +127,67 @@ class TestPluginLifecycle:
         assert app is not None
 
 
+class TestCreateGatewayApp:
+    """Tests for ADR-0012 owned-app factory (now the default)."""
+
+    def test_creates_fastapi_app(self):
+        """create_gateway_app() returns a FastAPI instance."""
+        from litellm_llmrouter.gateway import create_gateway_app
+        from fastapi import FastAPI
+
+        app = create_gateway_app(mount_litellm=False)
+        assert isinstance(app, FastAPI)
+
+    def test_app_has_routeiq_routes(self):
+        """Gateway app includes health, config, routing routes."""
+        from litellm_llmrouter.gateway import create_gateway_app
+
+        app = create_gateway_app(mount_litellm=False)
+
+        route_paths = [route.path for route in app.routes]
+        # Health routes
+        assert "/_health/live" in route_paths
+        assert "/_health/ready" in route_paths
+
+    def test_app_title_and_version(self):
+        """App metadata reflects RouteIQ branding."""
+        from litellm_llmrouter.gateway import create_gateway_app
+
+        app = create_gateway_app(mount_litellm=False)
+
+        assert app.title == "RouteIQ Gateway"
+        # Version should be a string (either real version or dev fallback)
+        assert isinstance(app.version, str)
+        assert len(app.version) > 0
+
+    def test_mount_litellm_false(self):
+        """Can create app without LiteLLM sub-mount."""
+        from litellm_llmrouter.gateway import create_gateway_app
+
+        app = create_gateway_app(mount_litellm=False)
+
+        # /v1 mount should NOT be present
+        mount_paths = [route.path for route in app.routes if hasattr(route, "app")]
+        assert "/v1" not in mount_paths
+
+    def test_lifespan_exists(self):
+        """App has a proper lifespan context manager."""
+        from litellm_llmrouter.gateway import create_gateway_app
+
+        app = create_gateway_app(mount_litellm=False)
+
+        # The lifespan should be set on the router
+        assert app.router.lifespan_context is not None
+
+    def test_own_app_state_flag(self):
+        """Gateway app sets routeiq_own_app=True on app.state."""
+        from litellm_llmrouter.gateway import create_gateway_app
+
+        app = create_gateway_app(mount_litellm=False)
+
+        assert getattr(app.state, "routeiq_own_app", False) is True
+
+
 class TestApplyPatchSafely:
     """Test the _apply_patch_safely function."""
 

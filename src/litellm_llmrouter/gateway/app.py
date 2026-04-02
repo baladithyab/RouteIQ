@@ -617,7 +617,8 @@ def create_gateway_app(
       more ``app.state`` lambda hacks.
     * LiteLLM is an optional sub-mount, not the host application.
 
-    Activate via ``ROUTEIQ_OWN_APP=true`` (default: false).
+    This is the default mode (``ROUTEIQ_OWN_APP=true``).  Set
+    ``ROUTEIQ_OWN_APP=false`` to fall back to the legacy :func:`create_app` path.
 
     Args:
         config_path: Path to config YAML file.  If provided, sets
@@ -747,7 +748,7 @@ def create_app(
     """
     warnings.warn(
         "create_app() is deprecated — use create_gateway_app() instead (ADR-0012). "
-        "Set ROUTEIQ_OWN_APP=true to opt in.",
+        "Own-app mode is now the default; this legacy path requires ROUTEIQ_OWN_APP=false.",
         DeprecationWarning,
         stacklevel=2,
     )

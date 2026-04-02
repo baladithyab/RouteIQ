@@ -1,6 +1,6 @@
 # ADR-0015: K8s-Native Leader Election via Lease API
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

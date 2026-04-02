@@ -1,0 +1,39 @@
+{{/*
+RBAC resources for K8s-native leader election via the Lease API.
+Only created when:
+  1. Leader election is enabled
+  2. Backend is explicitly "kubernetes" or auto-detected (backend is empty)
+  3. ServiceAccount is created by this chart
+
+The Role grants get/create/update on Lease objects in the release namespace.
+*/}}
+{{- if and .Values.routeiq.leaderElection.enabled .Values.serviceAccount.create }}
+{{- if or (eq .Values.routeiq.leaderElection.backend "kubernetes") (not .Values.routeiq.leaderElection.backend) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}-leader-election
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}-leader-election
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "routeiq-gateway.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "routeiq-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
