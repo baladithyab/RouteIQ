@@ -135,7 +135,7 @@ ARG INSTALL_LLMROUTER
 LABEL org.opencontainers.image.source="https://github.com/baladithyab/litellm-llm-router"
 LABEL org.opencontainers.image.description="RouteIQ: Intelligent LLM Gateway with ML-Powered Routing"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.version="0.2.0"
+LABEL org.opencontainers.image.version="1.0.0-rc1"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
 LABEL org.opencontainers.image.vendor="RouteIQ"

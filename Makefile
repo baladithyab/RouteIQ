@@ -1,3 +1,7 @@
+# RouteIQ uses uv as its primary package manager (https://docs.astral.sh/uv/)
+# All targets use 'uv run' for reproducible execution
+# RouteIQ uses uv as its primary package manager (https://docs.astral.sh/uv/)
+# All targets use 'uv run' for reproducible execution
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 

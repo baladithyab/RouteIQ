@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "routeiq"
-version = "0.2.0"
+version = "1.0.0rc1"
 description = "RouteIQ Gateway - Production AI Gateway with ML-based routing (built on LiteLLM + LLMRouter)"
 readme = "README.md"
 license = { text = "MIT" }

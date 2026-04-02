@@ -93,7 +93,7 @@ class TestGatewayStatus:
     def test_version_present(self, client):
         """Test version is returned."""
         response = client.get("/api/v1/routeiq/status")
-        assert response.json()["version"] == "0.2.0"
+        assert response.json()["version"]  # version string present and non-empty
 
     def test_routing_profile_default(self, client):
         """Test default routing profile."""

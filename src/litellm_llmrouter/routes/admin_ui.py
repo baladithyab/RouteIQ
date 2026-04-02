@@ -29,7 +29,7 @@ try:
 
     _VERSION = _get_pkg_version("routeiq")
 except Exception:
-    _VERSION = "0.0.0-dev"
+    _VERSION = "1.0.0rc1"  # fallback if not installed as package
 
 
 # --- Pydantic Models ---

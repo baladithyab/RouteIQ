@@ -19,6 +19,13 @@ enterprise governance, and cloud-native infrastructure for LLM APIs. Built on
 
 ## Quick Start
 
+=== "uv (recommended)"
+
+    ```bash
+    uv add routeiq
+    uv run routeiq start --config config.yaml
+    ```
+
 === "pip"
 
     ```bash

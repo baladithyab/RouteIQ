@@ -1,10 +1,10 @@
 """RouteIQ Routing — Intelligent ML-based routing for LLM APIs.
 
 Two modes:
-1. Standalone: pip install routeiq-routing
+1. Standalone: uv add routeiq-routing (or pip install routeiq-routing)
    Uses StandaloneCentroidRouter with cost-tier routing
 
-2. Full gateway: pip install routeiq
+2. Full gateway: uv add routeiq (or pip install routeiq)
    Uses CentroidRoutingStrategy with ML routing, vision, personalization
 
 Standalone usage with LiteLLM:
@@ -38,5 +38,5 @@ except ImportError:
 # Always expose the standalone router for explicit use
 from routeiq_routing._centroid_standalone import StandaloneCentroidRouter
 
-__version__ = "0.1.0"
+__version__ = "1.0.0rc1"
 __all__ = ["CentroidRoutingStrategy", "PersonalizedRouter", "StandaloneCentroidRouter"]

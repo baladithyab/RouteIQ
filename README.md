@@ -32,7 +32,7 @@ Cloud-native General AI Gateway with pluggable ML routing intelligence and end-t
 - **Personalized Routing**: Per-user/per-team model preference learning
 - **Router-R1**: Iterative reasoning-based routing using the gateway's own proxy
 - **CLI**: `routeiq start/validate-config/version/probe-services`
-- **Standalone Package**: `pip install routeiq-routing` for ML routing without the full gateway
+- **Standalone Package**: `uv add routeiq-routing` (or `pip install routeiq-routing`) for ML routing without the full gateway
 
 ## Gateway Surfaces
 
@@ -83,10 +83,26 @@ The gateway operates as the central nervous system for AI infrastructure:
 
 ### Prerequisites
 
+- [uv](https://docs.astral.sh/uv/) (recommended package manager)
 - [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- [uv](https://docs.astral.sh/uv/) (for local development)
 
-### 1. Docker Compose (Basic)
+### 1. Local Development (uv)
+
+```bash
+git clone https://github.com/baladithyab/RouteIQ.git
+cd RouteIQ
+uv sync
+uv run routeiq start --config config/config.yaml
+```
+
+Or with pip:
+
+```bash
+pip install -e .
+routeiq start --config config/config.yaml
+```
+
+### 2. Docker Compose (Basic)
 
 ```bash
 git clone https://github.com/baladithyab/RouteIQ.git
@@ -95,7 +111,7 @@ cp .env.example .env  # Edit with your API keys
 docker compose up -d
 ```
 
-### 2. High Availability (Production)
+### 3. High Availability (Production)
 
 Multi-replica with Redis, PostgreSQL, and Nginx load balancing:
 
@@ -105,7 +121,7 @@ docker compose -f examples/docker/ha/docker-compose.ha.yml up -d
 
 > **Note**: Deployment examples are organized in `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
 
-### 3. With Observability (OTel + Jaeger)
+### 4. With Observability (OTel + Jaeger)
 
 Full trace visualization with Jaeger:
 
@@ -114,7 +130,7 @@ docker compose -f examples/docker/observability/docker-compose.otel.yml up -d
 # Jaeger UI: http://localhost:16686
 ```
 
-### 4. Local Development
+### 5. Local Development (Full Stack)
 
 ```bash
 uv sync

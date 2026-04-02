@@ -4,14 +4,36 @@ Get RouteIQ Gateway running in 5 minutes.
 
 ## Prerequisites
 
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
 - An API key for at least one LLM provider (OpenAI, Anthropic, etc.)
 
-## 1. Clone and Configure
+## Option A: Local Development (uv)
+
+```bash
+# Clone and install with uv (recommended — fast, deterministic)
+git clone https://github.com/baladithyab/RouteIQ.git
+cd RouteIQ
+uv sync
+
+# Start the gateway
+uv run routeiq start --config config/config.yaml --port 4000
+```
+
+Or with pip:
+
+```bash
+pip install -e ".[prod]"
+routeiq start --config config/config.yaml --port 4000
+```
+
+## Option B: Docker (Quick Start)
+
+### 1. Clone and Configure
 
 ```bash
 git clone https://github.com/baladithyab/RouteIQ.git
-cd routeiq
+cd RouteIQ
 cp .env.example .env
 ```
 
@@ -74,7 +96,7 @@ export ROUTEIQ_ROUTING_PROFILE=auto  # auto | eco | premium | free | reasoning
 
 ## What's Next?
 
-- [Installation](installation.md) — Full installation options (pip, Docker, Helm)
+- [Installation](installation.md) — Full installation options (uv, pip, Docker, Helm)
 - [Configuration](configuration.md) — Detailed configuration reference
 - [Routing Strategies](../features/routing.md) — All 18+ routing algorithms
 - [Deployment](../operations/deployment.md) — Production deployment guides

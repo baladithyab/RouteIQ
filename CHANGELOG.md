@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc1] — 2026-04-02
+
 ### Fixed
 - Python 2 except syntax in policy_engine.py (tuple form required)
 - CORS wildcard + credentials security vulnerability (wildcard now forces credentials=false)
@@ -26,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - State is automatically loaded at startup and saved after every CRUD mutation
 - CORS origins default changed from `"*"` to `""` (must be explicitly configured)
 - CHANGELOG.md
+
+### Changed
+- Version bumped to 1.0.0-rc1 across all packages
+- `uv` is now the primary/recommended package manager (pip remains as alternative)
+- `routeiq-routing` standalone package bumped to 1.0.0rc1
+
+### Changed
+- Version bumped to 1.0.0-rc1 across all packages
+- `uv` is now the primary/recommended package manager (pip remains as alternative)
+- `routeiq-routing` standalone package bumped to 1.0.0rc1
 
 ## [0.2.0] — 2026-03-28
 
@@ -52,4 +64,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HA with leader election (Redis and Kubernetes Lease API)
 - OpenTelemetry traces, metrics, and structured logging
 - CLI: `routeiq start/validate-config/version/probe-services`
-- Standalone package: `pip install routeiq-routing` for ML routing without full gateway
+- Standalone package: `uv add routeiq-routing` (or `pip install routeiq-routing`) for ML routing without full gateway

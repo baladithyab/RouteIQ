@@ -12,11 +12,17 @@ for development on the RouteIQ Gateway project.
 
 ### Prerequisites
 
-- **Python 3.14+**
-- **[uv](https://docs.astral.sh/uv/)** - Fast Python package manager (preferred over pip)
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/)** - Fast, deterministic Python package manager (recommended)
 - **Docker** and **Docker Compose**
 - **Git**
 - **[Lefthook](https://github.com/evilmartians/lefthook)** - Git hooks manager (installed via script)
+
+### Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 ### Local Development
 
@@ -25,8 +31,11 @@ for development on the RouteIQ Gateway project.
 git clone https://github.com/baladithyab/RouteIQ.git
 cd RouteIQ
 
-# Install dependencies with uv
-uv sync
+# Install dependencies with uv (recommended — fast, deterministic, uses uv.lock)
+uv sync --extra dev
+
+# Or with pip (alternative)
+# pip install -e ".[dev]"
 
 # Install git hooks
 ./scripts/install_lefthook.sh

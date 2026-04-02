@@ -1,28 +1,39 @@
 # Installation
 
-RouteIQ Gateway can be installed via pip, Docker, or Helm.
+RouteIQ Gateway can be installed via uv (recommended), pip, Docker, or Helm.
 
-## Python Package
+## Install with uv (Recommended)
+
+[uv](https://docs.astral.sh/uv/) provides fast, deterministic dependency resolution with a lockfile.
 
 ### Requirements
 
-- Python 3.14+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
-
-### Install with uv
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/)
 
 ```bash
-# Install core package
-uv add routeiq
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install with optional extras
-uv add routeiq[knn]       # KNN routing (sentence-transformers)
-uv add routeiq[oidc]      # OIDC/SSO authentication
-uv add routeiq[prod]      # All production dependencies
-uv add routeiq[all]       # Everything including dev tools
+# Clone and install from source
+git clone https://github.com/baladithyab/RouteIQ.git
+cd RouteIQ
+uv sync                     # Install core dependencies from lockfile
+uv sync --extra dev         # Include dev tools (pytest, ruff, mypy)
+uv sync --extra prod        # All production dependencies
 ```
 
-### Install with pip
+Or install from PyPI:
+
+```bash
+uv add routeiq              # Core package
+uv add routeiq[knn]         # KNN routing (sentence-transformers)
+uv add routeiq[oidc]        # OIDC/SSO authentication
+uv add routeiq[prod]        # All production dependencies
+uv add routeiq[all]         # Everything including dev tools
+```
+
+## Install with pip (Alternative)
 
 ```bash
 pip install routeiq
@@ -32,12 +43,10 @@ pip install routeiq[prod]  # Production extras
 ### Start the Gateway
 
 ```bash
-routeiq start --config config/config.yaml --port 4000
-```
+# With uv (recommended)
+uv run routeiq start --config config/config.yaml --port 4000
 
-Or directly with Python:
-
-```bash
+# Or directly with Python
 python -m litellm_llmrouter.startup --config config/config.yaml --port 4000
 ```
 

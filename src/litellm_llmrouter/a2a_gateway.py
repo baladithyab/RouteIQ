@@ -801,7 +801,7 @@ class A2AGateway:
             "name": agent.name,
             "description": agent.description,
             "url": agent.url,
-            "version": "0.2.0",
+            "version": "1.0.0-rc1",
             "capabilities": {
                 "streaming": "streaming" in agent.capabilities,
                 "pushNotifications": False,
@@ -846,7 +846,7 @@ class A2AGateway:
             "name": "RouteIQ A2A Gateway",
             "description": "AI Gateway with A2A protocol support for agent-to-agent communication",
             "url": f"{base_url}/a2a",
-            "version": "0.2.0",
+            "version": "1.0.0-rc1",
             "capabilities": {
                 "streaming": True,
                 "pushNotifications": False,

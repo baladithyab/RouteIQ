@@ -190,7 +190,7 @@ try:
 
     __version__ = _get_version("routeiq")
 except Exception:
-    __version__ = "0.2.0"  # fallback if not installed as package
+    __version__ = "1.0.0rc1"  # fallback if not installed as package
 
 __all__ = [
     # Router patch stubs — REMOVED (no-op stubs for backward compatibility)

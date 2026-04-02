@@ -5,13 +5,14 @@ Intelligent ML-based routing for LLM APIs — works standalone with LiteLLM or a
 ## Installation
 
 ```bash
-# Core (centroid routing, routing profiles)
+# Using uv (recommended)
+uv add routeiq-routing                # Core (centroid routing, routing profiles)
+uv add routeiq-routing[knn]           # With KNN strategy support
+uv add routeiq-routing[all]           # With all ML strategies
+
+# Or using pip
 pip install routeiq-routing
-
-# With KNN strategy support (requires sentence-transformers)
 pip install routeiq-routing[knn]
-
-# With all ML strategies
 pip install routeiq-routing[all]
 ```
 
@@ -105,6 +106,10 @@ for standalone use. If you need the full gateway with security, observability,
 plugins, and the composition root, install the full package:
 
 ```bash
+# Using uv (recommended)
+uv add routeiq[prod]
+
+# Or using pip
 pip install routeiq[prod]
 ```
 
