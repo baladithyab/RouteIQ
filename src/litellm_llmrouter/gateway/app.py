@@ -68,6 +68,8 @@ from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI
 
+from ..settings import get_settings
+
 from ..routing_strategy_patch import is_patch_applied, patch_litellm_router
 from ..resilience import (
     add_backpressure_middleware,
@@ -97,26 +99,54 @@ def _use_plugin_strategy() -> bool:
     """
     Check whether the plugin-based routing strategy should be used.
 
-    Reads ``ROUTEIQ_USE_PLUGIN_STRATEGY`` environment variable.
+    Reads from typed settings (``settings.routing.use_plugin_strategy``),
+    falling back to ``ROUTEIQ_USE_PLUGIN_STRATEGY`` env var.
     Defaults to ``True`` (new behaviour).  Set to ``"false"`` to fall back
     to the legacy monkey-patch approach.
     """
-    return os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    try:
+        settings = get_settings()
+        return settings.routing.use_plugin_strategy
+    except Exception:
+        return os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
 
 def _parse_cors_origins() -> list[str]:
-    """Parse ROUTEIQ_CORS_ORIGINS into a list of allowed origins."""
-    raw = os.getenv("ROUTEIQ_CORS_ORIGINS", "*")
-    return [o.strip() for o in raw.split(",")]
+    """Parse CORS origins into a list of allowed origins.
+
+    Checks ``ROUTEIQ_CORS_ORIGINS`` env var first (legacy), then typed
+    settings, then defaults to ``["*"]``.
+    """
+    # Legacy env var takes precedence (it may differ from the settings
+    # model's env var name which is ROUTEIQ_SECURITY__CORS_ORIGINS).
+    raw = os.getenv("ROUTEIQ_CORS_ORIGINS")
+    if raw is not None:
+        return [o.strip() for o in raw.split(",")]
+    try:
+        settings = get_settings()
+        return settings.cors_origins_list
+    except Exception:
+        return ["*"]
 
 
 def _parse_cors_credentials() -> bool:
-    """Parse ROUTEIQ_CORS_CREDENTIALS flag."""
-    return os.getenv("ROUTEIQ_CORS_CREDENTIALS", "false").lower() == "true"
+    """Parse CORS credentials flag.
+
+    Checks ``ROUTEIQ_CORS_CREDENTIALS`` env var first (legacy), then
+    typed settings.
+    """
+    raw = os.getenv("ROUTEIQ_CORS_CREDENTIALS")
+    if raw is not None:
+        return raw.lower() == "true"
+    try:
+        settings = get_settings()
+        return settings.security.cors_credentials
+    except Exception:
+        return False
 
 
 def _apply_patch_safely() -> bool:
@@ -428,7 +458,16 @@ def _load_plugins_before_routes() -> int:
 
 def _mount_admin_ui(app: FastAPI) -> None:
     """Mount the admin UI static files if enabled and available."""
-    if os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED", "false").lower() != "true":
+    raw = os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED")
+    if raw is not None:
+        admin_ui_enabled = raw.lower() == "true"
+    else:
+        try:
+            settings = get_settings()
+            admin_ui_enabled = settings.admin_ui_enabled
+        except Exception:
+            admin_ui_enabled = False
+    if not admin_ui_enabled:
         return
 
     from pathlib import Path
@@ -607,16 +646,22 @@ def create_gateway_app(
             logger.error("Failed to load plugins: %s", exc)
 
     # --- Create RouteIQ's own FastAPI app with proper lifespan ---
+    _raw_ui = os.getenv("ROUTEIQ_ADMIN_UI_ENABLED")
+    if _raw_ui is not None:
+        _admin_ui_on = _raw_ui.lower() == "true"
+    else:
+        try:
+            _settings = get_settings()
+            _admin_ui_on = _settings.admin_ui_enabled
+        except Exception:
+            _admin_ui_on = False
+
     app = FastAPI(
         title="RouteIQ Gateway",
         description="Cloud-Native AI Gateway with Intelligent Routing",
         version=_get_version(),
         lifespan=_routeiq_lifespan,
-        docs_url=(
-            "/docs"
-            if os.getenv("ROUTEIQ_ADMIN_UI_ENABLED", "").lower() == "true"
-            else None
-        ),
+        docs_url="/docs" if _admin_ui_on else None,
     )
 
     # Tag the app so downstream code can detect ADR-0012 mode

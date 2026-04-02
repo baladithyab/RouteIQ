@@ -42,6 +42,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # Configure module logger
 logger = logging.getLogger(__name__)
 
+# Late-imported: from litellm_llmrouter.settings import get_settings
+# Imported inside functions to avoid circular imports at module load time.
+
 
 def register_router_decision_callback():
     """
@@ -118,11 +121,17 @@ def register_strategies():
     When using the legacy monkey-patch (deprecated), strategies are activated
     via ``routing_strategy_patch.py``.
     """
-    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        settings = get_settings()
+        use_plugin = settings.routing.use_plugin_strategy
+    except Exception:
+        use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
     try:
         from litellm_llmrouter.strategies import register_llmrouter_strategies
@@ -187,8 +196,16 @@ def install_plugin_routing_strategy(app):
         return False
 
     # Determine the strategy name:
-    # 1. Explicit env var override
-    strategy_name = os.environ.get("ROUTEIQ_ROUTING_STRATEGY")
+    # 1. Explicit override from typed settings or env var
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        _st = get_settings()
+        strategy_name = _st.routing.strategy_override
+    except Exception:
+        strategy_name = None
+    if not strategy_name:
+        strategy_name = os.environ.get("ROUTEIQ_ROUTING_STRATEGY")
 
     # 2. Extract from Router config's routing_strategy if it's an llmrouter-* value
     if not strategy_name:
@@ -248,16 +265,23 @@ def resolve_worker_count(cli_workers: int | None = None) -> int:
 
     Invalid values (non-integer, zero, negative) are silently coerced to 1.
     """
-    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    # Resolve use_plugin: env var first, then settings
+    _env_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY")
+    if _env_plugin is not None:
+        use_plugin = _env_plugin.lower() in ("true", "1", "yes")
+    else:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            use_plugin = get_settings().routing.use_plugin_strategy
+        except Exception:
+            use_plugin = True  # default
 
     # --- resolve the raw desired worker count ---
     workers = 1  # default
     source = "default"
 
+    # Env var override (highest priority for worker count)
     env_val = os.environ.get("ROUTEIQ_WORKERS")
     if env_val is not None:
         try:
@@ -302,12 +326,43 @@ def resolve_worker_count(cli_workers: int | None = None) -> int:
 
 def init_observability_if_enabled():
     """Initialize OpenTelemetry observability if enabled."""
-    if os.getenv("OTEL_ENABLED", "true").lower() == "true":
+    # Legacy env vars (OTEL_*) take precedence over typed settings
+    # (which use ROUTEIQ_OTEL__* prefix).
+    env_enabled = os.getenv("OTEL_ENABLED")
+    env_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    env_service = os.getenv("OTEL_SERVICE_NAME")
+
+    if env_enabled is not None:
+        otel_enabled = env_enabled.lower() == "true"
+    else:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otel_enabled = get_settings().otel.enabled
+        except Exception:
+            otel_enabled = True  # default
+
+    otlp_endpoint = env_endpoint
+    if otlp_endpoint is None:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otlp_endpoint = get_settings().otel.endpoint
+        except Exception:
+            pass
+
+    service_name = env_service
+    if service_name is None:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            service_name = get_settings().otel.service_name
+        except Exception:
+            service_name = "litellm-gateway"
+
+    if otel_enabled:
         try:
             from litellm_llmrouter.observability import init_observability
-
-            otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-            service_name = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
 
             init_observability(
                 service_name=service_name,
@@ -397,7 +452,12 @@ def init_a2a_tracing_if_enabled(app):
 
 
 def _use_own_app() -> bool:
-    """Return True when ADR-0012 own-app mode is requested."""
+    """Return True when ADR-0012 own-app mode is requested.
+
+    Note: ``ROUTEIQ_OWN_APP`` is not yet modelled in :class:`GatewaySettings`
+    because it controls *which* factory to call (i.e., it must be read
+    before the app — and therefore the settings singleton — is created).
+    """
     return os.getenv("ROUTEIQ_OWN_APP", "false").lower() in ("true", "1", "yes")
 
 
@@ -796,11 +856,16 @@ Examples:
     workers = resolve_worker_count(cli_workers=args.workers)
 
     # Determine routing mode for display
-    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    _env_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY")
+    if _env_plugin is not None:
+        use_plugin = _env_plugin.lower() in ("true", "1", "yes")
+    else:
+        try:
+            from litellm_llmrouter.settings import get_settings as _gs_main
+
+            use_plugin = _gs_main().routing.use_plugin_strategy
+        except Exception:
+            use_plugin = True  # default
 
     own_app = _use_own_app()
 

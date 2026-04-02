@@ -40,6 +40,8 @@ import os
 import warnings
 from typing import Any, Optional
 
+from litellm_llmrouter.settings import get_settings
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -51,28 +53,62 @@ _sync_client: Optional[Any] = None  # redis.Redis | None
 
 
 def _redis_settings() -> dict[str, Any]:
-    """Read common Redis settings from environment variables.
+    """Read common Redis settings from env vars, with typed settings fallback.
+
+    Legacy env vars (``REDIS_HOST``, ``REDIS_PORT``, etc.) take precedence
+    over the typed settings model (which uses ``ROUTEIQ_REDIS__*`` prefix).
+    This ensures backward compatibility while supporting the new settings.
 
     Returns a dict suitable for unpacking into the ``redis.Redis`` /
     ``redis.asyncio.Redis`` constructors.
     """
-    host = os.getenv("REDIS_HOST", "localhost")
-    port = int(os.getenv("REDIS_PORT", "6379"))
-    password = os.getenv("REDIS_PASSWORD") or None
-    ssl = os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes")
-    db = int(os.getenv("REDIS_DB", "0"))
-    return {
-        "host": host,
-        "port": port,
-        "password": password,
-        "ssl": ssl,
-        "db": db,
-    }
+    # Legacy env vars take precedence (most existing deployments use these)
+    env_host = os.getenv("REDIS_HOST")
+    env_port = os.getenv("REDIS_PORT")
+    env_password = os.getenv("REDIS_PASSWORD")
+    env_ssl = os.getenv("REDIS_SSL")
+    env_db = os.getenv("REDIS_DB")
+
+    # If any legacy env var is set, use env vars exclusively
+    if any(v is not None for v in (env_host, env_port, env_password, env_ssl, env_db)):
+        return {
+            "host": env_host or "localhost",
+            "port": int(env_port) if env_port else 6379,
+            "password": env_password or None,
+            "ssl": (env_ssl or "false").lower() in ("true", "1", "yes"),
+            "db": int(env_db) if env_db else 0,
+        }
+
+    # Fall back to typed settings (reads ROUTEIQ_REDIS__* vars)
+    try:
+        settings = get_settings()
+        return {
+            "host": settings.redis.host or "localhost",
+            "port": settings.redis.port,
+            "password": settings.redis.password,
+            "ssl": settings.redis.ssl,
+            "db": settings.redis.db,
+        }
+    except Exception:
+        return {
+            "host": "localhost",
+            "port": 6379,
+            "password": None,
+            "ssl": False,
+            "db": 0,
+        }
 
 
 def _warn_no_password() -> None:
     """Log a warning when Redis is configured without a password."""
-    if not os.getenv("REDIS_PASSWORD"):
+    has_password = bool(os.getenv("REDIS_PASSWORD"))
+    if not has_password:
+        try:
+            settings = get_settings()
+            has_password = bool(settings.redis.password)
+        except Exception:
+            pass
+    if not has_password:
         logger.warning(
             "Redis connection configured without password (REDIS_PASSWORD not set). "
             "This is insecure for production deployments."
@@ -111,7 +147,14 @@ async def get_async_redis_client() -> Optional[Any]:
         if _async_client is not None:
             return _async_client
 
+        # Check legacy env var first, then typed settings
         host = os.getenv("REDIS_HOST")
+        if not host:
+            try:
+                settings = get_settings()
+                host = settings.redis.host
+            except Exception:
+                pass
         if not host:
             return None
 
@@ -119,12 +162,13 @@ async def get_async_redis_client() -> Optional[Any]:
 
         _warn_no_password()
 
+        redis_cfg = _redis_settings()
         _async_client = aioredis.Redis(
-            host=host,
-            port=int(os.getenv("REDIS_PORT", "6379")),
-            password=os.getenv("REDIS_PASSWORD") or None,
-            ssl=os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes"),
-            db=int(os.getenv("REDIS_DB", "0")),
+            host=redis_cfg["host"],
+            port=redis_cfg["port"],
+            password=redis_cfg["password"],
+            ssl=redis_cfg["ssl"],
+            db=redis_cfg["db"],
             decode_responses=True,
             socket_connect_timeout=2.0,
             socket_timeout=2.0,
@@ -172,7 +216,14 @@ def get_sync_redis_client() -> Optional[Any]:
     if _sync_client is not None:
         return _sync_client
 
+    # Check legacy env var first, then typed settings
     host = os.getenv("REDIS_HOST")
+    if not host:
+        try:
+            settings = get_settings()
+            host = settings.redis.host
+        except Exception:
+            pass
     if not host:
         return None
 
@@ -180,12 +231,13 @@ def get_sync_redis_client() -> Optional[Any]:
 
     _warn_no_password()
 
+    redis_cfg = _redis_settings()
     _sync_client = redis.Redis(
-        host=host,
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        password=os.getenv("REDIS_PASSWORD") or None,
-        ssl=os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes"),
-        db=int(os.getenv("REDIS_DB", "0")),
+        host=redis_cfg["host"],
+        port=redis_cfg["port"],
+        password=redis_cfg["password"],
+        ssl=redis_cfg["ssl"],
+        db=redis_cfg["db"],
         decode_responses=True,
         socket_timeout=5.0,
     )
@@ -291,7 +343,7 @@ def create_sync_redis_client(
 
 
 def build_redis_url() -> str:
-    """Build a Redis URL from environment variables.
+    """Build a Redis URL from typed settings (falling back to env vars).
 
     Useful for consumers that accept a URL string rather than keyword
     arguments (e.g. ``redis.asyncio.from_url``).

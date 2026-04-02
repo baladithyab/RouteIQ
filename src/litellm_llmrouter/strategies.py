@@ -455,6 +455,1366 @@ class InferenceKNNRouter:
             return None
 
 
+class InferenceSVMRouter:
+    """
+    Lightweight inference-only SVM router that loads sklearn SVC models directly.
+
+    This class bypasses the UIUC LLMRouter's MetaRouter initialization which
+    requires training data. Instead, it:
+    - Loads a pre-trained sklearn SVC/SVM from a .pkl file
+    - Uses sentence-transformers for text embedding (same as training)
+    - Predicts the best model label for a given query
+
+    The trained .pkl file is produced by UIUC's SVMRouter trainer which calls
+    sklearn's SVC.fit() and saves via pickle.
+
+    Security:
+    - Pickle loading requires LLMROUTER_ALLOW_PICKLE_MODELS=true
+    - This protects against RCE via malicious pickle files
+    - When enabled, artifacts are verified against manifest if configured
+
+    Safe Activation:
+    - Models are loaded into a temporary instance first
+    - Only swapped to active if loading succeeds
+    - On failure, the old model remains active
+
+    Attributes:
+        model_path: Path to the trained .pkl model file
+        embedding_model: Name of the sentence-transformer model
+        embedding_device: Device for embedding model ('cpu', 'cuda')
+        svm_model: Loaded sklearn SVC model
+        label_mapping: Optional mapping from predicted labels to LLM candidate keys
+        model_version: Active model version metadata for observability
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_device: str = "cpu",
+        label_mapping: Optional[Dict[str, str]] = None,
+        correlation_id: Optional[str] = None,
+    ):
+        """
+        Initialize inference-only SVM router.
+
+        Args:
+            model_path: Path to the trained sklearn SVM model (.pkl file)
+            embedding_model: HuggingFace model name for sentence embeddings
+            embedding_device: Device for embedding model ('cpu', 'cuda', etc.)
+            label_mapping: Optional dict mapping predicted labels to LLM keys
+            correlation_id: Optional correlation ID for logging
+        """
+        self.model_path = model_path
+        self.embedding_model = embedding_model
+        self.embedding_device = embedding_device
+        self.label_mapping = label_mapping or {}
+        self.svm_model = None
+        self.model_version: Optional[ActiveModelVersion] = None
+        self._model_lock = threading.RLock()
+
+        # Load the model with verification
+        self._load_model(correlation_id=correlation_id)
+
+    def _load_model(self, correlation_id: Optional[str] = None):
+        """Load the sklearn SVM model from pickle file with verification.
+
+        Security:
+        - Requires LLMROUTER_ALLOW_PICKLE_MODELS=true environment variable.
+        - Pickle deserialization can execute arbitrary code, so it's disabled by default.
+        - When enabled, verifies artifact against manifest if LLMROUTER_MODEL_MANIFEST_PATH is set.
+        - In strict mode (LLMROUTER_STRICT_PICKLE_MODE=true), requires signed manifest.
+
+        Safe Activation:
+        - Loads model into temporary variable first
+        - Only swaps to active if successful
+        - Records model version for observability
+        """
+        if not self.model_path:
+            raise ValueError("model_path is required for InferenceSVMRouter")
+
+        # Security check: pickle loading disabled by default
+        if not ALLOW_PICKLE_MODELS:
+            raise PickleSecurityError(self.model_path)
+
+        path = Path(self.model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"SVM model file not found: {self.model_path}")
+
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+
+        # Verify artifact against manifest if enforcement is enabled
+        verifier = get_artifact_verifier()
+        require_manifest = ENFORCE_SIGNED_MODELS
+
+        # Compute hash first for allowlist check and verification
+        computed_hash = verifier.compute_sha256(self.model_path)
+
+        # Check if hash is in allowlist (bypasses signature requirement)
+        is_allowlisted = computed_hash in PICKLE_ALLOWLIST
+        if is_allowlisted:
+            verbose_proxy_logger.info(
+                f"{log_prefix}Model in pickle allowlist: {self.model_path} "
+                f"(sha256={computed_hash[:16]}...)"
+            )
+
+        # Strict pickle mode check
+        if STRICT_PICKLE_MODE and not is_allowlisted:
+            manifest = verifier._load_manifest()
+            if manifest is None:
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            if manifest.signature_type == SignatureType.NONE:
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            try:
+                verifier.verify_manifest_signature(manifest)
+            except SignatureVerificationError as e:
+                verbose_proxy_logger.error(
+                    f"{log_prefix}STRICT_PICKLE_MODE: Signature verification failed: {e}"
+                )
+                raise PickleSignatureRequiredError(self.model_path, strict_mode=True)
+
+            verbose_proxy_logger.info(
+                f"{log_prefix}STRICT_PICKLE_MODE: Manifest signature verified for {self.model_path}"
+            )
+
+        try:
+            verifier.verify_artifact(
+                self.model_path,
+                require_manifest=require_manifest,
+                correlation_id=correlation_id,
+            )
+        except ModelVerificationError as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Model verification failed: {e}. "
+                f"Hash mismatch or manifest missing. Details: {e.details}"
+            )
+            raise
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}Loading SVM model from: {self.model_path}"
+        )
+
+        # Safe activation: load into temp variable first
+        try:
+            with open(self.model_path, "rb") as f:
+                new_model = pickle.load(f)
+        except Exception as e:
+            raise ModelLoadError(
+                self.model_path,
+                f"Pickle load failed: {e}",
+                correlation_id,
+            )
+
+        # Verify it's a sklearn model with predict method
+        if not hasattr(new_model, "predict"):
+            raise ModelLoadError(
+                self.model_path,
+                f"Loaded model does not have 'predict' method. "
+                f"Expected sklearn SVC, got {type(new_model)}",
+                correlation_id,
+            )
+
+        # Safe swap: only update if everything succeeded
+        with self._model_lock:
+            old_model = self.svm_model
+            self.svm_model = new_model
+
+            # Record active version for observability
+            self.model_version = verifier.record_active_version(
+                self.model_path,
+                sha256=computed_hash,
+                tags=["svm", "active"],
+            )
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}SVM model loaded successfully. Type: {type(self.svm_model).__name__}, "
+            f"Version SHA256: {self.model_version.sha256[:16]}..."
+        )
+
+        # Clean up old model reference (let GC handle it)
+        del old_model
+
+    def reload_model(self, correlation_id: Optional[str] = None) -> bool:
+        """
+        Reload the model from disk with safe activation (for hot reload support).
+
+        Safe Activation Pattern:
+        1. Load new model into temporary instance
+        2. Verify against manifest
+        3. Only swap to active if successful
+        4. Keep old model active on failure
+
+        Args:
+            correlation_id: Optional correlation ID for logging
+
+        Returns:
+            True if reload succeeded, False if failed (old model remains active)
+        """
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+        old_version = self.model_version
+
+        try:
+            self._load_model(correlation_id=correlation_id)
+            verbose_proxy_logger.info(
+                f"{log_prefix}SVM model reloaded successfully. "
+                f"Old version: {old_version.sha256[:16] if old_version else 'none'}..., "
+                f"New version: {self.model_version.sha256[:16] if self.model_version else 'none'}..."
+            )
+            return True
+        except (ModelVerificationError, ModelLoadError, FileNotFoundError) as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}SVM model reload failed, keeping old model active. Error: {e}"
+            )
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Unexpected error during SVM model reload, keeping old model active. Error: {e}"
+            )
+            return False
+
+    def route(self, query: str) -> Optional[str]:
+        """
+        Route a query to the best model using SVM prediction.
+
+        Args:
+            query: User query text to route
+
+        Returns:
+            Predicted model label/key, or None if prediction fails
+        """
+        if self.svm_model is None:
+            verbose_proxy_logger.warning("SVM model not loaded, cannot route")
+            return None
+
+        try:
+            # Get embedding using the same model used in training
+            embedder = _get_sentence_transformer(
+                self.embedding_model, self.embedding_device
+            )
+
+            # Encode the query to get embedding vector
+            # Shape: (embedding_dim,) -> need (1, embedding_dim) for predict
+            embedding = embedder.encode([query], convert_to_numpy=True)
+
+            # Predict using the SVM model
+            predicted_label = self.svm_model.predict(embedding)[0]
+
+            # Security: Log only query length and prediction, not query content (PII risk)
+            verbose_proxy_logger.debug(
+                f"SVM routing: query_length={len(query)} -> predicted={predicted_label}"
+            )
+
+            # Apply label mapping if configured
+            if self.label_mapping and predicted_label in self.label_mapping:
+                mapped_label = self.label_mapping[predicted_label]
+                verbose_proxy_logger.debug(
+                    f"SVM label mapping: {predicted_label} -> {mapped_label}"
+                )
+                return mapped_label
+
+            return str(predicted_label)
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"SVM routing error: {e}")
+            return None
+
+
+class InferenceMLPRouter:
+    """
+    Lightweight inference-only MLP router that loads PyTorch state_dict directly.
+
+    This class bypasses the UIUC LLMRouter's MetaRouter initialization which
+    requires training data. Instead, it:
+    - Loads a pre-trained PyTorch MLP model from a state_dict file
+    - Loads model metadata (class mappings, architecture params) from a companion JSON
+    - Uses sentence-transformers for text embedding (same as training)
+    - Predicts the best model label for a given query via forward pass + argmax
+
+    The trained model is produced by UIUC's MLPRouter trainer using PyTorch's
+    MLPClassifierNN (Linear layers + activation) and saved via torch.save(state_dict).
+
+    Security:
+    - Uses torch.load(weights_only=True) which is safer than pickle
+    - Does NOT require LLMROUTER_ALLOW_PICKLE_MODELS since it avoids pickle
+    - Artifact verification via manifest is still supported
+    - The companion metadata JSON file must be present alongside the model
+
+    Safe Activation:
+    - Models are loaded into a temporary instance first
+    - Only swapped to active if loading succeeds
+    - On failure, the old model remains active
+
+    Attributes:
+        model_path: Path to the trained .pt/.pth model state_dict file
+        metadata_path: Path to companion JSON with class mappings and architecture
+        embedding_model: Name of the sentence-transformer model
+        embedding_device: Device for embedding model ('cpu', 'cuda')
+        mlp_model: Loaded PyTorch MLPClassifierNN model
+        idx_to_model: Mapping from class index to model name
+        model_to_idx: Mapping from model name to class index
+        model_version: Active model version metadata for observability
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        metadata_path: Optional[str] = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_device: str = "cpu",
+        label_mapping: Optional[Dict[str, str]] = None,
+        input_dim: int = 768,
+        hidden_layer_sizes: Optional[List[int]] = None,
+        num_classes: Optional[int] = None,
+        activation: str = "relu",
+        idx_to_model: Optional[Dict[int, str]] = None,
+        correlation_id: Optional[str] = None,
+    ):
+        """
+        Initialize inference-only MLP router.
+
+        The model architecture can be specified in two ways:
+        1. Via a companion metadata JSON file (metadata_path) containing all params
+        2. Via explicit constructor args (input_dim, hidden_layer_sizes, num_classes, etc.)
+
+        The metadata JSON format:
+        {
+            "input_dim": 768,
+            "hidden_layer_sizes": [128, 64],
+            "num_classes": 5,
+            "activation": "relu",
+            "idx_to_model": {"0": "gpt-4", "1": "claude-3-opus", ...},
+            "model_to_idx": {"gpt-4": 0, "claude-3-opus": 1, ...}
+        }
+
+        Args:
+            model_path: Path to the trained PyTorch model state_dict (.pt/.pth)
+            metadata_path: Optional path to JSON with architecture + class mappings.
+                           If None, defaults to model_path with .json extension.
+            embedding_model: HuggingFace model name for sentence embeddings
+            embedding_device: Device for embedding model ('cpu', 'cuda', etc.)
+            label_mapping: Optional dict mapping predicted labels to LLM keys
+            input_dim: Input dimension (embedding size), default 768 for all-MiniLM-L6-v2
+            hidden_layer_sizes: MLP hidden layer sizes, default [128, 64]
+            num_classes: Number of output classes (candidate models)
+            activation: Activation function ('relu', 'tanh', 'logistic', 'identity')
+            idx_to_model: Mapping from class index to model name
+            correlation_id: Optional correlation ID for logging
+        """
+        self.model_path = model_path
+        self.embedding_model = embedding_model
+        self.embedding_device = embedding_device
+        self.label_mapping = label_mapping or {}
+        self.mlp_model = None
+        self.model_version: Optional[ActiveModelVersion] = None
+        self._model_lock = threading.RLock()
+
+        # Architecture parameters (may be overridden by metadata)
+        self._input_dim = input_dim
+        self._hidden_layer_sizes = hidden_layer_sizes or [128, 64]
+        self._num_classes = num_classes
+        self._activation = activation
+
+        # Class mappings (may be overridden by metadata)
+        self.idx_to_model: Dict[int, str] = idx_to_model or {}
+        self.model_to_idx: Dict[str, int] = {}
+
+        # Load metadata if available
+        self.metadata_path = metadata_path or str(Path(model_path).with_suffix(".json"))
+        self._load_metadata()
+
+        # Load the model
+        self._load_model(correlation_id=correlation_id)
+
+    def _load_metadata(self):
+        """Load model metadata (architecture params + class mappings) from JSON.
+
+        The metadata file is a companion to the model state_dict and contains
+        all parameters needed to reconstruct the model architecture and map
+        class indices back to model names.
+
+        Falls back to constructor-provided values if metadata file is not found.
+        """
+        metadata_path = Path(self.metadata_path)
+        if not metadata_path.exists():
+            verbose_proxy_logger.info(
+                f"MLP metadata file not found at {self.metadata_path}, "
+                "using constructor-provided architecture params"
+            )
+            # Build reverse mapping from idx_to_model
+            if self.idx_to_model:
+                self.model_to_idx = {v: k for k, v in self.idx_to_model.items()}
+            return
+
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            self._input_dim = metadata.get("input_dim", self._input_dim)
+            self._hidden_layer_sizes = metadata.get(
+                "hidden_layer_sizes", self._hidden_layer_sizes
+            )
+            self._num_classes = metadata.get("num_classes", self._num_classes)
+            self._activation = metadata.get("activation", self._activation)
+
+            # Load class mappings (JSON keys are strings, convert to int)
+            raw_idx_to_model = metadata.get("idx_to_model", {})
+            if raw_idx_to_model:
+                self.idx_to_model = {int(k): v for k, v in raw_idx_to_model.items()}
+                self.model_to_idx = {v: k for k, v in self.idx_to_model.items()}
+            elif metadata.get("model_to_idx"):
+                self.model_to_idx = metadata["model_to_idx"]
+                self.idx_to_model = {v: k for k, v in self.model_to_idx.items()}
+
+            # Infer num_classes from mappings if not explicitly set
+            if self._num_classes is None and self.idx_to_model:
+                self._num_classes = len(self.idx_to_model)
+
+            verbose_proxy_logger.info(
+                f"Loaded MLP metadata: input_dim={self._input_dim}, "
+                f"hidden_layers={self._hidden_layer_sizes}, "
+                f"num_classes={self._num_classes}, "
+                f"activation={self._activation}"
+            )
+        except Exception as e:
+            verbose_proxy_logger.warning(
+                f"Failed to load MLP metadata from {self.metadata_path}: {e}. "
+                "Using constructor-provided params."
+            )
+
+    def _load_model(self, correlation_id: Optional[str] = None):
+        """Load the PyTorch MLP model from state_dict with verification.
+
+        Security:
+        - Uses torch.load(weights_only=True) to avoid arbitrary code execution.
+        - This is SAFER than pickle loading since it only loads tensor data.
+        - Artifact verification via manifest is still supported.
+
+        Safe Activation:
+        - Loads model into temporary variable first
+        - Only swaps to active if successful
+        - Records model version for observability
+        """
+        if not self.model_path:
+            raise ValueError("model_path is required for InferenceMLPRouter")
+
+        path = Path(self.model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"MLP model file not found: {self.model_path}")
+
+        if self._num_classes is None:
+            raise ValueError(
+                "num_classes is required for InferenceMLPRouter. "
+                "Provide via metadata JSON or constructor arg."
+            )
+
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+
+        # Verify artifact against manifest if enforcement is enabled
+        verifier = get_artifact_verifier()
+        computed_hash = verifier.compute_sha256(self.model_path)
+
+        if ENFORCE_SIGNED_MODELS:
+            try:
+                verifier.verify_artifact(
+                    self.model_path,
+                    require_manifest=True,
+                    correlation_id=correlation_id,
+                )
+            except ModelVerificationError as e:
+                verbose_proxy_logger.error(
+                    f"{log_prefix}MLP model verification failed: {e}. "
+                    f"Hash mismatch or manifest missing. Details: {e.details}"
+                )
+                raise
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}Loading MLP model from: {self.model_path}"
+        )
+
+        # Safe activation: load into temp variable first
+        try:
+            import torch
+
+            # weights_only=True is safer than pickle — only loads tensor data
+            state_dict = torch.load(
+                self.model_path, map_location="cpu", weights_only=True
+            )
+
+            # Reconstruct the MLPClassifierNN architecture
+            new_model = _build_mlp_classifier(
+                input_dim=self._input_dim,
+                hidden_layer_sizes=self._hidden_layer_sizes,
+                num_classes=self._num_classes,
+                activation=self._activation,
+            )
+            new_model.load_state_dict(state_dict)
+            new_model.eval()
+
+        except Exception as e:
+            raise ModelLoadError(
+                self.model_path,
+                f"PyTorch model load failed: {e}",
+                correlation_id,
+            )
+
+        # Safe swap: only update if everything succeeded
+        with self._model_lock:
+            old_model = self.mlp_model
+            self.mlp_model = new_model
+
+            self.model_version = verifier.record_active_version(
+                self.model_path,
+                sha256=computed_hash,
+                tags=["mlp", "active"],
+            )
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}MLP model loaded successfully. "
+            f"Architecture: {self._input_dim}->{self._hidden_layer_sizes}->{self._num_classes}, "
+            f"Version SHA256: {self.model_version.sha256[:16]}..."
+        )
+
+        del old_model
+
+    def reload_model(self, correlation_id: Optional[str] = None) -> bool:
+        """
+        Reload the model from disk with safe activation (for hot reload support).
+
+        Safe Activation Pattern:
+        1. Load new model into temporary instance
+        2. Verify against manifest
+        3. Only swap to active if successful
+        4. Keep old model active on failure
+
+        Args:
+            correlation_id: Optional correlation ID for logging
+
+        Returns:
+            True if reload succeeded, False if failed (old model remains active)
+        """
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+        old_version = self.model_version
+
+        try:
+            self._load_metadata()  # Reload metadata in case mappings changed
+            self._load_model(correlation_id=correlation_id)
+            verbose_proxy_logger.info(
+                f"{log_prefix}MLP model reloaded successfully. "
+                f"Old version: {old_version.sha256[:16] if old_version else 'none'}..., "
+                f"New version: {self.model_version.sha256[:16] if self.model_version else 'none'}..."
+            )
+            return True
+        except (ModelVerificationError, ModelLoadError, FileNotFoundError) as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}MLP model reload failed, keeping old model active. Error: {e}"
+            )
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Unexpected error during MLP model reload, keeping old model active. Error: {e}"
+            )
+            return False
+
+    def route(self, query: str) -> Optional[str]:
+        """
+        Route a query to the best model using MLP forward pass + argmax.
+
+        Args:
+            query: User query text to route
+
+        Returns:
+            Predicted model label/key, or None if prediction fails
+        """
+        if self.mlp_model is None:
+            verbose_proxy_logger.warning("MLP model not loaded, cannot route")
+            return None
+
+        try:
+            import torch
+
+            # Get embedding using the same model used in training
+            embedder = _get_sentence_transformer(
+                self.embedding_model, self.embedding_device
+            )
+
+            # Encode the query to get embedding vector
+            embedding = embedder.encode([query], convert_to_numpy=True)
+
+            # Convert to torch tensor and run forward pass
+            with torch.no_grad():
+                emb_tensor = torch.tensor(embedding, dtype=torch.float32)
+                logits = self.mlp_model(emb_tensor)
+                predicted_idx = torch.argmax(logits, dim=-1).item()
+
+            # Map index back to model name
+            if self.idx_to_model:
+                predicted_label = self.idx_to_model.get(
+                    predicted_idx, str(predicted_idx)
+                )
+            else:
+                predicted_label = str(predicted_idx)
+
+            # Security: Log only query length and prediction, not query content (PII risk)
+            verbose_proxy_logger.debug(
+                f"MLP routing: query_length={len(query)} -> "
+                f"predicted_idx={predicted_idx}, model={predicted_label}"
+            )
+
+            # Apply label mapping if configured
+            if self.label_mapping and predicted_label in self.label_mapping:
+                mapped_label = self.label_mapping[predicted_label]
+                verbose_proxy_logger.debug(
+                    f"MLP label mapping: {predicted_label} -> {mapped_label}"
+                )
+                return mapped_label
+
+            return str(predicted_label)
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"MLP routing error: {e}")
+            return None
+
+
+class InferenceMFRouter:
+    """
+    Lightweight inference-only Matrix Factorization router that loads PyTorch weights directly.
+
+    This class bypasses the UIUC LLMRouter's MetaRouter initialization which
+    requires training data. Instead, it:
+    - Loads a pre-trained BilinearMF model from a state_dict file
+    - Loads model metadata (class mappings, dimensions) from a companion JSON
+    - Uses sentence-transformers for text embedding (same as training)
+    - Scores all candidate models via bilinear interaction and picks the best
+
+    The trained model is produced by UIUC's MFRouter trainer using the BilinearMF
+    architecture: delta(M, q) = w2^T (v_m * (W1 * v_q)) and saved via torch.save(state_dict).
+
+    Security:
+    - Uses torch.load(weights_only=True) which is safer than pickle
+    - Does NOT require LLMROUTER_ALLOW_PICKLE_MODELS since it avoids pickle
+    - Artifact verification via manifest is still supported
+
+    Safe Activation:
+    - Models are loaded into a temporary instance first
+    - Only swapped to active if loading succeeds
+    - On failure, the old model remains active
+
+    Attributes:
+        model_path: Path to the trained .pt/.pth model state_dict file
+        metadata_path: Path to companion JSON with class mappings and dimensions
+        embedding_model: Name of the sentence-transformer model
+        embedding_device: Device for embedding model ('cpu', 'cuda')
+        mf_model: Loaded PyTorch BilinearMF model
+        idx_to_model: Mapping from model index to model name
+        model_version: Active model version metadata for observability
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        metadata_path: Optional[str] = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_device: str = "cpu",
+        label_mapping: Optional[Dict[str, str]] = None,
+        latent_dim: int = 128,
+        text_dim: int = 768,
+        num_models: Optional[int] = None,
+        idx_to_model: Optional[Dict[int, str]] = None,
+        correlation_id: Optional[str] = None,
+    ):
+        """
+        Initialize inference-only MF router.
+
+        The model architecture can be specified in two ways:
+        1. Via a companion metadata JSON file (metadata_path) containing all params
+        2. Via explicit constructor args (latent_dim, text_dim, num_models, etc.)
+
+        The metadata JSON format:
+        {
+            "latent_dim": 128,
+            "text_dim": 768,
+            "num_models": 5,
+            "idx_to_model": {"0": "gpt-4", "1": "claude-3-opus", ...},
+            "model_to_idx": {"gpt-4": 0, "claude-3-opus": 1, ...}
+        }
+
+        Args:
+            model_path: Path to the trained PyTorch model state_dict (.pt/.pth)
+            metadata_path: Optional path to JSON with dimensions + class mappings.
+                           If None, defaults to model_path with .json extension.
+            embedding_model: HuggingFace model name for sentence embeddings
+            embedding_device: Device for embedding model ('cpu', 'cuda', etc.)
+            label_mapping: Optional dict mapping predicted labels to LLM keys
+            latent_dim: Latent dimension for model embeddings (default 128)
+            text_dim: Text embedding dimension (default 768 for all-MiniLM-L6-v2)
+            num_models: Number of candidate models
+            idx_to_model: Mapping from model index to model name
+            correlation_id: Optional correlation ID for logging
+        """
+        self.model_path = model_path
+        self.embedding_model = embedding_model
+        self.embedding_device = embedding_device
+        self.label_mapping = label_mapping or {}
+        self.mf_model = None
+        self.model_version: Optional[ActiveModelVersion] = None
+        self._model_lock = threading.RLock()
+
+        # Architecture parameters (may be overridden by metadata)
+        self._latent_dim = latent_dim
+        self._text_dim = text_dim
+        self._num_models = num_models
+
+        # Class mappings (may be overridden by metadata)
+        self.idx_to_model: Dict[int, str] = idx_to_model or {}
+        self.model_to_idx: Dict[str, int] = {}
+
+        # Load metadata if available
+        self.metadata_path = metadata_path or str(Path(model_path).with_suffix(".json"))
+        self._load_metadata()
+
+        # Load the model
+        self._load_model(correlation_id=correlation_id)
+
+    def _load_metadata(self):
+        """Load model metadata (dimensions + class mappings) from JSON.
+
+        The metadata file is a companion to the model state_dict and contains
+        all parameters needed to reconstruct the BilinearMF architecture and map
+        model indices back to model names.
+
+        Falls back to constructor-provided values if metadata file is not found.
+        """
+        metadata_path = Path(self.metadata_path)
+        if not metadata_path.exists():
+            verbose_proxy_logger.info(
+                f"MF metadata file not found at {self.metadata_path}, "
+                "using constructor-provided architecture params"
+            )
+            if self.idx_to_model:
+                self.model_to_idx = {v: k for k, v in self.idx_to_model.items()}
+            return
+
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            self._latent_dim = metadata.get("latent_dim", self._latent_dim)
+            self._text_dim = metadata.get("text_dim", self._text_dim)
+            self._num_models = metadata.get("num_models", self._num_models)
+
+            # Load class mappings (JSON keys are strings, convert to int)
+            raw_idx_to_model = metadata.get("idx_to_model", {})
+            if raw_idx_to_model:
+                self.idx_to_model = {int(k): v for k, v in raw_idx_to_model.items()}
+                self.model_to_idx = {v: k for k, v in self.idx_to_model.items()}
+            elif metadata.get("model_to_idx"):
+                self.model_to_idx = metadata["model_to_idx"]
+                self.idx_to_model = {v: k for k, v in self.model_to_idx.items()}
+
+            # Infer num_models from mappings if not explicitly set
+            if self._num_models is None and self.idx_to_model:
+                self._num_models = len(self.idx_to_model)
+
+            verbose_proxy_logger.info(
+                f"Loaded MF metadata: latent_dim={self._latent_dim}, "
+                f"text_dim={self._text_dim}, num_models={self._num_models}"
+            )
+        except Exception as e:
+            verbose_proxy_logger.warning(
+                f"Failed to load MF metadata from {self.metadata_path}: {e}. "
+                "Using constructor-provided params."
+            )
+
+    def _load_model(self, correlation_id: Optional[str] = None):
+        """Load the PyTorch BilinearMF model from state_dict with verification.
+
+        Security:
+        - Uses torch.load(weights_only=True) to avoid arbitrary code execution.
+        - This is SAFER than pickle loading since it only loads tensor data.
+        - Artifact verification via manifest is still supported.
+
+        Safe Activation:
+        - Loads model into temporary variable first
+        - Only swaps to active if successful
+        - Records model version for observability
+        """
+        if not self.model_path:
+            raise ValueError("model_path is required for InferenceMFRouter")
+
+        path = Path(self.model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"MF model file not found: {self.model_path}")
+
+        if self._num_models is None:
+            raise ValueError(
+                "num_models is required for InferenceMFRouter. "
+                "Provide via metadata JSON or constructor arg."
+            )
+
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+
+        # Verify artifact against manifest if enforcement is enabled
+        verifier = get_artifact_verifier()
+        computed_hash = verifier.compute_sha256(self.model_path)
+
+        if ENFORCE_SIGNED_MODELS:
+            try:
+                verifier.verify_artifact(
+                    self.model_path,
+                    require_manifest=True,
+                    correlation_id=correlation_id,
+                )
+            except ModelVerificationError as e:
+                verbose_proxy_logger.error(
+                    f"{log_prefix}MF model verification failed: {e}. "
+                    f"Hash mismatch or manifest missing. Details: {e.details}"
+                )
+                raise
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}Loading MF model from: {self.model_path}"
+        )
+
+        # Safe activation: load into temp variable first
+        try:
+            import torch
+
+            # weights_only=True is safer than pickle — only loads tensor data
+            state_dict = torch.load(
+                self.model_path, map_location="cpu", weights_only=True
+            )
+
+            # Reconstruct the BilinearMF architecture
+            new_model = _build_bilinear_mf(
+                latent_dim=self._latent_dim,
+                num_models=self._num_models,
+                text_dim=self._text_dim,
+            )
+            new_model.load_state_dict(state_dict)
+            new_model.eval()
+
+        except Exception as e:
+            raise ModelLoadError(
+                self.model_path,
+                f"PyTorch model load failed: {e}",
+                correlation_id,
+            )
+
+        # Safe swap: only update if everything succeeded
+        with self._model_lock:
+            old_model = self.mf_model
+            self.mf_model = new_model
+
+            self.model_version = verifier.record_active_version(
+                self.model_path,
+                sha256=computed_hash,
+                tags=["mf", "active"],
+            )
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}MF model loaded successfully. "
+            f"Architecture: text_dim={self._text_dim}, latent_dim={self._latent_dim}, "
+            f"num_models={self._num_models}, "
+            f"Version SHA256: {self.model_version.sha256[:16]}..."
+        )
+
+        del old_model
+
+    def reload_model(self, correlation_id: Optional[str] = None) -> bool:
+        """
+        Reload the model from disk with safe activation (for hot reload support).
+
+        Safe Activation Pattern:
+        1. Load new model into temporary instance
+        2. Verify against manifest
+        3. Only swap to active if successful
+        4. Keep old model active on failure
+
+        Args:
+            correlation_id: Optional correlation ID for logging
+
+        Returns:
+            True if reload succeeded, False if failed (old model remains active)
+        """
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+        old_version = self.model_version
+
+        try:
+            self._load_metadata()  # Reload metadata in case mappings changed
+            self._load_model(correlation_id=correlation_id)
+            verbose_proxy_logger.info(
+                f"{log_prefix}MF model reloaded successfully. "
+                f"Old version: {old_version.sha256[:16] if old_version else 'none'}..., "
+                f"New version: {self.model_version.sha256[:16] if self.model_version else 'none'}..."
+            )
+            return True
+        except (ModelVerificationError, ModelLoadError, FileNotFoundError) as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}MF model reload failed, keeping old model active. Error: {e}"
+            )
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Unexpected error during MF model reload, keeping old model active. Error: {e}"
+            )
+            return False
+
+    def route(self, query: str) -> Optional[str]:
+        """
+        Route a query to the best model using bilinear MF scoring.
+
+        The scoring function is: delta(M, q) = w2^T (v_m * (W1 * v_q))
+        for all candidate models M, then argmax to pick the best.
+
+        Args:
+            query: User query text to route
+
+        Returns:
+            Predicted model label/key, or None if prediction fails
+        """
+        if self.mf_model is None:
+            verbose_proxy_logger.warning("MF model not loaded, cannot route")
+            return None
+
+        try:
+            import torch
+
+            # Get embedding using the same model used in training
+            embedder = _get_sentence_transformer(
+                self.embedding_model, self.embedding_device
+            )
+
+            # Encode the query to get embedding vector
+            embedding = embedder.encode([query], convert_to_numpy=True)
+
+            # Convert to torch tensor, project to latent space, score all models
+            with torch.no_grad():
+                q_emb = torch.tensor(embedding[0], dtype=torch.float32)
+                q_proj = self.mf_model.project_text(q_emb)
+                scores = self.mf_model.score_all(q_proj)
+                best_idx = torch.argmax(scores).item()
+
+            # Map index back to model name
+            if self.idx_to_model:
+                predicted_label = self.idx_to_model.get(best_idx, str(best_idx))
+            else:
+                predicted_label = str(best_idx)
+
+            # Security: Log only query length and prediction, not query content (PII risk)
+            verbose_proxy_logger.debug(
+                f"MF routing: query_length={len(query)} -> "
+                f"best_idx={best_idx}, model={predicted_label}"
+            )
+
+            # Apply label mapping if configured
+            if self.label_mapping and predicted_label in self.label_mapping:
+                mapped_label = self.label_mapping[predicted_label]
+                verbose_proxy_logger.debug(
+                    f"MF label mapping: {predicted_label} -> {mapped_label}"
+                )
+                return mapped_label
+
+            return str(predicted_label)
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"MF routing error: {e}")
+            return None
+
+
+class InferenceELORouter:
+    """
+    Lightweight inference-only ELO router that loads pre-computed Elo ratings.
+
+    This is the simplest inference adapter: Elo routing does not use query
+    embeddings at all. It simply picks the model with the highest pre-computed
+    Elo rating. The ratings are loaded from a JSON or pickle file containing
+    a dictionary mapping model names to Elo scores.
+
+    This class bypasses the UIUC LLMRouter's MetaRouter initialization which
+    requires training data. Instead, it:
+    - Loads pre-computed {model_name: elo_score} ratings from JSON or pickle
+    - Returns the highest-rated model for every query
+
+    The trained ratings are produced by UIUC's EloRouterTrainer which computes
+    pairwise Elo ratings from model comparison data and saves them to disk.
+
+    Security:
+    - Prefers JSON format (no code execution risk)
+    - For pickle format, requires LLMROUTER_ALLOW_PICKLE_MODELS=true
+    - Artifact verification via manifest is supported for both formats
+
+    Safe Activation:
+    - Ratings are loaded into a temporary variable first
+    - Only swapped to active if loading succeeds
+    - On failure, the old ratings remain active
+
+    Attributes:
+        ratings_path: Path to the ratings file (.json or .pkl)
+        elo_scores: Dictionary mapping model names to Elo scores
+        model_version: Active model version metadata for observability
+    """
+
+    def __init__(
+        self,
+        ratings_path: str,
+        label_mapping: Optional[Dict[str, str]] = None,
+        correlation_id: Optional[str] = None,
+    ):
+        """
+        Initialize inference-only ELO router.
+
+        The ratings file can be in two formats:
+        1. JSON: {"gpt-4": 1650, "claude-3-opus": 1580, "llama-3": 1420, ...}
+        2. Pickle: Same dict structure, loaded via pickle.load()
+
+        Args:
+            ratings_path: Path to pre-computed Elo ratings (.json or .pkl)
+            label_mapping: Optional dict mapping rating keys to LLM deployment keys
+            correlation_id: Optional correlation ID for logging
+        """
+        self.ratings_path = ratings_path
+        self.label_mapping = label_mapping or {}
+        self.elo_scores: Optional[Dict[str, float]] = None
+        self.model_version: Optional[ActiveModelVersion] = None
+        self._model_lock = threading.RLock()
+
+        # Load the ratings
+        self._load_ratings(correlation_id=correlation_id)
+
+    def _load_ratings(self, correlation_id: Optional[str] = None):
+        """Load Elo ratings from JSON or pickle file with verification.
+
+        Security:
+        - JSON is preferred (no code execution risk).
+        - Pickle requires LLMROUTER_ALLOW_PICKLE_MODELS=true.
+        - Artifact verification via manifest is supported for both.
+
+        Safe Activation:
+        - Loads ratings into temporary variable first
+        - Only swaps to active if successful
+        - Records model version for observability
+        """
+        if not self.ratings_path:
+            raise ValueError("ratings_path is required for InferenceELORouter")
+
+        path = Path(self.ratings_path)
+        if not path.exists():
+            raise FileNotFoundError(f"ELO ratings file not found: {self.ratings_path}")
+
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+
+        # Verify artifact against manifest if enforcement is enabled
+        verifier = get_artifact_verifier()
+        computed_hash = verifier.compute_sha256(self.ratings_path)
+
+        if ENFORCE_SIGNED_MODELS:
+            try:
+                verifier.verify_artifact(
+                    self.ratings_path,
+                    require_manifest=True,
+                    correlation_id=correlation_id,
+                )
+            except ModelVerificationError as e:
+                verbose_proxy_logger.error(
+                    f"{log_prefix}ELO ratings verification failed: {e}. "
+                    f"Hash mismatch or manifest missing. Details: {e.details}"
+                )
+                raise
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}Loading ELO ratings from: {self.ratings_path}"
+        )
+
+        # Safe activation: load into temp variable first
+        is_pickle = path.suffix.lower() in (".pkl", ".pickle")
+        try:
+            if is_pickle:
+                # Pickle format — requires explicit opt-in
+                if not ALLOW_PICKLE_MODELS:
+                    raise PickleSecurityError(self.ratings_path)
+                with open(self.ratings_path, "rb") as f:
+                    new_ratings = pickle.load(f)
+            else:
+                # JSON format — safe by default
+                with open(self.ratings_path, "r") as f:
+                    new_ratings = json.load(f)
+        except PickleSecurityError, json.JSONDecodeError:
+            raise
+        except Exception as e:
+            raise ModelLoadError(
+                self.ratings_path,
+                f"Ratings load failed: {e}",
+                correlation_id,
+            )
+
+        # Normalize: support pandas Series .to_dict() output and plain dicts
+        if hasattr(new_ratings, "to_dict"):
+            new_ratings = new_ratings.to_dict()
+
+        if not isinstance(new_ratings, dict):
+            raise ModelLoadError(
+                self.ratings_path,
+                f"Expected dict of {{model: score}}, got {type(new_ratings)}",
+                correlation_id,
+            )
+
+        if not new_ratings:
+            raise ModelLoadError(
+                self.ratings_path,
+                "Ratings file is empty",
+                correlation_id,
+            )
+
+        # Safe swap: only update if everything succeeded
+        with self._model_lock:
+            old_ratings = self.elo_scores
+            self.elo_scores = new_ratings
+
+            self.model_version = verifier.record_active_version(
+                self.ratings_path,
+                sha256=computed_hash,
+                tags=["elo", "active"],
+            )
+
+        verbose_proxy_logger.info(
+            f"{log_prefix}ELO ratings loaded successfully. "
+            f"{len(self.elo_scores)} models, "
+            f"top model: {max(self.elo_scores.items(), key=lambda kv: kv[1])[0]}, "
+            f"Version SHA256: {self.model_version.sha256[:16]}..."
+        )
+
+        del old_ratings
+
+    def reload_model(self, correlation_id: Optional[str] = None) -> bool:
+        """
+        Reload ratings from disk with safe activation (for hot reload support).
+
+        Safe Activation Pattern:
+        1. Load new ratings into temporary variable
+        2. Verify against manifest
+        3. Only swap to active if successful
+        4. Keep old ratings active on failure
+
+        Args:
+            correlation_id: Optional correlation ID for logging
+
+        Returns:
+            True if reload succeeded, False if failed (old ratings remain active)
+        """
+        log_prefix = f"[{correlation_id}] " if correlation_id else ""
+        old_version = self.model_version
+
+        try:
+            self._load_ratings(correlation_id=correlation_id)
+            verbose_proxy_logger.info(
+                f"{log_prefix}ELO ratings reloaded successfully. "
+                f"Old version: {old_version.sha256[:16] if old_version else 'none'}..., "
+                f"New version: {self.model_version.sha256[:16] if self.model_version else 'none'}..."
+            )
+            return True
+        except (ModelVerificationError, ModelLoadError, FileNotFoundError) as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}ELO ratings reload failed, keeping old ratings active. Error: {e}"
+            )
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"{log_prefix}Unexpected error during ELO ratings reload, keeping old ratings active. Error: {e}"
+            )
+            return False
+
+    def route(self, query: str) -> Optional[str]:
+        """
+        Route a query to the highest-rated model.
+
+        Note: ELO routing is query-independent — it always returns the model
+        with the highest Elo rating. The query parameter is accepted for
+        interface compatibility but is not used in the routing decision.
+
+        Args:
+            query: User query text (not used in ELO routing, but accepted
+                   for interface compatibility with other routers)
+
+        Returns:
+            Name of the highest-rated model, or None if no ratings loaded
+        """
+        if self.elo_scores is None:
+            verbose_proxy_logger.warning("ELO ratings not loaded, cannot route")
+            return None
+
+        try:
+            # Pick the model with the highest Elo rating
+            best_model = max(self.elo_scores.items(), key=lambda kv: kv[1])[0]
+
+            verbose_proxy_logger.debug(
+                f"ELO routing: selected={best_model} "
+                f"(score={self.elo_scores[best_model]:.1f})"
+            )
+
+            # Apply label mapping if configured
+            if self.label_mapping and best_model in self.label_mapping:
+                mapped_label = self.label_mapping[best_model]
+                verbose_proxy_logger.debug(
+                    f"ELO label mapping: {best_model} -> {mapped_label}"
+                )
+                return mapped_label
+
+            return str(best_model)
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"ELO routing error: {e}")
+            return None
+
+
+# ---------------------------------------------------------------------------
+# PyTorch model builders (standalone, no MetaRouter dependency)
+# ---------------------------------------------------------------------------
+
+
+def _build_mlp_classifier(
+    input_dim: int,
+    hidden_layer_sizes: List[int],
+    num_classes: int,
+    activation: str = "relu",
+):
+    """
+    Build a standalone MLPClassifierNN matching UIUC's architecture.
+
+    This reconstructs the exact same PyTorch model used by LLMRouter's
+    MLPRouter trainer, so that a state_dict from training can be loaded
+    directly.
+
+    Architecture: input -> [Linear + activation] * N -> Linear -> output
+    (No activation on final layer; softmax/argmax applied at inference.)
+
+    Args:
+        input_dim: Input feature dimension (embedding size)
+        hidden_layer_sizes: List of hidden layer dimensions (e.g. [128, 64])
+        num_classes: Number of output classes (candidate models)
+        activation: Activation function name ('relu', 'tanh', 'logistic', 'identity')
+
+    Returns:
+        A PyTorch nn.Module with the same architecture as MLPClassifierNN
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class _MLPClassifierNN(nn.Module):
+        """Standalone MLP classifier matching UIUC MLPClassifierNN architecture."""
+
+        def __init__(self, input_dim, hidden_layer_sizes, num_classes, activation):
+            super().__init__()
+            self.activation_name = activation
+            layers = []
+            prev_dim = input_dim
+            for hidden_dim in hidden_layer_sizes:
+                layers.append(nn.Linear(prev_dim, hidden_dim))
+                prev_dim = hidden_dim
+            layers.append(nn.Linear(prev_dim, num_classes))
+            self.layers = nn.ModuleList(layers)
+
+        def _get_activation(self):
+            if self.activation_name == "relu":
+                return F.relu
+            elif self.activation_name == "tanh":
+                return torch.tanh
+            elif self.activation_name == "logistic":
+                return torch.sigmoid
+            elif self.activation_name == "identity":
+                return lambda x: x
+            else:
+                return F.relu
+
+        def forward(self, x):
+            activation = self._get_activation()
+            for layer in self.layers[:-1]:
+                x = activation(layer(x))
+            x = self.layers[-1](x)
+            return x
+
+        def predict(self, x):
+            self.eval()
+            with torch.no_grad():
+                logits = self.forward(x)
+                return torch.argmax(logits, dim=-1)
+
+    return _MLPClassifierNN(input_dim, hidden_layer_sizes, num_classes, activation)
+
+
+def _build_bilinear_mf(
+    latent_dim: int,
+    num_models: int,
+    text_dim: int,
+):
+    """
+    Build a standalone BilinearMF matching UIUC's architecture.
+
+    This reconstructs the exact same PyTorch model used by LLMRouter's
+    MFRouter trainer, so that a state_dict from training can be loaded
+    directly.
+
+    Architecture:
+    - P: nn.Embedding(num_models, latent_dim) — latent model embeddings
+    - text_proj: nn.Linear(text_dim, latent_dim, bias=False) — text projection
+    - classifier: nn.Linear(latent_dim, 1, bias=False) — final scoring
+
+    Scoring: delta(M, q) = classifier(P_m * text_proj(q_emb))
+
+    Args:
+        latent_dim: Latent dimension for model/text embeddings
+        num_models: Number of candidate models
+        text_dim: Text embedding dimension (e.g. 768 for all-MiniLM-L6-v2)
+
+    Returns:
+        A PyTorch nn.Module with the same architecture as BilinearMF
+    """
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class _BilinearMF(nn.Module):
+        """Standalone BilinearMF matching UIUC BilinearMF architecture."""
+
+        def __init__(self, dim, num_models, text_dim):
+            super().__init__()
+            self.P = nn.Embedding(num_models, dim)
+            self.text_proj = nn.Linear(text_dim, dim, bias=False)
+            self.classifier = nn.Linear(dim, 1, bias=False)
+
+        @property
+        def device(self):
+            return self.P.weight.device
+
+        def project_text(self, q_emb):
+            """Project raw text embedding into latent routing space."""
+            if q_emb.dim() == 1:
+                q_emb = q_emb.unsqueeze(0)
+            proj = self.text_proj(q_emb)
+            return proj.squeeze(0)
+
+        def forward(self, model_win, model_loss, q_emb):
+            """Pairwise scoring: delta(win, q) - delta(loss, q)."""
+            v_win = F.normalize(self.P(model_win), p=2, dim=-1)
+            v_loss = F.normalize(self.P(model_loss), p=2, dim=-1)
+            h = v_win - v_loss
+            if q_emb.dim() == 1:
+                q_emb = q_emb.unsqueeze(0)
+            interaction = h * q_emb
+            logit = self.classifier(interaction).squeeze(-1)
+            return logit
+
+        def score_all(self, q_emb):
+            """Return delta(M, q) for all models."""
+            P_all = F.normalize(self.P.weight, p=2, dim=-1)
+            interaction = P_all * q_emb
+            logits = self.classifier(interaction).squeeze(-1)
+            return logits
+
+    return _BilinearMF(latent_dim, num_models, text_dim)
+
+
 # Available LLMRouter strategies (matching llmrouter.models exports)
 # See: https://github.com/ulab-uiuc/LLMRouter#-supported-routers
 LLMROUTER_STRATEGIES = [
@@ -621,18 +1981,27 @@ class LLMRouterStrategyFamily:
         self._llm_data = self._load_llm_data()
 
         verbose_proxy_logger.info(f"Initialized LLMRouter strategy: {strategy_name}")
-        if self.use_inference_only and strategy_name == "llmrouter-knn":
+        inference_strategies = {
+            "llmrouter-knn",
+            "llmrouter-svm",
+            "llmrouter-mlp",
+            "llmrouter-mf",
+            "llmrouter-elo",
+        }
+        if self.use_inference_only and strategy_name in inference_strategies:
             verbose_proxy_logger.info(
-                f"  Using inference-only mode with embedding_model={self.embedding_model}"
+                f"  Using inference-only mode for {strategy_name} "
+                f"with embedding_model={self.embedding_model}"
             )
 
     def _resolve_model_path(self, model_path: Optional[str]) -> Optional[str]:
         """
         Resolve model path to an actual file.
 
-        If model_path is a directory, look for a .pkl file inside.
+        If model_path is a directory, look for a model file inside.
+        Supports .pkl (sklearn), .pt/.pth (PyTorch), and .json (ELO ratings).
         This allows flexibility: users can specify either the directory
-        or the exact .pkl file path.
+        or the exact file path.
 
         Args:
             model_path: Path to model file or directory
@@ -649,26 +2018,32 @@ class LLMRouterStrategyFamily:
         if path.is_file():
             return str(path)
 
-        # If it's a directory, look for .pkl files
+        # If it's a directory, look for model files
         if path.is_dir():
-            pkl_files = list(path.glob("*.pkl"))
-            if len(pkl_files) == 1:
-                resolved = str(pkl_files[0])
+            # Look for model files in priority order: .pkl, .pt, .pth, .json
+            model_extensions = ["*.pkl", "*.pt", "*.pth", "*.json"]
+            model_files = []
+            for ext in model_extensions:
+                model_files.extend(path.glob(ext))
+
+            if len(model_files) == 1:
+                resolved = str(model_files[0])
                 verbose_proxy_logger.info(
                     f"Resolved model directory to file: {resolved}"
                 )
                 return resolved
-            elif len(pkl_files) > 1:
-                # Multiple .pkl files - use the most recently modified
-                pkl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                resolved = str(pkl_files[0])
+            elif len(model_files) > 1:
+                # Multiple model files - use the most recently modified
+                model_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                resolved = str(model_files[0])
                 verbose_proxy_logger.warning(
-                    f"Multiple .pkl files found, using most recent: {resolved}"
+                    f"Multiple model files found, using most recent: {resolved}"
                 )
                 return resolved
             else:
                 verbose_proxy_logger.warning(
-                    f"Directory {model_path} contains no .pkl files"
+                    f"Directory {model_path} contains no model files "
+                    f"(.pkl, .pt, .pth, .json)"
                 )
 
         # Return original path (may not exist yet, will be created by training)
@@ -761,12 +2136,30 @@ class LLMRouterStrategyFamily:
             raise
 
     def _load_router(self):
-        """Load the appropriate LLMRouter model based on strategy name."""
+        """Load the appropriate LLMRouter model based on strategy name.
+
+        When use_inference_only is True (the default), lightweight inference
+        adapters are used for KNN, SVM, MLP, MF, and ELO strategies. These
+        adapters load pre-trained models directly without requiring the full
+        MetaRouter training setup from UIUC LLMRouter.
+
+        For other strategies, falls back to the full UIUC LLMRouter MetaRouter
+        initialization which requires training data and config.
+        """
         strategy_type = self.strategy_name.replace("llmrouter-", "")
 
-        # For KNN with inference-only mode, use our lightweight InferenceKNNRouter
-        if strategy_type == "knn" and self.use_inference_only:
-            return self._load_inference_knn_router()
+        # Inference-only adapters for production deployment
+        if self.use_inference_only:
+            if strategy_type == "knn":
+                return self._load_inference_knn_router()
+            elif strategy_type == "svm":
+                return self._load_inference_svm_router()
+            elif strategy_type == "mlp":
+                return self._load_inference_mlp_router()
+            elif strategy_type == "mf":
+                return self._load_inference_mf_router()
+            elif strategy_type == "elo":
+                return self._load_inference_elo_router()
 
         # Map strategy names to router classes
         router_map = {
@@ -887,6 +2280,171 @@ class LLMRouterStrategyFamily:
             verbose_proxy_logger.error(f"Failed to load inference-only KNN router: {e}")
             return None
 
+    def _load_inference_svm_router(self) -> Optional[InferenceSVMRouter]:
+        """
+        Load inference-only SVM router that bypasses UIUC MetaRouter.
+
+        Uses the same pickle-based loading pattern as KNN since upstream SVM
+        uses sklearn's SVC which is serialized via pickle.
+
+        Returns:
+            InferenceSVMRouter instance, or None if loading fails
+        """
+        if not self.model_path:
+            verbose_proxy_logger.error(
+                "model_path is required for inference-only SVM router. "
+                "Set routing_strategy_args.model_path in config."
+            )
+            return None
+
+        try:
+            router = InferenceSVMRouter(
+                model_path=self.model_path,
+                embedding_model=self.embedding_model,
+                embedding_device=self.embedding_device,
+                label_mapping=self.label_mapping,
+            )
+            verbose_proxy_logger.info(
+                f"Loaded inference-only SVM router from: {self.model_path}"
+            )
+            return router
+        except FileNotFoundError as e:
+            verbose_proxy_logger.warning(
+                f"SVM model file not found: {e}. "
+                "Ensure model is trained and deployed to model_path."
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to load inference-only SVM router: {e}")
+            return None
+
+    def _load_inference_mlp_router(self) -> Optional[InferenceMLPRouter]:
+        """
+        Load inference-only MLP router that bypasses UIUC MetaRouter.
+
+        Uses PyTorch state_dict loading (weights_only=True) which is safer
+        than pickle. Requires a companion metadata JSON file with architecture
+        parameters and class mappings.
+
+        Returns:
+            InferenceMLPRouter instance, or None if loading fails
+        """
+        if not self.model_path:
+            verbose_proxy_logger.error(
+                "model_path is required for inference-only MLP router. "
+                "Set routing_strategy_args.model_path in config."
+            )
+            return None
+
+        try:
+            # Pass extra kwargs that may contain architecture params
+            router = InferenceMLPRouter(
+                model_path=self.model_path,
+                metadata_path=self.extra_kwargs.get("metadata_path"),
+                embedding_model=self.embedding_model,
+                embedding_device=self.embedding_device,
+                label_mapping=self.label_mapping,
+                input_dim=self.extra_kwargs.get("input_dim", 768),
+                hidden_layer_sizes=self.extra_kwargs.get("hidden_layer_sizes"),
+                num_classes=self.extra_kwargs.get("num_classes"),
+                activation=self.extra_kwargs.get("activation", "relu"),
+                idx_to_model=self.extra_kwargs.get("idx_to_model"),
+            )
+            verbose_proxy_logger.info(
+                f"Loaded inference-only MLP router from: {self.model_path}"
+            )
+            return router
+        except FileNotFoundError as e:
+            verbose_proxy_logger.warning(
+                f"MLP model file not found: {e}. "
+                "Ensure model is trained and deployed to model_path."
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to load inference-only MLP router: {e}")
+            return None
+
+    def _load_inference_mf_router(self) -> Optional[InferenceMFRouter]:
+        """
+        Load inference-only Matrix Factorization router that bypasses UIUC MetaRouter.
+
+        Uses PyTorch state_dict loading (weights_only=True) which is safer
+        than pickle. Requires a companion metadata JSON file with architecture
+        dimensions and class mappings.
+
+        Returns:
+            InferenceMFRouter instance, or None if loading fails
+        """
+        if not self.model_path:
+            verbose_proxy_logger.error(
+                "model_path is required for inference-only MF router. "
+                "Set routing_strategy_args.model_path in config."
+            )
+            return None
+
+        try:
+            router = InferenceMFRouter(
+                model_path=self.model_path,
+                metadata_path=self.extra_kwargs.get("metadata_path"),
+                embedding_model=self.embedding_model,
+                embedding_device=self.embedding_device,
+                label_mapping=self.label_mapping,
+                latent_dim=self.extra_kwargs.get("latent_dim", 128),
+                text_dim=self.extra_kwargs.get("text_dim", 768),
+                num_models=self.extra_kwargs.get("num_models"),
+                idx_to_model=self.extra_kwargs.get("idx_to_model"),
+            )
+            verbose_proxy_logger.info(
+                f"Loaded inference-only MF router from: {self.model_path}"
+            )
+            return router
+        except FileNotFoundError as e:
+            verbose_proxy_logger.warning(
+                f"MF model file not found: {e}. "
+                "Ensure model is trained and deployed to model_path."
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to load inference-only MF router: {e}")
+            return None
+
+    def _load_inference_elo_router(self) -> Optional[InferenceELORouter]:
+        """
+        Load inference-only ELO router that bypasses UIUC MetaRouter.
+
+        ELO is the simplest adapter — it just loads pre-computed Elo ratings
+        from a JSON or pickle file. JSON is preferred since it avoids the
+        pickle code execution risk entirely.
+
+        Returns:
+            InferenceELORouter instance, or None if loading fails
+        """
+        if not self.model_path:
+            verbose_proxy_logger.error(
+                "model_path is required for inference-only ELO router. "
+                "Set routing_strategy_args.model_path in config."
+            )
+            return None
+
+        try:
+            router = InferenceELORouter(
+                ratings_path=self.model_path,
+                label_mapping=self.label_mapping,
+            )
+            verbose_proxy_logger.info(
+                f"Loaded inference-only ELO router from: {self.model_path}"
+            )
+            return router
+        except FileNotFoundError as e:
+            verbose_proxy_logger.warning(
+                f"ELO ratings file not found: {e}. "
+                "Ensure ratings are computed and deployed to model_path."
+            )
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to load inference-only ELO router: {e}")
+            return None
+
     def _load_custom_router(self):
         """Load a custom router from the custom routers directory."""
         custom_path = os.environ.get(
@@ -896,19 +2454,29 @@ class LLMRouterStrategyFamily:
         verbose_proxy_logger.info(f"Loading custom router from: {custom_path}")
         return None
 
+    # Inference adapter types that support hot reload via reload_model()
+    _INFERENCE_ADAPTER_TYPES = (
+        InferenceKNNRouter,
+        InferenceSVMRouter,
+        InferenceMLPRouter,
+        InferenceMFRouter,
+        InferenceELORouter,
+    )
+
     @property
     def router(self):
         """Get the router instance, loading/reloading as needed."""
         with self._router_lock:
             if self._router is None or self._should_reload():
-                # For inference-only KNN, check if we need to reload the model
+                # For inference-only adapters, use in-place reload_model()
                 if (
                     self._router is not None
-                    and isinstance(self._router, InferenceKNNRouter)
+                    and isinstance(self._router, self._INFERENCE_ADAPTER_TYPES)
                     and self._should_reload()
                 ):
+                    adapter_name = type(self._router).__name__
                     verbose_proxy_logger.info(
-                        "Hot reloading KNN model due to file change"
+                        f"Hot reloading {adapter_name} model due to file change"
                     )
                     self._router.reload_model()
                 else:

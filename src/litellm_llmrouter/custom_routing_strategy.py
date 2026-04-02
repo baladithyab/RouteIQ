@@ -71,18 +71,34 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Feature flag: Use pipeline routing (enables A/B testing)
-# Set LLMROUTER_USE_PIPELINE=false to disable
-USE_PIPELINE_ROUTING = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
 
-# Feature flag: Enable centroid routing as fallback (zero-config intelligent routing)
-# Set ROUTEIQ_CENTROID_ROUTING=false to disable
-CENTROID_ROUTING_ENABLED = (
-    os.getenv("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
+def _load_routing_flags() -> tuple:
+    """Load routing feature flags from typed settings, falling back to env vars.
+
+    Returns:
+        Tuple of ``(use_pipeline, centroid_enabled, default_profile)``.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        settings = get_settings()
+        use_pipeline = settings.routing.pipeline_enabled
+        centroid_enabled = settings.routing.centroid_enabled
+        default_profile = settings.routing.default_profile.value
+        return use_pipeline, centroid_enabled, default_profile
+    except Exception:
+        use_pipeline = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
+        centroid_enabled = (
+            os.getenv("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
+        )
+        default_profile = os.getenv("ROUTEIQ_ROUTING_PROFILE", "auto")
+        return use_pipeline, centroid_enabled, default_profile
+
+
+# Feature flags (loaded once at import time, with typed-settings-first)
+USE_PIPELINE_ROUTING, CENTROID_ROUTING_ENABLED, DEFAULT_ROUTING_PROFILE = (
+    _load_routing_flags()
 )
-
-# Default routing profile (auto, eco, premium, free, reasoning)
-DEFAULT_ROUTING_PROFILE = os.getenv("ROUTEIQ_ROUTING_PROFILE", "auto")
 
 # Maximum routing attempts per request to prevent amplification loops
 MAX_ROUTING_ATTEMPTS = 3
@@ -709,11 +725,15 @@ def install_routeiq_strategy(
         )
 
     # Optionally warmup centroid classifier
-    if (
-        os.getenv("ROUTEIQ_CENTROID_WARMUP", "false").lower() == "true"
-        and CENTROID_ROUTING_AVAILABLE
-        and CENTROID_ROUTING_ENABLED
-    ):
+    try:
+        from litellm_llmrouter.settings import get_settings as _gs_warmup
+
+        _centroid_warmup = _gs_warmup().routing.centroid_warmup
+    except Exception:
+        _centroid_warmup = (
+            os.getenv("ROUTEIQ_CENTROID_WARMUP", "false").lower() == "true"
+        )
+    if _centroid_warmup and CENTROID_ROUTING_AVAILABLE and CENTROID_ROUTING_ENABLED:
         try:
             warmup_centroid_classifier()
             logger.info("Centroid classifier warmed up during strategy installation")

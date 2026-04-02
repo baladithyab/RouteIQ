@@ -106,6 +106,10 @@ def _reset_all_singletons():
 
     reset_service_discovery()
 
+    from litellm_llmrouter.settings import reset_settings
+
+    reset_settings()
+
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for
     # when the pool is not initialized, so skipping it is safe.
