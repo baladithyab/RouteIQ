@@ -68,6 +68,89 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
+# Model context windows (tokens) — from NadirClaw MODEL_REGISTRY + litellm.model_cost
+MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-3.5-turbo": 16_385,
+    "o1": 200_000,
+    "o1-mini": 128_000,
+    "o3-mini": 200_000,
+    "claude-3-5-sonnet-20241022": 200_000,
+    "claude-3-5-haiku-20241022": 200_000,
+    "claude-3-opus-20240229": 200_000,
+    "claude-sonnet-4-20250514": 200_000,
+    "gemini-2.0-flash": 1_048_576,
+    "gemini-2.5-pro-preview-05-06": 1_048_576,
+    "gemini-1.5-pro": 2_097_152,
+    "deepseek-chat": 128_000,
+    "deepseek-reasoner": 128_000,
+}
+
+# Cost per million tokens (USD) — from NadirClaw + litellm.model_cost
+MODEL_COSTS: Dict[str, Dict[str, float]] = {
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    "o1": {"input": 15.00, "output": 60.00},
+    "o1-mini": {"input": 1.10, "output": 4.40},
+    "o3-mini": {"input": 1.10, "output": 4.40},
+    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
+    "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini-2.5-pro-preview-05-06": {"input": 1.25, "output": 10.00},
+    "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
+    "deepseek-chat": {"input": 0.27, "output": 1.10},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+}
+
+
+def estimate_token_count(messages: List[Dict[str, Any]]) -> int:
+    """Estimate token count from messages (~4 chars per token heuristic)."""
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    return total_chars // 4
+
+
+def check_context_window(
+    model_name: str, messages: List[Dict[str, Any]], threshold: float = 0.9
+) -> bool:
+    """Check if messages fit within the model's context window.
+
+    Returns True if the estimated tokens are below threshold * max_tokens.
+    """
+    estimated = estimate_token_count(messages)
+    # Try exact match first, then check for partial matches
+    max_tokens = MODEL_CONTEXT_WINDOWS.get(model_name)
+    if max_tokens is None:
+        for key, val in MODEL_CONTEXT_WINDOWS.items():
+            if key in model_name or model_name in key:
+                max_tokens = val
+                break
+    if max_tokens is None:
+        max_tokens = 128_000  # safe default
+    return estimated < int(max_tokens * threshold)
+
+
+def estimate_request_cost(
+    model_name: str, input_tokens: int, estimated_output_tokens: int = 500
+) -> float:
+    """Estimate cost in USD for a request."""
+    costs = MODEL_COSTS.get(model_name)
+    if costs is None:
+        for key, val in MODEL_COSTS.items():
+            if key in model_name or model_name in key:
+                costs = val
+                break
+    if costs is None:
+        costs = {"input": 1.0, "output": 3.0}
+    return (
+        input_tokens * costs["input"] + estimated_output_tokens * costs["output"]
+    ) / 1_000_000
+
+
 # Default centroid directory relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_CENTROID_DIR = str(_PROJECT_ROOT / "models" / "centroids")
@@ -875,7 +958,40 @@ class CentroidRoutingStrategy:
 
         # Match tier to deployment
         deployments = self._get_healthy_deployments(context)
+
+        # For eco profile, sort deployments by estimated cost (cheapest first)
+        if self._profile == RoutingProfile.ECO:
+            input_tokens = estimate_token_count(full_messages)
+            deployments = sorted(
+                deployments,
+                key=lambda d: estimate_request_cost(
+                    d.get("litellm_params", {}).get("model", ""),
+                    input_tokens,
+                ),
+            )
+
         deployment = self._match_tier_to_deployment(tier, deployments)
+
+        # Context window check: if selected deployment can't fit the
+        # conversation, try the next tier up (simple → complex has larger
+        # context windows in many model families).
+        if deployment is not None:
+            dep_model = deployment.get("litellm_params", {}).get("model", "")
+            if not check_context_window(dep_model, full_messages):
+                logger.warning(
+                    "Context window exceeded for %s (est=%d tokens), trying next tier",
+                    dep_model,
+                    estimate_token_count(full_messages),
+                )
+                alt_tier = "complex" if tier == "simple" else "simple"
+                alt_deployment = self._match_tier_to_deployment(alt_tier, deployments)
+                if alt_deployment is not None:
+                    alt_model = alt_deployment.get("litellm_params", {}).get(
+                        "model", ""
+                    )
+                    if check_context_window(alt_model, full_messages):
+                        deployment = alt_deployment
+                        tier = alt_tier
 
         # Cache result
         if deployment is not None:
@@ -883,6 +999,69 @@ class CentroidRoutingStrategy:
             self._session_cache.put(session_key, model_name, tier)
 
         return deployment
+
+    def get_fallback_deployment(
+        self,
+        failed_model: str,
+        tier: str,
+        healthy_deployments: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Get a fallback deployment when primary returns 429 or is circuit-broken.
+
+        Strategy:
+        1. Try another model in the same tier
+        2. Try the adjacent tier (simple→complex or complex→simple)
+        3. Return None if no fallback available
+
+        Args:
+            failed_model: The model name that failed (to exclude).
+            tier: The current routing tier (``"simple"`` or ``"complex"``).
+            healthy_deployments: List of currently healthy deployment dicts.
+
+        Returns:
+            A fallback deployment dict, or ``None`` if no fallback is available.
+        """
+        # Filter out the failed model
+        candidates = [
+            d
+            for d in healthy_deployments
+            if d.get("litellm_params", {}).get("model", "") != failed_model
+        ]
+        if not candidates:
+            return None
+
+        # 1. Try same tier first
+        same_tier = self._match_tier_to_deployment(tier, candidates)
+        if same_tier is not None:
+            logger.info(
+                "Fallback: %s (tier=%s) → %s (same tier)",
+                failed_model,
+                tier,
+                same_tier.get("litellm_params", {}).get("model", ""),
+            )
+            return same_tier
+
+        # 2. Try adjacent tier
+        alt_tier = "complex" if tier == "simple" else "simple"
+        alt = self._match_tier_to_deployment(alt_tier, candidates)
+        if alt is not None:
+            logger.info(
+                "Fallback: %s (tier=%s) → %s (alt tier=%s)",
+                failed_model,
+                tier,
+                alt.get("litellm_params", {}).get("model", ""),
+                alt_tier,
+            )
+            return alt
+
+        # 3. Return first available candidate as last resort
+        logger.info(
+            "Fallback: %s (tier=%s) → %s (last resort)",
+            failed_model,
+            tier,
+            candidates[0].get("litellm_params", {}).get("model", ""),
+        )
+        return candidates[0]
 
     def _extract_prompt(
         self, messages: List[Dict[str, Any]]
