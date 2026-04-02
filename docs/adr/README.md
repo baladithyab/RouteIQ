@@ -35,6 +35,7 @@ Each ADR follows the standard format:
 | [0015](0015-k8s-native-leader-election.md) | K8s-Native Leader Election via Lease API | Proposed | 2026-04-02 |
 | [0016](0016-developer-experience-features.md) | Developer Experience Features | Proposed | 2026-04-02 |
 | [0017](0017-leverage-litellm-upstream.md) | Leverage LiteLLM Upstream Capabilities | Accepted | 2026-04-02 |
+| [0018](0018-disaggregated-ui.md) | Support Disaggregated UI Deployment | Accepted | 2026-04-02 |
 
 ## Lifecycle
 

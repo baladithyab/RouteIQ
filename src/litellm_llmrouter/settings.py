@@ -811,6 +811,16 @@ class GatewaySettings(BaseSettings):
         False,
         description="Enable admin UI at /ui/.",
     )
+    admin_ui_external_url: Optional[str] = Field(
+        None,
+        description=(
+            "External URL where the UI is hosted (for CORS).  "
+            "Leave empty when UI is embedded in the gateway container.  "
+            "Set to the UI origin (e.g. 'https://ui.routeiq.example.com') "
+            "for disaggregated deployments so the gateway auto-adds it "
+            "to CORS allowed origins."
+        ),
+    )
     skip_env_validation: bool = Field(
         False,
         description="Skip advisory env validation at startup.",

@@ -237,14 +237,30 @@ def _configure_middleware(app: FastAPI) -> None:
     from .plugin_middleware import PluginMiddleware
 
     # CORS middleware - configurable via ROUTEIQ_CORS_ORIGINS
+    # When the UI is deployed separately (disaggregated mode), its origin
+    # must be in the allowed list.  ROUTEIQ_ADMIN_UI_EXTERNAL_URL is
+    # automatically added to avoid manual CORS configuration.
+    cors_origins = _parse_cors_origins()
+    try:
+        settings = get_settings()
+        ext_url = settings.admin_ui_external_url
+    except Exception:
+        ext_url = os.getenv("ROUTEIQ_ADMIN_UI_EXTERNAL_URL")
+    if ext_url:
+        # Normalise: strip trailing slash to match Origin header format
+        ext_origin = ext_url.rstrip("/")
+        if ext_origin not in cors_origins and "*" not in cors_origins:
+            cors_origins.append(ext_origin)
+            logger.info("Added external UI origin to CORS: %s", ext_origin)
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_parse_cors_origins(),
+        allow_origins=cors_origins,
         allow_credentials=_parse_cors_credentials(),
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    logger.debug("Added CORSMiddleware")
+    logger.debug("Added CORSMiddleware (origins=%s)", cors_origins)
 
     # Request ID middleware - raw ASGI (streaming-safe, outermost for correlation)
     # Starlette's add_middleware works with any class accepting (app, **kwargs) --

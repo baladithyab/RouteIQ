@@ -370,3 +370,27 @@ async def get_models():
     """Get configured models with deployment info."""
     models = _get_models()
     return [ModelInfoResponse(**m) for m in models]
+
+
+@admin_router.get("/api/v1/routeiq/ui-config")
+async def get_ui_config():
+    """Return UI configuration for disaggregated deployments.
+
+    The UI can call this endpoint to get feature flags, OIDC config, etc.
+    This is useful when the UI is deployed separately from the gateway
+    (e.g., on S3+CloudFront, Cloudflare Pages, Vercel) and needs to
+    discover gateway capabilities at runtime.
+    """
+    oidc_enabled = os.environ.get("ROUTEIQ_OIDC_ENABLED", "false").lower() == "true"
+    return {
+        "version": _VERSION,
+        "features": {
+            "sso_login": oidc_enabled,
+            "model_playground": False,  # future
+            "cost_analytics": False,  # future
+        },
+        "oidc": {
+            "enabled": oidc_enabled,
+            "login_url": "/sso/login" if oidc_enabled else None,
+        },
+    }
