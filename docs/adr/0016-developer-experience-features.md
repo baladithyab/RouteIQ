@@ -1,6 +1,6 @@
 # ADR-0016: Developer Experience Features (Dashboard, Playground, SDK)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

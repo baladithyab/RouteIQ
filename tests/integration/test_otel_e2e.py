@@ -43,7 +43,7 @@ from ._otel_compose_helpers import (
 
 # Test configuration
 CONFIG = OTelTestConfig(
-    compose_file="docker-compose.otel.yml",
+    compose_file="examples/docker/observability/docker-compose.otel.yml",
     gateway_url="http://localhost:4001",
     jaeger_url="http://localhost:16686",
     master_key="sk-dev-key",

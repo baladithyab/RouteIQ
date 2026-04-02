@@ -48,8 +48,18 @@ logger = logging.getLogger(__name__)
 # Module-level singletons
 # ---------------------------------------------------------------------------
 _async_client: Optional[Any] = None  # redis.asyncio.Redis | None
-_async_client_lock = asyncio.Lock()
+_async_client_lock: Optional[asyncio.Lock] = None
 _sync_client: Optional[Any] = None  # redis.Redis | None
+_last_health_check: float = 0.0
+_HEALTH_CHECK_INTERVAL = 30.0  # seconds
+
+
+def _get_async_client_lock() -> asyncio.Lock:
+    """Lazily initialize the async client lock to avoid binding to wrong event loop."""
+    global _async_client_lock
+    if _async_client_lock is None:
+        _async_client_lock = asyncio.Lock()
+    return _async_client_lock
 
 
 def _redis_settings() -> dict[str, Any]:
@@ -131,18 +141,23 @@ async def get_async_redis_client() -> Optional[Any]:
         A ``redis.asyncio.Redis`` instance, or ``None`` if Redis is not
         configured (``REDIS_HOST`` is not set).
     """
-    global _async_client
+    global _async_client, _last_health_check
 
-    # Fast path: reuse existing healthy client
+    # Fast path: reuse existing healthy client with time-gated health check
     if _async_client is not None:
-        try:
-            await _async_client.ping()
-            return _async_client
-        except Exception:
-            logger.debug("Async Redis client health-check failed, reconnecting")
-            _async_client = None
+        import time
 
-    async with _async_client_lock:
+        if time.monotonic() - _last_health_check > _HEALTH_CHECK_INTERVAL:
+            try:
+                await _async_client.ping()
+                _last_health_check = time.monotonic()
+            except Exception:
+                logger.debug("Async Redis client health-check failed, reconnecting")
+                _async_client = None
+        else:
+            return _async_client
+
+    async with _get_async_client_lock():
         # Double-check after acquiring the lock
         if _async_client is not None:
             return _async_client
@@ -257,9 +272,11 @@ def reset_redis_clients() -> None:
     contamination.  Does **not** close open connections — use
     :func:`close_async_redis_client` for graceful shutdown.
     """
-    global _async_client, _sync_client
+    global _async_client, _sync_client, _async_client_lock, _last_health_check
     _async_client = None
     _sync_client = None
+    _async_client_lock = None
+    _last_health_check = 0.0
 
 
 # ---------------------------------------------------------------------------

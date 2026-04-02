@@ -1010,7 +1010,7 @@ class TestResolveIdentity:
         identity = OIDCIdentity(user_id="u1", email="a@b.com", roles=["internal_user"])
         api_key = "sk-oidc-test123456"
         key_hash = _hash_token(api_key)
-        _exchanged_keys[key_hash] = (identity, int(time.time()) + 3600)
+        _exchanged_keys.set(key_hash, (identity, int(time.time()) + 3600))
 
         request = MagicMock(spec=Request)
         request.headers = {"x-api-key": api_key}
@@ -1027,14 +1027,14 @@ class TestResolveIdentity:
         identity = OIDCIdentity(user_id="u1", email="a@b.com", roles=["internal_user"])
         api_key = "sk-oidc-expired"
         key_hash = _hash_token(api_key)
-        _exchanged_keys[key_hash] = (identity, int(time.time()) - 100)
+        _exchanged_keys.set(key_hash, (identity, int(time.time()) - 100))
 
         request = MagicMock(spec=Request)
         request.headers = {"x-api-key": api_key}
         result = await resolve_identity(request)
         assert result is None
         # Also cleans up expired key
-        assert key_hash not in _exchanged_keys
+        assert _exchanged_keys.get(key_hash) is None
 
     @pytest.mark.asyncio
     async def test_resolves_jwt_via_validator(self):
@@ -1089,7 +1089,7 @@ class TestResolveIdentity:
         )
         token = "my.cached.jwt"
         token_hash = _hash_token(token)
-        _identity_cache[token_hash] = (identity, time.monotonic() + 600)
+        _identity_cache.set(token_hash, (identity, time.monotonic() + 600))
 
         import litellm_llmrouter.oidc as oidc_mod
 
@@ -1157,14 +1157,20 @@ class TestSingletonLifecycle:
         import litellm_llmrouter.oidc as oidc_mod
 
         setup_oidc(_make_config())
-        _pending_auth_states["test"] = (time.time(), "url", "verifier")
-        _exchanged_keys["hash"] = (
-            OIDCIdentity(user_id="u", email="e@x.com"),
-            int(time.time()),
+        _pending_auth_states.set("test", (time.time(), "url", "verifier"))
+        _exchanged_keys.set(
+            "hash",
+            (
+                OIDCIdentity(user_id="u", email="e@x.com"),
+                int(time.time()),
+            ),
         )
-        _identity_cache["hash"] = (
-            OIDCIdentity(user_id="u", email="e@x.com"),
-            time.monotonic(),
+        _identity_cache.set(
+            "hash",
+            (
+                OIDCIdentity(user_id="u", email="e@x.com"),
+                time.monotonic(),
+            ),
         )
 
         reset_oidc()
@@ -1280,22 +1286,22 @@ class TestInternalHelpers:
     def test_prune_expired_states(self):
         """_prune_expired_states() removes old entries."""
         old_time = time.time() - 700
-        _pending_auth_states["old"] = (old_time, "url", "verifier")
-        _pending_auth_states["new"] = (time.time(), "url", "verifier")
+        _pending_auth_states.set("old", (old_time, "url", "verifier"))
+        _pending_auth_states.set("new", (time.time(), "url", "verifier"))
 
         _prune_expired_states(max_age=600)
-        assert "old" not in _pending_auth_states
-        assert "new" in _pending_auth_states
+        assert _pending_auth_states.get("old") is None
+        assert _pending_auth_states.get("new") is not None
 
     def test_prune_expired_identities(self):
         """_prune_expired_identities() removes expired entries."""
         identity = OIDCIdentity(user_id="u", email="e@x.com")
-        _identity_cache["expired"] = (identity, time.monotonic() - 10)
-        _identity_cache["valid"] = (identity, time.monotonic() + 600)
+        _identity_cache.set("expired", (identity, time.monotonic() - 10))
+        _identity_cache.set("valid", (identity, time.monotonic() + 600))
 
         _prune_expired_identities()
-        assert "expired" not in _identity_cache
-        assert "valid" in _identity_cache
+        assert _identity_cache.get("expired") is None
+        assert _identity_cache.get("valid") is not None
 
 
 # =============================================================================

@@ -49,7 +49,15 @@ def is_database_configured() -> bool:
 # =============================================================================
 
 _pool = None  # Optional[asyncpg.Pool]
-_pool_lock = asyncio.Lock()
+_pool_lock: Optional[asyncio.Lock] = None
+
+
+def _get_pool_lock() -> asyncio.Lock:
+    """Lazily initialize the pool lock to avoid binding to wrong event loop."""
+    global _pool_lock
+    if _pool_lock is None:
+        _pool_lock = asyncio.Lock()
+    return _pool_lock
 
 
 async def get_db_pool(db_url: Optional[str] = None):
@@ -71,7 +79,7 @@ async def get_db_pool(db_url: Optional[str] = None):
     if _pool is not None:
         return _pool
 
-    async with _pool_lock:
+    async with _get_pool_lock():
         if _pool is not None:  # Double-check after acquiring lock
             return _pool
 
@@ -82,16 +90,29 @@ async def get_db_pool(db_url: Optional[str] = None):
         try:
             import asyncpg
 
+            # Read pool settings from Pydantic settings if available
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                settings = get_settings()
+                min_size = settings.postgres.pool_min
+                max_size = settings.postgres.pool_max
+                ssl_mode = settings.postgres.ssl_mode
+            except Exception:
+                min_size = 2
+                max_size = 10
+                ssl_mode = "prefer"
+
             _pool = await asyncpg.create_pool(
                 url,
-                min_size=2,
-                max_size=10,
+                min_size=min_size,
+                max_size=max_size,
                 command_timeout=30,
                 # SSL enforcement when available
-                ssl="prefer",
+                ssl=ssl_mode,
             )
             verbose_proxy_logger.info(
-                "Database connection pool created (min=2, max=10)"
+                f"Database connection pool created (min={min_size}, max={max_size})"
             )
             return _pool
         except ImportError:
@@ -129,8 +150,9 @@ def reset_db_pool() -> None:
     Does NOT close the pool — use close_db_pool() for that.
     This is intended for unit tests that need to reset module-level state.
     """
-    global _pool
+    global _pool, _pool_lock
     _pool = None
+    _pool_lock = None
 
 
 # =============================================================================
@@ -281,7 +303,7 @@ class A2AAgentRepository:
         if agent_id not in self._agents:
             return None
 
-        agent.updated_at = datetime.utcnow()
+        agent.updated_at = datetime.now(timezone.utc)
         agent.created_at = self._agents[agent_id].created_at
         self._agents[agent_id] = agent
 
@@ -302,7 +324,7 @@ class A2AAgentRepository:
             if hasattr(agent, key) and key not in ("agent_id", "created_at"):
                 setattr(agent, key, value)
 
-        agent.updated_at = datetime.utcnow()
+        agent.updated_at = datetime.now(timezone.utc)
         self._agents[agent_id] = agent
 
         if self._db_url:

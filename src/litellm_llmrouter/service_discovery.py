@@ -74,7 +74,15 @@ class ExternalServices(str, Enum):
 # ---------------------------------------------------------------------------
 
 _last_probe: Dict[str, ServiceStatus] = {}
-_last_probe_lock = asyncio.Lock()
+_last_probe_lock: Optional[asyncio.Lock] = None
+
+
+def _get_last_probe_lock() -> asyncio.Lock:
+    """Lazily initialize the probe lock to avoid binding to wrong event loop."""
+    global _last_probe_lock
+    if _last_probe_lock is None:
+        _last_probe_lock = asyncio.Lock()
+    return _last_probe_lock
 
 
 def get_last_probe_results() -> Dict[str, ServiceStatus]:
@@ -84,8 +92,9 @@ def get_last_probe_results() -> Dict[str, ServiceStatus]:
 
 def reset_service_discovery() -> None:
     """Reset module state for testing."""
-    global _last_probe
+    global _last_probe, _last_probe_lock
     _last_probe = {}
+    _last_probe_lock = None
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +487,7 @@ async def probe_all_services() -> Dict[str, ServiceStatus]:
             )
 
     # Cache results
-    async with _last_probe_lock:
+    async with _get_last_probe_lock():
         _last_probe = dict(probes)
 
     return probes

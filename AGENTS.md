@@ -131,14 +131,8 @@ RouteIQ/
 │   ├── Dockerfile.slim            # Slim variant (proxy-only, no ML deps)
 │   ├── entrypoint.sh              # Production entrypoint
 │   └── entrypoint.local.sh        # Local dev entrypoint
-├── docker-compose.yml             # Basic stack
-├── docker-compose.ha.yml          # HA: multi-replica + Redis + Postgres + Nginx
-├── docker-compose.otel.yml        # Observability: OTel Collector + Jaeger
-├── docker-compose.ha-otel.yml     # HA + Observability combined
-├── docker-compose.ha-test.yml     # HA integration testing
+├── docker-compose.yml             # Basic dev stack
 ├── docker-compose.local-test.yml  # Local development testing
-├── docker-compose.quota-test.yml  # Quota enforcement testing
-├── docker-compose.streaming-perf.yml # Streaming performance testing
 ├── deploy/charts/                 # Helm charts for Kubernetes
 ├── docs/                          # Comprehensive documentation (~35 files)
 │   └── adr/                       # Architecture Decision Records
@@ -208,11 +202,11 @@ private key detection, trailing whitespace fix, merge conflict check, large file
 ### Docker
 
 ```bash
-docker compose up -d                                           # Basic stack
-docker compose -f docker-compose.ha.yml up -d                  # HA stack
-docker compose -f docker-compose.otel.yml up -d                # Observability stack
-docker compose -f docker-compose.ha-otel.yml up -d             # HA + Observability
-docker compose -f docker-compose.local-test.yml up -d          # Local test stack (port 4010)
+docker compose up -d                                                          # Basic stack
+docker compose -f docker-compose.local-test.yml up -d                          # Local test stack (port 4010)
+docker compose -f examples/docker/ha/docker-compose.ha.yml up -d               # HA stack
+docker compose -f examples/docker/observability/docker-compose.otel.yml up -d   # Observability stack
+docker compose -f examples/docker/ha/docker-compose.ha-otel.yml up -d          # HA + Observability
 docker build -f docker/Dockerfile -t litellm-llmrouter:latest . # Build production image
 docker build -f docker/Dockerfile.slim -t litellm-llmrouter:slim . # Build slim image (no ML deps)
 ```

@@ -38,7 +38,7 @@ for cmd in ("finch", "docker"):
 class OTelTestConfig:
     """Configuration for OTel E2E tests."""
 
-    compose_file: str = "docker-compose.otel.yml"
+    compose_file: str = "examples/docker/observability/docker-compose.otel.yml"
     gateway_url: str = "http://localhost:4001"
     jaeger_url: str = "http://localhost:16686"
     master_key: str = "sk-dev-key"
@@ -300,7 +300,7 @@ class ComposeStackManager:
                 if resp.status_code == 200:
                     print("✅ Jaeger accessible")
                     return
-            except (httpx.RequestError, httpx.TimeoutException):
+            except httpx.RequestError, httpx.TimeoutException:
                 pass
             time.sleep(2)
 

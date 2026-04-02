@@ -91,17 +91,17 @@ docker compose up -d
 Multi-replica with Redis, PostgreSQL, and Nginx load balancing:
 
 ```bash
-docker compose -f docker-compose.ha.yml up -d
+docker compose -f examples/docker/ha/docker-compose.ha.yml up -d
 ```
 
-> **Note**: Deployment examples have been reorganized into `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
+> **Note**: Deployment examples are organized in `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
 
 ### 3. With Observability (OTel + Jaeger)
 
 Full trace visualization with Jaeger:
 
 ```bash
-docker compose -f docker-compose.otel.yml up -d
+docker compose -f examples/docker/observability/docker-compose.otel.yml up -d
 # Jaeger UI: http://localhost:16686
 ```
 

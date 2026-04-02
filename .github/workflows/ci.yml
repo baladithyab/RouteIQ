@@ -35,6 +35,7 @@ jobs:
               - 'uv.lock'
             compose:
               - 'docker-compose*.yml'
+              - 'examples/docker/**/docker-compose*.yml'
               - 'examples/mlops/docker-compose*.yml'
 
   # ===========================================================================
@@ -163,7 +164,7 @@ jobs:
           LITELLM_MASTER_KEY: ci_validation_dummy_key
 
       - name: Validate docker-compose.ha.yml
-        run: docker compose -f docker-compose.ha.yml config
+        run: docker compose -f examples/docker/ha/docker-compose.ha.yml config
         env:
           # Dummy values for CI validation only - never used in production
           LITELLM_MASTER_KEY: ci_validation_dummy_key

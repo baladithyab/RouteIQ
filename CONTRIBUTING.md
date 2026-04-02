@@ -260,13 +260,13 @@ Development follows a Task Group pattern with quality gates:
 | File | Purpose | Use When |
 |------|---------|----------|
 | `docker-compose.yml` | Basic single instance | Quick local testing |
-| `docker-compose.ha.yml` | HA with Redis/Postgres/Nginx | Testing production-like setup |
-| `docker-compose.otel.yml` | Observability with Jaeger | Debugging traces |
 | `docker-compose.local-test.yml` | Full local dev stack | Running integration tests |
-| `docker-compose.ha-otel.yml` | HA + Observability | Full production simulation |
-| `docker-compose.ha-test.yml` | HA integration testing | Testing HA failover scenarios |
-| `docker-compose.quota-test.yml` | Quota enforcement testing | Testing per-team/key quotas |
-| `docker-compose.streaming-perf.yml` | Streaming performance testing | Benchmarking streaming throughput |
+| `examples/docker/ha/docker-compose.ha.yml` | HA with Redis/Postgres/Nginx | Testing production-like setup |
+| `examples/docker/observability/docker-compose.otel.yml` | Observability with Jaeger | Debugging traces |
+| `examples/docker/ha/docker-compose.ha-otel.yml` | HA + Observability | Full production simulation |
+| `examples/docker/testing/docker-compose.ha-test.yml` | HA integration testing | Testing HA failover scenarios |
+| `examples/docker/testing/docker-compose.quota-test.yml` | Quota enforcement testing | Testing per-team/key quotas |
+| `examples/docker/testing/docker-compose.streaming-perf.yml` | Streaming performance testing | Benchmarking streaming throughput |
 | `examples/docker/` | Reorganized deployment scenarios | Quick-start for basic, ha, observability, full-stack, local-dev |
 
 ## Security

@@ -60,11 +60,13 @@ Note:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import secrets
+import threading
 import time
 from typing import Any, Optional
 from urllib.parse import urlencode, urljoin
@@ -682,17 +684,61 @@ class OIDCAuthError(OIDCError):
 
 
 # =============================================================================
-# In-memory session & state store
+# In-memory session & state store (bounded, thread-safe)
 # =============================================================================
 
+_MAX_CACHE_SIZE = 10_000
+
+
+class _BoundedTTLDict:
+    """Thread-safe, bounded dict with TTL expiry."""
+
+    def __init__(self, max_size: int = _MAX_CACHE_SIZE):
+        self._data: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if len(self._data) >= self._max_size:
+                # Evict oldest 10%
+                to_remove = list(self._data.keys())[: self._max_size // 10]
+                for k in to_remove:
+                    del self._data[k]
+            self._data[key] = value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self._data.get(key, default)
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self._data.pop(key, default)
+
+    def prune(self, predicate) -> int:
+        """Remove entries where predicate(key, value) is True."""
+        with self._lock:
+            to_remove = [k for k, v in self._data.items() if predicate(k, v)]
+            for k in to_remove:
+                del self._data[k]
+            return len(to_remove)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
 # Maps state nonce -> (timestamp, redirect_uri, code_verifier) for CSRF protection
-_pending_auth_states: dict[str, tuple[float, str, str]] = {}
+_pending_auth_states: _BoundedTTLDict = _BoundedTTLDict()
 
 # Maps api_key_hash -> (OIDCIdentity, expires_at) for exchanged tokens
-_exchanged_keys: dict[str, tuple[OIDCIdentity, int]] = {}
+_exchanged_keys: _BoundedTTLDict = _BoundedTTLDict()
 
 # Validated identity cache: token_hash -> (OIDCIdentity, expires_at)
-_identity_cache: dict[str, tuple[OIDCIdentity, float]] = {}
+_identity_cache: _BoundedTTLDict = _BoundedTTLDict()
 
 
 def _generate_state() -> str:
@@ -715,21 +761,13 @@ def _prune_expired_states(max_age: float = 600.0) -> None:
     abandoned auth flows.
     """
     now = time.time()
-    expired_keys = [
-        k for k, (ts, _, _) in _pending_auth_states.items() if now - ts > max_age
-    ]
-    for k in expired_keys:
-        del _pending_auth_states[k]
+    _pending_auth_states.prune(lambda k, v: now - v[0] > max_age)
 
 
 def _prune_expired_identities() -> None:
     """Remove expired entries from the identity cache."""
     now = time.monotonic()
-    expired_keys = [
-        k for k, (_, expires_at) in _identity_cache.items() if now > expires_at
-    ]
-    for k in expired_keys:
-        del _identity_cache[k]
+    _identity_cache.prune(lambda k, v: now > v[1])
 
 
 # =============================================================================
@@ -834,7 +872,13 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
         # Generate state for CSRF protection
         state = _generate_state()
         code_verifier = secrets.token_urlsafe(64)
-        _pending_auth_states[state] = (time.time(), callback_url, code_verifier)
+        _pending_auth_states.set(state, (time.time(), callback_url, code_verifier))
+
+        # Build PKCE code_challenge from code_verifier (S256)
+        code_challenge_digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = (
+            base64.urlsafe_b64encode(code_challenge_digest).rstrip(b"=").decode("ascii")
+        )
 
         # Build authorization URL
         params = {
@@ -843,6 +887,8 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
             "redirect_uri": callback_url,
             "scope": "openid email profile",
             "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
 
         auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
@@ -900,7 +946,7 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
 
         # Validate state (CSRF protection)
         _prune_expired_states()
-        state_entry = _pending_auth_states.pop(state, None)
+        state_entry = _pending_auth_states.pop(state)
         if state_entry is None:
             logger.warning("OIDC callback with invalid or expired state parameter")
             raise HTTPException(
@@ -908,7 +954,7 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
                 detail="Invalid or expired state parameter. Please restart the login flow.",
             )
 
-        _, callback_url, _code_verifier = state_entry
+        _, callback_url, code_verifier = state_entry
 
         if not config.issuer_url or not config.client_id:
             raise HTTPException(
@@ -934,6 +980,7 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
             "code": code,
             "redirect_uri": callback_url,
             "client_id": config.client_id,
+            "code_verifier": code_verifier,
         }
         if config.client_secret:
             token_payload["client_secret"] = config.client_secret
@@ -983,9 +1030,12 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
 
         # Cache the identity
         token_hash = _hash_token(id_token)
-        _identity_cache[token_hash] = (
-            identity,
-            time.monotonic() + config.session_ttl,
+        _identity_cache.set(
+            token_hash,
+            (
+                identity,
+                time.monotonic() + config.session_ttl,
+            ),
         )
 
         logger.info(
@@ -1073,7 +1123,7 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
         key_hash = _hash_token(api_key)
 
         # Store the key mapping
-        _exchanged_keys[key_hash] = (identity, expires_at)
+        _exchanged_keys.set(key_hash, (identity, expires_at))
 
         alias = body.key_alias or f"oidc-{identity.user_id[:8]}"
 
@@ -1138,9 +1188,12 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
         # Cache the result
-        _identity_cache[token_hash] = (
-            identity,
-            time.monotonic() + config.session_ttl,
+        _identity_cache.set(
+            token_hash,
+            (
+                identity,
+                time.monotonic() + config.session_ttl,
+            ),
         )
 
         return JSONResponse(
@@ -1194,7 +1247,7 @@ async def resolve_identity(request: Request) -> Optional[OIDCIdentity]:
                 return identity
             else:
                 # Expired — clean up
-                del _exchanged_keys[key_hash]
+                _exchanged_keys.pop(key_hash)
                 logger.debug(
                     "Expired OIDC-exchanged key removed for user %s", identity.user_id
                 )
@@ -1228,9 +1281,12 @@ async def resolve_identity(request: Request) -> Optional[OIDCIdentity]:
         return None
 
     # Cache the result
-    _identity_cache[token_hash] = (
-        identity,
-        time.monotonic() + _oidc_config.session_ttl,
+    _identity_cache.set(
+        token_hash,
+        (
+            identity,
+            time.monotonic() + _oidc_config.session_ttl,
+        ),
     )
     return identity
 

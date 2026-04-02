@@ -45,6 +45,7 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -685,10 +686,9 @@ class SessionCache:
             ttl: Time-to-live in seconds (default 30 minutes).
             max_size: Maximum cache entries before LRU eviction.
         """
-        self._cache: Dict[str, Tuple[str, str, float]] = {}
+        self._cache: OrderedDict[str, Tuple[str, str, float]] = OrderedDict()
         self._ttl = ttl
         self._max_size = max_size
-        self._access_order: List[str] = []
         self._put_counter = 0
         self._lock = threading.Lock()
 
@@ -726,12 +726,8 @@ class SessionCache:
             if time.time() - ts > self._ttl:
                 # Expired
                 del self._cache[key]
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
                 return None
-            # Touch for LRU
+            # Touch for LRU — O(1) with OrderedDict
             self._touch(key)
             return model, tier
 
@@ -752,21 +748,18 @@ class SessionCache:
                 self._put_counter = 0
                 self._clear_expired()
 
+            # Remove first if exists so move_to_end works correctly
+            if key in self._cache:
+                del self._cache[key]
             self._cache[key] = (model, tier, time.time())
-            self._touch(key)
 
-            # Evict LRU if over capacity
-            while len(self._cache) > self._max_size and self._access_order:
-                oldest = self._access_order.pop(0)
-                self._cache.pop(oldest, None)
+            # Evict oldest (LRU) if over capacity — O(1) with OrderedDict
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
 
     def _touch(self, key: str) -> None:
-        """Move key to end of LRU access order."""
-        try:
-            self._access_order.remove(key)
-        except ValueError:
-            pass
-        self._access_order.append(key)
+        """Move key to end of LRU access order — O(1)."""
+        self._cache.move_to_end(key)
 
     def _clear_expired(self) -> int:
         """Remove expired entries. Returns count removed."""
@@ -774,10 +767,6 @@ class SessionCache:
         expired = [k for k, (_, _, ts) in self._cache.items() if now - ts > self._ttl]
         for k in expired:
             del self._cache[k]
-            try:
-                self._access_order.remove(k)
-            except ValueError:
-                pass
         return len(expired)
 
     @property

@@ -917,6 +917,15 @@ Examples:
             "Environment validation found %d warning(s)", len(env_result.warnings)
         )
 
+    # Apply RouteIQ key prefix to env vars (was previously a module-level side effect
+    # in auth.py; moved here to avoid import-time env mutation).
+    try:
+        from litellm_llmrouter.auth import apply_key_prefix
+
+        apply_key_prefix()
+    except ImportError:
+        pass
+
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()
 

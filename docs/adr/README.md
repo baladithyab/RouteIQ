@@ -28,14 +28,15 @@ Each ADR follows the standard format:
 | [0008](0008-oidc-identity-integration.md) | OIDC/SSO for Enterprise Identity Management | Accepted | 2026-04-02 |
 | [0009](0009-multi-tier-docker-images.md) | Multi-Tier Docker Images (Slim/Full/GPU) | Accepted | 2026-04-02 |
 | [0010](0010-centroid-zero-config-routing.md) | Centroid-Based Zero-Config Routing | Accepted | 2026-04-02 |
-| [0011](0011-pluggable-external-services.md) | Pluggable External Services | Proposed | 2026-04-02 |
-| [0012](0012-own-fastapi-app.md) | RouteIQ Owns Its FastAPI Application | Proposed | 2026-04-02 |
-| [0013](0013-pydantic-settings.md) | Pydantic Settings for Typed Configuration | Proposed | 2026-04-02 |
+| [0011](0011-pluggable-external-services.md) | Pluggable External Services | Accepted | 2026-04-02 |
+| [0012](0012-own-fastapi-app.md) | RouteIQ Owns Its FastAPI Application | Accepted | 2026-04-02 |
+| [0013](0013-pydantic-settings.md) | Pydantic Settings for Typed Configuration | Accepted | 2026-04-02 |
 | [0014](0014-plugin-extraction.md) | Extract RouteIQ into Independently Installable Packages | Proposed | 2026-04-02 |
-| [0015](0015-k8s-native-leader-election.md) | K8s-Native Leader Election via Lease API | Proposed | 2026-04-02 |
-| [0016](0016-developer-experience-features.md) | Developer Experience Features | Proposed | 2026-04-02 |
+| [0015](0015-k8s-native-leader-election.md) | K8s-Native Leader Election via Lease API | Accepted | 2026-04-02 |
+| [0016](0016-developer-experience-features.md) | Developer Experience Features | Accepted | 2026-04-02 |
 | [0017](0017-leverage-litellm-upstream.md) | Leverage LiteLLM Upstream Capabilities | Accepted | 2026-04-02 |
 | [0018](0018-disaggregated-ui.md) | Support Disaggregated UI Deployment | Accepted | 2026-04-02 |
+| [0019](0019-otel-genai-conventions.md) | Adopt OpenTelemetry GenAI Semantic Conventions | Proposed | 2026-04-02 |
 
 ## Lifecycle
 

@@ -54,7 +54,7 @@ MASTER_KEY = "quota-test-master-key"
 ADMIN_KEY = "quota-test-admin-key"
 
 # Compose file path
-COMPOSE_FILE = "docker-compose.quota-test.yml"
+COMPOSE_FILE = "examples/docker/testing/docker-compose.quota-test.yml"
 
 # Skip check for compose availability
 requires_compose = pytest.mark.skipif(

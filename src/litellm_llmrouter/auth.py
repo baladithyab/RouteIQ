@@ -146,9 +146,21 @@ def _apply_key_prefix_to_env() -> None:
             )
 
 
-# Apply prefix on module load so that all downstream code sees the
-# canonical prefixed keys from the start.
-_apply_key_prefix_to_env()
+# Guard: track whether key prefix has been applied
+_key_prefix_applied = False
+
+
+def apply_key_prefix() -> None:
+    """Apply the RouteIQ key prefix to env vars.
+
+    Safe to call multiple times — subsequent calls are no-ops.
+    Should be called from startup.py rather than on import.
+    """
+    global _key_prefix_applied
+    if _key_prefix_applied:
+        return
+    _apply_key_prefix_to_env()
+    _key_prefix_applied = True
 
 
 # Context variable to store request ID for the current request

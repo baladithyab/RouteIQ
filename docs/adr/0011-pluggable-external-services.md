@@ -1,6 +1,6 @@
 # ADR-0011: Pluggable External Services (Bring-Your-Own DB/Redis/OTel)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

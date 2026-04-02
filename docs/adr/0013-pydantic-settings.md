@@ -1,6 +1,6 @@
 # ADR-0013: Pydantic Settings for Typed Configuration
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 

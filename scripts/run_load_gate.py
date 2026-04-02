@@ -98,7 +98,7 @@ DEFAULT_MARKER_COUNT = 10  # Shorter streams for load test
 DEFAULT_INTERVAL_MS = 50  # 50ms between markers
 
 # Compose config
-COMPOSE_FILE = "docker-compose.streaming-perf.yml"
+COMPOSE_FILE = "examples/docker/testing/docker-compose.streaming-perf.yml"
 COMPOSE_CMD: Optional[str] = None
 for cmd in ("finch", "docker"):
     if shutil.which(cmd):
@@ -338,7 +338,7 @@ def start_compose_stack() -> bool:
             if resp.status_code == 200:
                 print("✅ Services healthy")
                 return True
-        except (httpx.RequestError, httpx.TimeoutException):
+        except httpx.RequestError, httpx.TimeoutException:
             pass
         time.sleep(2)
 
@@ -448,7 +448,9 @@ def print_results(
     if violations:
         print("🔴 GATE FAILED - Threshold violations:")
         for v in violations:
-            print(f"   ❌ {v.metric}: {v.actual:.2f}{v.unit} > {v.threshold:.1f}{v.unit}")
+            print(
+                f"   ❌ {v.metric}: {v.actual:.2f}{v.unit} > {v.threshold:.1f}{v.unit}"
+            )
     else:
         print("🟢 GATE PASSED - All thresholds met")
     print("=" * 60)
@@ -553,7 +555,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--error-rate-pct",
         type=float,
-        default=float(os.environ.get("LOAD_GATE_ERROR_RATE_PCT", DEFAULT_ERROR_RATE_PCT)),
+        default=float(
+            os.environ.get("LOAD_GATE_ERROR_RATE_PCT", DEFAULT_ERROR_RATE_PCT)
+        ),
         help=f"Max error rate percentage. Default: {DEFAULT_ERROR_RATE_PCT}",
     )
 
@@ -604,7 +608,9 @@ def main() -> int:
 
     # Resolve duration and concurrency (CLI overrides preset)
     duration_s = args.duration if args.duration is not None else preset["duration_s"]
-    concurrency = args.concurrency if args.concurrency is not None else preset["concurrency"]
+    concurrency = (
+        args.concurrency if args.concurrency is not None else preset["concurrency"]
+    )
 
     # Override from env if set
     if os.environ.get("LOAD_GATE_DURATION_S"):

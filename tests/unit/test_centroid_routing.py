@@ -486,7 +486,6 @@ class TestSessionCache:
         for i in range(5):
             key = f"expired_{i}"
             cache._cache[key] = (f"model_{i}", "simple", time.time() - 10)
-            cache._access_order.append(key)
 
         initial_size = len(cache._cache)
 
