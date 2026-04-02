@@ -10,9 +10,9 @@ These routes extend the LiteLLM proxy server with:
   - DELETE /v1/agents/{agent_id} - Delete agent (DB-backed)
   - POST /a2a/{agent_id} - Invoke agent (A2A JSON-RPC protocol)
   - POST /a2a/{agent_id}/message/stream - Streaming alias (proxies to canonical)
-- MCP (Model Context Protocol) gateway endpoints
-- MCP Parity Layer - upstream-compatible endpoint aliases
-- MCP Namespaced Routes - /mcp for built-in, /{server_prefix}/mcp for per-server
+- MCP (Model Context Protocol) gateway REST endpoints (/llmrouter/mcp/*)
+  Note: MCP parity layer, JSON-RPC, and SSE transport are now provided natively
+  by LiteLLM and have been removed from RouteIQ.
 - Hot reload and config sync endpoints
 - Kubernetes health probe endpoints (/_health/live, /_health/ready)
 
@@ -21,28 +21,15 @@ Usage:
         health_router,
         llmrouter_router,
         admin_router,
-        mcp_parity_router,
-        mcp_parity_admin_router,
-        mcp_rest_router,
-        mcp_proxy_router,
-        mcp_namespace_router,
-        oauth_callback_router,
         RequestIDMiddleware,
     )
     app.add_middleware(RequestIDMiddleware)  # Add first for request correlation
     app.include_router(health_router)  # Unauthenticated health probes
     app.include_router(llmrouter_router)  # User auth-protected routes
     app.include_router(admin_router)  # Admin auth-protected control-plane routes
-    app.include_router(mcp_parity_router)  # Upstream-compatible MCP aliases
-    app.include_router(mcp_parity_admin_router)  # Admin MCP parity routes
-    app.include_router(mcp_rest_router)  # MCP REST API (/mcp-rest)
-    app.include_router(mcp_namespace_router)  # Namespaced /mcp routes
-    # Feature-flagged:
-    app.include_router(mcp_proxy_router)  # MCP protocol proxy (if enabled)
-    app.include_router(oauth_callback_router)  # OAuth callback (if enabled)
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
@@ -50,6 +37,7 @@ from ..auth import (
     admin_api_key_auth,
     RequestIDMiddleware,
 )
+from ..audit import audit_log, AuditAction, AuditOutcome, AuditWriteError
 
 # ---- Router definitions (must be defined BEFORE sub-module imports) ----
 
@@ -75,6 +63,46 @@ admin_router = APIRouter(
 # Legacy alias for backwards compatibility (deprecated - use health_router + llmrouter_router + admin_router)
 router = llmrouter_router
 
+
+# ---- Shared audit utility (used by a2a, mcp, config route modules) ----
+
+
+async def handle_audit_write(
+    action: AuditAction,
+    resource_type: str,
+    resource_id: str | None,
+    outcome: AuditOutcome,
+    rbac_info: dict | None,
+    request_id: str,
+    outcome_reason: str | None = None,
+):
+    """
+    Handle audit write with fail-closed mode support.
+
+    If fail-closed mode is enabled and audit write fails, raises 503.
+    Otherwise, failure is logged and the request continues.
+    """
+    try:
+        await audit_log(
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            outcome=outcome,
+            outcome_reason=outcome_reason,
+            actor_info=rbac_info,
+        )
+    except AuditWriteError:
+        # Fail-closed: reject the request with 503
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "audit_log_unavailable",
+                "message": "Cannot process request: audit logging is unavailable and fail-closed mode is enabled",
+                "request_id": request_id,
+            },
+        )
+
+
 # ---- Import sub-modules (registers routes on the routers above) ----
 
 from . import health as _health_routes  # noqa: E402, F401
@@ -82,34 +110,6 @@ from . import a2a as _a2a_routes  # noqa: E402, F401
 from . import mcp as _mcp_routes  # noqa: E402, F401
 from . import config as _config_routes  # noqa: E402, F401
 from . import admin_ui as _admin_ui_routes  # noqa: E402, F401
-
-# ---- Re-export external routers ----
-
-# Import MCP parity layer routers and feature flags
-from ..mcp_parity import (  # noqa: E402
-    mcp_parity_router,
-    mcp_parity_admin_router,
-    mcp_rest_router,
-    mcp_proxy_router,
-    mcp_namespace_router,
-    oauth_callback_router,
-    MCP_OAUTH_ENABLED,
-    MCP_PROTOCOL_PROXY_ENABLED,
-)
-
-# Import MCP native JSON-RPC router
-from ..mcp_jsonrpc import mcp_jsonrpc_router  # noqa: E402
-
-# Import MCP SSE transport router
-from ..mcp_sse_transport import (  # noqa: E402
-    mcp_sse_router,
-    MCP_SSE_TRANSPORT_ENABLED,
-    MCP_SSE_LEGACY_MODE,
-    MCP_SSE_SESSION_TIMEOUT,
-    get_transport_mode,
-    get_session,
-    cleanup_expired_sessions,
-)
 
 # Re-export Pydantic models for backwards compatibility
 from .models import (  # noqa: E402
@@ -127,29 +127,11 @@ __all__ = [
     "admin_router",
     "router",
     "RequestIDMiddleware",
+    "handle_audit_write",
     # Pydantic models
     "AgentRegistration",
     "ServerRegistration",
     "ReloadRequest",
     "MCPToolCall",
     "MCPToolRegister",
-    # MCP Parity Layer (upstream-compatible aliases)
-    "mcp_parity_router",
-    "mcp_parity_admin_router",
-    "mcp_rest_router",
-    "mcp_proxy_router",
-    "mcp_namespace_router",
-    "oauth_callback_router",
-    "MCP_OAUTH_ENABLED",
-    "MCP_PROTOCOL_PROXY_ENABLED",
-    # MCP Native JSON-RPC
-    "mcp_jsonrpc_router",
-    # MCP SSE Transport
-    "mcp_sse_router",
-    "MCP_SSE_TRANSPORT_ENABLED",
-    "MCP_SSE_LEGACY_MODE",
-    "MCP_SSE_SESSION_TIMEOUT",
-    "get_transport_mode",
-    "get_session",
-    "cleanup_expired_sessions",
 ]

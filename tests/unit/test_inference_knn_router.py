@@ -39,13 +39,19 @@ def enable_pickle_loading(monkeypatch):
     Security Note: This is required because pickle loading is disabled by default
     to prevent RCE attacks. Tests explicitly enable it since they use controlled
     test fixtures.
+
+    Also disables ENFORCE_SIGNED_MODELS since unit tests use ad-hoc pickle
+    files without manifests.  The enforcement default changed to True in
+    ADR-0006 (security hardening).
     """
     monkeypatch.setenv("LLMROUTER_ALLOW_PICKLE_MODELS", "true")
+    monkeypatch.setenv("LLMROUTER_ENFORCE_SIGNED_MODELS", "false")
     # Reload the module to pick up the new env var value
     import litellm_llmrouter.strategies as strategies_module
 
-    # Update the module-level flag since it's evaluated at import time
+    # Update the module-level flags since they're evaluated at import time
     monkeypatch.setattr(strategies_module, "ALLOW_PICKLE_MODELS", True)
+    monkeypatch.setattr(strategies_module, "ENFORCE_SIGNED_MODELS", False)
     yield
 
 

@@ -23,7 +23,16 @@ Cloud-native General AI Gateway with pluggable ML routing intelligence and end-t
 - **MLOps Pipeline**: End-to-end tooling to collect telemetry, train routing models, and deploy them with hot-reload
 - **Enterprise Hardening**: RBAC, quotas, audit logging, policy engine, SSRF protection, circuit breakers
 - **Cloud-Native**: Helm charts, HA with leader election, graceful shutdown, health probes, OpenTelemetry
-- **Admin UI**: Built-in admin interface at `/ui/` (enable with `ROUTEIQ_ADMIN_UI_ENABLED=true`)
+- **Admin Dashboard**: 6-page React admin UI (Dashboard, Routing, Governance, Guardrails, Prompts, Observability) at `/ui/`
+- **Governance**: Workspace isolation, dynamic usage policies, guardrail policies (14 check types), API key governance
+- **Identity**: OIDC/SSO integration with Keycloak, Auth0, Okta, Azure AD, Google
+- **Prompt Management**: Named templates with versioning, A/B testing, rollback
+- **Context Optimization**: 30-70% token savings via 6 lossless transforms (enable with `ROUTEIQ_CONTEXT_OPTIMIZE`)
+- **Evaluation Pipeline**: LLM-as-judge quality scoring with feedback to routing
+- **Personalized Routing**: Per-user/per-team model preference learning
+- **Router-R1**: Iterative reasoning-based routing using the gateway's own proxy
+- **CLI**: `routeiq start/validate-config/version/probe-services`
+- **Standalone Package**: `uv add routeiq-routing` (or `pip install routeiq-routing`) for ML routing without the full gateway
 
 ## Gateway Surfaces
 
@@ -74,10 +83,26 @@ The gateway operates as the central nervous system for AI infrastructure:
 
 ### Prerequisites
 
+- [uv](https://docs.astral.sh/uv/) (recommended package manager)
 - [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- [uv](https://docs.astral.sh/uv/) (for local development)
 
-### 1. Docker Compose (Basic)
+### 1. Local Development (uv)
+
+```bash
+git clone https://github.com/baladithyab/RouteIQ.git
+cd RouteIQ
+uv sync
+uv run routeiq start --config config/config.yaml
+```
+
+Or with pip:
+
+```bash
+pip install -e .
+routeiq start --config config/config.yaml
+```
+
+### 2. Docker Compose (Basic)
 
 ```bash
 git clone https://github.com/baladithyab/RouteIQ.git
@@ -86,26 +111,26 @@ cp .env.example .env  # Edit with your API keys
 docker compose up -d
 ```
 
-### 2. High Availability (Production)
+### 3. High Availability (Production)
 
 Multi-replica with Redis, PostgreSQL, and Nginx load balancing:
 
 ```bash
-docker compose -f docker-compose.ha.yml up -d
+docker compose -f examples/docker/ha/docker-compose.ha.yml up -d
 ```
 
-> **Note**: Deployment examples have been reorganized into `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
+> **Note**: Deployment examples are organized in `examples/docker/` with ready-to-use scenarios: basic, ha, observability, full-stack, and local-dev. Each includes its own `docker-compose.yml`, `.env.example`, and `README.md`. See the [`examples/docker/`](examples/docker/) directory for details.
 
-### 3. With Observability (OTel + Jaeger)
+### 4. With Observability (OTel + Jaeger)
 
 Full trace visualization with Jaeger:
 
 ```bash
-docker compose -f docker-compose.otel.yml up -d
+docker compose -f examples/docker/observability/docker-compose.otel.yml up -d
 # Jaeger UI: http://localhost:16686
 ```
 
-### 4. Local Development
+### 5. Local Development (Full Stack)
 
 ```bash
 uv sync

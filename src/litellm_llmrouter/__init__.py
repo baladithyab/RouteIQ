@@ -12,17 +12,23 @@ Features:
 - S3/GCS config sync with hot reload
 - ETag-based change detection for efficient syncing
 - Runtime A/B testing via strategy registry and routing pipeline
+- Centroid routing for zero-config intelligent routing (~2ms)
 
-Usage:
-    from litellm_llmrouter import register_llmrouter_strategies, patch_litellm_router
+Recommended Usage (Plugin Strategy — default):
+    from litellm_llmrouter import install_routeiq_strategy
 
-    # Apply the router patch BEFORE creating any Router instances
-    # This is explicit and idempotent (safe to call multiple times)
-    patch_litellm_router()
+    # After creating a LiteLLM Router instance:
+    install_routeiq_strategy(router, strategy_name="llmrouter-knn")
 
-    # Log available LLMRouter strategies (activated via the patch above,
-    # NOT registered in a separate registry despite the function name)
-    register_llmrouter_strategies()
+    # Or use the gateway factory which handles everything automatically:
+    from litellm_llmrouter.gateway import create_app
+    app = create_app()
+
+Legacy Usage (REMOVED — monkey-patch approach):
+    # The monkey-patch module has been deleted.
+    # patch_litellm_router() is now a no-op that emits a DeprecationWarning.
+    from litellm_llmrouter import patch_litellm_router
+    patch_litellm_router()  # no-op, emits DeprecationWarning
 
 A/B Testing:
     from litellm_llmrouter import get_routing_registry, get_routing_pipeline
@@ -32,21 +38,63 @@ A/B Testing:
     registry.set_weights({"baseline": 90, "candidate": 10})
 
 Note:
-    Importing this module does NOT apply any monkey patches automatically.
-    You must call patch_litellm_router() explicitly from your startup code.
-    For convenience, use the gateway.create_app() factory which handles this.
+    Importing this module does NOT apply any monkey patches.
+    The gateway factory (``create_app()``) handles routing strategy installation.
+    The plugin strategy is the only supported routing path.
+    The legacy monkey-patch module has been removed.
 
 Build: Migrated CI to uv for faster package management (2026-01-26)
 """
 
-# Routing strategy patch - NOT auto-applied on import
-# Call patch_litellm_router() explicitly from startup
-from .routing_strategy_patch import (
-    patch_litellm_router,
-    unpatch_litellm_router,
-    is_patch_applied,
-    is_pipeline_routing_enabled,
-)
+# Legacy routing strategy patch — REMOVED.
+# The monkey-patch module (routing_strategy_patch.py) has been deleted.
+# These no-op stubs are retained for backward compatibility only.
+import logging as _logging
+import warnings as _warnings
+
+_legacy_logger = _logging.getLogger(__name__)
+
+
+def patch_litellm_router() -> bool:
+    """No-op stub. The legacy monkey-patch module has been removed."""
+    _warnings.warn(
+        "patch_litellm_router() has been removed. "
+        "The plugin-based routing strategy (RouteIQRoutingStrategy) is now "
+        "the only supported path. This call is a no-op.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    _legacy_logger.warning(
+        "REMOVED: patch_litellm_router() called — this is a no-op. "
+        "The plugin-based routing strategy is the only supported path."
+    )
+    return True
+
+
+def unpatch_litellm_router() -> bool:
+    """No-op stub. The legacy monkey-patch module has been removed."""
+    _warnings.warn(
+        "unpatch_litellm_router() has been removed. "
+        "The plugin-based routing strategy does not require patching/unpatching. "
+        "This call is a no-op.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    _legacy_logger.warning(
+        "REMOVED: unpatch_litellm_router() called — this is a no-op."
+    )
+    return True
+
+
+def is_patch_applied() -> bool:
+    """No-op stub. Always returns False — the patch system has been removed."""
+    return False
+
+
+def is_pipeline_routing_enabled() -> bool:
+    """No-op stub. Always returns True — pipeline routing is always enabled."""
+    return True
+
 
 from .strategies import (
     LLMRouterStrategyFamily,
@@ -125,15 +173,27 @@ try:
 except ImportError:
     pass  # centroid routing deps not installed
 
+# Personalized routing (per-user preference learning)
+try:
+    from .personalized_routing import (
+        PersonalizedRouter,
+        PreferenceStore,
+        UserPreference,
+        get_personalized_router,
+        reset_personalized_router,
+    )
+except ImportError:
+    pass  # personalized routing deps not installed
+
 try:
     from importlib.metadata import version as _get_version
 
     __version__ = _get_version("routeiq")
 except Exception:
-    __version__ = "0.2.0"  # fallback if not installed as package
+    __version__ = "1.0.0rc1"  # fallback if not installed as package
 
 __all__ = [
-    # Router patch (for llmrouter-* strategies)
+    # Router patch stubs — REMOVED (no-op stubs for backward compatibility)
     "patch_litellm_router",
     "unpatch_litellm_router",
     "is_patch_applied",
@@ -162,6 +222,12 @@ __all__ = [
     "get_centroid_strategy",
     "reset_centroid_strategy",
     "warmup_centroid_classifier",
+    # Personalized routing (per-user preference learning)
+    "PersonalizedRouter",
+    "PreferenceStore",
+    "UserPreference",
+    "get_personalized_router",
+    "reset_personalized_router",
     # Strategies
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",

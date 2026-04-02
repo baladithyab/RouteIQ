@@ -12,11 +12,17 @@ for development on the RouteIQ Gateway project.
 
 ### Prerequisites
 
-- **Python 3.14+**
-- **[uv](https://docs.astral.sh/uv/)** - Fast Python package manager (preferred over pip)
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/)** - Fast, deterministic Python package manager (recommended)
 - **Docker** and **Docker Compose**
 - **Git**
 - **[Lefthook](https://github.com/evilmartians/lefthook)** - Git hooks manager (installed via script)
+
+### Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 ### Local Development
 
@@ -25,8 +31,11 @@ for development on the RouteIQ Gateway project.
 git clone https://github.com/baladithyab/RouteIQ.git
 cd RouteIQ
 
-# Install dependencies with uv
-uv sync
+# Install dependencies with uv (recommended — fast, deterministic, uses uv.lock)
+uv sync --extra dev
+
+# Or with pip (alternative)
+# pip install -e ".[dev]"
 
 # Install git hooks
 ./scripts/install_lefthook.sh
@@ -260,13 +269,13 @@ Development follows a Task Group pattern with quality gates:
 | File | Purpose | Use When |
 |------|---------|----------|
 | `docker-compose.yml` | Basic single instance | Quick local testing |
-| `docker-compose.ha.yml` | HA with Redis/Postgres/Nginx | Testing production-like setup |
-| `docker-compose.otel.yml` | Observability with Jaeger | Debugging traces |
 | `docker-compose.local-test.yml` | Full local dev stack | Running integration tests |
-| `docker-compose.ha-otel.yml` | HA + Observability | Full production simulation |
-| `docker-compose.ha-test.yml` | HA integration testing | Testing HA failover scenarios |
-| `docker-compose.quota-test.yml` | Quota enforcement testing | Testing per-team/key quotas |
-| `docker-compose.streaming-perf.yml` | Streaming performance testing | Benchmarking streaming throughput |
+| `examples/docker/ha/docker-compose.ha.yml` | HA with Redis/Postgres/Nginx | Testing production-like setup |
+| `examples/docker/observability/docker-compose.otel.yml` | Observability with Jaeger | Debugging traces |
+| `examples/docker/ha/docker-compose.ha-otel.yml` | HA + Observability | Full production simulation |
+| `examples/docker/testing/docker-compose.ha-test.yml` | HA integration testing | Testing HA failover scenarios |
+| `examples/docker/testing/docker-compose.quota-test.yml` | Quota enforcement testing | Testing per-team/key quotas |
+| `examples/docker/testing/docker-compose.streaming-perf.yml` | Streaming performance testing | Benchmarking streaming throughput |
 | `examples/docker/` | Reorganized deployment scenarios | Quick-start for basic, ha, observability, full-stack, local-dev |
 
 ## Security

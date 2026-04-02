@@ -55,16 +55,8 @@ OVERRIDE_STRATEGY_NAME = os.getenv(
 # =============================================================================
 
 # Maps all LLM API endpoint paths to their operation type.
-# Used by both the middleware and callback to detect instrumented requests.
-LLM_API_PATHS: Dict[str, str] = {
-    "/v1/chat/completions": "chat_completion",
-    "/chat/completions": "chat_completion",
-    "/v1/responses": "responses",
-    "/responses": "responses",
-    "/openai/v1/responses": "responses",
-    "/v1/embeddings": "embedding",
-    "/v1/completions": "completion",
-}
+# Imported from the canonical source in telemetry_contracts.
+from litellm_llmrouter.telemetry_contracts import LLM_API_PATHS  # noqa: E402
 
 
 # =============================================================================
@@ -72,9 +64,23 @@ LLM_API_PATHS: Dict[str, str] = {
 # =============================================================================
 
 
+# Custom header names for routing transparency
+HEADER_ROUTEIQ_MODEL = "X-RouteIQ-Model"
+HEADER_ROUTEIQ_TIER = "X-RouteIQ-Tier"
+HEADER_ROUTEIQ_STRATEGY = "X-RouteIQ-Strategy"
+
+# All custom RouteIQ headers (for CORS expose_headers)
+ROUTEIQ_RESPONSE_HEADERS = [
+    HEADER_ROUTEIQ_MODEL,
+    HEADER_ROUTEIQ_TIER,
+    HEADER_ROUTEIQ_STRATEGY,
+]
+
+
 class RouterDecisionMiddleware:
     """
-    Raw ASGI middleware that emits TG4.1 router decision span attributes.
+    Raw ASGI middleware that emits TG4.1 router decision span attributes
+    and injects ``X-RouteIQ-*`` routing transparency headers into responses.
 
     Uses the raw ASGI pattern (same as BackpressureMiddleware) instead of
     BaseHTTPMiddleware, which buffers the entire response and breaks streaming.
@@ -82,6 +88,11 @@ class RouterDecisionMiddleware:
     This middleware intercepts LLM API requests and emits router.*
     span attributes BEFORE the LLM API call happens. It also increments
     gateway.request.total and gateway.routing.strategy.usage metrics.
+
+    Response headers:
+        - ``X-RouteIQ-Model``: The model selected by the router.
+        - ``X-RouteIQ-Tier``: The complexity tier (simple/complex/reasoning).
+        - ``X-RouteIQ-Strategy``: The routing strategy that made the decision.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -111,8 +122,78 @@ class RouterDecisionMiddleware:
         # Increment gateway metrics
         self._increment_metrics(path)
 
+        # Resolve routing context for response headers
+        model, tier, strategy = self._resolve_routing_context()
+
+        # Wrap send to inject X-RouteIQ-* headers into response
+        async def send_with_routing_headers(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                if model:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_MODEL.lower().encode("latin-1"),
+                            model.encode("latin-1"),
+                        )
+                    )
+                if tier:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_TIER.lower().encode("latin-1"),
+                            tier.encode("latin-1"),
+                        )
+                    )
+                if strategy:
+                    headers.append(
+                        (
+                            HEADER_ROUTEIQ_STRATEGY.lower().encode("latin-1"),
+                            strategy.encode("latin-1"),
+                        )
+                    )
+                message = {**message, "headers": headers}
+            await send(message)
+
         # Pass through to the next ASGI app (streaming-safe)
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, send_with_routing_headers)
+
+    def _resolve_routing_context(self) -> tuple:
+        """Resolve the current routing context for response headers.
+
+        Inspects the LiteLLM router (if available) to determine the
+        model, tier, and strategy that will handle the current request.
+
+        Returns:
+            Tuple of ``(model, tier, strategy)`` strings. Empty strings
+            for values that cannot be determined.
+        """
+        strategy = OVERRIDE_STRATEGY_NAME or "litellm-builtin"
+        model = ""
+        tier = ""
+
+        try:
+            from litellm.proxy.proxy_server import llm_router
+
+            if llm_router is not None:
+                model_list = getattr(llm_router, "model_list", []) or []
+                if model_list:
+                    first_model = model_list[0]
+                    model = first_model.get("litellm_params", {}).get("model", "")
+        except Exception:
+            pass
+
+        # Derive tier heuristic from model name
+        if model:
+            model_lower = model.lower()
+            simple_indicators = ["mini", "nano", "haiku", "flash", "small", "light"]
+            reasoning_indicators = ["o1", "o3", "o4", "reasoner"]
+            if any(ind in model_lower for ind in reasoning_indicators):
+                tier = "reasoning"
+            elif any(ind in model_lower for ind in simple_indicators):
+                tier = "simple"
+            else:
+                tier = "complex"
+
+        return model, tier, strategy
 
     def _emit_router_telemetry(self, path: str) -> None:
         """
@@ -143,8 +224,10 @@ class RouterDecisionMiddleware:
                 fallback_triggered=False,
             )
 
-            # GenAI semantic convention attributes
-            span.set_attribute("gen_ai.operation.name", operation_name)
+            # GenAI semantic convention attributes (ADR-0019)
+            from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
+            span.set_attribute(GA.OPERATION_NAME, operation_name)
 
             # Try to resolve the system (provider) from the router config
             try:
@@ -163,7 +246,7 @@ class RouterDecisionMiddleware:
                         if not provider and "/" in litellm_model:
                             provider = litellm_model.split("/")[0]
                         if provider:
-                            span.set_attribute("gen_ai.system", provider)
+                            span.set_attribute(GA.SYSTEM, provider)
             except Exception:
                 pass
 
@@ -345,13 +428,15 @@ class RouterDecisionCallback:
             fallback_triggered=bool(metadata.get("fallback")),
         )
 
-        # Set gen_ai.* span attributes (GenAI Semantic Conventions)
-        span.set_attribute("gen_ai.request.model", model)
+        # Set gen_ai.* span attributes (GenAI Semantic Conventions — ADR-0019)
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
+        span.set_attribute(GA.REQUEST_MODEL, model)
         # Extract provider from litellm_params if available
         litellm_params = kwargs.get("litellm_params", {}) or {}
         provider = litellm_params.get("custom_llm_provider", "")
         if provider:
-            span.set_attribute("gen_ai.system", provider)
+            span.set_attribute(GA.SYSTEM, provider)
 
         logger.debug(
             f"Emitted router telemetry: model={model}, strategy={strategy}, "
@@ -418,9 +503,11 @@ class RouterDecisionCallback:
                 if reason:
                     finish_reasons.append(str(reason))
 
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
         attrs = {
-            "gen_ai.request.model": model,
-            "gen_ai.system": provider,
+            GA.REQUEST_MODEL: model,
+            GA.SYSTEM: provider,
         }
 
         gm = get_gateway_metrics()
@@ -451,15 +538,20 @@ class RouterDecisionCallback:
             # Decrement active gauge
             gm.request_active.add(-1, {"model": model})
 
-        # Set gen_ai.* span attributes on the current span
+        # Set gen_ai.* span attributes on the current span (ADR-0019)
         span = trace.get_current_span()
         if span and span.is_recording():
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            span.set_attribute(GA.USAGE_INPUT_TOKENS, input_tokens)
+            span.set_attribute(GA.USAGE_OUTPUT_TOKENS, output_tokens)
+            total_tokens = input_tokens + output_tokens
+            if total_tokens > 0:
+                span.set_attribute(GA.USAGE_TOTAL_TOKENS, total_tokens)
             if hasattr(response_obj, "model") and response_obj.model:
-                span.set_attribute("gen_ai.response.model", response_obj.model)
+                span.set_attribute(GA.RESPONSE_MODEL, response_obj.model)
+            if hasattr(response_obj, "id") and response_obj.id:
+                span.set_attribute(GA.RESPONSE_ID, response_obj.id)
             if finish_reasons:
-                span.set_attribute("gen_ai.response.finish_reasons", finish_reasons)
+                span.set_attribute(GA.RESPONSE_FINISH_REASONS, finish_reasons)
 
     def log_failure_event(
         self,
@@ -518,10 +610,12 @@ class RouterDecisionCallback:
             # Decrement active gauge
             gm.request_active.add(-1, {"model": model})
 
-        # Set gen_ai.response.finish_reasons = ["error"] on the span
+        # Set gen_ai.response.finish_reasons = ["error"] on the span (ADR-0019)
+        from litellm_llmrouter.telemetry_contracts import GenAIAttributes as GA
+
         span = trace.get_current_span()
         if span and span.is_recording():
-            span.set_attribute("gen_ai.response.finish_reasons", ["error"])
+            span.set_attribute(GA.RESPONSE_FINISH_REASONS, ["error"])
 
     async def async_log_pre_api_call(
         self,

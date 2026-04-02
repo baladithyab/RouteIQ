@@ -386,7 +386,7 @@ class TestMain:
                 side_effect=track("run_proxy"),
             ) as mock_run,
             patch(
-                "litellm_llmrouter.routing_strategy_patch.is_patch_applied",
+                "litellm_llmrouter.is_patch_applied",
                 return_value=False,
             ),
         ):
@@ -450,3 +450,9 @@ class TestMain:
         self._run_main_with_patches(["startup", "--unknown-flag", "value"])
         captured = capsys.readouterr()
         assert "unknown" in captured.out.lower()
+
+    def test_plugin_strategy_mode_displayed(self, capsys):
+        """Startup always shows plugin strategy mode."""
+        self._run_main_with_patches(["startup"])
+        captured = capsys.readouterr()
+        assert "plugin strategy" in captured.out.lower()

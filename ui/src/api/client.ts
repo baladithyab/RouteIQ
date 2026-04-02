@@ -1,4 +1,6 @@
-const API_BASE = import.meta.env.VITE_API_BASE || ''
+import config from '../config'
+
+const API_BASE = config.API_BASE
 
 interface ApiOptions {
     method?: string

@@ -215,25 +215,43 @@ class MCPGateway:
         self._lock = threading.RLock()
 
         self.servers: dict[str, MCPServer] = {}
-        self.enabled = os.getenv("MCP_GATEWAY_ENABLED", "false").lower() == "true"
         # Map tool names to server IDs for quick lookup
         self._tool_to_server: dict[str, str] = {}
         # Callbacks for tool list change notifications (MCP 2025-11-25)
         self._on_tools_changed_callbacks: list[Any] = []
 
-        # Feature flag for remote tool invocation (disabled by default for security)
-        self._tool_invocation_enabled = (
-            os.getenv("LLMROUTER_ENABLE_MCP_TOOL_INVOCATION", "false").lower() == "true"
-        )
+        # MCP_* env vars don't have ROUTEIQ_ prefix — check env first,
+        # then fall back to typed settings for ROUTEIQ_ prefix overrides.
+        env_enabled = os.getenv("MCP_GATEWAY_ENABLED")
+        env_tool = os.getenv("LLMROUTER_ENABLE_MCP_TOOL_INVOCATION")
+        env_ha = os.getenv("MCP_HA_SYNC_ENABLED")
+        env_interval = os.getenv("MCP_SYNC_INTERVAL")
+
+        if any(v is not None for v in (env_enabled, env_tool, env_ha, env_interval)):
+            self.enabled = (env_enabled or "false").lower() == "true"
+            self._tool_invocation_enabled = (env_tool or "false").lower() == "true"
+            self._ha_sync_enabled = (
+                env_ha or "true"
+            ).lower() == "true" and REDIS_AVAILABLE
+            self._sync_interval = float(env_interval or "5")
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                mcp_s = get_settings().mcp
+                self.enabled = mcp_s.enabled
+                self._tool_invocation_enabled = mcp_s.tool_invocation_enabled
+                self._ha_sync_enabled = mcp_s.ha_sync_enabled and REDIS_AVAILABLE
+                self._sync_interval = mcp_s.sync_interval
+            except Exception:
+                self.enabled = False
+                self._tool_invocation_enabled = False
+                self._ha_sync_enabled = REDIS_AVAILABLE
+                self._sync_interval = 5.0
 
         # HA sync via Redis (optional)
         self._redis_client: Any = None
-        self._ha_sync_enabled = (
-            os.getenv("MCP_HA_SYNC_ENABLED", "true").lower() == "true"
-            and REDIS_AVAILABLE
-        )
         self._last_sync_time = 0.0
-        self._sync_interval = float(os.getenv("MCP_SYNC_INTERVAL", "5"))  # seconds
 
         if self._ha_sync_enabled:
             self._init_redis_client()
@@ -244,7 +262,12 @@ class MCPGateway:
             verbose_proxy_logger.debug("MCP: Redis not available, HA sync disabled")
             return
 
-        redis_host = os.getenv("REDIS_HOST")
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            redis_host = get_settings().redis.host
+        except Exception:
+            redis_host = os.getenv("REDIS_HOST")
 
         if not redis_host:
             verbose_proxy_logger.debug("MCP: REDIS_HOST not set, HA sync disabled")

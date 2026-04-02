@@ -67,7 +67,7 @@ GATEWAY_URL = "http://localhost:4020"
 MASTER_KEY = "local-dev-streaming-perf-key"
 
 # Compose file path
-COMPOSE_FILE = "docker-compose.streaming-perf.yml"
+COMPOSE_FILE = "examples/docker/testing/docker-compose.streaming-perf.yml"
 
 
 # =============================================================================
@@ -195,7 +195,7 @@ def compose_stack():
             if resp.status_code == 200:
                 print("✅ Services healthy")
                 break
-        except (httpx.RequestError, httpx.TimeoutException):
+        except httpx.RequestError, httpx.TimeoutException:
             pass
         time.sleep(2)
     else:

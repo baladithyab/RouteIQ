@@ -69,7 +69,7 @@ import httpx
 # =============================================================================
 
 # Default settings
-DEFAULT_COMPOSE_FILE = "docker-compose.ha-test.yml"
+DEFAULT_COMPOSE_FILE = "examples/docker/testing/docker-compose.ha-test.yml"
 DEFAULT_FAILOVER_TIMEOUT = 90  # seconds
 DEFAULT_STARTUP_TIMEOUT = 180  # seconds
 DEFAULT_READINESS_POLL_INTERVAL = 5  # seconds
@@ -168,7 +168,9 @@ def get_compose_command() -> list[str]:
         if result.returncode == 0:
             return ["finch", "compose"]
 
-    raise RuntimeError("Neither 'docker compose', 'docker-compose', nor 'finch compose' found")
+    raise RuntimeError(
+        "Neither 'docker compose', 'docker-compose', nor 'finch compose' found"
+    )
 
 
 def run_compose(
@@ -192,7 +194,9 @@ def run_compose(
             "LITELLM_MASTER_KEY": os.getenv(
                 "LITELLM_MASTER_KEY", "ha-gate-test-key-not-for-production"
             ),
-            "POSTGRES_PASSWORD": os.getenv("POSTGRES_PASSWORD", "litellm_test_password"),
+            "POSTGRES_PASSWORD": os.getenv(
+                "POSTGRES_PASSWORD", "litellm_test_password"
+            ),
             "LLMROUTER_HA_MODE": "leader_election",
             "LLMROUTER_CONFIG_SYNC_LEASE_SECONDS": "15",  # Faster for testing
             "LLMROUTER_CONFIG_SYNC_RENEW_INTERVAL_SECONDS": "5",
@@ -550,9 +554,7 @@ async def run_ha_gate(
                 print(f"  ⚠️  Split-brain during failover: {leader_count} leaders!")
 
         if new_leader is None:
-            raise TimeoutError(
-                f"No new leader elected within {failover_timeout}s"
-            )
+            raise TimeoutError(f"No new leader elected within {failover_timeout}s")
 
         result.new_leader = new_leader.holder_id
 
@@ -680,9 +682,15 @@ Environment Variables:
         print(f"  Failover time:             {result.failover_time_seconds:.1f}s")
     print(f"  Initial leader:            {result.initial_leader or 'N/A'}")
     print(f"  New leader:                {result.new_leader or 'N/A'}")
-    print(f"  Split-brain detected:      {'⚠️ Yes' if result.split_brain_detected else '✅ No'}")
-    print(f"  Nginx during failover:     {'✅ Available' if result.nginx_available_during_failover else '⚠️ Unavailable'}")
-    print(f"  Nginx after failover:      {'✅ Available' if result.nginx_available_after_failover else '⚠️ Unavailable'}")
+    print(
+        f"  Split-brain detected:      {'⚠️ Yes' if result.split_brain_detected else '✅ No'}"
+    )
+    print(
+        f"  Nginx during failover:     {'✅ Available' if result.nginx_available_during_failover else '⚠️ Unavailable'}"
+    )
+    print(
+        f"  Nginx after failover:      {'✅ Available' if result.nginx_available_after_failover else '⚠️ Unavailable'}"
+    )
     if result.error:
         print(f"  Error:                     {result.error}")
     print("-" * 60)

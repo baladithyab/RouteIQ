@@ -58,10 +58,10 @@ lefthook run pre-commit            # Manual run
 ### Docker
 
 ```bash
-docker compose up -d                                           # Basic
-docker compose -f docker-compose.ha.yml up -d                  # HA (Redis/Postgres/Nginx)
-docker compose -f docker-compose.otel.yml up -d                # Observability (OTel/Jaeger)
-docker compose -f docker-compose.local-test.yml up -d          # Local test stack
+docker compose up -d                                                          # Basic
+docker compose -f docker-compose.local-test.yml up -d                          # Local test stack
+docker compose -f examples/docker/ha/docker-compose.ha.yml up -d               # HA (Redis/Postgres/Nginx)
+docker compose -f examples/docker/observability/docker-compose.otel.yml up -d   # Observability (OTel/Jaeger)
 docker build -f docker/Dockerfile -t litellm-llmrouter:latest . # Build
 ```
 

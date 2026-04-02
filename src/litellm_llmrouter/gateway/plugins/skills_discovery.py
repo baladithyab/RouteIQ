@@ -95,7 +95,15 @@ class SkillsStore:
         if override:
             return override.resolve()
 
-        # Check env var
+        # Check settings then env var
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            skills_dir = get_settings().skills_discovery.skills_dir
+            if skills_dir:
+                return Path(skills_dir).resolve()
+        except Exception:
+            pass
         env_dir = os.getenv("ROUTEIQ_SKILLS_DIR")
         if env_dir:
             return Path(env_dir).resolve()

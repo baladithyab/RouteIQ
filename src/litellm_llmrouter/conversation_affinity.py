@@ -48,12 +48,31 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
 # Feature flag and configuration defaults
-CONVERSATION_AFFINITY_ENABLED = (
-    os.getenv("CONVERSATION_AFFINITY_ENABLED", "false").lower() == "true"
+def _resolve_conversation_affinity_settings() -> tuple[bool, int, int]:
+    # CONVERSATION_AFFINITY_* env vars don't have ROUTEIQ_ prefix — check directly.
+    env_enabled = os.getenv("CONVERSATION_AFFINITY_ENABLED")
+    env_ttl = os.getenv("CONVERSATION_AFFINITY_TTL")
+    env_max = os.getenv("CONVERSATION_AFFINITY_MAX_ENTRIES")
+    if any(v is not None for v in (env_enabled, env_ttl, env_max)):
+        return (
+            (env_enabled or "false").lower() == "true",
+            int(env_ttl or "3600"),
+            int(env_max or "10000"),
+        )
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        s = get_settings().conversation_affinity
+        return s.enabled, s.ttl, s.max_entries
+    except Exception:
+        return False, 3600, 10000
+
+
+CONVERSATION_AFFINITY_ENABLED, DEFAULT_TTL_SECONDS, DEFAULT_MAX_ENTRIES = (
+    _resolve_conversation_affinity_settings()
 )
-DEFAULT_TTL_SECONDS = int(os.getenv("CONVERSATION_AFFINITY_TTL", "3600"))
-DEFAULT_MAX_ENTRIES = int(os.getenv("CONVERSATION_AFFINITY_MAX_ENTRIES", "10000"))
 
 
 @dataclass(frozen=True)

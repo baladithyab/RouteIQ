@@ -4,20 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "routeiq"
-version = "0.2.0"
+version = "1.0.0rc1"
 description = "RouteIQ Gateway - Production AI Gateway with ML-based routing (built on LiteLLM + LLMRouter)"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     # Core application framework
     "fastapi>=0.109.0",
     "pydantic>=2.5.0",
+    "pydantic-settings>=2.2.0",
     "httpx>=0.26.0",
     # LiteLLM core (provides Router, logging, etc.)
     # Note: Using litellm without [proxy] extra due to strict pinned dependencies in proxy extra
     # that conflict with project requirements. Adding needed proxy deps individually below.
-    "litellm>=1.81.3,<1.82.0",
+    "litellm==1.82.3",
     # APScheduler - required by litellm proxy for background scheduling
     "apscheduler>=3.10.0",
     # email-validator - required by pydantic.EmailStr (used by LiteLLM proxy SCIM)
@@ -30,13 +31,9 @@ dependencies = [
     "backoff>=2.0.0",
     # redis - required by LiteLLM for Redis caching
     "redis>=5.0.0",
-    # A2A Protocol SDK (Agent-to-Agent communication)
-    "a2a-sdk>=0.2.0",
     # Configuration and utilities
     "pyyaml>=6.0",
-    "boto3>=1.42.32",
     "aiofiles>=23.0.0",
-    "watchdog>=3.0.0",
     # Observability: OpenTelemetry core
     "prometheus-client>=0.24.1",
     "opentelemetry-api>=1.22.0",
@@ -53,7 +50,6 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "hypothesis>=6.100.0",
-    "black>=26.1.0",
     "ruff>=0.14.13",
     "mypy>=1.8.0",
 ]
@@ -67,16 +63,33 @@ otel = [
     "opentelemetry-instrumentation-httpx>=0.43b0",
     "opentelemetry-instrumentation-requests>=0.43b0",
 ]
-# Cloud provider SDKs (optional)
-cloud = ["google-cloud-aiplatform>=1.134.0", "azure-identity>=1.15.0"]
+# Cloud provider SDKs (optional, includes boto3 for AWS S3 config sync)
+# kubernetes: required for K8s Lease API leader election (ADR-0015)
+cloud = ["boto3>=1.42.32", "google-cloud-aiplatform>=1.134.0", "azure-identity>=1.15.0", "kubernetes>=31.0.0"]
+# A2A Protocol SDK (Agent-to-Agent communication)
+a2a = ["a2a-sdk>=0.2.0"]
+# Hot reload with filesystem watching
+hotreload = ["watchdog>=3.0.0"]
+# OIDC authentication support
+oidc = ["authlib>=1.5.0"]
 # Callback integrations (langfuse, etc.)
 callbacks = ["langfuse>=3.0.0"]
 # KNN routing inference dependencies (sentence-transformers for embeddings)
 knn = ["sentence-transformers>=5.2.0", "scikit-learn>=1.3.0"]
-# Production extras (for Docker builds) - db, otel, cloud, callbacks, knn without dev tools
-prod = ["routeiq[db,otel,cloud,callbacks,knn]"]
+# Production extras (for Docker builds) - all optional features without dev tools
+prod = ["routeiq[db,otel,cloud,callbacks,knn,a2a,hotreload,oidc]"]
 # All optional dependencies (including dev tools)
-all = ["routeiq[dev,db,otel,cloud,knn]"]
+all = ["routeiq[dev,db,otel,cloud,knn,a2a,hotreload,oidc]"]
+# Documentation site
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.5",
+    "mkdocs-autorefs>=0.5",
+    "pymdown-extensions>=10.0",
+]
+
+[project.scripts]
+routeiq = "litellm_llmrouter.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -92,17 +105,13 @@ addopts = "-v"
 [tool.hypothesis]
 max_examples = 100
 
-[tool.black]
-line-length = 88
-target-version = ["py314"]
-
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py312"
 exclude = ["reference/"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 

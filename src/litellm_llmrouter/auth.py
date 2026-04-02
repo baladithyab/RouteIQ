@@ -31,6 +31,7 @@ Configuration:
     control-plane endpoints will deny all requests (fail-closed).
 """
 
+import hmac as _hmac_module
 import logging
 import os
 import re
@@ -41,14 +42,41 @@ from typing import Optional
 from fastapi import HTTPException, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from litellm_llmrouter.settings import get_settings
+
 logger = logging.getLogger(__name__)
+
+# Regex for validating client-provided request IDs
+_VALID_REQUEST_ID = re.compile(r"^[a-zA-Z0-9\-_.]{1,128}$")
+
+
+def _constant_time_contains(candidate: str, valid_keys: set[str]) -> bool:
+    """
+    Check whether *candidate* is in *valid_keys* using constant-time comparison.
+
+    A naive ``candidate in valid_keys`` leaks timing information that can be
+    exploited to brute-force API keys one character at a time.  This helper
+    iterates **all** valid keys and uses :func:`hmac.compare_digest` for each
+    comparison so that the total time is independent of which (if any) key
+    matches.
+    """
+    found = False
+    for key in valid_keys:
+        if _hmac_module.compare_digest(candidate, key):
+            found = True
+    return found
+
 
 # ============================================================================
 # RouteIQ Key Prefix Support
 # ============================================================================
 
 # Default prefix for RouteIQ API keys
-ROUTEIQ_KEY_PREFIX = os.getenv("ROUTEIQ_KEY_PREFIX", "sk-riq-")
+try:
+    _init_settings = get_settings()
+    ROUTEIQ_KEY_PREFIX = _init_settings.security.key_prefix
+except Exception:
+    ROUTEIQ_KEY_PREFIX = os.getenv("ROUTEIQ_KEY_PREFIX", "sk-riq-")
 
 
 def _ensure_prefix(key: str) -> str:
@@ -118,9 +146,21 @@ def _apply_key_prefix_to_env() -> None:
             )
 
 
-# Apply prefix on module load so that all downstream code sees the
-# canonical prefixed keys from the start.
-_apply_key_prefix_to_env()
+# Guard: track whether key prefix has been applied
+_key_prefix_applied = False
+
+
+def apply_key_prefix() -> None:
+    """Apply the RouteIQ key prefix to env vars.
+
+    Safe to call multiple times — subsequent calls are no-ops.
+    Should be called from startup.py rather than on import.
+    """
+    global _key_prefix_applied
+    if _key_prefix_applied:
+        return
+    _apply_key_prefix_to_env()
+    _key_prefix_applied = True
 
 
 # Context variable to store request ID for the current request
@@ -218,7 +258,7 @@ def get_request_id() -> Optional[str]:
 
 def _load_admin_api_keys() -> set[str]:
     """
-    Load admin API keys from environment configuration.
+    Load admin API keys from typed settings, falling back to env vars.
 
     For backwards compatibility, both the stored (prefixed) form and the
     unprefixed form of each key are accepted.  For example, if the stored
@@ -230,23 +270,33 @@ def _load_admin_api_keys() -> set[str]:
         variants). Empty set if none configured.
 
     Configuration sources (in order of precedence):
-    1. ADMIN_API_KEYS: Comma-separated list of keys
-    2. ADMIN_API_KEY: Single key (legacy fallback)
+    1. Typed settings (settings.security.admin_api_keys / admin_api_key)
+    2. ADMIN_API_KEYS env var: Comma-separated list of keys
+    3. ADMIN_API_KEY env var: Single key (legacy fallback)
     """
     keys: set[str] = set()
 
-    # Primary: comma-separated list
-    keys_str = os.getenv("ADMIN_API_KEYS", "").strip()
-    if keys_str:
-        for key in keys_str.split(","):
-            key = key.strip()
-            if key:
-                keys.add(key)
+    try:
+        settings = get_settings()
+        # Use the convenience property that combines both fields
+        keys = settings.admin_api_keys_set
+    except Exception:
+        pass
 
-    # Fallback: single key
-    single_key = os.getenv("ADMIN_API_KEY", "").strip()
-    if single_key:
-        keys.add(single_key)
+    # If settings didn't provide keys, fall back to env vars.
+    # The settings model uses ROUTEIQ_ prefix (ROUTEIQ_SECURITY__ADMIN_API_KEYS),
+    # but legacy env vars use ADMIN_API_KEYS / ADMIN_API_KEY without prefix.
+    if not keys:
+        keys_str = os.getenv("ADMIN_API_KEYS", "").strip()
+        if keys_str:
+            for key in keys_str.split(","):
+                key = key.strip()
+                if key:
+                    keys.add(key)
+
+        single_key = os.getenv("ADMIN_API_KEY", "").strip()
+        if single_key:
+            keys.add(single_key)
 
     # For backwards compatibility, also accept the unprefixed variant of
     # each key (and the prefixed variant of any unprefixed key).
@@ -262,6 +312,9 @@ def _is_admin_auth_enabled() -> bool:
     """
     Check if admin authentication is enabled.
 
+    Reads from typed settings (``settings.security.admin_auth_enabled``),
+    falling back to ``ADMIN_AUTH_ENABLED`` env var.
+
     Returns:
         True if admin auth is enabled (default), False if explicitly disabled.
 
@@ -269,8 +322,20 @@ def _is_admin_auth_enabled() -> bool:
         Setting ADMIN_AUTH_ENABLED=false is NOT recommended for production.
         When disabled, control-plane endpoints are only protected by user API key auth.
     """
-    env_val = os.getenv("ADMIN_AUTH_ENABLED", "true").lower().strip()
-    return env_val not in ("false", "0", "no", "off")
+    # Check typed settings first, then fall back to legacy env var.
+    # The settings model uses ROUTEIQ_SECURITY__ADMIN_AUTH_ENABLED prefix,
+    # but legacy env var is ADMIN_AUTH_ENABLED (no prefix).  Always check
+    # the legacy env var as well for backward compatibility.
+    legacy_env = os.getenv("ADMIN_AUTH_ENABLED")
+    if legacy_env is not None:
+        # Legacy env var explicitly set — honour it directly
+        return legacy_env.lower().strip() not in ("false", "0", "no", "off")
+
+    try:
+        settings = get_settings()
+        return settings.security.admin_auth_enabled
+    except Exception:
+        return True  # default: auth enabled
 
 
 def _extract_bearer_token(auth_header: str) -> Optional[str]:
@@ -301,6 +366,27 @@ async def admin_api_key_auth(request: Request) -> dict:
 
     # Check if admin auth is enabled
     if not _is_admin_auth_enabled():
+        # Only allow disabling admin auth outside of production.
+        # Use the env var directly — ROUTEIQ_ENV is the canonical source.
+        # We intentionally do NOT fall back to settings defaults here
+        # because the settings model defaults to "production", and we
+        # want an *explicit* ROUTEIQ_ENV=production to trigger the block.
+        routeiq_env = os.getenv("ROUTEIQ_ENV", "").lower().strip()
+        if routeiq_env == "production":
+            logger.error(
+                "ADMIN_AUTH_ENABLED=false is forbidden in production "
+                "(ROUTEIQ_ENV=production) — denying request",
+                extra={"request_id": request_id},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "admin_auth_disabled_in_production",
+                    "message": "Admin auth cannot be disabled in production.",
+                    "request_id": request_id,
+                },
+            )
+
         logger.warning(
             "Admin auth disabled via ADMIN_AUTH_ENABLED=false",
             extra={"request_id": request_id},
@@ -349,7 +435,7 @@ async def admin_api_key_auth(request: Request) -> dict:
             },
         )
 
-    if admin_key not in admin_keys:
+    if not _constant_time_contains(admin_key, admin_keys):
         logger.warning(
             "Invalid admin API key in request",
             extra={"request_id": request_id, "path": str(request.url.path)},
@@ -438,7 +524,9 @@ class RequestIDMiddleware:
                 request_id = header_value.decode("latin-1").strip()
                 break
 
-        if not request_id:
+        # Validate client-provided request ID; generate a fresh one if missing
+        # or if the value contains unexpected characters (injection defence).
+        if not request_id or not _VALID_REQUEST_ID.match(request_id):
             request_id = str(uuid.uuid4())
 
         # Set in context for access throughout request handling

@@ -79,8 +79,17 @@ _META_QUOTA_SUBJECT = "_quota_subject"
 
 
 def _is_enabled() -> bool:
-    """Check if cost tracker is enabled via environment variable."""
-    return os.getenv("COST_TRACKER_ENABLED", "true").lower() != "false"
+    """Check if cost tracker is enabled via settings or environment variable."""
+    # COST_TRACKER_ENABLED is NOT ROUTEIQ_-prefixed, so check env var first.
+    env_val = os.getenv("COST_TRACKER_ENABLED")
+    if env_val is not None:
+        return env_val.lower() != "false"
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().cost_tracker.enabled
+    except Exception:
+        return True  # Default: enabled
 
 
 def _extract_usage(response: Any) -> tuple[int, int]:

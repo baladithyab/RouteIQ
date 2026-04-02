@@ -125,21 +125,46 @@ class ConfigSyncManager:
         self._last_sync_time: float | None = None
         self._skipped_sync_count = 0  # Track skipped syncs (non-leader)
 
-        # S3 config
-        self.s3_bucket = os.getenv("CONFIG_S3_BUCKET")
-        self.s3_key = os.getenv("CONFIG_S3_KEY")
+        # CONFIG_* env vars don't have ROUTEIQ_ prefix — check env first,
+        # then fall back to typed settings for ROUTEIQ_ prefix overrides.
+        env_s3b = os.getenv("CONFIG_S3_BUCKET")
+        env_s3k = os.getenv("CONFIG_S3_KEY")
+        env_gcsb = os.getenv("CONFIG_GCS_BUCKET")
+        env_gcsk = os.getenv("CONFIG_GCS_KEY")
+        env_hot = os.getenv("CONFIG_HOT_RELOAD")
+        env_sync = os.getenv("CONFIG_SYNC_ENABLED")
+
+        if any(
+            v is not None
+            for v in (env_s3b, env_s3k, env_gcsb, env_gcsk, env_hot, env_sync)
+        ):
+            self.s3_bucket = env_s3b
+            self.s3_key = env_s3k
+            self.gcs_bucket = env_gcsb
+            self.gcs_key = env_gcsk
+            self.hot_reload_enabled = (env_hot or "false").lower() == "true"
+            self.sync_enabled = (env_sync or "true").lower() == "true"
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                cs = get_settings().config_sync
+                self.s3_bucket = cs.s3_bucket
+                self.s3_key = cs.s3_key
+                self.gcs_bucket = cs.gcs_bucket
+                self.gcs_key = cs.gcs_key
+                self.hot_reload_enabled = cs.hot_reload
+                self.sync_enabled = cs.sync_enabled
+            except Exception:
+                self.s3_bucket = None
+                self.s3_key = None
+                self.gcs_bucket = None
+                self.gcs_key = None
+                self.hot_reload_enabled = False
+                self.sync_enabled = True
+
         self.s3_sync_enabled = bool(self.s3_bucket and self.s3_key)
-
-        # GCS config
-        self.gcs_bucket = os.getenv("CONFIG_GCS_BUCKET")
-        self.gcs_key = os.getenv("CONFIG_GCS_KEY")
         self.gcs_sync_enabled = bool(self.gcs_bucket and self.gcs_key)
-
-        # Hot reload settings
-        self.hot_reload_enabled = (
-            os.getenv("CONFIG_HOT_RELOAD", "false").lower() == "true"
-        )
-        self.sync_enabled = os.getenv("CONFIG_SYNC_ENABLED", "true").lower() == "true"
 
         # Incremental reload tracking
         self._current_model_configs: list[dict[str, Any]] = []

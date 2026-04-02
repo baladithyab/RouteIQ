@@ -12,7 +12,8 @@ Features:
   multi-step execution, agentic keywords).
 - **ReasoningDetector**: Regex-based reasoning marker detection (step-by-step,
   chain-of-thought, proofs, etc.).
-- **SessionCache**: In-memory routing affinity cache with TTL and LRU eviction.
+- **SessionCache**: Routing affinity cache with TTL and LRU eviction.
+  Redis-backed when available (multi-worker safe), in-memory fallback.
 - **CentroidRoutingStrategy**: ``RoutingStrategy`` implementation that combines
   classification, agentic/reasoning detection, routing profiles, and session
   persistence for zero-config intelligent model routing.
@@ -45,10 +46,11 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,337 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Model context windows (tokens) — from NadirClaw MODEL_REGISTRY + litellm.model_cost
+MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
+    # GPT-4o family
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4-turbo": 128_000,
+    # GPT-4.1 family
+    "gpt-4.1": 1_050_000,
+    "gpt-4.1-mini": 1_050_000,
+    "gpt-4.1-nano": 1_050_000,
+    # GPT-5 family
+    "gpt-5": 400_000,
+    "gpt-5-mini": 400_000,
+    "gpt-5.2": 400_000,
+    "gpt-5.4": 1_050_000,
+    # o-series
+    "o1": 200_000,
+    "o1-mini": 128_000,
+    "o3-mini": 200_000,
+    "o4-mini": 200_000,
+    # Claude 3.x
+    "claude-3-5-sonnet-20241022": 200_000,
+    "claude-3-5-haiku-20241022": 200_000,
+    "claude-3-opus-20240229": 200_000,
+    "claude-sonnet-4-20250514": 200_000,
+    # Claude 4.x
+    "claude-opus-4-6-20250918": 200_000,
+    "claude-sonnet-4-5-20250929": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+    # Gemini
+    "gemini-2.0-flash": 1_048_576,
+    "gemini-2.5-pro-preview-05-06": 1_048_576,
+    "gemini-1.5-pro": 2_097_152,
+    "gemini-3-flash-preview": 1_000_000,
+    # DeepSeek
+    "deepseek-chat": 128_000,
+    "deepseek-reasoner": 128_000,
+}
+
+# Cost per million tokens (USD) — from NadirClaw + litellm.model_cost
+MODEL_COSTS: Dict[str, Dict[str, float]] = {
+    # GPT-4o family
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    # GPT-4.1 family
+    "gpt-4.1": {"input": 2.00, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
+    # GPT-5 family
+    "gpt-5": {"input": 1.25, "output": 10.00},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
+    "gpt-5.2": {"input": 1.75, "output": 14.00},
+    "gpt-5.4": {"input": 2.00, "output": 16.00},
+    # o-series
+    "o1": {"input": 15.00, "output": 60.00},
+    "o1-mini": {"input": 1.10, "output": 4.40},
+    "o3-mini": {"input": 1.10, "output": 4.40},
+    "o4-mini": {"input": 1.10, "output": 4.40},
+    # Claude 3.x
+    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
+    "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    # Claude 4.x
+    "claude-opus-4-6-20250918": {"input": 5.00, "output": 25.00},
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    # Gemini
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini-2.5-pro-preview-05-06": {"input": 1.25, "output": 10.00},
+    "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
+    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
+    # DeepSeek
+    "deepseek-chat": {"input": 0.27, "output": 1.10},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+}
+
+# Models with vision/image understanding capability
+VISION_CAPABLE_MODELS: Set[str] = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.2",
+    "gpt-5.4",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-6-20250918",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-1.5-pro",
+    "gemini-3-flash-preview",
+}
+
+# Model capabilities — used for capability-based routing
+# When a request requires a specific capability, only route to models that have it
+MODEL_CAPABILITIES: Dict[str, Set[str]] = {
+    # GPT-4o family
+    "gpt-4o": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4o-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4-turbo": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    # GPT-4.1 family
+    "gpt-4.1": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4.1-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-4.1-nano": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    # GPT-5 family
+    "gpt-5": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gpt-5-mini": {"text", "vision", "function_calling", "json_mode", "streaming"},
+    "gpt-5.2": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gpt-5.4": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    # Claude family
+    "claude-3-5-sonnet-20241022": {"text", "vision", "function_calling", "streaming"},
+    "claude-3-5-haiku-20241022": {"text", "vision", "function_calling", "streaming"},
+    "claude-3-opus-20240229": {"text", "vision", "function_calling", "streaming"},
+    "claude-sonnet-4-20250514": {
+        "text",
+        "vision",
+        "function_calling",
+        "streaming",
+        "computer_use",
+    },
+    "claude-opus-4-6-20250918": {
+        "text",
+        "vision",
+        "function_calling",
+        "streaming",
+        "reasoning",
+    },
+    # Gemini family
+    "gemini-2.0-flash": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+    },
+    "gemini-2.5-pro-preview-05-06": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+        "reasoning",
+    },
+    "gemini-3-flash-preview": {
+        "text",
+        "vision",
+        "function_calling",
+        "json_mode",
+        "streaming",
+    },
+    # DeepSeek
+    "deepseek-chat": {"text", "function_calling", "json_mode", "streaming"},
+    "deepseek-reasoner": {"text", "streaming", "reasoning"},
+    # o-series
+    "o1": {"text", "reasoning"},
+    "o1-mini": {"text", "reasoning"},
+    "o3-mini": {"text", "reasoning", "function_calling"},
+    "o4-mini": {"text", "reasoning", "function_calling"},
+}
+
+
+def detect_required_capabilities(request_data: Dict[str, Any]) -> Set[str]:
+    """Detect what capabilities a request requires based on its content.
+
+    Inspects messages for vision content, tool/function calls, json_mode,
+    streaming, and reasoning indicators.
+
+    Args:
+        request_data: The incoming request data dict (OpenAI-compatible format).
+
+    Returns:
+        Set of capability strings required by this request.
+    """
+    caps: Set[str] = {"text"}  # Always need text
+
+    messages = request_data.get("messages", [])
+
+    # Vision detection
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "image_url",
+                    "image",
+                ):
+                    caps.add("vision")
+                    break
+
+    # Function calling
+    if request_data.get("tools") or request_data.get("functions"):
+        caps.add("function_calling")
+
+    # JSON mode
+    if request_data.get("response_format", {}).get("type") == "json_object":
+        caps.add("json_mode")
+
+    # Streaming
+    if request_data.get("stream", False):
+        caps.add("streaming")
+
+    return caps
+
+
+def filter_by_capabilities(
+    deployments: List[Dict[str, Any]],
+    required: Set[str],
+) -> List[Dict[str, Any]]:
+    """Filter deployments to only those whose models have all required capabilities.
+
+    If no deployments match after filtering, falls back to the original list
+    to avoid routing failures.
+
+    Args:
+        deployments: List of deployment dicts.
+        required: Set of required capability strings.
+
+    Returns:
+        Filtered list of deployments, or the original list if none match.
+    """
+    if not required or required == {"text"}:
+        return deployments  # No filtering needed
+
+    filtered = []
+    for dep in deployments:
+        model_name = dep.get("model_name", "") or dep.get("litellm_params", {}).get(
+            "model", ""
+        )
+        # Look up capabilities (fuzzy match)
+        model_caps = _get_model_capabilities(model_name)
+        if required.issubset(model_caps):
+            filtered.append(dep)
+
+    return filtered if filtered else deployments  # Fall back to all if none match
+
+
+def _get_model_capabilities(model_name: str) -> Set[str]:
+    """Get capabilities for a model, with fuzzy matching.
+
+    Tries exact match first, then substring matching against known models.
+    Falls back to ``{"text", "streaming"}`` if no match is found.
+
+    Args:
+        model_name: The model identifier string.
+
+    Returns:
+        Set of capability strings for the model.
+    """
+    caps = MODEL_CAPABILITIES.get(model_name)
+    if caps:
+        return caps
+    # Fuzzy match
+    for key, val in MODEL_CAPABILITIES.items():
+        if key in model_name or model_name in key:
+            return val
+    return {"text", "streaming"}  # Safe default
+
+
+def estimate_token_count(messages: List[Dict[str, Any]]) -> int:
+    """Estimate token count from messages (~4 chars per token heuristic)."""
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    return total_chars // 4
+
+
+def check_context_window(
+    model_name: str, messages: List[Dict[str, Any]], threshold: float = 0.9
+) -> bool:
+    """Check if messages fit within the model's context window.
+
+    Returns True if the estimated tokens are below threshold * max_tokens.
+    """
+    estimated = estimate_token_count(messages)
+    # Try exact match first, then check for partial matches
+    max_tokens = MODEL_CONTEXT_WINDOWS.get(model_name)
+    if max_tokens is None:
+        for key, val in MODEL_CONTEXT_WINDOWS.items():
+            if key in model_name or model_name in key:
+                max_tokens = val
+                break
+    if max_tokens is None:
+        max_tokens = 128_000  # safe default
+    return estimated < int(max_tokens * threshold)
+
+
+def estimate_request_cost(
+    model_name: str, input_tokens: int, estimated_output_tokens: int = 500
+) -> float:
+    """Estimate cost in USD for a request."""
+    costs = MODEL_COSTS.get(model_name)
+    if costs is None:
+        for key, val in MODEL_COSTS.items():
+            if key in model_name or model_name in key:
+                costs = val
+                break
+    if costs is None:
+        costs = {"input": 1.0, "output": 3.0}
+    return (
+        input_tokens * costs["input"] + estimated_output_tokens * costs["output"]
+    ) / 1_000_000
+
 
 # Default centroid directory relative to project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -588,26 +921,140 @@ class ReasoningDetector:
 
 
 class SessionCache:
-    """In-memory session-based routing affinity cache with LRU eviction.
+    """Session-based routing affinity cache with LRU eviction.
+
+    Uses Redis when available (multi-worker safe), falls back to in-memory
+    OrderedDict (single-worker). Both backends maintain the same synchronous
+    interface so callers (including the synchronous ``select_deployment``)
+    need no changes.
 
     Ported from NadirClaw's ``SessionCache``. Keyed by a hash of the
     system prompt + first user message. Expired entries are cleaned up
-    periodically (every 100 puts).
+    periodically (every 100 puts in the local backend; Redis uses native
+    TTL expiry via ``EX``).
     """
+
+    _REDIS_PREFIX = "routeiq:session:"
 
     def __init__(self, ttl: int = 1800, max_size: int = 10000):
         """Initialize session cache.
 
         Args:
             ttl: Time-to-live in seconds (default 30 minutes).
-            max_size: Maximum cache entries before LRU eviction.
+            max_size: Maximum cache entries before LRU eviction
+                (only applies to in-memory fallback; Redis uses TTL).
         """
-        self._cache: Dict[str, Tuple[str, str, float]] = {}
+        # In-memory fallback
+        self._cache: OrderedDict[str, Tuple[str, str, float]] = OrderedDict()
         self._ttl = ttl
         self._max_size = max_size
-        self._access_order: List[str] = []
         self._put_counter = 0
         self._lock = threading.Lock()
+
+        # Redis state — lazily initialised on first call
+        self._redis_checked = False
+        self._redis_available = False
+
+    def _check_redis(self) -> bool:
+        """Lazily check for Redis availability (sync client).
+
+        Result is cached so the import + ping happens at most once.
+        """
+        if self._redis_checked:
+            return self._redis_available
+        self._redis_checked = True
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is not None:
+                client.ping()
+                self._redis_available = True
+                logger.info("SessionCache: using Redis backend")
+            else:
+                logger.debug("SessionCache: Redis not configured, using in-memory")
+        except Exception as exc:
+            logger.debug("SessionCache: Redis unavailable (%s), using in-memory", exc)
+        return self._redis_available
+
+    # ------------------------------------------------------------------
+    # Redis backend helpers
+    # ------------------------------------------------------------------
+
+    def _redis_get(self, key: str) -> Optional[Tuple[str, str]]:
+        """Get from Redis. Returns ``(model, tier)`` or ``None``."""
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is None:
+                return None
+            val = client.get(f"{self._REDIS_PREFIX}{key}")
+            if val is None:
+                return None
+            # Stored as "model|tier"
+            parts = val.split("|", 1)
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+        except Exception as exc:
+            logger.debug("SessionCache Redis GET failed: %s", exc)
+            # Fall through to local cache
+            return self._local_get(key)
+
+    def _redis_put(self, key: str, model: str, tier: str) -> None:
+        """Put into Redis with TTL."""
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is None:
+                return
+            client.set(
+                f"{self._REDIS_PREFIX}{key}",
+                f"{model}|{tier}",
+                ex=self._ttl,
+            )
+        except Exception as exc:
+            logger.debug("SessionCache Redis SET failed: %s", exc)
+            # Fall through to local cache
+            self._local_put(key, model, tier)
+
+    # ------------------------------------------------------------------
+    # Local (in-memory) backend helpers
+    # ------------------------------------------------------------------
+
+    def _local_get(self, key: str) -> Optional[Tuple[str, str]]:
+        """Retrieve from in-memory cache."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            model, tier, ts = entry
+            if time.time() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            self._touch(key)
+            return model, tier
+
+    def _local_put(self, key: str, model: str, tier: str) -> None:
+        """Store in in-memory cache."""
+        with self._lock:
+            self._put_counter += 1
+            if self._put_counter >= 100:
+                self._put_counter = 0
+                self._clear_expired()
+
+            if key in self._cache:
+                del self._cache[key]
+            self._cache[key] = (model, tier, time.time())
+
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
+    # ------------------------------------------------------------------
+    # Public API (unchanged signatures)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _make_key(system_message: str, first_user_message: str) -> str:
@@ -629,61 +1076,37 @@ class SessionCache:
     def get(self, key: str) -> Optional[Tuple[str, str]]:
         """Retrieve cached routing decision if not expired.
 
+        Uses Redis when available, otherwise falls back to in-memory.
+
         Args:
             key: Session key from :meth:`_make_key`.
 
         Returns:
             Tuple of ``(model, tier)`` if cache hit, ``None`` otherwise.
         """
-        with self._lock:
-            entry = self._cache.get(key)
-            if entry is None:
-                return None
-            model, tier, ts = entry
-            if time.time() - ts > self._ttl:
-                # Expired
-                del self._cache[key]
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                return None
-            # Touch for LRU
-            self._touch(key)
-            return model, tier
+        if self._check_redis():
+            return self._redis_get(key)
+        return self._local_get(key)
 
     def put(self, key: str, model: str, tier: str) -> None:
         """Store a routing decision for a session.
 
-        Periodically cleans up expired entries (every 100 puts) and
-        evicts LRU entries when over capacity.
+        Uses Redis when available (with native TTL), otherwise falls
+        back to in-memory with periodic cleanup and LRU eviction.
 
         Args:
             key: Session key from :meth:`_make_key`.
             model: Selected model name.
             tier: Selected tier (``"simple"`` or ``"complex"``).
         """
-        with self._lock:
-            self._put_counter += 1
-            if self._put_counter >= 100:
-                self._put_counter = 0
-                self._clear_expired()
-
-            self._cache[key] = (model, tier, time.time())
-            self._touch(key)
-
-            # Evict LRU if over capacity
-            while len(self._cache) > self._max_size and self._access_order:
-                oldest = self._access_order.pop(0)
-                self._cache.pop(oldest, None)
+        if self._check_redis():
+            self._redis_put(key, model, tier)
+        else:
+            self._local_put(key, model, tier)
 
     def _touch(self, key: str) -> None:
-        """Move key to end of LRU access order."""
-        try:
-            self._access_order.remove(key)
-        except ValueError:
-            pass
-        self._access_order.append(key)
+        """Move key to end of LRU access order — O(1)."""
+        self._cache.move_to_end(key)
 
     def _clear_expired(self) -> int:
         """Remove expired entries. Returns count removed."""
@@ -691,15 +1114,16 @@ class SessionCache:
         expired = [k for k, (_, _, ts) in self._cache.items() if now - ts > self._ttl]
         for k in expired:
             del self._cache[k]
-            try:
-                self._access_order.remove(k)
-            except ValueError:
-                pass
         return len(expired)
 
     @property
     def size(self) -> int:
-        """Current number of cached entries."""
+        """Current number of cached entries (in-memory only).
+
+        When Redis is the active backend this returns the local cache
+        size (likely 0) — not the Redis key count — because scanning
+        Redis for a count would be too expensive for a property.
+        """
         return len(self._cache)
 
 
@@ -807,6 +1231,11 @@ class CentroidRoutingStrategy:
         if not prompt:
             return self._fallback_deployment(context)
 
+        # Detect required capabilities from the request
+        request_data = context.request_kwargs or {}
+        request_data_with_messages = {**request_data, "messages": full_messages}
+        required_caps = detect_required_capabilities(request_data_with_messages)
+
         # Check session cache
         session_key = SessionCache._make_key(system_message, prompt)
         cached = self._session_cache.get(session_key)
@@ -818,9 +1247,10 @@ class CentroidRoutingStrategy:
                 cached_model,
                 cached_tier,
             )
-            deployment = self._match_tier_to_deployment(
-                cached_tier, self._get_healthy_deployments(context)
-            )
+            deployments = self._get_healthy_deployments(context)
+            # Filter by capabilities before tier matching
+            deployments = filter_by_capabilities(deployments, required_caps)
+            deployment = self._match_tier_to_deployment(cached_tier, deployments)
             if deployment is not None:
                 return deployment
 
@@ -875,7 +1305,70 @@ class CentroidRoutingStrategy:
 
         # Match tier to deployment
         deployments = self._get_healthy_deployments(context)
+
+        # Filter by required capabilities BEFORE tier matching
+        if required_caps and required_caps != {"text"}:
+            pre_filter_count = len(deployments)
+            deployments = filter_by_capabilities(deployments, required_caps)
+            if len(deployments) < pre_filter_count:
+                logger.debug(
+                    "Capability filter: %d→%d deployments (required=%s)",
+                    pre_filter_count,
+                    len(deployments),
+                    required_caps,
+                )
+
+        # For eco profile, sort deployments by estimated cost (cheapest first)
+        if self._profile == RoutingProfile.ECO:
+            input_tokens = estimate_token_count(full_messages)
+            deployments = sorted(
+                deployments,
+                key=lambda d: estimate_request_cost(
+                    d.get("litellm_params", {}).get("model", ""),
+                    input_tokens,
+                ),
+            )
+
         deployment = self._match_tier_to_deployment(tier, deployments)
+
+        # Context window check: if selected deployment can't fit the
+        # conversation, try the next tier up (simple → complex has larger
+        # context windows in many model families).
+        if deployment is not None:
+            dep_model = deployment.get("litellm_params", {}).get("model", "")
+            if not check_context_window(dep_model, full_messages):
+                logger.warning(
+                    "Context window exceeded for %s (est=%d tokens), trying next tier",
+                    dep_model,
+                    estimate_token_count(full_messages),
+                )
+                alt_tier = "complex" if tier == "simple" else "simple"
+                alt_deployment = self._match_tier_to_deployment(alt_tier, deployments)
+                if alt_deployment is not None:
+                    alt_model = alt_deployment.get("litellm_params", {}).get(
+                        "model", ""
+                    )
+                    if check_context_window(alt_model, full_messages):
+                        deployment = alt_deployment
+                        tier = alt_tier
+
+        # Vision check: if the request contains image/vision content and
+        # the selected model lacks vision capability, swap to the cheapest
+        # vision-capable model in the same tier.
+        if deployment is not None and self._detect_vision_content(full_messages):
+            dep_model = deployment.get("litellm_params", {}).get("model", "")
+            is_vision = any(
+                vm in dep_model or dep_model in vm for vm in VISION_CAPABLE_MODELS
+            )
+            if not is_vision:
+                vision_dep = self._find_cheapest_vision_model(tier, deployments)
+                if vision_dep is not None:
+                    logger.info(
+                        "Vision swap: %s → %s (vision content detected)",
+                        dep_model,
+                        vision_dep.get("litellm_params", {}).get("model", ""),
+                    )
+                    deployment = vision_dep
 
         # Cache result
         if deployment is not None:
@@ -883,6 +1376,159 @@ class CentroidRoutingStrategy:
             self._session_cache.put(session_key, model_name, tier)
 
         return deployment
+
+    def get_fallback_deployment(
+        self,
+        failed_model: str,
+        tier: str,
+        healthy_deployments: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Get a fallback deployment when primary returns 429 or is circuit-broken.
+
+        Strategy:
+        1. Try another model in the same tier
+        2. Try the adjacent tier (simple→complex or complex→simple)
+        3. Return None if no fallback available
+
+        Args:
+            failed_model: The model name that failed (to exclude).
+            tier: The current routing tier (``"simple"`` or ``"complex"``).
+            healthy_deployments: List of currently healthy deployment dicts.
+
+        Returns:
+            A fallback deployment dict, or ``None`` if no fallback is available.
+        """
+        # Filter out the failed model
+        candidates = [
+            d
+            for d in healthy_deployments
+            if d.get("litellm_params", {}).get("model", "") != failed_model
+        ]
+        if not candidates:
+            return None
+
+        # 1. Try same tier first
+        same_tier = self._match_tier_to_deployment(tier, candidates)
+        if same_tier is not None:
+            logger.info(
+                "Fallback: %s (tier=%s) → %s (same tier)",
+                failed_model,
+                tier,
+                same_tier.get("litellm_params", {}).get("model", ""),
+            )
+            return same_tier
+
+        # 2. Try adjacent tier
+        alt_tier = "complex" if tier == "simple" else "simple"
+        alt = self._match_tier_to_deployment(alt_tier, candidates)
+        if alt is not None:
+            logger.info(
+                "Fallback: %s (tier=%s) → %s (alt tier=%s)",
+                failed_model,
+                tier,
+                alt.get("litellm_params", {}).get("model", ""),
+                alt_tier,
+            )
+            return alt
+
+        # 3. Return first available candidate as last resort
+        logger.info(
+            "Fallback: %s (tier=%s) → %s (last resort)",
+            failed_model,
+            tier,
+            candidates[0].get("litellm_params", {}).get("model", ""),
+        )
+        return candidates[0]
+
+    @staticmethod
+    def _detect_vision_content(messages: List[Dict[str, Any]]) -> bool:
+        """Detect if messages contain image/vision content.
+
+        Checks for ``image_url`` or ``image`` content parts in multi-modal
+        messages, and for base64-encoded image data in text parts.
+
+        Args:
+            messages: List of message dicts.
+
+        Returns:
+            True if vision content is detected.
+        """
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") in ("image_url", "image"):
+                            return True
+                        if (
+                            part.get("type") == "text"
+                            and "base64" in str(part.get("text", ""))[:100]
+                        ):
+                            return True
+        return False
+
+    @staticmethod
+    def _find_cheapest_vision_model(
+        tier: str, deployments: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Find the cheapest vision-capable model in the given tier.
+
+        Iterates through deployments, filters to those whose model name
+        matches a key in :data:`VISION_CAPABLE_MODELS`, and returns the
+        one with the lowest input cost.
+
+        Args:
+            tier: Current routing tier (``"simple"`` or ``"complex"``).
+            deployments: List of healthy deployment dicts.
+
+        Returns:
+            Deployment dict for the cheapest vision model, or ``None``.
+        """
+        simple_indicators = ["mini", "nano", "haiku", "flash", "small", "light"]
+
+        vision_candidates: List[Tuple[float, Dict[str, Any]]] = []
+        for dep in deployments:
+            model = dep.get("litellm_params", {}).get("model", "")
+            # Check if any VISION_CAPABLE_MODELS key matches
+            is_vision = False
+            for vm in VISION_CAPABLE_MODELS:
+                if vm in model or model in vm:
+                    is_vision = True
+                    break
+            if not is_vision:
+                continue
+
+            # Tier-match: simple tier prefers mini/flash/haiku models
+            model_lower = model.lower()
+            is_simple = any(ind in model_lower for ind in simple_indicators)
+            if tier == "simple" and not is_simple:
+                continue
+            if tier == "complex" and is_simple:
+                continue
+
+            cost = MODEL_COSTS.get(model, {}).get("input", 999.0)
+            # Also try partial match on cost lookup
+            if cost == 999.0:
+                for cost_key, cost_val in MODEL_COSTS.items():
+                    if cost_key in model or model in cost_key:
+                        cost = cost_val.get("input", 999.0)
+                        break
+            vision_candidates.append((cost, dep))
+
+        if not vision_candidates:
+            # Relax tier constraint — take any vision model
+            for dep in deployments:
+                model = dep.get("litellm_params", {}).get("model", "")
+                for vm in VISION_CAPABLE_MODELS:
+                    if vm in model or model in vm:
+                        cost = MODEL_COSTS.get(model, {}).get("input", 999.0)
+                        vision_candidates.append((cost, dep))
+                        break
+
+        if vision_candidates:
+            vision_candidates.sort(key=lambda x: x[0])
+            return vision_candidates[0][1]
+        return None
 
     def _extract_prompt(
         self, messages: List[Dict[str, Any]]

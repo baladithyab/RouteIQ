@@ -128,23 +128,94 @@ class SemanticCachePlugin(GatewayPlugin):
         self, app: "FastAPI", context: PluginContext | None = None
     ) -> None:
         """Initialize cache backends from environment configuration."""
-        self._enabled = os.getenv("CACHE_ENABLED", "false").lower() == "true"
+        # CACHE_* env vars are NOT ROUTEIQ_-prefixed, so read directly with
+        # settings as default fallback.
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            cache_cfg = get_settings().cache
+        except Exception:
+            cache_cfg = None
+
+        def _default(key: str, fallback: str) -> str:
+            """Read env var, falling back to settings then hardcoded default."""
+            return os.getenv(key, fallback)
+
+        _cfg_enabled = cache_cfg.enabled if cache_cfg else False
+        self._enabled = (
+            os.getenv("CACHE_ENABLED", str(_cfg_enabled).lower()).lower() == "true"
+        )
         if not self._enabled:
             logger.info("Semantic cache plugin disabled (CACHE_ENABLED=false)")
             return
 
+        _cfg_sem = cache_cfg.semantic_enabled if cache_cfg else False
         self._semantic_enabled = (
-            os.getenv("CACHE_SEMANTIC_ENABLED", "false").lower() == "true"
+            os.getenv("CACHE_SEMANTIC_ENABLED", str(_cfg_sem).lower()).lower() == "true"
         )
-        self._ttl = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-        self._l1_max_size = int(os.getenv("CACHE_L1_MAX_SIZE", "1000"))
+        self._ttl = int(
+            _default(
+                "CACHE_TTL_SECONDS", str(cache_cfg.ttl_seconds if cache_cfg else 3600)
+            )
+        )
+        self._l1_max_size = int(
+            _default(
+                "CACHE_L1_MAX_SIZE", str(cache_cfg.l1_max_size if cache_cfg else 1000)
+            )
+        )
         self._similarity_threshold = float(
-            os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95")
+            _default(
+                "CACHE_SIMILARITY_THRESHOLD",
+                str(cache_cfg.similarity_threshold if cache_cfg else 0.95),
+            )
         )
-        self._embedding_model = os.getenv("CACHE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-        self._redis_url = os.getenv("CACHE_REDIS_URL")
-        temp_str = os.getenv("CACHE_MAX_TEMPERATURE", "0.1")
-        self._max_cacheable_temperature = float(temp_str)
+        self._embedding_model = _default(
+            "CACHE_EMBEDDING_MODEL",
+            cache_cfg.embedding_model if cache_cfg else "all-MiniLM-L6-v2",
+        )
+        self._redis_url = os.getenv(
+            "CACHE_REDIS_URL", cache_cfg.redis_url if cache_cfg else None
+        )
+        self._max_cacheable_temperature = float(
+            _default(
+                "CACHE_MAX_TEMPERATURE",
+                str(cache_cfg.max_temperature if cache_cfg else 0.1),
+            )
+        )
+
+        _cfg_sem = cache_cfg.semantic_enabled if cache_cfg else False
+        self._semantic_enabled = (
+            os.getenv("CACHE_SEMANTIC_ENABLED", str(_cfg_sem).lower()).lower() == "true"
+        )
+        self._ttl = int(
+            _default(
+                "CACHE_TTL_SECONDS", str(cache_cfg.ttl_seconds if cache_cfg else 3600)
+            )
+        )
+        self._l1_max_size = int(
+            _default(
+                "CACHE_L1_MAX_SIZE", str(cache_cfg.l1_max_size if cache_cfg else 1000)
+            )
+        )
+        self._similarity_threshold = float(
+            _default(
+                "CACHE_SIMILARITY_THRESHOLD",
+                str(cache_cfg.similarity_threshold if cache_cfg else 0.95),
+            )
+        )
+        self._embedding_model = _default(
+            "CACHE_EMBEDDING_MODEL",
+            cache_cfg.embedding_model if cache_cfg else "all-MiniLM-L6-v2",
+        )
+        self._redis_url = os.getenv(
+            "CACHE_REDIS_URL", cache_cfg.redis_url if cache_cfg else None
+        )
+        self._max_cacheable_temperature = float(
+            _default(
+                "CACHE_MAX_TEMPERATURE",
+                str(cache_cfg.max_temperature if cache_cfg else 0.1),
+            )
+        )
 
         # Initialize L1
         self._l1 = InMemoryCache(max_size=self._l1_max_size)

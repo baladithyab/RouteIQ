@@ -51,7 +51,7 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
     def metadata(self) -> PluginMetadata:
         return PluginMetadata(
             name="bedrock-agentcore-mcp",
-            version="0.2.0",
+            version="1.0.0rc1",
             capabilities={
                 PluginCapability.TOOL_RUNTIME,
                 PluginCapability.OBSERVABILITY_EXPORTER,

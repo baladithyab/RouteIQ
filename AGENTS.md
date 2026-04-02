@@ -47,7 +47,9 @@ RouteIQ/
 │   │       ├── guardrails_base.py # Base guardrails plugin class
 │   │       ├── llamaguard_plugin.py # LlamaGuard safety plugin
 │   │       ├── pii_guard.py       # PII detection/redaction plugin
-│   │       └── prompt_injection_guard.py # Prompt injection detection plugin
+│   │       ├── prompt_injection_guard.py # Prompt injection detection plugin
+│   │       ├── context_optimizer.py   # Context optimization (30-70% savings)
+│   │       └── agentic_pipeline.py    # Agentic multi-round routing
 │   ├── startup.py                 # Entry point: python -m litellm_llmrouter.startup
 │   ├── routes/                    # FastAPI routers (package)
 │   │   ├── __init__.py            # Re-exports all routers + feature flags
@@ -58,12 +60,9 @@ RouteIQ/
 │   │   └── models.py              # Model management routes
 │   ├── strategies.py              # ML routing strategies (18+ algorithms)
 │   ├── strategy_registry.py       # A/B testing, hot-swap, routing pipeline
-│   ├── routing_strategy_patch.py  # Monkey-patch to LiteLLM's Router for ML strategies
+│   ├── custom_routing_strategy.py # Plugin-based routing via LiteLLM's CustomRoutingStrategyBase
 │   ├── router_decision_callback.py # TG4.1 telemetry: router.* span attributes
 │   ├── mcp_gateway.py             # MCP protocol: server registry, tool discovery
-│   ├── mcp_jsonrpc.py             # MCP JSON-RPC 2.0 handler (for Claude Desktop)
-│   ├── mcp_sse_transport.py       # MCP SSE transport for streaming
-│   ├── mcp_parity.py              # Upstream-compatible /v1/mcp/* aliases
 │   ├── mcp_tracing.py             # OpenTelemetry instrumentation for MCP
 │   ├── a2a_gateway.py             # A2A agent registry (wraps LiteLLM's global_agent_registry)
 │   ├── a2a_tracing.py             # OpenTelemetry instrumentation for A2A
@@ -93,6 +92,17 @@ RouteIQ/
 │   ├── semantic_cache.py          # Semantic caching for LLM responses
 │   ├── centroid_routing.py        # NadirClaw-inspired centroid-based routing (~2ms)
 │   ├── custom_routing_strategy.py # LiteLLM CustomRoutingStrategyBase plugin adapter
+│   ├── oidc.py                    # OIDC/SSO authentication integration
+│   ├── settings.py                # Canonical settings (Pydantic) — use get_settings()
+│   ├── service_discovery.py       # Service discovery probing at startup
+│   ├── governance.py              # Workspace isolation & API key governance
+│   ├── usage_policies.py          # Dynamic usage/rate limit policies (CRUD)
+│   ├── guardrail_policies.py      # Guardrail policy engine (14 check types)
+│   ├── personalized_routing.py    # Per-user preference learning
+│   ├── prompt_management.py       # Prompt versioning & A/B testing
+│   ├── eval_pipeline.py           # LLM-as-judge evaluation feedback loop
+│   ├── router_r1.py               # Router-R1 iterative reasoning
+│   ├── cli.py                     # CLI entry point (routeiq command)
 │   └── __init__.py                # Public API exports
 ├── tests/
 │   ├── conftest.py                # Root conftest: auto-skip integration if stack not running
@@ -116,30 +126,33 @@ RouteIQ/
 │   ├── otel-collector-config.yaml # OpenTelemetry Collector pipeline
 │   └── policy.example.yaml        # Example policy engine rules
 ├── scripts/                       # Utility scripts (lint, test, validate, secrets)
-├── examples/mlops/                # MLOps training pipeline
-│   ├── scripts/                   # Training scripts (extract traces, train, deploy)
-│   ├── configs/                   # Training configs (knn, mlp, svm, mf)
-│   └── docker-compose.mlops.yml   # MLOps Docker stack
+├── examples/
+│   ├── mlops/                     # MLOps training pipeline
+│   │   ├── scripts/               # Training scripts (extract traces, train, deploy)
+│   │   ├── configs/               # Training configs (knn, mlp, svm, mf)
+│   │   └── docker-compose.mlops.yml # MLOps Docker stack
+│   └── docker/                    # Docker deployment examples
+│       ├── plug-in/               # Plug-in mode (mount into LiteLLM)
+│       ├── batteries-included/    # Full gateway with all features
+│       └── slim/                  # Minimal proxy-only deployment
 ├── docker/
 │   ├── Dockerfile                 # Production multi-stage build
 │   ├── Dockerfile.local           # Local dev build
+│   ├── Dockerfile.slim            # Slim variant (proxy-only, no ML deps)
 │   ├── entrypoint.sh              # Production entrypoint
 │   └── entrypoint.local.sh        # Local dev entrypoint
-├── docker-compose.yml             # Basic stack
-├── docker-compose.ha.yml          # HA: multi-replica + Redis + Postgres + Nginx
-├── docker-compose.otel.yml        # Observability: OTel Collector + Jaeger
-├── docker-compose.ha-otel.yml     # HA + Observability combined
-├── docker-compose.ha-test.yml     # HA integration testing
+├── docker-compose.yml             # Basic dev stack
 ├── docker-compose.local-test.yml  # Local development testing
-├── docker-compose.quota-test.yml  # Quota enforcement testing
-├── docker-compose.streaming-perf.yml # Streaming performance testing
 ├── deploy/charts/                 # Helm charts for Kubernetes
 ├── docs/                          # Comprehensive documentation (~35 files)
+│   └── adr/                       # Architecture Decision Records
 ├── plans/                         # Development planning (TG epics, roadmaps)
 │   └── archive/                   # Archived plan files (completed TG epics)
 ├── models/                        # Trained ML models (empty .gitkeep placeholder)
 │   └── centroids/                 # Pre-computed centroid vectors for zero-config routing
 ├── custom_routers/                # Custom routing strategies (empty .gitkeep placeholder)
+├── packages/
+│   └── routeiq-routing/           # Standalone pip package for ML routing
 ├── reference/litellm/             # Upstream LiteLLM submodule (READ-ONLY)
 ├── pyproject.toml                 # Build config, deps, tool settings
 ├── lefthook.yml                   # Git hooks (pre-commit, pre-push, post-commit)
@@ -153,6 +166,8 @@ RouteIQ/
 ```bash
 uv sync                            # Install all dependencies
 uv sync --extra dev                # Install with dev dependencies
+uv sync --extra oidc               # Install with OIDC/SSO support
+uv sync --extra prod               # Install all production dependencies
 uv add <package>                   # Add a dependency
 uv run python -m <module>          # Run a module
 uv run python -m litellm_llmrouter.startup --config config/config.yaml  # Start gateway
@@ -199,12 +214,13 @@ private key detection, trailing whitespace fix, merge conflict check, large file
 ### Docker
 
 ```bash
-docker compose up -d                                           # Basic stack
-docker compose -f docker-compose.ha.yml up -d                  # HA stack
-docker compose -f docker-compose.otel.yml up -d                # Observability stack
-docker compose -f docker-compose.ha-otel.yml up -d             # HA + Observability
-docker compose -f docker-compose.local-test.yml up -d          # Local test stack (port 4010)
+docker compose up -d                                                          # Basic stack
+docker compose -f docker-compose.local-test.yml up -d                          # Local test stack (port 4010)
+docker compose -f examples/docker/ha/docker-compose.ha.yml up -d               # HA stack
+docker compose -f examples/docker/observability/docker-compose.otel.yml up -d   # Observability stack
+docker compose -f examples/docker/ha/docker-compose.ha-otel.yml up -d          # HA + Observability
 docker build -f docker/Dockerfile -t litellm-llmrouter:latest . # Build production image
+docker build -f docker/Dockerfile.slim -t litellm-llmrouter:slim . # Build slim image (no ML deps)
 ```
 
 ### Remote Execution (rr - Road Runner)
@@ -230,6 +246,7 @@ rr ci                              # Run full CI pipeline on remote
 - **Pydantic v2** for data validation
 - **Async/await** patterns throughout FastAPI routes
 - **No side effects on import** - patches applied explicitly via `patch_litellm_router()`
+- **Settings via Pydantic** - new code should use `get_settings()` from `settings.py` instead of raw `os.environ.get()` calls where possible
 
 ### File Patterns
 
@@ -305,14 +322,15 @@ uv run python -m litellm_llmrouter.startup --config config/config.yaml --port 40
 
 ### 2. Routing Strategies
 
-18+ ML strategies registered via the strategy registry. Strategies are monkey-patched
-into LiteLLM's Router class via `routing_strategy_patch.py`:
+18+ ML strategies registered via the strategy registry. Strategies are installed
+via the plugin-based `RouteIQRoutingStrategy` class using LiteLLM's official
+`CustomRoutingStrategyBase` API:
 
 ```python
-from litellm_llmrouter import patch_litellm_router, register_llmrouter_strategies
+from litellm_llmrouter import install_routeiq_strategy
 
-patch_litellm_router()          # Must be called BEFORE creating Router instances
-register_llmrouter_strategies() # Register all llmrouter-* strategies
+# After creating a LiteLLM Router instance:
+install_routeiq_strategy(router, strategy_name="llmrouter-knn")
 ```
 
 **A/B testing** via the routing pipeline:
@@ -326,16 +344,19 @@ registry.set_weights({"baseline": 90, "candidate": 10})
 **Strategy families**: KNN, MLP, SVM, ELO, MF (matrix factorization), hybrid, custom.
 KNN uses sentence-transformers for embedding-based similarity routing.
 
-### 3. MCP Gateway (Multiple Surfaces)
+### 3. MCP Gateway
 
-MCP is exposed through several protocol surfaces:
+Native LiteLLM MCP support is the primary MCP implementation. RouteIQ adds an
+observability/security overlay via `mcp_tracing.py` (OpenTelemetry spans),
+`url_security.py` (SSRF protection for registered servers), and `audit.py`
+(audit logging for MCP operations). The `mcp_gateway.py` module provides
+additional server registry and tool discovery capabilities.
 
 | Surface | Endpoint | Use Case |
 |---------|----------|----------|
-| JSON-RPC | `POST /mcp` | Native MCP clients (Claude Desktop, IDEs) |
+| Native MCP | `POST /mcp` | Primary MCP via LiteLLM (Claude Desktop, IDEs) |
 | SSE | `/mcp/sse` | Real-time streaming events |
 | REST | `/mcp-rest/*` | RESTful access to MCP operations |
-| Parity | `/v1/mcp/*` | Upstream LiteLLM-compatible aliases |
 | Proxy | `/mcp-proxy/*` | Protocol-level MCP server proxy (admin) |
 
 **Feature flags**: `MCP_GATEWAY_ENABLED`, `MCP_SSE_TRANSPORT_ENABLED`,
@@ -433,10 +454,9 @@ The `reference/litellm/` directory is a git submodule containing upstream LiteLL
 
 ### 4. Monkey-Patch Constraint
 
-LiteLLM's Router is patched at runtime via `routing_strategy_patch.py`. This means:
-- **When using legacy monkey-patch mode** (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`), only 1 uvicorn worker is supported. When using the plugin strategy (default), multiple workers can be configured via `ROUTEIQ_WORKERS`.
-- **Call `patch_litellm_router()` BEFORE creating Router instances**
-- The `create_app()` factory handles this automatically
+RouteIQ uses LiteLLM's official `CustomRoutingStrategyBase` plugin API for routing.
+- Multiple uvicorn workers can be configured via `ROUTEIQ_WORKERS`.
+- The `create_gateway_app()` factory handles strategy installation automatically.
 
 ### 5. Branding & Attribution
 
@@ -520,12 +540,24 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_CORS_ORIGINS` | No | Allowed CORS origins |
 | `ROUTEIQ_SKIP_ENV_VALIDATION` | No | Skip startup env validation |
 | `ROUTEIQ_EVALUATOR_ENABLED` | No | Enable LLM-as-judge evaluator plugin |
-| `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Use plugin routing strategy instead of monkey-patch (default: true) |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Always true. Legacy monkey-patch mode has been removed. |
 | `ROUTEIQ_WORKERS` | No | Number of uvicorn workers (default: 1, multi-worker requires plugin strategy) |
 | `ROUTEIQ_CENTROID_ROUTING` | No | Enable centroid routing fallback (default: true) |
 | `ROUTEIQ_ROUTING_PROFILE` | No | Default routing profile: auto/eco/premium/free/reasoning (default: auto) |
 | `ROUTEIQ_CENTROID_WARMUP` | No | Pre-warm centroid classifier at startup (default: false) |
 | `ROUTEIQ_ADMIN_UI_ENABLED` | No | Enable admin UI at /ui/ (default: false) |
+| `ROUTEIQ_OIDC_ENABLED` | No | Enable OIDC/SSO authentication (default: false) |
+| `ROUTEIQ_OIDC_ISSUER_URL` | No | OIDC provider discovery URL |
+| `ROUTEIQ_OWN_APP` | No | Use RouteIQ-owned FastAPI app (default: false) |
+| `ROUTEIQ_CONTEXT_OPTIMIZE` | No | Context optimization mode (off/safe/aggressive) |
+| `ROUTEIQ_EVAL_PIPELINE` | No | Enable evaluation feedback loop |
+| `ROUTEIQ_PROMPT_MANAGEMENT` | No | Enable prompt management |
+| `ROUTEIQ_ROUTER_R1_ENABLED` | No | Enable Router-R1 reasoning |
+| `ROUTEIQ_AGENTIC_PIPELINE` | No | Enable agentic multi-round routing |
+| `ROUTEIQ_PERSONALIZED_ROUTING` | No | Enable personalized routing |
+
+> **Canonical settings source**: All settings are defined in `src/litellm_llmrouter/settings.py`
+> using Pydantic. Access via `get_settings()` at runtime.
 
 ## DOCUMENTATION
 
@@ -545,16 +577,18 @@ Development follows a Task Group pattern with quality gates:
 | [`docs/mlops-training.md`](docs/mlops-training.md) | MLOps training loop |
 | [`docs/rr-workflow.md`](docs/rr-workflow.md) | Remote push workflow |
 | [`docs/aws-production-guide.md`](docs/aws-production-guide.md) | AWS production deployment guide |
+| [`docs/adr/README.md`](docs/adr/README.md) | Architecture Decision Records index (21 ADRs) |
+| [`mkdocs.yml`](mkdocs.yml) | Documentation site configuration |
+| [`plans/v1.0-rearchitecture-plan.md`](plans/v1.0-rearchitecture-plan.md) | v1.0 rearchitecture roadmap |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 
 ## NON-OBVIOUS BEHAVIORS & GOTCHAS
 
 1. **In-process uvicorn is mandatory**: `startup.py` uses `uvicorn.run(app=app)` instead
    of `os.execvp()`. This is critical because `os.execvp()` replaces the process and would
-   lose all monkey-patches to LiteLLM's Router class. When using the plugin strategy
-   (default), multiple workers are supported via `ROUTEIQ_WORKERS` since `os.fork()`
-   preserves the app state including installed strategies. Legacy monkey-patch mode
-   is restricted to 1 worker.
+   lose the in-process app state.  Multiple workers are supported via
+   ``ROUTEIQ_WORKERS`` since ``os.fork()`` preserves the app state including
+   installed routing strategies.
 2. **BackpressureMiddleware is the innermost middleware**: It is registered first via
    `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app
    directly (replaces `app.app`). This is required because `BaseHTTPMiddleware` does NOT
@@ -566,8 +600,11 @@ Development follows a Task Group pattern with quality gates:
 4. **Readiness returns 200 for degraded state**: When circuit breakers are open, `/_health/ready`
    returns `status: "degraded"` with HTTP 200, not 503.
 
-5. **Two separate MCP surfaces**: `/llmrouter/mcp/*` (REST for LLMRouter's MCP gateway) and
-   `/mcp` (native JSON-RPC for Claude Desktop) are distinct systems.
+5. **MCP is primarily native LiteLLM**: RouteIQ's MCP layer is an overlay (tracing, SSRF,
+   audit) on top of LiteLLM's native MCP implementation. The custom `mcp_gateway.py` adds
+   server registry and tool discovery. The legacy files `mcp_parity.py`, `mcp_jsonrpc.py`,
+   and `mcp_sse_transport.py` have been removed — their functionality is now handled by
+   upstream LiteLLM.
 
 6. **SSRF validation happens twice**: At registration time (no DNS) and at invocation time
    (with DNS resolution) to catch DNS rebinding attacks.
@@ -591,6 +628,20 @@ Development follows a Task Group pattern with quality gates:
 
 12. **SSE uses async queues**: POST to `/mcp/messages` pushes to an asyncio.Queue and returns
     202 immediately. The response is emitted on the SSE stream.
+
+13. **`routing_strategy_patch.py` has been removed**: The legacy monkey-patch module
+    has been deleted.  The plugin-based routing strategy (``RouteIQRoutingStrategy``
+    in ``custom_routing_strategy.py``) is the only supported routing path.
+    ``patch_litellm_router()`` and ``unpatch_litellm_router()`` are no-op stubs
+    in ``__init__.py`` for backward compatibility.
+
+14. **Service discovery probes at startup**: `service_discovery.py` probes for Redis,
+    Postgres, and other backing services at startup to populate health status and log
+    connectivity warnings. This is advisory — the gateway starts regardless of probe results.
+
+15. **ADR documentation**: Architecture Decision Records are maintained in `docs/adr/`.
+    New architectural decisions should be documented as ADRs following the template in
+    `docs/adr/README.md`.
 
 ## WHEN IN DOUBT
 

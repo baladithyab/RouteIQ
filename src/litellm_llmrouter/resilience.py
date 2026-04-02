@@ -19,13 +19,19 @@ This module provides gateway-level resilience primitives for the LLMRouter gatew
    - States: CLOSED (normal), OPEN (failing fast), HALF_OPEN (testing recovery)
    - Tracks failure rate and opens circuit when threshold exceeded
    - Automatic recovery testing after timeout
+   - **Redis-backed shared state** (multi-worker safe) with in-memory fallback
 
-4. **CircuitBreakerManager**: Manages circuit breakers for DB, Redis, etc.
+4. **SharedCircuitBreakerState**: Cross-worker circuit breaker coordination via Redis
+   - Broadcasts state transitions (open/close) to all workers
+   - Aggregates failure counts across workers via Redis INCR
+   - Falls back to per-process state when Redis is unavailable
+
+5. **CircuitBreakerManager**: Manages circuit breakers for DB, Redis, etc.
    - Provides named breakers for different services
    - Exposes degraded mode status for health checks
    - Supports graceful degradation (cached reads when writes fail)
 
-5. **Per-Provider Circuit Breakers**: Protect outbound LLM HTTP calls per provider
+6. **Per-Provider Circuit Breakers**: Protect outbound LLM HTTP calls per provider
    - Feature-flagged via ROUTEIQ_PROVIDER_CB_ENABLED (default: false)
    - Per-provider env overrides: ROUTEIQ_CB_{PROVIDER}_FAILURE_THRESHOLD, etc.
    - OTel event emission on state changes
@@ -48,6 +54,8 @@ Usage:
         CircuitBreakerManager,
         get_circuit_breaker_manager,
         CircuitBreakerOpenError,
+        SharedCircuitBreakerState,
+        get_shared_circuit_breaker_state,
     )
 
     # In app factory:
@@ -120,29 +128,38 @@ class ResilienceConfig:
     @classmethod
     def from_env(cls) -> "ResilienceConfig":
         """Load configuration from environment variables."""
-        max_concurrent_str = os.getenv("ROUTEIQ_MAX_CONCURRENT_REQUESTS", "0")
-        drain_timeout_str = os.getenv(
-            "ROUTEIQ_DRAIN_TIMEOUT_SECONDS", str(DEFAULT_DRAIN_TIMEOUT_SECONDS)
-        )
-
         try:
-            max_concurrent = int(max_concurrent_str)
-        except ValueError:
-            logger.warning(
-                f"Invalid ROUTEIQ_MAX_CONCURRENT_REQUESTS value '{max_concurrent_str}', using default 0"
-            )
-            max_concurrent = 0
+            from litellm_llmrouter.settings import get_settings
 
-        try:
-            drain_timeout = float(drain_timeout_str)
-        except ValueError:
-            logger.warning(
-                f"Invalid ROUTEIQ_DRAIN_TIMEOUT_SECONDS value '{drain_timeout_str}', using default {DEFAULT_DRAIN_TIMEOUT_SECONDS}"
+            s = get_settings().resilience
+            max_concurrent = s.max_concurrent_requests
+            drain_timeout = s.drain_timeout_seconds
+            extra_excluded_str = s.backpressure_excluded_paths
+        except Exception:
+            max_concurrent_str = os.getenv("ROUTEIQ_MAX_CONCURRENT_REQUESTS", "0")
+            drain_timeout_str = os.getenv(
+                "ROUTEIQ_DRAIN_TIMEOUT_SECONDS", str(DEFAULT_DRAIN_TIMEOUT_SECONDS)
             )
-            drain_timeout = DEFAULT_DRAIN_TIMEOUT_SECONDS
+
+            try:
+                max_concurrent = int(max_concurrent_str)
+            except ValueError:
+                logger.warning(
+                    f"Invalid ROUTEIQ_MAX_CONCURRENT_REQUESTS value '{max_concurrent_str}', using default 0"
+                )
+                max_concurrent = 0
+
+            try:
+                drain_timeout = float(drain_timeout_str)
+            except ValueError:
+                logger.warning(
+                    f"Invalid ROUTEIQ_DRAIN_TIMEOUT_SECONDS value '{drain_timeout_str}', using default {DEFAULT_DRAIN_TIMEOUT_SECONDS}"
+                )
+                drain_timeout = DEFAULT_DRAIN_TIMEOUT_SECONDS
+
+            extra_excluded_str = os.getenv("ROUTEIQ_BACKPRESSURE_EXCLUDED_PATHS", "")
 
         # Additional excluded paths from env
-        extra_excluded_str = os.getenv("ROUTEIQ_BACKPRESSURE_EXCLUDED_PATHS", "")
         extra_excluded = frozenset(
             p.strip() for p in extra_excluded_str.split(",") if p.strip()
         )
@@ -563,6 +580,182 @@ class CircuitBreakerState(Enum):
     HALF_OPEN = "half_open"  # Testing recovery - limited requests pass through
 
 
+class SharedCircuitBreakerState:
+    """Shared circuit breaker state across workers via Redis.
+
+    Uses Redis for cross-worker state sharing when available.  Falls
+    back to a no-op (callers use local in-process state) when Redis
+    is not configured.
+
+    Key format::
+
+        routeiq:cb:{name}:state       -> "closed" | "open" | "half_open"
+        routeiq:cb:{name}:failures    -> int  (INCR, TTL = window_seconds)
+        routeiq:cb:{name}:opened_at   -> float  (SET, TTL = timeout_seconds * 2)
+
+    All operations are best-effort — Redis errors never propagate to
+    callers.
+    """
+
+    _REDIS_PREFIX = "routeiq:cb:"
+
+    def __init__(self) -> None:
+        self._checked = False
+        self._available = False
+
+    async def _ensure_redis(self) -> bool:
+        """Lazily check Redis availability (async)."""
+        if self._checked:
+            return self._available
+        self._checked = True
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is not None:
+                await client.ping()
+                self._available = True
+                logger.info("SharedCircuitBreakerState: Redis backend active")
+        except Exception as exc:
+            logger.debug(
+                "SharedCircuitBreakerState: Redis unavailable (%s), "
+                "circuit breaker state is per-process only",
+                exc,
+            )
+        return self._available
+
+    # ------------------------------------------------------------------
+    # State accessors
+    # ------------------------------------------------------------------
+
+    async def get_state(self, name: str) -> str | None:
+        """Get shared circuit state.
+
+        Returns:
+            ``"closed"``, ``"open"``, ``"half_open"``, or ``None`` if
+            Redis is unavailable or the key does not exist.
+        """
+        if not await self._ensure_redis():
+            return None
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is None:
+                return None
+            return await client.get(f"{self._REDIS_PREFIX}{name}:state")
+        except Exception:
+            return None
+
+    async def set_state(
+        self, name: str, state: str, timeout_seconds: float = 60.0
+    ) -> None:
+        """Set shared circuit state with TTL.
+
+        The TTL prevents stale keys from lingering if the process
+        that set the state crashes before clearing it.
+        """
+        if not await self._ensure_redis():
+            return
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is None:
+                return
+            # TTL = 2x timeout so half-open has time to recover
+            ttl = max(int(timeout_seconds * 2), 60)
+            await client.set(f"{self._REDIS_PREFIX}{name}:state", state, ex=ttl)
+        except Exception as exc:
+            logger.debug("SharedCircuitBreakerState SET failed: %s", exc)
+
+    async def record_failure(self, name: str, window_seconds: float = 60.0) -> int:
+        """Atomically increment the failure counter.
+
+        Returns:
+            Current failure count, or ``-1`` if Redis is unavailable.
+        """
+        if not await self._ensure_redis():
+            return -1
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is None:
+                return -1
+            key = f"{self._REDIS_PREFIX}{name}:failures"
+            count = await client.incr(key)
+            # Set TTL on the first failure (INCR creates the key with no
+            # TTL if it doesn't exist).
+            if count == 1:
+                await client.expire(key, int(window_seconds))
+            return int(count)
+        except Exception:
+            return -1
+
+    async def get_failure_count(self, name: str) -> int:
+        """Get current failure count.
+
+        Returns:
+            Failure count, or ``-1`` if Redis is unavailable.
+        """
+        if not await self._ensure_redis():
+            return -1
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is None:
+                return -1
+            val = await client.get(f"{self._REDIS_PREFIX}{name}:failures")
+            return int(val) if val is not None else 0
+        except Exception:
+            return -1
+
+    async def reset_failures(self, name: str) -> None:
+        """Reset failure counter (on recovery / circuit close)."""
+        if not await self._ensure_redis():
+            return
+        try:
+            from litellm_llmrouter.redis_pool import get_async_redis_client
+
+            client = await get_async_redis_client()
+            if client is None:
+                return
+            await client.delete(
+                f"{self._REDIS_PREFIX}{name}:failures",
+                f"{self._REDIS_PREFIX}{name}:state",
+            )
+        except Exception as exc:
+            logger.debug("SharedCircuitBreakerState RESET failed: %s", exc)
+
+    async def open_circuit(self, name: str, timeout_seconds: float = 30.0) -> None:
+        """Mark circuit as open across all workers."""
+        await self.set_state(name, "open", timeout_seconds)
+
+    async def close_circuit(self, name: str) -> None:
+        """Mark circuit as closed and clear failure count."""
+        await self.reset_failures(name)
+
+
+# Module-level singleton
+_shared_cb_state: SharedCircuitBreakerState | None = None
+
+
+def get_shared_circuit_breaker_state() -> SharedCircuitBreakerState:
+    """Get or create the global shared circuit breaker state."""
+    global _shared_cb_state
+    if _shared_cb_state is None:
+        _shared_cb_state = SharedCircuitBreakerState()
+    return _shared_cb_state
+
+
+def reset_shared_circuit_breaker_state() -> None:
+    """Reset the shared state singleton (for testing)."""
+    global _shared_cb_state
+    _shared_cb_state = None
+
+
 class CircuitBreakerOpenError(Exception):
     """Raised when circuit breaker is open and request is rejected."""
 
@@ -651,6 +844,7 @@ class CircuitBreaker:
         self,
         name: str,
         config: CircuitBreakerConfig | None = None,
+        shared_state: SharedCircuitBreakerState | None = None,
     ):
         self.name = name
         self._config = config or CircuitBreakerConfig.from_env(name)
@@ -660,6 +854,7 @@ class CircuitBreaker:
         self._opened_at: float | None = None  # When circuit opened
         self._lock = asyncio.Lock()
         self._last_failure_error: str | None = None
+        self._shared_state = shared_state or get_shared_circuit_breaker_state()
 
     @property
     def state(self) -> CircuitBreakerState:
@@ -715,7 +910,7 @@ class CircuitBreaker:
             self._failures.popleft()
 
     async def _transition_to(self, new_state: CircuitBreakerState) -> None:
-        """Transition to a new state."""
+        """Transition to a new state and broadcast to Redis."""
         old_state = self._state
         self._state = new_state
 
@@ -726,10 +921,16 @@ class CircuitBreaker:
                 f"Circuit breaker '{self.name}' OPENED after {self.failure_count} failures. "
                 f"Will retry in {self._config.timeout_seconds}s"
             )
+            await self._shared_state.open_circuit(
+                self.name, self._config.timeout_seconds
+            )
         elif new_state == CircuitBreakerState.HALF_OPEN:
             self._success_count = 0
             logger.info(
                 f"Circuit breaker '{self.name}' now HALF_OPEN, testing recovery"
+            )
+            await self._shared_state.set_state(
+                self.name, "half_open", self._config.timeout_seconds
             )
         elif new_state == CircuitBreakerState.CLOSED:
             self._failures.clear()
@@ -738,9 +939,10 @@ class CircuitBreaker:
             self._last_failure_error = None
             if old_state != CircuitBreakerState.CLOSED:
                 logger.info(f"Circuit breaker '{self.name}' CLOSED, service recovered")
+            await self._shared_state.close_circuit(self.name)
 
     async def record_success(self) -> None:
-        """Record a successful call."""
+        """Record a successful call (local + shared Redis state)."""
         async with self._lock:
             current_state = self.state  # Triggers timeout check
 
@@ -751,10 +953,15 @@ class CircuitBreaker:
             # In CLOSED state, successes are not specifically tracked
 
     async def record_failure(self, error: str | None = None) -> None:
-        """Record a failed call."""
+        """Record a failed call (local + shared Redis state)."""
         async with self._lock:
             self._last_failure_error = error
             current_state = self.state  # Triggers timeout check
+
+            # Record to shared state (best-effort)
+            await self._shared_state.record_failure(
+                self.name, self._config.window_seconds
+            )
 
             if current_state == CircuitBreakerState.HALF_OPEN:
                 # Any failure in half-open immediately opens the circuit
@@ -764,12 +971,25 @@ class CircuitBreaker:
                 self._cleanup_old_failures()
                 self._failures.append(time.monotonic())
 
-                if len(self._failures) >= self._config.failure_threshold:
+                # Check both local and shared failure counts
+                local_failures = len(self._failures)
+                shared_failures = await self._shared_state.get_failure_count(self.name)
+                # Use the higher of local vs shared count to detect
+                # cross-worker failure accumulation
+                effective_failures = max(
+                    local_failures,
+                    shared_failures if shared_failures >= 0 else 0,
+                )
+
+                if effective_failures >= self._config.failure_threshold:
                     await self._transition_to(CircuitBreakerState.OPEN)
 
     async def allow_request(self) -> bool:
         """
         Check if a request should be allowed.
+
+        Checks both local state and shared Redis state.  If *any*
+        worker has opened the circuit, this worker will also fast-fail.
 
         Returns:
             True if request can proceed, False if circuit is open
@@ -778,6 +998,11 @@ class CircuitBreaker:
             current_state = self.state
 
             if current_state == CircuitBreakerState.CLOSED:
+                # Check if another worker opened the circuit
+                shared = await self._shared_state.get_state(self.name)
+                if shared == "open":
+                    await self._transition_to(CircuitBreakerState.OPEN)
+                    return False
                 return True
             elif current_state == CircuitBreakerState.HALF_OPEN:
                 # In half-open, allow limited requests
@@ -894,6 +1119,9 @@ class CircuitBreakerManager:
         """
         Get or create a circuit breaker by name.
 
+        All breakers share a single :class:`SharedCircuitBreakerState`
+        instance for cross-worker coordination via Redis.
+
         Args:
             name: Name of the circuit breaker (e.g., "database", "redis")
 
@@ -904,6 +1132,7 @@ class CircuitBreakerManager:
             self._breakers[name] = CircuitBreaker(
                 name=name,
                 config=CircuitBreakerConfig.from_env(name),
+                shared_state=get_shared_circuit_breaker_state(),
             )
         return self._breakers[name]
 
@@ -923,7 +1152,11 @@ class CircuitBreakerManager:
         key = f"provider:{provider_name}"
         if key not in self._breakers:
             config = CircuitBreakerConfig.from_env(prefix=provider_name)
-            self._breakers[key] = CircuitBreaker(name=key, config=config)
+            self._breakers[key] = CircuitBreaker(
+                name=key,
+                config=config,
+                shared_state=get_shared_circuit_breaker_state(),
+            )
         return self._breakers[key]
 
     @property
@@ -995,9 +1228,10 @@ def get_circuit_breaker_manager() -> CircuitBreakerManager:
 
 
 def reset_circuit_breaker_manager() -> None:
-    """Reset the global circuit breaker manager (for testing)."""
+    """Reset the global circuit breaker manager and shared state (for testing)."""
     global _circuit_breaker_manager
     _circuit_breaker_manager = None
+    reset_shared_circuit_breaker_state()
 
 
 def compute_model_health_summary(
@@ -1033,10 +1267,18 @@ def compute_model_health_summary(
 # Per-Provider Circuit Breaker Support
 # =============================================================================
 
+
 # Feature flag: opt-in per-provider circuit breakers for LLM HTTP calls
-PROVIDER_CB_ENABLED = (
-    os.getenv("ROUTEIQ_PROVIDER_CB_ENABLED", "false").lower() == "true"
-)
+def _resolve_provider_cb_enabled() -> bool:
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().resilience.provider_circuit_breaker_enabled
+    except Exception:
+        return os.getenv("ROUTEIQ_PROVIDER_CB_ENABLED", "false").lower() == "true"
+
+
+PROVIDER_CB_ENABLED = _resolve_provider_cb_enabled()
 
 
 def _notify_circuit_breaker_change(provider_name: str, breaker: CircuitBreaker) -> None:

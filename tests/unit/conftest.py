@@ -68,7 +68,6 @@ def _reset_all_singletons():
     from litellm_llmrouter.policy_engine import reset_policy_engine
     from litellm_llmrouter.quota import reset_quota_enforcer
     from litellm_llmrouter.audit import reset_audit_repository
-    from litellm_llmrouter.mcp_jsonrpc import reset_sessions
     from litellm_llmrouter.conversation_affinity import reset_affinity_tracker
     from litellm_llmrouter.gateway.plugin_manager import reset_plugin_manager
     from litellm_llmrouter.gateway.plugin_middleware import reset_plugin_middleware
@@ -80,7 +79,6 @@ def _reset_all_singletons():
         reset_artifact_verifier,
     )
     from litellm_llmrouter.leader_election import reset_leader_election
-    from litellm_llmrouter.mcp_sse_transport import reset_sse_sessions
 
     reset_routing_singletons()
     reset_mcp_gateway()
@@ -90,7 +88,6 @@ def _reset_all_singletons():
     reset_policy_engine()
     reset_quota_enforcer()
     reset_audit_repository()
-    reset_sessions()
     reset_affinity_tracker()
     reset_plugin_manager()
     reset_plugin_middleware()
@@ -100,11 +97,50 @@ def _reset_all_singletons():
     reset_activation_manager()
     reset_artifact_verifier()
     reset_leader_election()
-    reset_sse_sessions()
 
     from litellm_llmrouter.centroid_routing import reset_centroid_strategy
 
     reset_centroid_strategy()
+
+    from litellm_llmrouter.service_discovery import reset_service_discovery
+
+    reset_service_discovery()
+
+    from litellm_llmrouter.settings import reset_settings
+
+    reset_settings()
+
+    from litellm_llmrouter.oidc import reset_oidc
+
+    reset_oidc()
+
+    from litellm_llmrouter.governance import reset_governance_engine
+
+    reset_governance_engine()
+
+    from litellm_llmrouter.usage_policies import reset_usage_policy_engine
+
+    reset_usage_policy_engine()
+
+    from litellm_llmrouter.router_r1 import reset_router_r1
+
+    reset_router_r1()
+
+    from litellm_llmrouter.guardrail_policies import reset_guardrail_policy_engine
+
+    reset_guardrail_policy_engine()
+
+    from litellm_llmrouter.eval_pipeline import reset_eval_pipeline
+
+    reset_eval_pipeline()
+
+    from litellm_llmrouter.personalized_routing import reset_personalized_router
+
+    reset_personalized_router()
+
+    from litellm_llmrouter.prompt_management import reset_prompt_manager
+
+    reset_prompt_manager()
 
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for

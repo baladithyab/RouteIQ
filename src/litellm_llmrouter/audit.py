@@ -248,11 +248,14 @@ class AuditLogRepository:
 
     async def _persist_to_db(self, entry: AuditLogEntry) -> None:
         """Persist audit log entry to PostgreSQL database."""
-        import asyncpg
         import json
 
-        conn = await asyncpg.connect(self._db_url)
-        try:
+        from .database import get_db_pool
+
+        pool = await get_db_pool(self._db_url)
+        if pool is None:
+            raise RuntimeError("Database pool not available")
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO audit_logs (
@@ -274,8 +277,6 @@ class AuditLogRepository:
                 entry.outcome_reason,
                 json.dumps(entry.metadata) if entry.metadata else "{}",
             )
-        finally:
-            await conn.close()
 
     async def query(
         self,
@@ -295,11 +296,15 @@ class AuditLogRepository:
             return []
 
         try:
-            import asyncpg
             import json
 
-            conn = await asyncpg.connect(self._db_url)
-            try:
+            from .database import get_db_pool
+
+            pool = await get_db_pool(self._db_url)
+            if pool is None:
+                return []
+
+            async with pool.acquire() as conn:
                 # Build query with optional filters
                 query = "SELECT * FROM audit_logs WHERE 1=1"
                 params = []
@@ -355,8 +360,6 @@ class AuditLogRepository:
                         )
                     )
                 return entries
-            finally:
-                await conn.close()
         except Exception as e:
             logger.error(f"Audit query failed: {e}")
             return []
@@ -411,16 +414,17 @@ async def run_audit_migrations() -> None:
         return
 
     try:
-        import asyncpg
+        from .database import get_db_pool
 
-        conn = await asyncpg.connect(db_url)
-        try:
+        pool = await get_db_pool(db_url)
+        if pool is None:
+            verbose_proxy_logger.warning(
+                "Database pool not available, skipping audit migrations"
+            )
+            return
+        async with pool.acquire() as conn:
             await conn.execute(AUDIT_LOGS_TABLE_SQL)
             verbose_proxy_logger.info("Audit: Migrations completed successfully")
-        finally:
-            await conn.close()
-    except ImportError:
-        verbose_proxy_logger.warning("asyncpg not installed, skipping audit migrations")
     except Exception as e:
         verbose_proxy_logger.error(f"Audit: Error running migrations: {e}")
 

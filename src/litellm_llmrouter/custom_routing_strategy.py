@@ -26,6 +26,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Union
 
+from fastapi import HTTPException
+
 # Import CustomRoutingStrategyBase with graceful fallback for test environments
 try:
     from litellm.types.router import CustomRoutingStrategyBase
@@ -68,21 +70,45 @@ try:
 except ImportError:
     CENTROID_ROUTING_AVAILABLE = False
 
+# Import personalized routing with graceful fallback
+try:
+    from litellm_llmrouter.personalized_routing import get_personalized_router
+
+    PERSONALIZED_ROUTING_AVAILABLE = True
+except ImportError:
+    PERSONALIZED_ROUTING_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
-# Feature flag: Use pipeline routing (enables A/B testing)
-# Set LLMROUTER_USE_PIPELINE=false to disable
-USE_PIPELINE_ROUTING = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
 
-# Feature flag: Enable centroid routing as fallback (zero-config intelligent routing)
-# Set ROUTEIQ_CENTROID_ROUTING=false to disable
-CENTROID_ROUTING_ENABLED = (
-    os.getenv("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
+def _load_routing_flags() -> tuple:
+    """Load routing feature flags from typed settings, falling back to env vars.
+
+    Returns:
+        Tuple of ``(use_pipeline, centroid_enabled, default_profile)``.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        settings = get_settings()
+        use_pipeline = settings.routing.pipeline_enabled
+        centroid_enabled = settings.routing.centroid_enabled
+        default_profile = settings.routing.default_profile.value
+        return use_pipeline, centroid_enabled, default_profile
+    except Exception:
+        use_pipeline = os.getenv("LLMROUTER_USE_PIPELINE", "true").lower() == "true"
+        centroid_enabled = (
+            os.getenv("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
+        )
+        default_profile = os.getenv("ROUTEIQ_ROUTING_PROFILE", "auto")
+        return use_pipeline, centroid_enabled, default_profile
+
+
+# Feature flags (loaded once at import time, with typed-settings-first)
+USE_PIPELINE_ROUTING, CENTROID_ROUTING_ENABLED, DEFAULT_ROUTING_PROFILE = (
+    _load_routing_flags()
 )
-
-# Default routing profile (auto, eco, premium, free, reasoning)
-DEFAULT_ROUTING_PROFILE = os.getenv("ROUTEIQ_ROUTING_PROFILE", "auto")
 
 # Maximum routing attempts per request to prevent amplification loops
 MAX_ROUTING_ATTEMPTS = 3
@@ -173,12 +199,17 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         Async routing method called by LiteLLM's Router.
 
         Order of operations:
+        0. Governance enforcement (budget, rate limit, model access)
         1. Check amplification guard
         2. Try pipeline routing (A/B testing)
         3. Fall back to direct LLMRouter ML routing
-        4. Fall back to centroid routing (zero-config intelligent routing)
-        5. Fall back to first available deployment
+        4. Try personalized re-ranking (if enabled and user_id available)
+        5. Fall back to centroid routing (zero-config intelligent routing)
+        6. Fall back to first available deployment
         """
+        # 0. Governance enforcement (before routing)
+        await self._enforce_governance(model, request_kwargs)
+
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
 
@@ -205,7 +236,15 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         except Exception as e:
             logger.warning(f"ML routing failed, falling back: {e}")
 
-        # 4. Try centroid routing (zero-config intelligent routing)
+        # 4. Try personalized routing (re-ranks centroid candidates)
+        result = await self._route_via_personalized(
+            model=model,
+            request_kwargs=request_kwargs,
+        )
+        if result is not None:
+            return result
+
+        # 5. Try centroid routing (zero-config intelligent routing)
         result = self._route_via_centroid(
             model=model,
             messages=messages,
@@ -214,7 +253,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         if result is not None:
             return result
 
-        # 5. Fallback to first available deployment
+        # 6. Fallback to first available deployment
         return self._fallback_deployment(model)
 
     def get_available_deployment(
@@ -229,6 +268,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         Sync routing method called by LiteLLM's Router.
 
         Same logic as the async version but uses synchronous calls.
+        Note: Personalized routing is skipped in sync path because the
+        preference store requires async Redis operations.
+        Note: Governance enforcement is skipped in sync path because the
+        governance engine requires async operations.
         """
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
@@ -267,6 +310,77 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # 5. Fallback to first available deployment
         return self._fallback_deployment(model)
+
+    # ------------------------------------------------------------------
+    # Internal: Governance enforcement
+    # ------------------------------------------------------------------
+
+    async def _enforce_governance(
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+    ) -> None:
+        """Enforce governance rules (budget, rate limit, model access) before routing.
+
+        Extracts the API key from ``request_kwargs`` and calls the governance
+        engine's ``enforce()`` method.  On violation, ``HTTPException`` is raised
+        and propagated to the caller, short-circuiting routing entirely.
+
+        When governance is not configured for the key (no key governance rules
+        registered), the request passes through (fail-open).
+
+        If governance enforcement itself fails (import error, unexpected
+        exception), the request passes through and the failure is logged at
+        debug level.
+
+        Args:
+            model: The requested model name.
+            request_kwargs: Request keyword arguments containing api_key and metadata.
+        """
+        if not request_kwargs:
+            return
+
+        # Extract the API key from the various places LiteLLM may put it
+        api_key = request_kwargs.get("api_key") or request_kwargs.get(
+            "litellm_params", {}
+        ).get("api_key")
+        if not api_key:
+            metadata = request_kwargs.get("metadata", {})
+            if isinstance(metadata, dict):
+                api_key = metadata.get("api_key")
+        if not api_key:
+            return
+
+        try:
+            from litellm_llmrouter.governance import get_governance_engine
+
+            engine = get_governance_engine()
+
+            # Fast path: if no governance rules are registered at all, skip
+            if not engine._key_governance and not engine._workspaces:
+                return
+
+            ctx = await engine.enforce(api_key, model)
+
+            # Store governance context in metadata for downstream use
+            metadata = request_kwargs.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                request_kwargs["metadata"] = metadata
+
+            metadata["_governance_ctx"] = {
+                "workspace_id": ctx.workspace_id,
+                "effective_profile": ctx.effective_routing_profile,
+            }
+
+            # If governance specifies a routing profile, propagate it
+            if ctx.effective_routing_profile:
+                metadata["_routing_profile"] = ctx.effective_routing_profile
+
+        except HTTPException:
+            raise  # Budget/rate limit/model access denied — propagate
+        except Exception as exc:
+            logger.debug("Governance check skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Internal: Amplification guard
@@ -472,6 +586,103 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         except Exception as e:
             logger.warning(f"Centroid routing failed, falling back: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Internal: Personalized routing (preference-based re-ranking)
+    # ------------------------------------------------------------------
+
+    async def _route_via_personalized(
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Re-rank candidate deployments using learned user preferences.
+
+        When personalized routing is enabled and a ``user_id`` is available
+        in the request metadata, the personalized router re-ranks the
+        candidate models by preference score. Cold-start users (no stored
+        preferences) get quality-bias-only ranking.
+
+        Args:
+            model: The requested model group name.
+            request_kwargs: Request keyword arguments (may contain user_id).
+
+        Returns:
+            Selected deployment dict, or None if personalized routing is
+            unavailable or the user has no preference data.
+        """
+        if not PERSONALIZED_ROUTING_AVAILABLE:
+            return None
+
+        try:
+            p_router = get_personalized_router()
+            if p_router is None:
+                return None
+
+            # Extract user_id from request metadata
+            user_id = self._extract_user_id(request_kwargs)
+            if not user_id:
+                return None
+
+            # Get candidate models from healthy deployments
+            model_list, healthy_deployments = self._get_model_list(model)
+            if not model_list or len(model_list) < 2:
+                # No point re-ranking with 0 or 1 candidates
+                return None
+
+            # Get personalized ranking
+            ranked = await p_router.rank_models(user_id, model_list)
+            if not ranked:
+                return None
+
+            # Select the top-ranked model and map to deployment
+            top_model = ranked[0][0]
+            result = self._match_deployment(top_model, model, healthy_deployments)
+
+            if result is not None:
+                logger.debug(
+                    "Personalized routing selected: %s for user=%s (model=%s, score=%.3f)",
+                    top_model,
+                    user_id,
+                    model,
+                    ranked[0][1],
+                )
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"Personalized routing failed, falling back: {e}")
+            return None
+
+    @staticmethod
+    def _extract_user_id(request_kwargs: Optional[Dict]) -> Optional[str]:
+        """Extract user_id from request kwargs metadata.
+
+        Checks multiple fields where LiteLLM may store the user identifier:
+        ``user``, ``user_id``, and ``metadata.user_id``.
+
+        Args:
+            request_kwargs: Request keyword arguments.
+
+        Returns:
+            User ID string, or None if not found.
+        """
+        if not request_kwargs:
+            return None
+
+        # Direct fields
+        user_id = request_kwargs.get("user") or request_kwargs.get("user_id")
+        if user_id:
+            return str(user_id)
+
+        # Nested in metadata
+        metadata = request_kwargs.get("metadata", {})
+        if isinstance(metadata, dict):
+            user_id = metadata.get("user_id") or metadata.get("user")
+            if user_id:
+                return str(user_id)
+
+        return None
 
     def _get_or_create_centroid_strategy(
         self,
@@ -709,11 +920,15 @@ def install_routeiq_strategy(
         )
 
     # Optionally warmup centroid classifier
-    if (
-        os.getenv("ROUTEIQ_CENTROID_WARMUP", "false").lower() == "true"
-        and CENTROID_ROUTING_AVAILABLE
-        and CENTROID_ROUTING_ENABLED
-    ):
+    try:
+        from litellm_llmrouter.settings import get_settings as _gs_warmup
+
+        _centroid_warmup = _gs_warmup().routing.centroid_warmup
+    except Exception:
+        _centroid_warmup = (
+            os.getenv("ROUTEIQ_CENTROID_WARMUP", "false").lower() == "true"
+        )
+    if _centroid_warmup and CENTROID_ROUTING_AVAILABLE and CENTROID_ROUTING_ENABLED:
         try:
             warmup_centroid_classifier()
             logger.info("Centroid classifier warmed up during strategy installation")

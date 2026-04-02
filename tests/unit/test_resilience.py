@@ -12,7 +12,7 @@ These tests verify:
 import asyncio
 import json
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 # Mark all tests in this module as asyncio
 pytestmark = pytest.mark.asyncio
@@ -138,14 +138,19 @@ class TestResilienceConfig:
     def test_config_from_env(self):
         """Test loading config from environment variables."""
         from litellm_llmrouter.resilience import ResilienceConfig
+        from litellm_llmrouter.settings import reset_settings
 
         with patch.dict(
             "os.environ",
             {
                 "ROUTEIQ_MAX_CONCURRENT_REQUESTS": "100",
                 "ROUTEIQ_DRAIN_TIMEOUT_SECONDS": "60",
+                # pydantic-settings nested delimiter format
+                "ROUTEIQ_RESILIENCE__MAX_CONCURRENT_REQUESTS": "100",
+                "ROUTEIQ_RESILIENCE__DRAIN_TIMEOUT_SECONDS": "60",
             },
         ):
+            reset_settings()
             config = ResilienceConfig.from_env()
 
             assert config.max_concurrent_requests == 100
@@ -486,3 +491,280 @@ class TestGlobalSingleton:
         dm2 = get_drain_manager()
 
         assert dm1 is not dm2
+
+
+class TestSharedCircuitBreakerState:
+    """Test the Redis-backed SharedCircuitBreakerState."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_shared_state(self):
+        """Reset shared state singleton between tests."""
+        from litellm_llmrouter.resilience import reset_shared_circuit_breaker_state
+
+        reset_shared_circuit_breaker_state()
+        yield
+        reset_shared_circuit_breaker_state()
+
+    async def test_returns_none_when_redis_unavailable(self):
+        """get_state should return None when Redis is not available."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        state = SharedCircuitBreakerState()
+        state._checked = True
+        state._available = False
+
+        result = await state.get_state("test_breaker")
+        assert result is None
+
+    async def test_record_failure_returns_negative_when_no_redis(self):
+        """record_failure should return -1 when Redis is unavailable."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        state = SharedCircuitBreakerState()
+        state._checked = True
+        state._available = False
+
+        count = await state.record_failure("test_breaker")
+        assert count == -1
+
+    @patch("litellm_llmrouter.redis_pool.get_async_redis_client")
+    async def test_get_state_from_redis(self, mock_get_client):
+        """get_state should return the state string from Redis."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock()
+        mock_client.get = AsyncMock(return_value="open")
+        mock_get_client.return_value = mock_client
+
+        state = SharedCircuitBreakerState()
+        result = await state.get_state("provider:openai")
+
+        assert result == "open"
+        mock_client.get.assert_called_once_with("routeiq:cb:provider:openai:state")
+
+    @patch("litellm_llmrouter.redis_pool.get_async_redis_client")
+    async def test_set_state_to_redis(self, mock_get_client):
+        """set_state should write to Redis with TTL."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock()
+        mock_client.set = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        state = SharedCircuitBreakerState()
+        await state.set_state("database", "open", timeout_seconds=30.0)
+
+        mock_client.set.assert_called_once_with(
+            "routeiq:cb:database:state", "open", ex=60
+        )
+
+    @patch("litellm_llmrouter.redis_pool.get_async_redis_client")
+    async def test_record_failure_increments(self, mock_get_client):
+        """record_failure should INCR the failure counter."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock()
+        mock_client.incr = AsyncMock(return_value=3)
+        mock_client.expire = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        state = SharedCircuitBreakerState()
+        count = await state.record_failure("provider:openai", window_seconds=60.0)
+
+        assert count == 3
+        mock_client.incr.assert_called_once_with("routeiq:cb:provider:openai:failures")
+
+    @patch("litellm_llmrouter.redis_pool.get_async_redis_client")
+    async def test_record_failure_sets_ttl_on_first(self, mock_get_client):
+        """record_failure should set TTL on the first failure."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock()
+        mock_client.incr = AsyncMock(return_value=1)  # First failure
+        mock_client.expire = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        state = SharedCircuitBreakerState()
+        await state.record_failure("test", window_seconds=60.0)
+
+        mock_client.expire.assert_called_once_with("routeiq:cb:test:failures", 60)
+
+    @patch("litellm_llmrouter.redis_pool.get_async_redis_client")
+    async def test_reset_failures_deletes_keys(self, mock_get_client):
+        """reset_failures should delete both failure and state keys."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        mock_client = AsyncMock()
+        mock_client.ping = AsyncMock()
+        mock_client.delete = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        state = SharedCircuitBreakerState()
+        await state.reset_failures("provider:openai")
+
+        mock_client.delete.assert_called_once_with(
+            "routeiq:cb:provider:openai:failures",
+            "routeiq:cb:provider:openai:state",
+        )
+
+    async def test_lazy_redis_check_only_once(self):
+        """_ensure_redis should only probe Redis once."""
+        from litellm_llmrouter.resilience import SharedCircuitBreakerState
+
+        state = SharedCircuitBreakerState()
+
+        with patch(
+            "litellm_llmrouter.redis_pool.get_async_redis_client",
+            new_callable=AsyncMock,
+        ) as mock_get_client:
+            mock_get_client.return_value = None
+
+            result1 = await state._ensure_redis()
+            result2 = await state._ensure_redis()
+
+        assert result1 is False
+        assert result2 is False
+        # Called only once due to _checked flag
+        mock_get_client.assert_called_once()
+
+
+class TestCircuitBreakerWithSharedState:
+    """Test CircuitBreaker integration with SharedCircuitBreakerState."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        """Reset shared state between tests."""
+        from litellm_llmrouter.resilience import reset_shared_circuit_breaker_state
+
+        reset_shared_circuit_breaker_state()
+        yield
+        reset_shared_circuit_breaker_state()
+
+    async def test_circuit_breaker_broadcasts_open_to_shared_state(self):
+        """Opening circuit should broadcast to shared state."""
+        from litellm_llmrouter.resilience import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+            CircuitBreakerState as CBState,
+            SharedCircuitBreakerState,
+        )
+
+        shared = SharedCircuitBreakerState()
+        shared._checked = True
+        shared._available = False  # No Redis — just verify calls
+        shared.open_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.set_state = AsyncMock()  # type: ignore[method-assign]
+        shared.close_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.record_failure = AsyncMock(return_value=-1)  # type: ignore[method-assign]
+        shared.get_failure_count = AsyncMock(return_value=-1)  # type: ignore[method-assign]
+
+        config = CircuitBreakerConfig(
+            failure_threshold=2, timeout_seconds=10.0, window_seconds=60.0
+        )
+        breaker = CircuitBreaker("test", config=config, shared_state=shared)
+
+        # Record enough failures to open
+        await breaker.record_failure("error1")
+        await breaker.record_failure("error2")
+
+        assert breaker._state == CBState.OPEN
+        shared.open_circuit.assert_called_once_with("test", 10.0)
+
+    async def test_circuit_breaker_broadcasts_close_to_shared_state(self):
+        """Closing circuit should broadcast to shared state."""
+        from litellm_llmrouter.resilience import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+            CircuitBreakerState as CBState,
+            SharedCircuitBreakerState,
+        )
+
+        shared = SharedCircuitBreakerState()
+        shared._checked = True
+        shared._available = False
+        shared.open_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.set_state = AsyncMock()  # type: ignore[method-assign]
+        shared.close_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.record_failure = AsyncMock(return_value=-1)  # type: ignore[method-assign]
+        shared.get_failure_count = AsyncMock(return_value=-1)  # type: ignore[method-assign]
+
+        config = CircuitBreakerConfig(
+            failure_threshold=2,
+            success_threshold=1,
+            timeout_seconds=0.01,
+            window_seconds=60.0,
+        )
+        breaker = CircuitBreaker("test", config=config, shared_state=shared)
+
+        # Open the circuit
+        await breaker.record_failure("err1")
+        await breaker.record_failure("err2")
+        assert breaker._state == CBState.OPEN
+
+        # Wait for timeout to transition to half-open
+        import time
+
+        time.sleep(0.02)
+
+        # Record success to close
+        await breaker.record_success()
+        assert breaker._state == CBState.CLOSED
+        shared.close_circuit.assert_called_with("test")
+
+    async def test_allow_request_checks_shared_state(self):
+        """allow_request should check shared state for cross-worker opens."""
+        from litellm_llmrouter.resilience import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+            SharedCircuitBreakerState,
+        )
+
+        shared = SharedCircuitBreakerState()
+        shared._checked = True
+        shared._available = True
+        shared.get_state = AsyncMock(return_value="open")  # type: ignore[method-assign]
+        shared.open_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.set_state = AsyncMock()  # type: ignore[method-assign]
+        shared.close_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.record_failure = AsyncMock(return_value=-1)  # type: ignore[method-assign]
+
+        config = CircuitBreakerConfig(failure_threshold=5, timeout_seconds=30.0)
+        breaker = CircuitBreaker("test", config=config, shared_state=shared)
+
+        # Local state is CLOSED, but shared state says OPEN
+        allowed = await breaker.allow_request()
+        assert allowed is False
+
+    async def test_shared_failure_count_opens_circuit(self):
+        """Circuit should open when shared failure count exceeds threshold."""
+        from litellm_llmrouter.resilience import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+            CircuitBreakerState as CBState,
+            SharedCircuitBreakerState,
+        )
+
+        shared = SharedCircuitBreakerState()
+        shared._checked = True
+        shared._available = True
+        # Shared state reports 4 failures already from other workers
+        shared.record_failure = AsyncMock(return_value=5)  # type: ignore[method-assign]
+        shared.get_failure_count = AsyncMock(return_value=5)  # type: ignore[method-assign]
+        shared.open_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.set_state = AsyncMock()  # type: ignore[method-assign]
+        shared.close_circuit = AsyncMock()  # type: ignore[method-assign]
+        shared.get_state = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        config = CircuitBreakerConfig(
+            failure_threshold=5, timeout_seconds=30.0, window_seconds=60.0
+        )
+        breaker = CircuitBreaker("test", config=config, shared_state=shared)
+
+        # Even a single local failure should open the circuit because
+        # the shared count (5) >= threshold (5)
+        await breaker.record_failure("err")
+        assert breaker._state == CBState.OPEN

@@ -138,14 +138,32 @@ class QuotaConfig:
     @classmethod
     def from_env(cls) -> "QuotaConfig":
         """Load configuration from environment variables."""
-        enabled = os.getenv("ROUTEIQ_QUOTA_ENABLED", "false").lower() == "true"
-        fail_mode_str = os.getenv("ROUTEIQ_QUOTA_FAIL_MODE", "open").lower()
-        fail_mode = (
-            QuotaFailMode.CLOSED if fail_mode_str == "closed" else QuotaFailMode.OPEN
-        )
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            s = get_settings().quota
+            enabled = s.enabled
+            fail_mode = (
+                QuotaFailMode.CLOSED
+                if s.fail_mode.value == "closed"
+                else QuotaFailMode.OPEN
+            )
+            limits_json = s.limits_json or ""
+            spend_multiplier = s.default_spend_per_1k_tokens
+        except Exception:
+            enabled = os.getenv("ROUTEIQ_QUOTA_ENABLED", "false").lower() == "true"
+            fail_mode_str = os.getenv("ROUTEIQ_QUOTA_FAIL_MODE", "open").lower()
+            fail_mode = (
+                QuotaFailMode.CLOSED
+                if fail_mode_str == "closed"
+                else QuotaFailMode.OPEN
+            )
+            limits_json = os.getenv("ROUTEIQ_QUOTA_LIMITS_JSON", "")
+            spend_multiplier = float(
+                os.getenv("ROUTEIQ_QUOTA_DEFAULT_SPEND_PER_1K_TOKENS", "0.002")
+            )
 
         limits: list[QuotaLimit] = []
-        limits_json = os.getenv("ROUTEIQ_QUOTA_LIMITS_JSON", "")
         if limits_json:
             try:
                 limits_data = json.loads(limits_json)
@@ -159,10 +177,6 @@ class QuotaConfig:
                             )
             except json.JSONDecodeError as e:
                 logger.warning(f"Invalid ROUTEIQ_QUOTA_LIMITS_JSON: {e}")
-
-        spend_multiplier = float(
-            os.getenv("ROUTEIQ_QUOTA_DEFAULT_SPEND_PER_1K_TOKENS", "0.002")
-        )
 
         return cls(
             enabled=enabled,
@@ -610,8 +624,15 @@ class QuotaEnforcer:
     async def _get_repository(self) -> QuotaRepository:
         """Get or create the repository."""
         if self._repository is None:
-            redis_host = os.getenv("REDIS_HOST", "localhost")
-            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                s = get_settings().redis
+                redis_host = s.host or "localhost"
+                redis_port = s.port
+            except Exception:
+                redis_host = os.getenv("REDIS_HOST", "localhost")
+                redis_port = int(os.getenv("REDIS_PORT", "6379"))
             self._repository = QuotaRepository(
                 redis_host=redis_host,
                 redis_port=redis_port,
@@ -931,7 +952,14 @@ class QuotaEnforcer:
 
 def _is_cost_reconciliation_enabled() -> bool:
     """Check if cost reconciliation is enabled via environment variable."""
-    return os.getenv("ROUTEIQ_COST_RECONCILIATION_ENABLED", "true").lower() != "false"
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().quota.cost_reconciliation_enabled
+    except Exception:
+        return (
+            os.getenv("ROUTEIQ_COST_RECONCILIATION_ENABLED", "true").lower() != "false"
+        )
 
 
 def _emit_reconciliation_metrics(

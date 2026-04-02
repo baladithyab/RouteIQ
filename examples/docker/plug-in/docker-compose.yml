@@ -1,0 +1,86 @@
+# =============================================================================
+# RouteIQ Gateway — Plug-In Mode
+# =============================================================================
+# For users who bring their own PostgreSQL, Redis, and/or OTel Collector.
+# RouteIQ connects to your existing managed services (e.g., RDS, ElastiCache,
+# Datadog, Grafana Cloud).
+#
+# Quick start:
+#   1. Copy .env.example to .env and fill in your service URLs
+#   2. docker compose up -d
+#
+# RouteIQ degrades gracefully — any unconfigured service simply disables
+# the corresponding feature. You can check /config/services at runtime
+# to see which services are connected and which features are active.
+# =============================================================================
+
+services:
+  routeiq:
+    image: ghcr.io/baladithyab/litellm-llm-router:latest
+    container_name: routeiq-gateway
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+    environment:
+      # --- Required ---
+      LITELLM_CONFIG_PATH: /app/config/config.yaml
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in .env}"
+
+      # --- LLM Provider Keys ---
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+
+      # --- External PostgreSQL (enables persistence, DB-backed keys/teams) ---
+      # Example: postgresql://routeiq:secret@your-rds.amazonaws.com:5432/litellm
+      DATABASE_URL: "${DATABASE_URL:-}"
+
+      # --- External Redis (enables caching, HA leader election, rate limiting) ---
+      # Example: your-elasticache.xxx.cache.amazonaws.com
+      REDIS_HOST: "${REDIS_HOST:-}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      REDIS_SSL: "${REDIS_SSL:-false}"
+
+      # --- External OTel Collector (enables distributed tracing & metrics) ---
+      # Example: http://your-otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_ENDPOINT:-}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-routeiq-gateway}"
+      OTEL_ENABLED: "${OTEL_ENABLED:-true}"
+
+      # --- OIDC / SSO (enables single sign-on for the admin UI) ---
+      ROUTEIQ_OIDC_ENABLED: "${OIDC_ENABLED:-false}"
+      ROUTEIQ_OIDC_ISSUER_URL: "${OIDC_ISSUER_URL:-}"
+      ROUTEIQ_OIDC_CLIENT_ID: "${OIDC_CLIENT_ID:-}"
+      ROUTEIQ_OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:-}"
+
+      # --- RouteIQ Settings ---
+      ROUTEIQ_USE_PLUGIN_STRATEGY: "true"
+      ROUTEIQ_WORKERS: "${ROUTEIQ_WORKERS:-2}"
+      ROUTEIQ_CENTROID_ROUTING: "true"
+      ROUTEIQ_ROUTING_PROFILE: "${ROUTEIQ_ROUTING_PROFILE:-auto}"
+      ROUTEIQ_ADMIN_UI_ENABLED: "${ROUTEIQ_ADMIN_UI_ENABLED:-true}"
+
+      # --- Gateway Features ---
+      A2A_GATEWAY_ENABLED: "${A2A_GATEWAY_ENABLED:-false}"
+      MCP_GATEWAY_ENABLED: "${MCP_GATEWAY_ENABLED:-false}"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/_health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+    restart: unless-stopped
+    networks:
+      - routeiq-network
+
+networks:
+  routeiq-network:
+    driver: bridge

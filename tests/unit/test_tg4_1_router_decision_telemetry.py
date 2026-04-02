@@ -107,7 +107,9 @@ class TestSetRouterDecisionAttributes:
 
         set_router_decision_attributes(mock_span, strategy="knn")
 
-        mock_span.set_attribute.assert_called_with(ROUTER_STRATEGY_ATTR, "knn")
+        # Dual-emit: both legacy router.* and gen_ai.routeiq.* attributes
+        mock_span.set_attribute.assert_any_call(ROUTER_STRATEGY_ATTR, "knn")
+        mock_span.set_attribute.assert_any_call("gen_ai.routeiq.strategy", "knn")
 
     def test_sets_model_selected_attribute(self):
         """Test that model_selected attribute is set when provided."""
@@ -193,7 +195,9 @@ class TestSetRouterDecisionAttributes:
 
         set_router_decision_attributes(mock_span, fallback_triggered=True)
 
-        mock_span.set_attribute.assert_called_with(ROUTER_FALLBACK_TRIGGERED_ATTR, True)
+        # Dual-emit: both legacy router.* and gen_ai.routeiq.* attributes
+        mock_span.set_attribute.assert_any_call(ROUTER_FALLBACK_TRIGGERED_ATTR, True)
+        mock_span.set_attribute.assert_any_call("gen_ai.routeiq.fallback_used", True)
 
     def test_does_not_set_none_values(self):
         """Test that None values do not result in set_attribute calls."""
@@ -425,8 +429,8 @@ class TestRouterDecisionTelemetryIntegration:
             fallback_triggered=False,
         )
 
-        # All 9 attributes should be set
-        assert call_count == 9
+        # 9 legacy attributes + 2 dual-emitted gen_ai.routeiq.* (strategy, fallback) = 11
+        assert call_count == 11
 
     def test_telemetry_attributes_for_error_path(self):
         """Test that error path sets appropriate number of attributes."""
@@ -453,8 +457,8 @@ class TestRouterDecisionTelemetryIntegration:
             fallback_triggered=True,
         )
 
-        # 8 attributes should be set (no model_selected)
-        assert call_count == 8
+        # 8 legacy attributes + 2 dual-emitted gen_ai.routeiq.* (strategy, fallback) = 10
+        assert call_count == 10
 
 
 # Import the GenAI attributes helper

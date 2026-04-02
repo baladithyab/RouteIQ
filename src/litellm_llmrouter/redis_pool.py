@@ -7,7 +7,14 @@ Centralises Redis connection configuration so every consumer
 uses the same env-var-driven settings: REDIS_HOST, REDIS_PORT,
 REDIS_PASSWORD, REDIS_SSL, and REDIS_DB.
 
-Usage (async):
+Preferred usage (singleton, async):
+    from litellm_llmrouter.redis_pool import get_async_redis_client
+
+    client = await get_async_redis_client()
+    if client:
+        await client.ping()
+
+Legacy usage (creates new client per call — deprecated):
     from litellm_llmrouter.redis_pool import create_async_redis_client
 
     client = create_async_redis_client()
@@ -21,32 +28,260 @@ Usage (sync):
 
 All factory functions read environment variables at call time so they
 respect late-binding (hot-reload, test overrides via ``monkeypatch``).
+The singleton ``get_async_redis_client()`` creates the client once and
+reuses it across all callers, with automatic health-check ping.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
-from typing import Any
+import warnings
+from typing import Any, Optional
+
+from litellm_llmrouter.settings import get_settings
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level singletons
+# ---------------------------------------------------------------------------
+_async_client: Optional[Any] = None  # redis.asyncio.Redis | None
+_async_client_lock: Optional[asyncio.Lock] = None
+_sync_client: Optional[Any] = None  # redis.Redis | None
+_last_health_check: float = 0.0
+_HEALTH_CHECK_INTERVAL = 30.0  # seconds
+
+
+def _get_async_client_lock() -> asyncio.Lock:
+    """Lazily initialize the async client lock to avoid binding to wrong event loop."""
+    global _async_client_lock
+    if _async_client_lock is None:
+        _async_client_lock = asyncio.Lock()
+    return _async_client_lock
 
 
 def _redis_settings() -> dict[str, Any]:
-    """Read common Redis settings from environment variables.
+    """Read common Redis settings from env vars, with typed settings fallback.
+
+    Legacy env vars (``REDIS_HOST``, ``REDIS_PORT``, etc.) take precedence
+    over the typed settings model (which uses ``ROUTEIQ_REDIS__*`` prefix).
+    This ensures backward compatibility while supporting the new settings.
 
     Returns a dict suitable for unpacking into the ``redis.Redis`` /
     ``redis.asyncio.Redis`` constructors.
     """
-    host = os.getenv("REDIS_HOST", "localhost")
-    port = int(os.getenv("REDIS_PORT", "6379"))
-    password = os.getenv("REDIS_PASSWORD") or None
-    ssl = os.getenv("REDIS_SSL", "false").lower() in ("true", "1", "yes")
-    db = int(os.getenv("REDIS_DB", "0"))
-    return {
-        "host": host,
-        "port": port,
-        "password": password,
-        "ssl": ssl,
-        "db": db,
-    }
+    # Legacy env vars take precedence (most existing deployments use these)
+    env_host = os.getenv("REDIS_HOST")
+    env_port = os.getenv("REDIS_PORT")
+    env_password = os.getenv("REDIS_PASSWORD")
+    env_ssl = os.getenv("REDIS_SSL")
+    env_db = os.getenv("REDIS_DB")
+
+    # If any legacy env var is set, use env vars exclusively
+    if any(v is not None for v in (env_host, env_port, env_password, env_ssl, env_db)):
+        return {
+            "host": env_host or "localhost",
+            "port": int(env_port) if env_port else 6379,
+            "password": env_password or None,
+            "ssl": (env_ssl or "false").lower() in ("true", "1", "yes"),
+            "db": int(env_db) if env_db else 0,
+        }
+
+    # Fall back to typed settings (reads ROUTEIQ_REDIS__* vars)
+    try:
+        settings = get_settings()
+        return {
+            "host": settings.redis.host or "localhost",
+            "port": settings.redis.port,
+            "password": settings.redis.password,
+            "ssl": settings.redis.ssl,
+            "db": settings.redis.db,
+        }
+    except Exception:
+        return {
+            "host": "localhost",
+            "port": 6379,
+            "password": None,
+            "ssl": False,
+            "db": 0,
+        }
+
+
+def _warn_no_password() -> None:
+    """Log a warning when Redis is configured without a password."""
+    has_password = bool(os.getenv("REDIS_PASSWORD"))
+    if not has_password:
+        try:
+            settings = get_settings()
+            has_password = bool(settings.redis.password)
+        except Exception:
+            pass
+    if not has_password:
+        logger.warning(
+            "Redis connection configured without password (REDIS_PASSWORD not set). "
+            "This is insecure for production deployments."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Async singleton
+# ---------------------------------------------------------------------------
+
+
+async def get_async_redis_client() -> Optional[Any]:
+    """Get or create the shared async Redis client singleton.
+
+    Returns the cached ``redis.asyncio.Redis`` instance, creating it on
+    first call.  If the cached client fails a ``PING`` health-check it is
+    discarded and a fresh one is created.
+
+    Returns:
+        A ``redis.asyncio.Redis`` instance, or ``None`` if Redis is not
+        configured (``REDIS_HOST`` is not set).
+    """
+    global _async_client, _last_health_check
+
+    # Fast path: reuse existing healthy client with time-gated health check
+    if _async_client is not None:
+        import time
+
+        if time.monotonic() - _last_health_check > _HEALTH_CHECK_INTERVAL:
+            try:
+                await _async_client.ping()
+                _last_health_check = time.monotonic()
+            except Exception:
+                logger.debug("Async Redis client health-check failed, reconnecting")
+                _async_client = None
+        else:
+            return _async_client
+
+    async with _get_async_client_lock():
+        # Double-check after acquiring the lock
+        if _async_client is not None:
+            return _async_client
+
+        # Check legacy env var first, then typed settings
+        host = os.getenv("REDIS_HOST")
+        if not host:
+            try:
+                settings = get_settings()
+                host = settings.redis.host
+            except Exception:
+                pass
+        if not host:
+            return None
+
+        import redis.asyncio as aioredis
+
+        _warn_no_password()
+
+        redis_cfg = _redis_settings()
+        _async_client = aioredis.Redis(
+            host=redis_cfg["host"],
+            port=redis_cfg["port"],
+            password=redis_cfg["password"],
+            ssl=redis_cfg["ssl"],
+            db=redis_cfg["db"],
+            decode_responses=True,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+            retry_on_timeout=True,
+            health_check_interval=30,
+        )
+        logger.info("Async Redis client singleton created (host=%s)", host)
+        return _async_client
+
+
+async def close_async_redis_client() -> None:
+    """Close the async Redis client singleton.
+
+    Safe to call multiple times or when no client exists.
+    Should be called during application shutdown.
+    """
+    global _async_client
+    if _async_client is not None:
+        try:
+            await _async_client.close()
+            logger.info("Async Redis client closed")
+        except Exception as exc:
+            logger.warning("Error closing async Redis client: %s", exc)
+        finally:
+            _async_client = None
+
+
+# ---------------------------------------------------------------------------
+# Sync singleton
+# ---------------------------------------------------------------------------
+
+
+def get_sync_redis_client() -> Optional[Any]:
+    """Get or create the shared sync Redis client singleton.
+
+    Returns the cached ``redis.Redis`` instance, creating it on first
+    call.
+
+    Returns:
+        A ``redis.Redis`` instance, or ``None`` if Redis is not
+        configured (``REDIS_HOST`` is not set).
+    """
+    global _sync_client
+
+    if _sync_client is not None:
+        return _sync_client
+
+    # Check legacy env var first, then typed settings
+    host = os.getenv("REDIS_HOST")
+    if not host:
+        try:
+            settings = get_settings()
+            host = settings.redis.host
+        except Exception:
+            pass
+    if not host:
+        return None
+
+    import redis
+
+    _warn_no_password()
+
+    redis_cfg = _redis_settings()
+    _sync_client = redis.Redis(
+        host=redis_cfg["host"],
+        port=redis_cfg["port"],
+        password=redis_cfg["password"],
+        ssl=redis_cfg["ssl"],
+        db=redis_cfg["db"],
+        decode_responses=True,
+        socket_timeout=5.0,
+    )
+    logger.info("Sync Redis client singleton created (host=%s)", host)
+    return _sync_client
+
+
+# ---------------------------------------------------------------------------
+# Reset for testing
+# ---------------------------------------------------------------------------
+
+
+def reset_redis_clients() -> None:
+    """Reset all client singletons.
+
+    Intended for test fixtures (``autouse=True``) to prevent cross-test
+    contamination.  Does **not** close open connections — use
+    :func:`close_async_redis_client` for graceful shutdown.
+    """
+    global _async_client, _sync_client, _async_client_lock, _last_health_check
+    _async_client = None
+    _sync_client = None
+    _async_client_lock = None
+    _last_health_check = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Legacy factory functions (backward-compatible, deprecated)
+# ---------------------------------------------------------------------------
 
 
 def create_async_redis_client(
@@ -58,6 +293,10 @@ def create_async_redis_client(
 ) -> Any:
     """Create an async ``redis.asyncio.Redis`` client from env vars.
 
+    .. deprecated::
+        Use :func:`get_async_redis_client` instead to share a single
+        connection across all callers.
+
     Any keyword *overrides* are merged on top of the environment-derived
     settings, so callers can customise individual options.
 
@@ -67,6 +306,12 @@ def create_async_redis_client(
     Raises:
         ImportError: If the ``redis`` package is not installed.
     """
+    warnings.warn(
+        "create_async_redis_client() creates a new connection on every call. "
+        "Use get_async_redis_client() for the shared singleton instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     import redis.asyncio as aioredis
 
     kwargs = {
@@ -87,12 +332,22 @@ def create_sync_redis_client(
 ) -> Any:
     """Create a synchronous ``redis.Redis`` client from env vars.
 
+    .. deprecated::
+        Use :func:`get_sync_redis_client` instead to share a single
+        connection across all callers.
+
     Returns:
         A ``redis.Redis`` instance.
 
     Raises:
         ImportError: If the ``redis`` package is not installed.
     """
+    warnings.warn(
+        "create_sync_redis_client() creates a new connection on every call. "
+        "Use get_sync_redis_client() for the shared singleton instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     import redis
 
     kwargs = {
@@ -105,7 +360,7 @@ def create_sync_redis_client(
 
 
 def build_redis_url() -> str:
-    """Build a Redis URL from environment variables.
+    """Build a Redis URL from typed settings (falling back to env vars).
 
     Useful for consumers that accept a URL string rather than keyword
     arguments (e.g. ``redis.asyncio.from_url``).

@@ -295,6 +295,65 @@ routeiq:
   adminUI:
     enabled: false          # ROUTEIQ_ADMIN_UI_ENABLED
 
+  # Leader election configuration
+  # Auto-detects backend: K8s Lease API > Redis > PostgreSQL > None
+  leaderElection:
+    enabled: false          # LLMROUTER_HA_MODE=leader_election
+    # Explicit backend override (empty = auto-detect):
+    # kubernetes, redis, postgres, none
+    backend: ""             # ROUTEIQ_LEADER_ELECTION_BACKEND
+
+# -----------------------------------------------------------------------------
+# External services (plug-in mode)
+# -----------------------------------------------------------------------------
+# When deploying RouteIQ alongside managed services (RDS, ElastiCache, etc.),
+# configure these sections. Leave empty to disable the corresponding feature.
+# RouteIQ degrades gracefully — unconfigured services simply disable features.
+# Check /config/services at runtime to see which services are connected.
+
+# External PostgreSQL (enables persistence, DB-backed keys, teams)
+# Set postgresql.enabled=false in a sub-chart scenario and configure here
+externalPostgresql:
+  # Host of your managed PostgreSQL (e.g., mydb.abc123.rds.amazonaws.com)
+  host: ""
+  port: 5432
+  database: "litellm"
+  username: "routeiq"
+  # K8s secret containing the password
+  existingSecret: ""         # Secret name
+  existingSecretKey: "password"  # Key within the secret
+  # SSL mode: disable, allow, prefer, require, verify-ca, verify-full
+  sslMode: "require"
+
+# External Redis (enables caching, HA leader election, rate limiting)
+externalRedis:
+  # Host of your managed Redis (e.g., mycluster.abc123.cache.amazonaws.com)
+  host: ""
+  port: 6379
+  # K8s secret containing the password
+  existingSecret: ""
+  existingSecretKey: "password"
+  db: 0
+  # Enable TLS/SSL for Redis connections
+  ssl: false
+
+# External OTel Collector (enables distributed tracing and metrics export)
+externalOtel:
+  # OTLP endpoint (e.g., http://otel-collector.monitoring:4317)
+  endpoint: ""
+  # Protocol: grpc or http
+  protocol: "grpc"
+
+# OIDC / SSO Configuration (enables single sign-on for admin UI)
+oidc:
+  enabled: false
+  # OIDC issuer URL (e.g., https://your-tenant.auth0.com/)
+  issuerUrl: ""
+  clientId: ""
+  # K8s secret containing the client_secret
+  existingSecret: ""
+  existingSecretKey: "oidc-client-secret"
+
 # -----------------------------------------------------------------------------
 # Secrets configuration
 # -----------------------------------------------------------------------------
@@ -487,6 +546,28 @@ terminationGracePeriodSeconds: 30
 priorityClassName: ""
 
 # -----------------------------------------------------------------------------
+# Database migrations init container
+# -----------------------------------------------------------------------------
+# Runs database migrations before the main container starts.
+# Only active when postgresql is configured (externalPostgresql.host or
+# DATABASE_URL in secrets).
+migrations:
+  enabled: true
+  # Command to run for migrations. Uses the same image as the gateway.
+  command:
+    - python
+    - "-c"
+    - "from litellm_llmrouter.database import run_migrations; import asyncio; asyncio.run(run_migrations())"
+  # Resources for the init container (typically less than the main container)
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# -----------------------------------------------------------------------------
 # Init containers (optional)
 # -----------------------------------------------------------------------------
 initContainers: []
@@ -502,3 +583,35 @@ sidecars: []
   #   image: otel/opentelemetry-collector:latest
   #   ports:
   #     - containerPort: 4317
+
+# -----------------------------------------------------------------------------
+# Metrics / Observability (Prometheus Operator CRDs)
+# -----------------------------------------------------------------------------
+# Requires the Prometheus Operator (or kube-prometheus-stack) to be installed
+# in the cluster for ServiceMonitor and PrometheusRule resources.
+metrics:
+  # ServiceMonitor for automatic Prometheus scrape target discovery
+  serviceMonitor:
+    enabled: false
+    # Scrape interval (how often Prometheus scrapes the /metrics endpoint)
+    interval: "30s"
+    # Scrape timeout (must be less than interval)
+    scrapeTimeout: "10s"
+    # Additional labels for ServiceMonitor (e.g., to match Prometheus selectors)
+    labels: {}
+    # Annotations for ServiceMonitor
+    annotations: {}
+    # Metric relabeling rules
+    # https://prometheus.io/docs/prometheus/latest/configuration/configuration/#metric_relabel_configs
+    metricRelabelings: []
+
+  # PrometheusRule for alerting rules
+  prometheusRule:
+    enabled: false
+
+  # Grafana dashboard auto-provisioning via sidecar ConfigMap discovery
+  # Requires the Grafana sidecar (grafana_dashboard: "1" label selector)
+  grafanaDashboard:
+    enabled: false
+    # Annotations for the dashboard ConfigMap
+    annotations: {}

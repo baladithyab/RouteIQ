@@ -255,9 +255,14 @@ class TestObservabilityManager:
 
     def test_otlp_endpoint_from_env(self):
         """Test that OTLP endpoint can be set from environment."""
+        # Mock get_settings to raise so the fallback env-var path is exercised
         with patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://env:4317"}):
-            manager = ObservabilityManager()
-            assert manager.otlp_endpoint == "http://env:4317"
+            with patch(
+                "litellm_llmrouter.settings.get_settings",
+                side_effect=RuntimeError("no settings"),
+            ):
+                manager = ObservabilityManager()
+                assert manager.otlp_endpoint == "http://env:4317"
 
     def test_otlp_endpoint_default(self):
         """Test that OTLP endpoint has a default value."""
@@ -779,7 +784,12 @@ def test_custom_metrics_namespace(monkeypatch):
     monkeypatch.setenv("ROUTEIQ_SERVICE_NAME", "routeiq-prod")
     monkeypatch.setenv("ROUTEIQ_DEPLOYMENT_ENV", "production")
 
-    attrs = get_routeiq_resource_attributes()
+    # Mock get_settings to raise so the fallback env-var path is exercised
+    with patch(
+        "litellm_llmrouter.settings.get_settings",
+        side_effect=RuntimeError("no settings"),
+    ):
+        attrs = get_routeiq_resource_attributes()
     assert attrs["service.name"] == "routeiq-prod"
     assert attrs["deployment.environment"] == "production"
     assert attrs["routeiq.metrics.namespace"] == "RouteIQ/prod"

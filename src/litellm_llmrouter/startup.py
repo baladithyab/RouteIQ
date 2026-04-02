@@ -42,6 +42,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # Configure module logger
 logger = logging.getLogger(__name__)
 
+# Late-imported: from litellm_llmrouter.settings import get_settings
+# Imported inside functions to avoid circular imports at module load time.
+
 
 def register_router_decision_callback():
     """
@@ -112,17 +115,17 @@ def run_leader_migrations_if_enabled():
 def register_strategies():
     """Log available LLMRouter strategies.
 
-    Strategies are activated at request time via the monkey-patch in
-    ``routing_strategy_patch.py``, not through a runtime registry.
-    This helper calls :func:`register_llmrouter_strategies` to enumerate
-    and log the available strategy names at startup.
+    Enumerates and logs the available strategy names at startup.
+    Strategies are activated via ``RouteIQRoutingStrategy``
+    (``custom_routing_strategy.py``).
     """
     try:
         from litellm_llmrouter.strategies import register_llmrouter_strategies
 
         strategies = register_llmrouter_strategies()
         print(
-            f"✅ {len(strategies)} LLMRouter strategies available (activated via routing_strategy_patch)"
+            f"\u2705 {len(strategies)} LLMRouter strategies available "
+            f"(activated via plugin strategy \u2014 RouteIQRoutingStrategy)"
         )
         return strategies
     except ImportError as e:
@@ -155,8 +158,7 @@ def install_plugin_routing_strategy(app):
     use_plugin = getattr(app.state, "use_plugin_strategy", False)
     if not use_plugin:
         logger.debug(
-            "Plugin routing strategy not active — "
-            "using legacy monkey-patch approach"
+            "Plugin routing strategy not active — using legacy monkey-patch approach"
         )
         return False
 
@@ -174,8 +176,16 @@ def install_plugin_routing_strategy(app):
         return False
 
     # Determine the strategy name:
-    # 1. Explicit env var override
-    strategy_name = os.environ.get("ROUTEIQ_ROUTING_STRATEGY")
+    # 1. Explicit override from typed settings or env var
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        _st = get_settings()
+        strategy_name = _st.routing.strategy_override
+    except Exception:
+        strategy_name = None
+    if not strategy_name:
+        strategy_name = os.environ.get("ROUTEIQ_ROUTING_STRATEGY")
 
     # 2. Extract from Router config's routing_strategy if it's an llmrouter-* value
     if not strategy_name:
@@ -219,32 +229,20 @@ def start_config_sync_if_enabled():
 
 
 def resolve_worker_count(cli_workers: int | None = None) -> int:
-    """Resolve the number of uvicorn workers based on strategy mode.
+    """Resolve the number of uvicorn workers.
 
     Resolution order:
     1. ``ROUTEIQ_WORKERS`` env var (if set and valid)
     2. *cli_workers* argument (from ``--workers`` CLI flag)
     3. Default: ``1``
 
-    When using the **legacy monkey-patch** mode
-    (``ROUTEIQ_USE_PLUGIN_STRATEGY=false``), workers is always forced to 1.
-    A warning is emitted if the user attempted to configure > 1 in that mode.
-
-    When using the **plugin strategy** (default), the resolved value is
-    returned as-is, allowing multi-worker deployments.
-
     Invalid values (non-integer, zero, negative) are silently coerced to 1.
     """
-    use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-
     # --- resolve the raw desired worker count ---
     workers = 1  # default
     source = "default"
 
+    # Env var override (highest priority for worker count)
     env_val = os.environ.get("ROUTEIQ_WORKERS")
     if env_val is not None:
         try:
@@ -266,35 +264,54 @@ def resolve_worker_count(cli_workers: int | None = None) -> int:
         workers = cli_workers
         source = "--workers CLI"
 
-    # --- enforce single-worker in legacy monkey-patch mode ---
-    if not use_plugin:
-        if workers > 1:
-            logger.warning(
-                "ROUTEIQ_WORKERS=%d requested but legacy monkey-patch mode is active "
-                "(ROUTEIQ_USE_PLUGIN_STRATEGY=false). Forcing workers=1. "
-                "Enable the plugin strategy to use multiple workers.",
-                workers,
-            )
-        workers = 1
-        logger.info("Legacy monkey-patch mode: using 1 worker")
-    else:
-        logger.info(
-            "Plugin strategy mode: using %d worker(s) (source: %s)",
-            workers,
-            source,
-        )
+    logger.info(
+        "Plugin strategy mode: using %d worker(s) (source: %s)",
+        workers,
+        source,
+    )
 
     return workers
 
 
 def init_observability_if_enabled():
     """Initialize OpenTelemetry observability if enabled."""
-    if os.getenv("OTEL_ENABLED", "true").lower() == "true":
+    # Legacy env vars (OTEL_*) take precedence over typed settings
+    # (which use ROUTEIQ_OTEL__* prefix).
+    env_enabled = os.getenv("OTEL_ENABLED")
+    env_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    env_service = os.getenv("OTEL_SERVICE_NAME")
+
+    if env_enabled is not None:
+        otel_enabled = env_enabled.lower() == "true"
+    else:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otel_enabled = get_settings().otel.enabled
+        except Exception:
+            otel_enabled = True  # default
+
+    otlp_endpoint = env_endpoint
+    if otlp_endpoint is None:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otlp_endpoint = get_settings().otel.endpoint
+        except Exception:
+            pass
+
+    service_name = env_service
+    if service_name is None:
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            service_name = get_settings().otel.service_name
+        except Exception:
+            service_name = "litellm-gateway"
+
+    if otel_enabled:
         try:
             from litellm_llmrouter.observability import init_observability
-
-            otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-            service_name = os.getenv("OTEL_SERVICE_NAME", "litellm-gateway")
 
             init_observability(
                 service_name=service_name,
@@ -383,9 +400,105 @@ def init_a2a_tracing_if_enabled(app):
             print(f"⚠️ A2A gateway tracing initialization failed: {e}")
 
 
+def _use_own_app() -> bool:
+    """Return True when ADR-0012 own-app mode is active.
+
+    Own-app mode is the **default** since v0.3.  Set
+    ``ROUTEIQ_OWN_APP=false`` to fall back to the legacy path where
+    LiteLLM owns the FastAPI instance.
+
+    Note: This flag is read *before* the settings singleton is created
+    (it controls which factory to call), so it also consults
+    ``GatewaySettings.own_app`` as a fallback.
+    """
+    raw = os.getenv("ROUTEIQ_OWN_APP")
+    if raw is not None:
+        return raw.lower() in ("true", "1", "yes")
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().own_app
+    except Exception:
+        return True  # default: own-app mode
+
+
+def _run_gateway_app(config_path: str, host: str, port: int, **kwargs):
+    """Run RouteIQ in ADR-0012 own-app mode.
+
+    RouteIQ owns the FastAPI application and its lifespan.  LiteLLM is
+    mounted as a sub-application at ``/v1/``.  All startup and shutdown
+    logic is handled by ``_routeiq_lifespan`` — no ``app.state`` lambda
+    hacks.
+
+    Args:
+        config_path: Path to the LiteLLM config file
+        host: Host to bind to
+        port: Port to listen on
+        **kwargs: Additional arguments passed to uvicorn
+    """
+    import uvicorn
+
+    from litellm_llmrouter.gateway import create_gateway_app
+
+    app = create_gateway_app(
+        config_path=config_path,
+        mount_litellm=True,
+        include_admin_routes=True,
+        enable_plugins=True,
+        enable_resilience=True,
+    )
+
+    # A2A tracing is registered eagerly because it instruments LiteLLM's
+    # built-in /a2a/* routes which live on the mounted sub-app.
+    init_a2a_tracing_if_enabled(app)
+
+    # SIGTERM is handled by the lifespan's shutdown path — the drain
+    # manager, plugin shutdown, and resource cleanup all live there.
+    # We still register a thin handler so SIGTERM reaches uvicorn's
+    # server.shutdown() path (K8s sends SIGTERM before SIGKILL).
+    _original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_handler(signum, frame):
+        """Signal the lifespan to shut down via uvicorn's loop."""
+        logger.info("SIGTERM received — lifespan shutdown will handle cleanup")
+        if callable(_original_sigterm):
+            _original_sigterm(signum, frame)
+        elif _original_sigterm == signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    workers = kwargs.get("workers", 1)
+    uvicorn_config = {
+        "app": app,
+        "host": host,
+        "port": port,
+        "log_level": kwargs.get("log_level", "info"),
+        "access_log": kwargs.get("access_log", True),
+        "workers": workers,
+    }
+    if kwargs.get("ssl_keyfile"):
+        uvicorn_config["ssl_keyfile"] = kwargs["ssl_keyfile"]
+    if kwargs.get("ssl_certfile"):
+        uvicorn_config["ssl_certfile"] = kwargs["ssl_certfile"]
+
+    print(
+        f"🚀 Starting RouteIQ Gateway on {host}:{port} "
+        f"(workers: {workers}, mode: own-app / ADR-0012)"
+    )
+    print("   RouteIQ routes: /, LiteLLM proxy: /v1/")
+    uvicorn.run(**uvicorn_config)
+
+
 def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs):
     """
     Run LiteLLM proxy in-process using uvicorn.
+
+    When ``ROUTEIQ_OWN_APP=true``, delegates to :func:`_run_gateway_app`
+    which uses the ADR-0012 ``create_gateway_app()`` factory.  Otherwise
+    uses the legacy ``create_app()`` path where LiteLLM owns the FastAPI
+    instance.
 
     This is the preferred method because it preserves our monkey-patches
     to LiteLLM's Router class. Using os.execvp() would replace the process
@@ -400,6 +513,11 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         port: Port to listen on
         **kwargs: Additional arguments passed to uvicorn
     """
+    # ---- ADR-0012: RouteIQ-owned app mode ----
+    if _use_own_app():
+        return _run_gateway_app(config_path, host, port, **kwargs)
+
+    # ---- Legacy path: LiteLLM owns the FastAPI app ----
     import uvicorn
 
     # Set environment variables that LiteLLM expects
@@ -410,15 +528,19 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
 
     # Import gateway factory AFTER setting env vars
     # The factory applies the patch explicitly before importing litellm
-    from litellm_llmrouter.gateway import create_app
+    import warnings
 
-    # Create and configure the app using the composition root
-    # This applies the patch, adds middleware, and registers routes
-    app = create_app(
-        apply_patch=True,
-        include_admin_routes=True,
-        enable_plugins=True,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from litellm_llmrouter.gateway import create_app
+
+        # Create and configure the app using the composition root
+        # This applies the patch, adds middleware, and registers routes
+        app = create_app(
+            apply_patch=True,
+            include_admin_routes=True,
+            enable_plugins=True,
+        )
 
     # Get LiteLLM's initialize function
     from litellm.proxy.proxy_server import initialize
@@ -475,13 +597,52 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     except RuntimeError:
         asyncio.run(run_plugin_startup())
 
-    print("✅ LLMRouter routes registered with LiteLLM")
+    # ---- Service Discovery: probe external services and log status ----
+    async def run_service_probes():
+        try:
+            from litellm_llmrouter.service_discovery import (
+                probe_all_services,
+                get_feature_availability,
+                format_service_status_table,
+            )
+
+            services = await probe_all_services()
+            features = get_feature_availability(services)
+            table = format_service_status_table(services, features)
+            print(table)
+        except ImportError as e:
+            logger.debug(f"Service discovery not available: {e}")
+        except Exception as e:
+            logger.warning(f"Service discovery failed: {e}")
+            print(f"⚠️ Service discovery failed: {e}")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(run_service_probes())
+    except RuntimeError:
+        asyncio.run(run_service_probes())
+
+    # ---- OIDC / SSO initialization ----
+    oidc_config = None
+    if hasattr(app.state, "llmrouter_oidc_setup"):
+        oidc_config = app.state.llmrouter_oidc_setup()
+        if oidc_config and oidc_config.enabled:
+            print("✅ OIDC/SSO integration initialized")
+        else:
+            logger.debug("OIDC/SSO integration is disabled")
+
+    print(
+        "✅ LLMRouter routes registered with LiteLLM (legacy mode — set ROUTEIQ_OWN_APP=true to upgrade)"
+    )
     print("   ├── /_health/* (K8s probes, unauthenticated)")
+    print("   ├── /config/services (service discovery, unauthenticated)")
     print("   ├── /a2a/agents (convenience wrapper, auth-protected)")
     print("   ├── /llmrouter/mcp/* (MCP gateway, auth-protected)")
-    print("   └── /router/*, /config/* (hot reload, auth-protected)")
+    print("   ├── /router/*, /config/* (hot reload, auth-protected)")
+    if oidc_config and oidc_config.enabled:
+        print("   ├── /sso/login, /sso/callback (OIDC SSO)")
+        print("   ├── /auth/token-exchange, /auth/userinfo (OIDC auth)")
     print(
-        "   Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
+        "   └── Note: LiteLLM provides /v1/agents (DB-backed) and /a2a/{agent_id} (A2A protocol)"
     )
 
     # Register SIGTERM handler to trigger graceful drain before uvicorn shuts down.
@@ -493,14 +654,27 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
     def _sigterm_handler(signum, frame):
         """Trigger DrainManager drain on SIGTERM, then delegate to uvicorn."""
         logger.info("SIGTERM received, starting graceful drain...")
-        if hasattr(app.state, "graceful_shutdown"):
-            import asyncio
 
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(app.state.graceful_shutdown())
-            except RuntimeError:
-                asyncio.run(app.state.graceful_shutdown())
+        async def _shutdown_sequence():
+            if hasattr(app.state, "graceful_shutdown"):
+                await app.state.graceful_shutdown()
+            # Reset OIDC state
+            if hasattr(app.state, "llmrouter_oidc_shutdown"):
+                app.state.llmrouter_oidc_shutdown()
+            # Close database connection pool
+            if hasattr(app.state, "llmrouter_db_pool_shutdown"):
+                await app.state.llmrouter_db_pool_shutdown()
+            # Close Redis singleton client
+            if hasattr(app.state, "llmrouter_redis_shutdown"):
+                await app.state.llmrouter_redis_shutdown()
+
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_shutdown_sequence())
+        except RuntimeError:
+            asyncio.run(_shutdown_sequence())
         # Delegate to uvicorn's original signal handler
         if callable(_original_sigterm):
             _original_sigterm(signum, frame)
@@ -549,11 +723,10 @@ def main():
         LITELLM_CONFIG_PATH  Default config path if --config not provided
         ROUTEIQ_WORKERS      Number of uvicorn workers (overrides --workers)
         ROUTEIQ_USE_PLUGIN_STRATEGY  Enable plugin strategy mode (default: true)
+        ROUTEIQ_OWN_APP      Use RouteIQ-owned FastAPI app — ADR-0012 (default: true)
     """
     import argparse
 
-    # Import patch status check - does NOT apply patch
-    from litellm_llmrouter import is_patch_applied
 
     parser = argparse.ArgumentParser(
         description="RouteIQ Gateway",
@@ -643,9 +816,19 @@ Examples:
     # Resolve worker count (env var overrides CLI, legacy mode forces 1)
     workers = resolve_worker_count(cli_workers=args.workers)
 
-    print("🚀 Starting RouteIQ Gateway...")
+    own_app = _use_own_app()
+
+    print("\U0001f680 Starting RouteIQ Gateway...")
+    if own_app:
+        print(
+            "   App mode: own-app (ADR-0012 \u2014 RouteIQ owns FastAPI, LiteLLM at /v1/)"
+        )
+    else:
+        print(
+            "   App mode: legacy (LiteLLM owns FastAPI \u2014 opt-in via ROUTEIQ_OWN_APP=false)"
+        )
     print(
-        f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
+        "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"
     )
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
@@ -662,6 +845,15 @@ Examples:
         logger.warning(
             "Environment validation found %d warning(s)", len(env_result.warnings)
         )
+
+    # Apply RouteIQ key prefix to env vars (was previously a module-level side effect
+    # in auth.py; moved here to avoid import-time env mutation).
+    try:
+        from litellm_llmrouter.auth import apply_key_prefix
+
+        apply_key_prefix()
+    except ImportError:
+        pass
 
     # Initialize observability first (so it's available for other components)
     init_observability_if_enabled()

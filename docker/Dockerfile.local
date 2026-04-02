@@ -32,7 +32,7 @@ ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
 
 LABEL org.opencontainers.image.description="RouteIQ Gateway: Local Development Build"
-LABEL org.opencontainers.image.version="0.2.0-dev"
+LABEL org.opencontainers.image.version="1.0.0-rc1-dev"
 LABEL litellm.version="${LITELLM_VERSION}"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
 LABEL build.reproducible="true"

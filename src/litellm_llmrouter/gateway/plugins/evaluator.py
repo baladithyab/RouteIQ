@@ -324,7 +324,17 @@ def clear_evaluator_plugins() -> None:
 
 def is_evaluator_enabled() -> bool:
     """Check if evaluator hooks are enabled."""
-    return os.getenv("ROUTEIQ_EVALUATOR_ENABLED", "false").lower() == "true"
+    # ROUTEIQ_EVALUATOR_ENABLED doesn't match the pydantic-settings env path
+    # (ROUTEIQ_EVALUATOR__ENABLED), so check env var first.
+    env_val = os.getenv("ROUTEIQ_EVALUATOR_ENABLED")
+    if env_val is not None:
+        return env_val.lower() == "true"
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().evaluator.enabled
+    except Exception:
+        return False
 
 
 async def run_mcp_evaluators(context: MCPInvocationContext) -> list[EvaluationResult]:

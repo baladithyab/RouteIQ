@@ -1,0 +1,41 @@
+# RouteIQ Slim - Minimal Configuration
+# =============================================================================
+# This config uses centroid routing (zero-config, ~2ms) which requires
+# NO model artifacts or ML dependencies. Routes are selected based on
+# pre-computed centroid vectors shipped with RouteIQ.
+#
+# For KNN/ML routing strategies, use the full RouteIQ image instead.
+# =============================================================================
+
+model_list:
+  # OpenAI models
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Anthropic models
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-haiku
+    litellm_params:
+      model: anthropic/claude-3-5-haiku-20241022
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  # Centroid routing is handled by the RouteIQ plugin strategy
+  # No additional router_settings needed for basic centroid routing
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 120
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

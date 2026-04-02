@@ -1,0 +1,25 @@
+[project]
+name = "routeiq-routing"
+version = "1.0.0rc1"
+description = "Intelligent ML-based routing for LLM APIs — works standalone with LiteLLM or as part of RouteIQ Gateway"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+knn = ["sentence-transformers>=2.2", "scikit-learn>=1.3"]
+ml = ["torch>=2.0"]
+litellm = ["litellm>=1.80"]
+all = ["routeiq-routing[knn,ml,litellm]"]
+
+[project.entry-points."litellm.custom_routing_strategy"]
+routeiq-centroid = "routeiq_routing.centroid:CentroidRoutingStrategy"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/routeiq_routing"]

@@ -1,0 +1,33 @@
+# Disaggregated deployment: UI served separately from gateway
+# The UI can also be deployed to S3+CloudFront, Cloudflare Pages, Vercel, etc.
+#
+# Usage:
+#   docker compose up -d
+#
+# The gateway API is at http://localhost:4000
+# The UI is at http://localhost:8080
+services:
+  gateway:
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile
+      args:
+        BUILD_UI: "false"  # Don't embed UI in gateway
+    ports:
+      - "4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-routeiq-dev}"
+      ROUTEIQ_ADMIN_UI_ENABLED: "false"
+      ROUTEIQ_CORS_ORIGINS: "http://localhost:8080"
+      ROUTEIQ_ADMIN_UI_EXTERNAL_URL: "http://localhost:8080"
+
+  ui:
+    build:
+      context: ../../../ui
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config.js:/usr/share/nginx/html/config.js:ro
+    depends_on:
+      - gateway

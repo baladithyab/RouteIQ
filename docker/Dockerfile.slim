@@ -1,0 +1,187 @@
+# syntax=docker/dockerfile:1.4
+# =============================================================================
+# RouteIQ Gateway Slim Dockerfile
+# =============================================================================
+# Minimal production image (~500MB) for the RouteIQ gateway core.
+# Includes centroid routing (zero-config, ~2ms) but excludes heavy ML
+# dependencies (PyTorch, sentence-transformers) and Prisma/DB layer.
+#
+# What's included:
+#   - RouteIQ gateway core (FastAPI, LiteLLM proxy)
+#   - Centroid routing (zero-config, ~2ms latency)
+#   - OpenTelemetry instrumentation
+#   - Cloud provider SDKs (AWS, GCP, Azure)
+#   - A2A protocol support
+#   - Hot reload (watchdog)
+#   - OIDC authentication
+#
+# What's excluded (saves ~1GB+):
+#   - KNN routing (PyTorch, sentence-transformers, scikit-learn)
+#   - LLMRouter wheel (only needed for KNN/ML strategies)
+#   - Prisma / direct database access (uses LiteLLM's DB layer)
+#   - Admin UI (React SPA)
+#   - Dev dependencies
+#
+# Usage:
+#   docker build -f docker/Dockerfile.slim -t routeiq:slim .
+#
+# Or use the parameterized main Dockerfile:
+#   docker build -f docker/Dockerfile \
+#     --build-arg ROUTEIQ_EXTRAS="otel,cloud,a2a,hotreload,oidc" \
+#     --build-arg BUILD_UI=false \
+#     --build-arg INSTALL_LLMROUTER=false \
+#     -t routeiq:slim .
+#
+# Reproducible Builds:
+#   This Dockerfile uses uv.lock for deterministic dependency resolution.
+#   Run `uv lock --check` locally to verify lockfile is up-to-date.
+# =============================================================================
+
+ARG PYTHON_VERSION=3.14
+ARG UV_VERSION=0.9
+ARG LITELLM_VERSION=1.81.3
+
+# ==============================================================================
+# Base image digest for reproducibility
+# To update: docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
+# ==============================================================================
+ARG RUNTIME_DIGEST=sha256:f37be263fb880ce4ed918e487d84576462fb4fafa934dbd08d216ab4cf058808
+
+# ==============================================================================
+# Single-stage build (no LLMRouter wheel, no UI build needed)
+# ==============================================================================
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${RUNTIME_DIGEST} AS runtime
+
+ARG LITELLM_VERSION
+ARG BUILD_DATE
+ARG VCS_REF
+
+# OCI Image Labels
+LABEL org.opencontainers.image.source="https://github.com/baladithyab/litellm-llm-router"
+LABEL org.opencontainers.image.description="RouteIQ Slim: Lightweight AI Gateway with Centroid Routing"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.version="1.0.0-rc1-slim"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.revision="${VCS_REF}"
+LABEL org.opencontainers.image.vendor="RouteIQ"
+LABEL org.opencontainers.image.title="RouteIQ Gateway (Slim)"
+LABEL litellm.version="${LITELLM_VERSION}"
+LABEL routeiq.variant="slim"
+LABEL build.reproducible="true"
+LABEL build.lockfile-driven="uv.lock"
+
+# Security: Create non-root user with specific UID/GID for consistency
+RUN groupadd -r -g 1000 litellm && \
+    useradd -r -u 1000 -g litellm -d /app -s /sbin/nologin litellm
+
+WORKDIR /app
+
+# Install minimal runtime dependencies (no libatomic1 - not needed without Prisma)
+# build-essential installed temporarily for uvloop compilation, then removed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    tini \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* /root/.cache
+
+# =============================================================================
+# Lockfile-driven dependency installation
+# =============================================================================
+# Copy lockfile and project metadata first for layer caching
+COPY pyproject.toml uv.lock /app/
+COPY src/ /app/src/
+
+# Install slim extras only: otel, cloud, a2a, hotreload, oidc
+# NO knn (saves PyTorch ~800MB + sentence-transformers ~400MB)
+# NO db (saves Prisma + asyncpg)
+# NO callbacks (saves langfuse - add back if needed)
+# NO LLMRouter wheel (only needed for KNN/ML routing strategies)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd /app && uv pip install --system -e ".[otel,cloud,a2a,hotreload,oidc]" \
+    # Remove build-essential (no longer needed after compilation)
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# No Prisma generation needed (db extra not installed)
+
+# Copy application files (after dependencies for better layer caching)
+COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter
+COPY --chown=litellm:litellm docker/entrypoint.sh /app/entrypoint.sh
+COPY --chown=litellm:litellm config/ /app/config/
+
+# Create directories with proper permissions and cleanup
+RUN mkdir -p /app/models /app/data /app/custom_routers /app/ui/dist && \
+    # Placeholder for UI (not included in slim)
+    echo '<!DOCTYPE html><html><body>Admin UI not included in slim build</body></html>' > /app/ui/dist/index.html && \
+    chown -R litellm:litellm /app && \
+    chmod +x /app/entrypoint.sh && \
+    # Security: Remove unnecessary files
+    find /app -name "*.pyc" -delete && \
+    find /app -name "__pycache__" -type d -delete
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PYTHONFAULTHANDLER=1 \
+    # Application config
+    LITELLM_CONFIG_PATH=/app/config/config.yaml \
+    LLMROUTER_MODELS_PATH=/app/models \
+    LLMROUTER_CUSTOM_ROUTERS_PATH=/app/custom_routers \
+    # OTEL defaults (override at runtime)
+    OTEL_SERVICE_NAME=litellm-gateway \
+    OTEL_TRACES_EXPORTER=none \
+    OTEL_METRICS_EXPORTER=none \
+    OTEL_LOGS_EXPORTER=none \
+    # Gateway features
+    A2A_GATEWAY_ENABLED=false \
+    MCP_GATEWAY_ENABLED=false \
+    # Admin UI (disabled in slim - not built)
+    ROUTEIQ_ADMIN_UI_ENABLED=false \
+    # Centroid routing enabled by default (the main routing mode for slim)
+    ROUTEIQ_CENTROID_ROUTING=true \
+    ROUTEIQ_ROUTING_PROFILE=auto \
+    # Config sync and hot reload
+    CONFIG_HOT_RELOAD=false \
+    CONFIG_SYNC_ENABLED=true \
+    CONFIG_SYNC_INTERVAL=60 \
+    STORE_MODEL_IN_DB=false
+
+# Health check for orchestrators (ECS, K8s, etc.)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:4000/_health/live || exit 1
+
+EXPOSE 4000
+
+# Security: Ensure proper signal handling for graceful shutdown
+STOPSIGNAL SIGTERM
+
+# Security: Run as non-root user
+USER litellm
+
+# =============================================================================
+# ReadOnlyRootFilesystem Support
+# =============================================================================
+# This image supports Kubernetes readOnlyRootFilesystem: true with the following
+# writable volume mounts required:
+#   - /app/data      - Runtime data (if using local file storage)
+#   - /app/models    - Model files (if hot-reloading models)
+#   - /tmp           - Temporary files (Python)
+#   - /app/.cache    - Application cache (optional)
+#
+# Example K8s securityContext:
+#   securityContext:
+#     readOnlyRootFilesystem: true
+#     runAsNonRoot: true
+#     runAsUser: 1000
+#   volumeMounts:
+#     - name: tmp-vol
+#       mountPath: /tmp
+#     - name: data-vol
+#       mountPath: /app/data
+# =============================================================================
+
+# Use tini as init system for proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+CMD ["--config", "/app/config/config.yaml", "--port", "4000"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import patch
 
 import pytest
@@ -33,8 +35,12 @@ class TestSpendReport:
     )
     def test_spend_report_no_router(self, mock_perm, client):
         """Returns no_router status when llm_router is None."""
-        with patch("litellm.proxy.proxy_server.llm_router", None):
-            # Need to re-create client since deps were patched
+        # Inject a stub module so `from litellm.proxy.proxy_server import llm_router`
+        # resolves to None instead of raising ImportError.
+        mock_mod = types.ModuleType("litellm.proxy.proxy_server")
+        mock_mod.llm_router = None  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": mock_mod}):
+            # Re-create client so the patched dependency is used
             app = FastAPI()
             app.include_router(admin_router)
             tc = TestClient(app)

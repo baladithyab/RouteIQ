@@ -5,7 +5,30 @@ Gateway Application Factory (Composition Root)
 This module provides the FastAPI application factory for the LLMRouter gateway.
 It explicitly configures all middleware, routers, and patches in a single place.
 
-Load Order:
+Three factory functions are provided:
+
+- ``create_gateway_app()`` — **ADR-0012** (recommended): RouteIQ owns the FastAPI
+  application and its full lifecycle.  LiteLLM proxy is optionally mounted as a
+  sub-application at ``/v1/``.  Activated via ``ROUTEIQ_OWN_APP=true``.
+
+- ``create_app()`` — **Legacy default**: borrows LiteLLM's ``FastAPI`` instance and
+  layers RouteIQ middleware/routes on top.  Lifecycle hooks are stored as lambdas
+  on ``app.state`` and invoked by ``startup.py``.  Emits a deprecation notice
+  pointing to ``create_gateway_app()``.
+
+- ``create_standalone_app()`` — Testing / standalone mode: creates a standalone
+  FastAPI app with only RouteIQ routes (no LiteLLM proxy).
+
+Load Order (create_gateway_app):
+1. Create RouteIQ-owned FastAPI app with proper lifespan
+2. Add backpressure middleware (INNERMOST)
+3. Add remaining middleware (RequestID, CORS, Policy, Plugins, etc.)
+4. Load and register plugins (deterministically before routes)
+5. Register built-in routes
+6. Mount LiteLLM proxy at /v1/ (optional)
+7. Lifespan manages ALL startup/shutdown — no more app.state lambdas
+
+Load Order (create_app — legacy):
 1. Apply LiteLLM router patch (if enabled, and not using plugin strategy)
 2. Get/create FastAPI app
 3. Add backpressure middleware (INNERMOST – registered first so outer
@@ -17,7 +40,13 @@ Load Order:
 8. Set up HTTP client pool lifecycle hooks
 9. Set up graceful shutdown hooks
 
-Usage with LiteLLM proxy (in-process):
+Usage (new — ADR-0012):
+    from litellm_llmrouter.gateway import create_gateway_app
+
+    # RouteIQ owns the app; LiteLLM mounted at /v1/
+    app = create_gateway_app()
+
+Usage with LiteLLM proxy (legacy):
     from litellm_llmrouter.gateway import create_app
 
     # This configures the LiteLLM proxy's FastAPI app
@@ -30,14 +59,19 @@ Usage standalone (without LiteLLM):
     app = create_standalone_app()
 """
 
+import importlib.metadata
 import logging
 import os
+import warnings
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI
 
-from ..routing_strategy_patch import is_patch_applied, patch_litellm_router
+from ..settings import get_settings
+
+# Legacy monkey-patch module has been removed.
+# is_patch_applied() and patch_litellm_router() are now no-op stubs in __init__.py.
 from ..resilience import (
     add_backpressure_middleware,
     get_drain_manager,
@@ -47,55 +81,76 @@ from ..http_client_pool import (
     startup_http_client_pool,
     shutdown_http_client_pool,
 )
+from ..redis_pool import close_async_redis_client
+from ..database import close_db_pool
 from ..policy_engine import add_policy_middleware
 
 logger = logging.getLogger(__name__)
 
 
+def _get_version() -> str:
+    """Return the RouteIQ package version, falling back to ``0.0.0-dev``."""
+    try:
+        return importlib.metadata.version("routeiq")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0-dev"
+
+
 def _use_plugin_strategy() -> bool:
     """
-    Check whether the plugin-based routing strategy should be used.
-
-    Reads ``ROUTEIQ_USE_PLUGIN_STRATEGY`` environment variable.
-    Defaults to ``True`` (new behaviour).  Set to ``"false"`` to fall back
-    to the legacy monkey-patch approach.
+    Always returns True — the plugin-based routing strategy is the only
+    supported path.  The legacy monkey-patch has been removed.
     """
-    return os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    return True
 
 
 def _parse_cors_origins() -> list[str]:
-    """Parse ROUTEIQ_CORS_ORIGINS into a list of allowed origins."""
-    raw = os.getenv("ROUTEIQ_CORS_ORIGINS", "*")
-    return [o.strip() for o in raw.split(",")]
+    """Parse CORS origins into a list of allowed origins.
+
+    Checks ``ROUTEIQ_CORS_ORIGINS`` env var first (legacy), then typed
+    settings, then defaults to ``["*"]``.
+    """
+    # Legacy env var takes precedence (it may differ from the settings
+    # model's env var name which is ROUTEIQ_SECURITY__CORS_ORIGINS).
+    raw = os.getenv("ROUTEIQ_CORS_ORIGINS")
+    if raw is not None:
+        return [o.strip() for o in raw.split(",")]
+    try:
+        settings = get_settings()
+        return settings.cors_origins_list
+    except Exception:
+        return ["*"]
 
 
 def _parse_cors_credentials() -> bool:
-    """Parse ROUTEIQ_CORS_CREDENTIALS flag."""
-    return os.getenv("ROUTEIQ_CORS_CREDENTIALS", "false").lower() == "true"
+    """Parse CORS credentials flag.
+
+    Checks ``ROUTEIQ_CORS_CREDENTIALS`` env var first (legacy), then
+    typed settings.
+    """
+    raw = os.getenv("ROUTEIQ_CORS_CREDENTIALS")
+    if raw is not None:
+        return raw.lower() == "true"
+    try:
+        settings = get_settings()
+        return settings.security.cors_credentials
+    except Exception:
+        return False
 
 
 def _apply_patch_safely() -> bool:
     """
-    Apply the LiteLLM router patch idempotently.
+    Legacy stub — the monkey-patch module has been removed.
 
-    Returns:
-        True if patch is applied (either now or was already applied)
+    Always returns False and logs a warning. The plugin-based routing
+    strategy (``RouteIQRoutingStrategy``) is the only supported path.
     """
-    if is_patch_applied():
-        logger.debug("LiteLLM router patch already applied")
-        return True
-
-    result = patch_litellm_router()
-    if result:
-        logger.info("LiteLLM router patch applied successfully")
-    else:
-        logger.warning("Failed to apply LiteLLM router patch")
-
-    return result
+    logger.warning(
+        "_apply_patch_safely() called but the legacy monkey-patch module "
+        "has been removed. The plugin-based routing strategy is the only "
+        "supported path. Returning False."
+    )
+    return False
 
 
 def _install_plugin_strategy(
@@ -128,11 +183,11 @@ def _install_plugin_strategy(
         )
         return True
     except Exception as e:
-        logger.warning(
+        logger.error(
             f"Failed to install plugin routing strategy: {e}. "
-            f"Falling back to legacy monkey-patch approach."
+            f"No fallback available (legacy monkey-patch has been removed)."
         )
-        return _apply_patch_safely()
+        return False
 
 
 def _configure_middleware(app: FastAPI) -> None:
@@ -153,18 +208,43 @@ def _configure_middleware(app: FastAPI) -> None:
     from starlette.middleware.cors import CORSMiddleware
 
     from ..auth import RequestIDMiddleware
-    from ..router_decision_callback import register_router_decision_middleware
+    from ..router_decision_callback import (
+        register_router_decision_middleware,
+        ROUTEIQ_RESPONSE_HEADERS,
+    )
     from .plugin_middleware import PluginMiddleware
 
     # CORS middleware - configurable via ROUTEIQ_CORS_ORIGINS
+    # When the UI is deployed separately (disaggregated mode), its origin
+    # must be in the allowed list.  ROUTEIQ_ADMIN_UI_EXTERNAL_URL is
+    # automatically added to avoid manual CORS configuration.
+    cors_origins = _parse_cors_origins()
+    try:
+        settings = get_settings()
+        ext_url = settings.admin_ui_external_url
+    except Exception:
+        ext_url = os.getenv("ROUTEIQ_ADMIN_UI_EXTERNAL_URL")
+    if ext_url:
+        # Normalise: strip trailing slash to match Origin header format
+        ext_origin = ext_url.rstrip("/")
+        if ext_origin not in cors_origins and "*" not in cors_origins:
+            cors_origins.append(ext_origin)
+            logger.info("Added external UI origin to CORS: %s", ext_origin)
+
+    cors_credentials = _parse_cors_credentials()
+    if "*" in cors_origins:
+        # Wildcard + credentials is a browser security vulnerability
+        cors_credentials = False
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_parse_cors_origins(),
-        allow_credentials=_parse_cors_credentials(),
+        allow_origins=cors_origins,
+        allow_credentials=cors_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=ROUTEIQ_RESPONSE_HEADERS,
     )
-    logger.debug("Added CORSMiddleware")
+    logger.debug("Added CORSMiddleware (origins=%s)", cors_origins)
 
     # Request ID middleware - raw ASGI (streaming-safe, outermost for correlation)
     # Starlette's add_middleware works with any class accepting (app, **kwargs) --
@@ -207,17 +287,6 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         admin_router,
         health_router,
         llmrouter_router,
-        mcp_parity_router,
-        mcp_parity_admin_router,
-        mcp_rest_router,
-        mcp_proxy_router,
-        oauth_callback_router,
-        mcp_jsonrpc_router,
-        mcp_sse_router,
-        MCP_OAUTH_ENABLED,
-        MCP_PROTOCOL_PROXY_ENABLED,
-        MCP_SSE_TRANSPORT_ENABLED,
-        MCP_SSE_LEGACY_MODE,
     )
 
     # Health router - unauthenticated K8s probes
@@ -225,6 +294,7 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     logger.debug("Registered health_router")
 
     # LLMRouter routes - user auth protected
+    # Includes MCP gateway REST endpoints (/llmrouter/mcp/*)
     app.include_router(llmrouter_router, prefix="")
     logger.debug("Registered llmrouter_router")
 
@@ -233,49 +303,25 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         app.include_router(admin_router, prefix="")
         logger.debug("Registered admin_router")
 
-    # MCP Parity Layer - upstream-compatible aliases
-    # User-accessible parity endpoints (read operations)
-    app.include_router(mcp_parity_router, prefix="")
-    logger.debug("Registered mcp_parity_router (upstream-compatible /v1/mcp/*)")
+    # Register OIDC routes if configured
+    try:
+        from litellm_llmrouter.oidc import create_oidc_router, get_oidc_config
 
-    # Admin parity endpoints (write operations)
-    if include_admin:
-        app.include_router(mcp_parity_admin_router, prefix="")
-        logger.debug(
-            "Registered mcp_parity_admin_router (upstream-compatible /v1/mcp/* admin)"
-        )
+        oidc_config = get_oidc_config()
+        if oidc_config.enabled:
+            oidc_router = create_oidc_router(oidc_config)
+            app.include_router(oidc_router)
+            logger.info(
+                "OIDC/SSO routes registered: /sso/login, /sso/callback, "
+                "/auth/token-exchange, /auth/userinfo"
+            )
+    except ImportError:
+        logger.debug("OIDC module not available")
+    except Exception as e:
+        logger.warning(f"OIDC route registration failed: {e}")
 
-    # MCP REST API (/mcp-rest/*) - upstream-compatible
-    app.include_router(mcp_rest_router, prefix="")
-    logger.debug("Registered mcp_rest_router (upstream-compatible /mcp-rest/*)")
-
-    # MCP Native JSON-RPC surface (/mcp) - for Claude Desktop / IDE MCP clients
-    # This provides native MCP protocol (JSON-RPC 2.0 over HTTP)
-    app.include_router(mcp_jsonrpc_router, prefix="")
-    logger.debug("Registered mcp_jsonrpc_router (native MCP JSON-RPC at /mcp)")
-
-    # MCP SSE Transport (/mcp/sse) - for real-time streaming events
-    # Conditionally enabled based on feature flags
-    if MCP_SSE_TRANSPORT_ENABLED and not MCP_SSE_LEGACY_MODE:
-        app.include_router(mcp_sse_router, prefix="")
-        logger.info(
-            "Registered mcp_sse_router (SSE transport at /mcp/sse, "
-            "MCP_SSE_TRANSPORT_ENABLED=true, MCP_SSE_LEGACY_MODE=false)"
-        )
-    else:
-        logger.debug(
-            f"Skipped mcp_sse_router (MCP_SSE_TRANSPORT_ENABLED={MCP_SSE_TRANSPORT_ENABLED}, "
-            f"MCP_SSE_LEGACY_MODE={MCP_SSE_LEGACY_MODE})"
-        )
-
-    # Feature-flagged routers
-    if MCP_PROTOCOL_PROXY_ENABLED and include_admin:
-        app.include_router(mcp_proxy_router, prefix="")
-        logger.info("Registered mcp_proxy_router (MCP_PROTOCOL_PROXY_ENABLED=true)")
-
-    if MCP_OAUTH_ENABLED:
-        app.include_router(oauth_callback_router, prefix="")
-        logger.info("Registered oauth_callback_router (MCP_OAUTH_ENABLED=true)")
+    # Note: MCP parity layer, JSON-RPC, and SSE transport routers have been
+    # removed. These are now provided natively by LiteLLM.
 
 
 async def _run_plugin_startup(app: FastAPI) -> None:
@@ -412,7 +458,16 @@ def _load_plugins_before_routes() -> int:
 
 def _mount_admin_ui(app: FastAPI) -> None:
     """Mount the admin UI static files if enabled and available."""
-    if os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED", "false").lower() != "true":
+    raw = os.environ.get("ROUTEIQ_ADMIN_UI_ENABLED")
+    if raw is not None:
+        admin_ui_enabled = raw.lower() == "true"
+    else:
+        try:
+            settings = get_settings()
+            admin_ui_enabled = settings.admin_ui_enabled
+        except Exception:
+            admin_ui_enabled = False
+    if not admin_ui_enabled:
         return
 
     from pathlib import Path
@@ -449,6 +504,266 @@ def _mount_admin_ui(app: FastAPI) -> None:
     logger.info(f"Admin UI mounted at /ui/ from {ui_dist}")
 
 
+# ---------------------------------------------------------------------------
+# ADR-0012: RouteIQ-owned application lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def _run_http_pool_startup() -> None:
+    """Initialize the shared HTTP client pool during lifespan startup."""
+    await startup_http_client_pool()
+
+
+async def _probe_services() -> None:
+    """Run service discovery probes and log the results table."""
+    try:
+        from ..service_discovery import (
+            probe_all_services,
+            get_feature_availability,
+            format_service_status_table,
+        )
+
+        services = await probe_all_services()
+        features = get_feature_availability(services)
+        table = format_service_status_table(services, features)
+        logger.info("Service discovery complete:\n%s", table)
+    except ImportError as exc:
+        logger.debug("Service discovery not available: %s", exc)
+    except Exception as exc:
+        logger.warning("Service discovery failed: %s", exc)
+
+
+@asynccontextmanager
+async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """RouteIQ application lifespan manager (ADR-0012).
+
+    Handles startup and shutdown of **all** subsystems in the correct order,
+    replacing the ``app.state.*`` lambda-hook pattern used by
+    :func:`create_app`.
+
+    Startup order:
+        1. HTTP client pool (outbound connections — plugins may use this)
+        2. Plugin startup (middleware wiring, callback bridges)
+        3. Service discovery probes (informational logging)
+
+    Shutdown order (reverse):
+        1. Graceful drain (stop accepting, wait for in-flight)
+        2. Plugin shutdown (middleware + callbacks cleared)
+        3. Database connection pool close
+        4. Redis client close
+        5. HTTP client pool close
+    """
+    # === STARTUP ===
+    logger.info("RouteIQ Gateway starting (ADR-0012 own-app mode)...")
+
+    # 1. HTTP client pool — must be ready before plugins that may issue requests
+    await _run_http_pool_startup()
+    logger.info("HTTP client pool initialized")
+
+    # 2. Plugin startup
+    await _run_plugin_startup(app)
+
+    # 3. Load persisted governance state from disk
+    try:
+        from ..governance import (
+            get_governance_engine,
+            load_governance_state,
+        )
+        from ..usage_policies import (
+            get_usage_policy_engine,
+            load_usage_policies_state,
+        )
+        from ..guardrail_policies import (
+            get_guardrail_policy_engine,
+            load_guardrail_policies_state,
+        )
+        from ..prompt_management import (
+            get_prompt_manager,
+            load_prompts_state,
+        )
+
+        gov_count = load_governance_state(get_governance_engine())
+        up_count = load_usage_policies_state(get_usage_policy_engine())
+        gp_count = load_guardrail_policies_state(get_guardrail_policy_engine())
+        pm_count = load_prompts_state(get_prompt_manager())
+        total = gov_count + up_count + gp_count + pm_count
+        if total > 0:
+            logger.info(
+                "Loaded persisted state: governance=%d, usage_policies=%d, "
+                "guardrail_policies=%d, prompts=%d",
+                gov_count,
+                up_count,
+                gp_count,
+                pm_count,
+            )
+    except Exception as exc:
+        logger.warning("Failed to load persisted governance state: %s", exc)
+
+    # 4. Service discovery (informational only, never blocks startup)
+    await _probe_services()
+
+    # 4. Start eval pipeline background loop if enabled
+    eval_pipeline = None
+    try:
+        from ..eval_pipeline import get_eval_pipeline
+
+        eval_pipeline = get_eval_pipeline()
+        if eval_pipeline is not None:
+            await eval_pipeline.start_background_loop()
+            logger.info("Eval pipeline background loop started")
+    except ImportError:
+        logger.debug("Eval pipeline module not available")
+    except Exception as exc:
+        logger.warning("Eval pipeline startup failed: %s", exc)
+
+    logger.info("RouteIQ Gateway ready")
+
+    yield
+
+    # === SHUTDOWN ===
+    logger.info("RouteIQ Gateway shutting down...")
+
+    # 0. Stop eval pipeline background loop
+    if eval_pipeline is not None:
+        try:
+            await eval_pipeline.stop()
+            logger.info("Eval pipeline stopped")
+        except Exception as exc:
+            logger.warning("Eval pipeline shutdown error: %s", exc)
+
+    # 1. Graceful drain — let in-flight requests finish
+    try:
+        drain_manager = get_drain_manager()
+        await drain_manager.start_drain()
+        await drain_manager.wait_for_drain()
+    except Exception as exc:
+        logger.warning("Drain manager error during shutdown: %s", exc)
+
+    # 2. Plugin shutdown (stops middleware interception first)
+    await _run_plugin_shutdown(app)
+
+    # 3. Database connection pool
+    await close_db_pool()
+
+    # 4. Redis client
+    await close_async_redis_client()
+
+    # 5. HTTP client pool (last — other shutdown steps may issue requests)
+    await shutdown_http_client_pool()
+
+    logger.info("RouteIQ Gateway stopped")
+
+
+def create_gateway_app(
+    config_path: Optional[str] = None,
+    *,
+    mount_litellm: bool = True,
+    include_admin_routes: bool = True,
+    enable_plugins: bool = True,
+    enable_resilience: bool = True,
+) -> FastAPI:
+    """Create the RouteIQ gateway FastAPI application (ADR-0012).
+
+    This is the **new recommended entry point**.  RouteIQ owns the app
+    lifecycle, middleware stack, and exception handlers.  LiteLLM proxy is
+    mounted as a sub-application at ``/v1/`` when *mount_litellm* is True.
+
+    Compared to :func:`create_app` (legacy):
+
+    * RouteIQ owns the ``FastAPI`` instance and its lifespan.
+    * All startup/shutdown logic lives in :func:`_routeiq_lifespan` — no
+      more ``app.state`` lambda hacks.
+    * LiteLLM is an optional sub-mount, not the host application.
+
+    This is the default mode (``ROUTEIQ_OWN_APP=true``).  Set
+    ``ROUTEIQ_OWN_APP=false`` to fall back to the legacy :func:`create_app` path.
+
+    Args:
+        config_path: Path to config YAML file.  If provided, sets
+            ``LITELLM_CONFIG_PATH`` / ``CONFIG_FILE_PATH`` for LiteLLM.
+        mount_litellm: Whether to mount LiteLLM proxy at ``/v1/``
+            (default: True).
+        include_admin_routes: Whether to include admin routes (default: True).
+        enable_plugins: Whether to enable plugin lifecycle (default: True).
+        enable_resilience: Whether to enable backpressure / drain middleware
+            (default: True).
+
+    Returns:
+        FastAPI application with RouteIQ routes and optional LiteLLM proxy.
+    """
+    # Propagate config path so LiteLLM can pick it up when mounted
+    if config_path:
+        os.environ.setdefault("LITELLM_CONFIG_PATH", config_path)
+        os.environ.setdefault("CONFIG_FILE_PATH", config_path)
+
+    # Pre-load plugins (discovery + validation) before app creation so plugin
+    # route registration can participate in the route table.
+    if enable_plugins:
+        try:
+            _load_plugins_before_routes()
+        except Exception as exc:
+            logger.error("Failed to load plugins: %s", exc)
+
+    # --- Create RouteIQ's own FastAPI app with proper lifespan ---
+    _raw_ui = os.getenv("ROUTEIQ_ADMIN_UI_ENABLED")
+    if _raw_ui is not None:
+        _admin_ui_on = _raw_ui.lower() == "true"
+    else:
+        try:
+            _settings = get_settings()
+            _admin_ui_on = _settings.admin_ui_enabled
+        except Exception:
+            _admin_ui_on = False
+
+    app = FastAPI(
+        title="RouteIQ Gateway",
+        description="Cloud-Native AI Gateway with Intelligent Routing",
+        version=_get_version(),
+        lifespan=_routeiq_lifespan,
+        docs_url="/docs" if _admin_ui_on else None,
+    )
+
+    # Tag the app so downstream code can detect ADR-0012 mode
+    app.state.routeiq_own_app = True
+    app.state.use_plugin_strategy = _use_plugin_strategy()
+
+    # --- Resilience (innermost middleware) ---
+    if enable_resilience:
+        add_backpressure_middleware(app)
+        app.state.graceful_shutdown = lambda timeout=None: graceful_shutdown(
+            app, timeout
+        )
+        logger.debug("Resilience middleware and drain manager attached (innermost)")
+
+    # --- Remaining middleware (outermost layers) ---
+    _configure_middleware(app)
+
+    # --- Routes ---
+    _register_routes(app, include_admin=include_admin_routes)
+
+    # --- Admin UI static files (after routes so API routes take priority) ---
+    _mount_admin_ui(app)
+
+    # --- Mount LiteLLM as sub-application ---
+    if mount_litellm:
+        try:
+            from litellm.proxy.proxy_server import app as litellm_app
+
+            app.mount("/v1", litellm_app)
+            logger.info("LiteLLM proxy mounted at /v1/")
+        except ImportError:
+            logger.warning(
+                "LiteLLM proxy not available; running RouteIQ standalone "
+                "(mount_litellm=True but litellm package not found)"
+            )
+
+    logger.info(
+        "Gateway app created (ADR-0012 own-app mode, mount_litellm=%s)",
+        mount_litellm,
+    )
+    return app
+
+
 def create_app(
     *,
     apply_patch: bool = True,
@@ -458,6 +773,12 @@ def create_app(
 ) -> FastAPI:
     """
     Configure the LiteLLM proxy's FastAPI app with LLMRouter extensions.
+
+    .. deprecated::
+        Use :func:`create_gateway_app` instead (ADR-0012).  This function
+        borrows LiteLLM's FastAPI instance and stores lifecycle hooks as
+        lambdas on ``app.state``.  ``create_gateway_app()`` owns the app
+        and manages lifecycle via a proper lifespan context manager.
 
     This function:
     1. Applies the LiteLLM router patch (explicit, idempotent) — OR skips it
@@ -483,6 +804,17 @@ def create_app(
     Returns:
         The configured FastAPI application instance
     """
+    warnings.warn(
+        "create_app() is deprecated — use create_gateway_app() instead (ADR-0012). "
+        "Own-app mode is now the default; this legacy path requires ROUTEIQ_OWN_APP=false.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    logger.info(
+        "Using legacy create_app() — LiteLLM owns the FastAPI instance. "
+        "Set ROUTEIQ_OWN_APP=true to use RouteIQ-owned app (ADR-0012)."
+    )
+
     # Step 1: Determine routing approach — plugin strategy vs legacy monkey-patch.
     #
     # When ROUTEIQ_USE_PLUGIN_STRATEGY=true (the default), we skip the
@@ -575,6 +907,45 @@ def create_app(
     app.state.llmrouter_http_pool_shutdown = _shutdown_http_client_pool
     logger.debug("HTTP client pool lifecycle hooks attached")
 
+    # Step 9: Set up database pool shutdown hook
+    app.state.llmrouter_db_pool_shutdown = close_db_pool
+    logger.debug("Database connection pool shutdown hook attached")
+
+    # Step 10: Set up Redis client shutdown hook
+    app.state.llmrouter_redis_shutdown = close_async_redis_client
+    logger.debug("Redis client shutdown hook attached")
+
+    # Step 11: Set up OIDC lifecycle hooks (no-op when OIDC is disabled)
+    def _oidc_setup():
+        try:
+            from litellm_llmrouter.oidc import setup_oidc
+
+            result = setup_oidc()
+            if result and result.enabled:
+                logger.info("OIDC module initialized")
+            return result
+        except ImportError:
+            logger.debug("OIDC module not available for setup")
+            return None
+        except Exception as e:
+            logger.warning(f"OIDC setup failed: {e}")
+            return None
+
+    def _oidc_reset():
+        try:
+            from litellm_llmrouter.oidc import reset_oidc
+
+            reset_oidc()
+            logger.debug("OIDC module state reset")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"OIDC reset failed: {e}")
+
+    app.state.llmrouter_oidc_setup = _oidc_setup
+    app.state.llmrouter_oidc_shutdown = _oidc_reset
+    logger.debug("OIDC lifecycle hooks attached")
+
     logger.info("Gateway app created and configured")
     return app
 
@@ -619,6 +990,16 @@ def create_standalone_app(
         # Initialize HTTP client pool
         await _startup_http_client_pool()
 
+        # Initialize OIDC if configured
+        try:
+            from litellm_llmrouter.oidc import setup_oidc
+
+            setup_oidc()
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"OIDC setup failed during standalone startup: {e}")
+
         if enable_plugins:
             await _run_plugin_startup(app)
         try:
@@ -631,6 +1012,17 @@ def create_standalone_app(
                 await drain_manager.wait_for_drain()
             if enable_plugins:
                 await _run_plugin_shutdown(app)
+            # Reset OIDC state
+            try:
+                from litellm_llmrouter.oidc import reset_oidc
+
+                reset_oidc()
+            except ImportError:
+                pass
+            # Close database connection pool
+            await close_db_pool()
+            # Close Redis client singleton
+            await close_async_redis_client()
             # Shutdown HTTP client pool
             await _shutdown_http_client_pool()
 

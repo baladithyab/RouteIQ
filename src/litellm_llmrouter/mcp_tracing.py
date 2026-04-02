@@ -40,7 +40,7 @@ except ImportError:
 # Tracer name for MCP operations
 TRACER_NAME = "litellm.mcp_gateway"
 
-# Span attribute names (following OTel semantic conventions where applicable)
+# Legacy span attribute names (backward compatibility)
 ATTR_MCP_SERVER_ID = "mcp.server.id"
 ATTR_MCP_SERVER_NAME = "mcp.server.name"
 ATTR_MCP_TOOL_NAME = "mcp.tool.name"
@@ -52,6 +52,12 @@ ATTR_MCP_RESULT_TYPE = "mcp.result.type"
 ATTR_MCP_HTTP_STATUS = "mcp.http.status_code"
 ATTR_MCP_INVOCATION_URL = "mcp.invocation.url"
 ATTR_MCP_INVOCATION_DISABLED = "mcp.invocation.disabled"
+
+# GenAI Semantic Convention attribute names (ADR-0019)
+# These are imported lazily to avoid circular imports at module level.
+# See: litellm_llmrouter.telemetry_contracts.GenAIAttributes
+_GENAI_TOOL_NAME = "gen_ai.tool.name"
+_GENAI_TOOL_MCP_SERVER = "gen_ai.tool.mcp.server"
 
 
 def get_tracer() -> Any:
@@ -114,10 +120,14 @@ def trace_tool_call(
 
     # Use start_as_current_span to ensure span is active and exported
     with tracer.start_as_current_span(f"mcp.tool.call/{tool_name}") as span:
+        # Legacy mcp.* attributes (backward compatibility)
         span.set_attribute(ATTR_MCP_TOOL_NAME, tool_name)
         span.set_attribute(ATTR_MCP_SERVER_ID, server_id)
         span.set_attribute(ATTR_MCP_SERVER_NAME, server_name)
         span.set_attribute(ATTR_MCP_TRANSPORT, transport)
+        # ADR-0019: GenAI semantic convention attributes
+        span.set_attribute(_GENAI_TOOL_NAME, tool_name)
+        span.set_attribute(_GENAI_TOOL_MCP_SERVER, server_name)
 
         try:
             yield span
