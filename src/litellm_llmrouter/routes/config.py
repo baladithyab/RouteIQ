@@ -1,5 +1,6 @@
 """
-Hot Reload, Config Sync, Governance, Usage Policy, and Guardrail Policy Endpoints.
+Hot Reload, Config Sync, Governance, Usage Policy, Guardrail Policy, and Prompt
+Management Endpoints.
 
 - POST /llmrouter/reload - Trigger config reload (sync manager)
 - POST /config/reload - Trigger config reload (hot reload manager)
@@ -8,6 +9,7 @@ Hot Reload, Config Sync, Governance, Usage Policy, and Guardrail Policy Endpoint
 - /api/v1/routeiq/governance/* - Workspace & key governance CRUD
 - /api/v1/routeiq/governance/policies/* - Usage policy CRUD & counters
 - /api/v1/routeiq/governance/guardrails/* - Guardrail policy CRUD
+- /api/v1/routeiq/prompts/* - Prompt management CRUD, versioning, A/B testing
 """
 
 from fastapi import Depends, HTTPException
@@ -33,6 +35,16 @@ from ..guardrail_policies import (
     GuardrailPolicy,
     GuardrailPhase,
     get_guardrail_policy_engine,
+)
+from ..prompt_management import (
+    get_prompt_manager,
+    is_prompt_management_enabled,
+    CreatePromptRequest,
+    UpdatePromptRequest,
+    RollbackRequest,
+    ABTestRequest,
+    ABTestStopRequest,
+    ImportPromptsRequest,
 )
 from fastapi import Request
 
@@ -1262,3 +1274,587 @@ async def guardrail_policy_status(
     """
     engine = get_guardrail_policy_engine()
     return engine.get_status()
+
+
+# =============================================================================
+# Prompt Management CRUD Endpoints
+# =============================================================================
+
+
+def _require_prompt_management() -> None:
+    """Raise 404 if prompt management feature is disabled."""
+    if not is_prompt_management_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "feature_disabled",
+                "message": (
+                    "Prompt management is not enabled. "
+                    "Set ROUTEIQ_PROMPT_MANAGEMENT=true to enable."
+                ),
+            },
+        )
+
+
+@admin_router.get("/api/v1/routeiq/prompts")
+async def list_prompts(
+    workspace_id: Optional[str] = None,
+    tag: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """List all prompts. Optionally filter by workspace_id and/or tag.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    manager = get_prompt_manager()
+    tags = [tag] if tag else None
+    prompts = manager.list_prompts(workspace_id=workspace_id, tags=tags)
+    return {
+        "prompts": [p.model_dump() for p in prompts],
+        "count": len(prompts),
+    }
+
+
+@admin_router.post("/api/v1/routeiq/prompts", status_code=201)
+async def create_prompt(
+    body: CreatePromptRequest,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Create a new named prompt.
+
+    The prompt name must be lowercase alphanumeric with hyphens (1-64 chars).
+    Returns the created prompt definition with version 1.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    try:
+        prompt = manager.create_prompt(
+            name=body.name,
+            template=body.template,
+            system_template=body.system_template,
+            model=body.model,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            description=body.description,
+            workspace_id=body.workspace_id,
+            created_by=rbac_info.get("user_id") if rbac_info else None,
+            tags=body.tags,
+            metadata=body.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_prompt",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt",
+        body.name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"prompt": prompt.model_dump()}
+
+
+@admin_router.get("/api/v1/routeiq/prompts/{name}")
+async def get_prompt(
+    name: str,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get a prompt definition by name.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    manager = get_prompt_manager()
+    prompt = manager.get_prompt(name, workspace_id=workspace_id)
+    if prompt is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "prompt_not_found",
+                "message": f"Prompt '{name}' not found.",
+                "request_id": get_request_id() or "unknown",
+            },
+        )
+    return {"prompt": prompt.model_dump()}
+
+
+@admin_router.put("/api/v1/routeiq/prompts/{name}")
+async def update_prompt(
+    name: str,
+    body: UpdatePromptRequest,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Create a new version of an existing prompt.
+
+    Each update creates a new version and sets it as active.
+    The full version history is preserved for rollback.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    try:
+        prompt = manager.update_prompt(
+            name=name,
+            template=body.template,
+            system_template=body.system_template,
+            model=body.model,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            change_note=body.change_note,
+            created_by=rbac_info.get("user_id") if rbac_info else None,
+            workspace_id=workspace_id,
+            description=body.description,
+            tags=body.tags,
+            metadata=body.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "prompt_not_found",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt",
+        name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"prompt": prompt.model_dump()}
+
+
+@admin_router.delete("/api/v1/routeiq/prompts/{name}")
+async def delete_prompt(
+    name: str,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Delete a prompt and all its versions.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    deleted = manager.delete_prompt(name, workspace_id=workspace_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "prompt_not_found",
+                "message": f"Prompt '{name}' not found.",
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt",
+        name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"deleted": True, "name": name}
+
+
+@admin_router.post("/api/v1/routeiq/prompts/{name}/rollback")
+async def rollback_prompt(
+    name: str,
+    body: RollbackRequest,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Roll back a prompt to a previous version.
+
+    Sets the active version to the specified version number.
+    The version must exist in the prompt's history.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    try:
+        prompt = manager.rollback(name, body.version, workspace_id=workspace_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "rollback_failed",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt_rollback",
+        name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"prompt": prompt.model_dump(), "rolled_back_to": body.version}
+
+
+@admin_router.post("/api/v1/routeiq/prompts/{name}/ab-test")
+async def start_ab_test(
+    name: str,
+    body: ABTestRequest,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Configure A/B testing between prompt versions.
+
+    Provide a mapping of version numbers to traffic weights.
+    Weights must sum to ~1.0 (tolerance: 0.01).
+    All referenced versions must exist.
+
+    Example body: {"versions": {"1": 0.9, "2": 0.1}}
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    try:
+        prompt = manager.set_ab_test(name, body.versions, workspace_id=workspace_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ab_test_failed",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt_ab_test",
+        name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"prompt": prompt.model_dump(), "ab_test": "started"}
+
+
+@admin_router.post("/api/v1/routeiq/prompts/{name}/ab-test/stop")
+async def stop_ab_test(
+    name: str,
+    body: ABTestStopRequest,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Stop an A/B test. Optionally promote a winning version.
+
+    If ``winner`` is provided, that version becomes the new active version.
+    Otherwise the current active version is kept.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    try:
+        prompt = manager.stop_ab_test(
+            name, winner=body.winner, workspace_id=workspace_id
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "ab_test_stop_failed",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt_ab_test_stop",
+        name,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {
+        "prompt": prompt.model_dump(),
+        "ab_test": "stopped",
+        "winner": body.winner,
+    }
+
+
+@admin_router.get("/api/v1/routeiq/prompts-export")
+async def export_prompts(
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Export all prompts as JSON.
+
+    Optionally filter by workspace_id. Returns the full prompt definitions
+    including all versions, suitable for backup/migration.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    manager = get_prompt_manager()
+    prompts = manager.list_prompts(workspace_id=workspace_id)
+    return {
+        "prompts": [p.model_dump() for p in prompts],
+        "count": len(prompts),
+    }
+
+
+@admin_router.post("/api/v1/routeiq/prompts-import")
+async def import_prompts(
+    body: ImportPromptsRequest,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Import prompts from JSON.
+
+    Accepts a list of prompt definitions. Existing prompts with the same
+    name are overwritten. If ``workspace_id`` is provided, it overrides
+    the workspace in the imported data.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    _require_prompt_management()
+    request_id = get_request_id() or "unknown"
+    manager = get_prompt_manager()
+
+    count = manager.import_prompts(body.prompts, workspace_id=body.workspace_id)
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "prompt_import",
+        f"batch-{count}",
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"imported": count}
+
+
+# =============================================================================
+# Evaluation Pipeline Endpoints
+# =============================================================================
+
+
+@admin_router.get("/api/v1/routeiq/eval/stats")
+async def get_eval_stats(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get evaluation pipeline statistics.
+
+    Returns pipeline state, pending/evaluated counts, model quality scores,
+    and model rankings.
+
+    Requires admin API key authentication.
+    """
+    from ..eval_pipeline import get_eval_pipeline
+
+    pipeline = get_eval_pipeline()
+    if pipeline is None:
+        return {
+            "enabled": False,
+            "message": (
+                "Evaluation pipeline is not enabled. "
+                "Set ROUTEIQ_EVAL_PIPELINE=true to enable."
+            ),
+        }
+    return {"enabled": True, **pipeline.get_stats()}
+
+
+@admin_router.get("/api/v1/routeiq/eval/samples")
+async def get_eval_samples(
+    limit: int = 50,
+    model: Optional[str] = None,
+    evaluated_only: bool = False,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get recent evaluation samples.
+
+    Returns the most recent evaluation samples, optionally filtered by model
+    or evaluation status.
+
+    Args:
+        limit: Maximum number of samples to return (default: 50, max: 500).
+        model: Filter by model name (optional).
+        evaluated_only: Only return evaluated samples (default: false).
+
+    Requires admin API key authentication.
+    """
+    from ..eval_pipeline import get_eval_pipeline
+
+    pipeline = get_eval_pipeline()
+    if pipeline is None:
+        return {
+            "enabled": False,
+            "samples": [],
+            "message": "Evaluation pipeline is not enabled.",
+        }
+
+    # Clamp limit
+    limit = min(max(limit, 1), 500)
+
+    samples = pipeline.get_recent_samples(
+        limit=limit, model=model, evaluated_only=evaluated_only
+    )
+    return {
+        "samples": samples,
+        "count": len(samples),
+        "limit": limit,
+        "filter_model": model,
+        "evaluated_only": evaluated_only,
+    }
+
+
+@admin_router.post("/api/v1/routeiq/eval/run-batch")
+async def run_eval_batch(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Manually trigger an evaluation batch.
+
+    Evaluates up to ``batch_size`` pending samples immediately, regardless
+    of the background loop schedule. Useful for testing or when you want
+    immediate evaluation results.
+
+    Requires admin API key authentication.
+    """
+    from ..eval_pipeline import get_eval_pipeline
+
+    request_id = get_request_id() or "unknown"
+    pipeline = get_eval_pipeline()
+    if pipeline is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "eval_pipeline_disabled",
+                "message": (
+                    "Evaluation pipeline is not enabled. "
+                    "Set ROUTEIQ_EVAL_PIPELINE=true to enable."
+                ),
+                "request_id": request_id,
+            },
+        )
+
+    count = await pipeline.run_evaluation_batch()
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "eval_pipeline",
+        "run_batch",
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {
+        "evaluated": count,
+        "pending_remaining": len(pipeline._pending_samples),
+    }
+
+
+@admin_router.get("/api/v1/routeiq/eval/model-quality")
+async def get_model_quality(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get per-model quality scores from evaluations.
+
+    Returns quality scores, rankings, and sample counts for all models
+    that have been evaluated. Scores are normalized to 0.0-1.0.
+
+    Requires admin API key authentication.
+    """
+    from ..eval_pipeline import get_eval_pipeline
+
+    pipeline = get_eval_pipeline()
+    if pipeline is None:
+        return {
+            "enabled": False,
+            "models": {},
+            "message": "Evaluation pipeline is not enabled.",
+        }
+
+    tracker = pipeline.tracker
+    return {
+        "models": tracker.get_all_qualities(),
+        "ranking": tracker.get_ranking(),
+        "sample_counts": tracker.get_sample_counts(),
+    }
+
+
+@admin_router.post("/api/v1/routeiq/eval/push-feedback")
+async def push_eval_feedback(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Manually push evaluation quality scores to routing strategies.
+
+    Immediately updates the personalized router's quality bias with
+    the latest per-model scores from evaluations.
+
+    Requires admin API key authentication.
+    """
+    from ..eval_pipeline import get_eval_pipeline
+
+    request_id = get_request_id() or "unknown"
+    pipeline = get_eval_pipeline()
+    if pipeline is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "eval_pipeline_disabled",
+                "message": "Evaluation pipeline is not enabled.",
+                "request_id": request_id,
+            },
+        )
+
+    result = await pipeline.push_feedback()
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "eval_pipeline",
+        "push_feedback",
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return result

@@ -291,12 +291,12 @@ class RoutingSettings(BaseModel):
     ``LLMROUTER_EXPERIMENT_ID``, ``LLMROUTER_EXPERIMENT_CONFIG``.
     """
 
+    # use_plugin_strategy is always True. The legacy monkey-patch mode has
+    # been removed. This property exists for backward compatibility with code
+    # that reads ``settings.routing.use_plugin_strategy``.
     use_plugin_strategy: bool = Field(
         True,
-        description=(
-            "Use plugin-based routing (CustomRoutingStrategyBase).  "
-            "Set to false for deprecated legacy monkey-patch mode."
-        ),
+        description="Always True. Legacy monkey-patch mode has been removed.",
     )
     centroid_enabled: bool = Field(
         True,
@@ -749,6 +749,44 @@ class CacheSettings(BaseModel):
     )
 
 
+class EvalPipelineSettings(BaseModel):
+    """Evaluation pipeline configuration.
+
+    Closes the feedback loop between routing decisions and quality outcomes.
+    When enabled, a fraction of requests are evaluated by an LLM-as-judge
+    and the resulting quality scores feed back into routing strategies.
+
+    Env vars: ``ROUTEIQ_EVAL_PIPELINE``, ``ROUTEIQ_EVAL_SAMPLE_RATE``,
+    ``ROUTEIQ_EVAL_JUDGE_MODEL``, ``ROUTEIQ_EVAL_BATCH_SIZE``,
+    ``ROUTEIQ_EVAL_FEEDBACK_INTERVAL``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable the evaluation feedback loop pipeline.",
+    )
+    sample_rate: float = Field(
+        0.1,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of requests to evaluate (0.0-1.0).",
+    )
+    judge_model: str = Field(
+        "gpt-4o-mini",
+        description="LLM model used for LLM-as-judge evaluations.",
+    )
+    batch_size: int = Field(
+        10,
+        ge=1,
+        description="Number of samples per evaluation batch.",
+    )
+    feedback_interval: int = Field(
+        300,
+        ge=10,
+        description="Seconds between routing feedback updates.",
+    )
+
+
 class HASettings(BaseModel):
     """High-availability and leader election configuration.
 
@@ -979,6 +1017,10 @@ class GatewaySettings(BaseSettings):
         default_factory=HASettings,
         description="High-availability settings.",
     )
+    eval_pipeline: EvalPipelineSettings = Field(
+        default_factory=EvalPipelineSettings,
+        description="Evaluation feedback loop pipeline settings.",
+    )
 
     # ------------------------------------------------------------------
     # Validators
@@ -999,14 +1041,6 @@ class GatewaySettings(BaseSettings):
     @model_validator(mode="after")
     def _cross_validate(self) -> "GatewaySettings":
         """Cross-field validation after all fields are populated."""
-        # Warn if workers > 1 in legacy monkey-patch mode
-        if self.workers > 1 and not self.routing.use_plugin_strategy:
-            warnings.warn(
-                f"ROUTEIQ_WORKERS={self.workers} requested but legacy "
-                f"monkey-patch mode is active.  Only 1 worker is supported "
-                f"in legacy mode.",
-                stacklevel=2,
-            )
         return self
 
     # ------------------------------------------------------------------

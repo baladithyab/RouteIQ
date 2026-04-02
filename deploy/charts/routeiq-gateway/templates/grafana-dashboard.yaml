@@ -1,0 +1,331 @@
+{{- if .Values.metrics.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}-dashboard
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  {{- with .Values.metrics.grafanaDashboard.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  routeiq-overview.json: |
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": "-- Grafana --",
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "title": "Request Rate by Model",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisBorderShow": false,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": { "mode": "none" }
+              },
+              "unit": "reqps"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m])) by (model)",
+              "legendFormat": "{{ model }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Error Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "red" },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "lineWidth": 2,
+                "thresholdsStyle": { "mode": "line" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 0.01 },
+                  { "color": "red", "value": 0.05 }
+                ]
+              },
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(routeiq_requests_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m]))",
+              "legendFormat": "Error Rate",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Error Rate (Current)",
+          "type": "gauge",
+          "gridPos": { "h": 8, "w": 4, "x": 20, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 0.01 },
+                  { "color": "red", "value": 0.05 }
+                ]
+              },
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(routeiq_requests_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m]))",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Latency Distribution (p50 / p95 / p99)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2
+              },
+              "unit": "s"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "legendFormat": "p50",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "legendFormat": "p95",
+              "refId": "B"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "legendFormat": "p99",
+              "refId": "C"
+            }
+          ]
+        },
+        {
+          "title": "Routing Strategy Distribution",
+          "type": "piechart",
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" }
+            }
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "right" },
+            "pieType": "donut",
+            "reduceOptions": { "calcs": ["lastNotNull"] }
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(routeiq_routing_decisions_total{namespace=\"$namespace\"}[1h])) by (strategy)",
+              "legendFormat": "{{ strategy }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Active Circuit Breakers",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 1 },
+                  { "color": "red", "value": 2 }
+                ]
+              },
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "All Healthy", "color": "green" } } }
+              ]
+            }
+          },
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "sum(routeiq_circuit_breaker_state{state=\"open\", namespace=\"$namespace\"})",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Token Usage by Model",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "drawStyle": "bars",
+                "fillOpacity": 80,
+                "lineWidth": 1,
+                "stacking": { "mode": "normal" }
+              },
+              "unit": "short"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(routeiq_tokens_total{namespace=\"$namespace\"}[5m])) by (model)",
+              "legendFormat": "{{ model }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Cost per Hour",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "orange" },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "lineWidth": 2
+              },
+              "unit": "currencyUSD"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(routeiq_cost_usd_total{namespace=\"$namespace\"}[1h]))",
+              "legendFormat": "Cost/hr",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Context Optimization Savings",
+          "type": "gauge",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 0.1 },
+                  { "color": "green", "value": 0.3 }
+                ]
+              },
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            }
+          },
+          "options": {
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "expr": "1 - (sum(rate(routeiq_tokens_total{namespace=\"$namespace\", type=\"output\"}[1h])) / sum(rate(routeiq_tokens_total{namespace=\"$namespace\", type=\"input\"}[1h])))",
+              "refId": "A"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["routeiq", "ai-gateway"],
+      "templating": {
+        "list": [
+          {
+            "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+            "hide": 0,
+            "includeAll": false,
+            "label": "Datasource",
+            "multi": false,
+            "name": "datasource",
+            "options": [],
+            "query": "prometheus",
+            "type": "datasource"
+          },
+          {
+            "current": { "selected": false, "text": "", "value": "" },
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "definition": "label_values(routeiq_requests_total, namespace)",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Namespace",
+            "multi": false,
+            "name": "namespace",
+            "query": { "query": "label_values(routeiq_requests_total, namespace)", "refId": "StandardVariableQuery" },
+            "type": "query"
+          }
+        ]
+      },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "",
+      "title": "RouteIQ Gateway Overview",
+      "uid": "routeiq-gateway-overview",
+      "version": 1
+    }
+{{- end }}

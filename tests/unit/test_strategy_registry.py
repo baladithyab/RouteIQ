@@ -5,7 +5,7 @@ These tests verify:
 1. RoutingStrategyRegistry registration and thread-safety
 2. Deterministic weighted A/B selection (same key -> same choice)
 3. RoutingPipeline execution with fallback and telemetry
-4. Integration with routing_strategy_patch
+4. Integration with custom_routing_strategy
 5. Concurrency safety for registry updates
 6. Staged loading with promotion/rollback
 7. Experiment assignment with version tracking

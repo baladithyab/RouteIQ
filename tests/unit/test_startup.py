@@ -386,7 +386,7 @@ class TestMain:
                 side_effect=track("run_proxy"),
             ) as mock_run,
             patch(
-                "litellm_llmrouter.routing_strategy_patch.is_patch_applied",
+                "litellm_llmrouter.is_patch_applied",
                 return_value=False,
             ),
         ):
@@ -452,13 +452,7 @@ class TestMain:
         assert "unknown" in captured.out.lower()
 
     def test_plugin_strategy_mode_displayed(self, capsys):
-        """When plugin strategy is active (default), startup shows plugin mode."""
-        self._run_main_with_patches(["startup"], ROUTEIQ_USE_PLUGIN_STRATEGY="true")
+        """Startup always shows plugin strategy mode."""
+        self._run_main_with_patches(["startup"])
         captured = capsys.readouterr()
         assert "plugin strategy" in captured.out.lower()
-
-    def test_legacy_mode_displayed(self, capsys):
-        """When legacy mode is active, startup shows deprecation notice."""
-        self._run_main_with_patches(["startup"], ROUTEIQ_USE_PLUGIN_STRATEGY="false")
-        captured = capsys.readouterr()
-        assert "deprecated" in captured.out.lower()

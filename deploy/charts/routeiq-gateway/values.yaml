@@ -583,3 +583,35 @@ sidecars: []
   #   image: otel/opentelemetry-collector:latest
   #   ports:
   #     - containerPort: 4317
+
+# -----------------------------------------------------------------------------
+# Metrics / Observability (Prometheus Operator CRDs)
+# -----------------------------------------------------------------------------
+# Requires the Prometheus Operator (or kube-prometheus-stack) to be installed
+# in the cluster for ServiceMonitor and PrometheusRule resources.
+metrics:
+  # ServiceMonitor for automatic Prometheus scrape target discovery
+  serviceMonitor:
+    enabled: false
+    # Scrape interval (how often Prometheus scrapes the /metrics endpoint)
+    interval: "30s"
+    # Scrape timeout (must be less than interval)
+    scrapeTimeout: "10s"
+    # Additional labels for ServiceMonitor (e.g., to match Prometheus selectors)
+    labels: {}
+    # Annotations for ServiceMonitor
+    annotations: {}
+    # Metric relabeling rules
+    # https://prometheus.io/docs/prometheus/latest/configuration/configuration/#metric_relabel_configs
+    metricRelabelings: []
+
+  # PrometheusRule for alerting rules
+  prometheusRule:
+    enabled: false
+
+  # Grafana dashboard auto-provisioning via sidecar ConfigMap discovery
+  # Requires the Grafana sidecar (grafana_dashboard: "1" label selector)
+  grafanaDashboard:
+    enabled: false
+    # Annotations for the dashboard ConfigMap
+    annotations: {}

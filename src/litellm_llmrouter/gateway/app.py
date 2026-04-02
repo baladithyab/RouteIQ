@@ -70,7 +70,8 @@ from fastapi import FastAPI
 
 from ..settings import get_settings
 
-from ..routing_strategy_patch import is_patch_applied, patch_litellm_router
+# Legacy monkey-patch module has been removed.
+# is_patch_applied() and patch_litellm_router() are now no-op stubs in __init__.py.
 from ..resilience import (
     add_backpressure_middleware,
     get_drain_manager,
@@ -97,22 +98,10 @@ def _get_version() -> str:
 
 def _use_plugin_strategy() -> bool:
     """
-    Check whether the plugin-based routing strategy should be used.
-
-    Reads from typed settings (``settings.routing.use_plugin_strategy``),
-    falling back to ``ROUTEIQ_USE_PLUGIN_STRATEGY`` env var.
-    Defaults to ``True`` (new behaviour).  Set to ``"false"`` to fall back
-    to the legacy monkey-patch approach.
+    Always returns True — the plugin-based routing strategy is the only
+    supported path.  The legacy monkey-patch has been removed.
     """
-    try:
-        settings = get_settings()
-        return settings.routing.use_plugin_strategy
-    except Exception:
-        return os.environ.get("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
+    return True
 
 
 def _parse_cors_origins() -> list[str]:
@@ -151,31 +140,17 @@ def _parse_cors_credentials() -> bool:
 
 def _apply_patch_safely() -> bool:
     """
-    Apply the LiteLLM router patch idempotently.
+    Legacy stub — the monkey-patch module has been removed.
 
-    .. deprecated:: 0.3.0
-        This function calls the deprecated ``patch_litellm_router()``.
-        It is only used when ``ROUTEIQ_USE_PLUGIN_STRATEGY=false`` (legacy mode).
-
-    Returns:
-        True if patch is applied (either now or was already applied)
+    Always returns False and logs a warning. The plugin-based routing
+    strategy (``RouteIQRoutingStrategy``) is the only supported path.
     """
-    if is_patch_applied():
-        logger.debug("LiteLLM router patch already applied")
-        return True
-
     logger.warning(
-        "Applying DEPRECATED legacy monkey-patch. "
-        "Set ROUTEIQ_USE_PLUGIN_STRATEGY=true (the default) to use the "
-        "plugin-based routing strategy instead."
+        "_apply_patch_safely() called but the legacy monkey-patch module "
+        "has been removed. The plugin-based routing strategy is the only "
+        "supported path. Returning False."
     )
-    result = patch_litellm_router()
-    if result:
-        logger.info("Legacy LiteLLM router patch applied successfully")
-    else:
-        logger.warning("Failed to apply legacy LiteLLM router patch")
-
-    return result
+    return False
 
 
 def _install_plugin_strategy(
@@ -208,11 +183,11 @@ def _install_plugin_strategy(
         )
         return True
     except Exception as e:
-        logger.warning(
+        logger.error(
             f"Failed to install plugin routing strategy: {e}. "
-            f"Falling back to legacy monkey-patch approach."
+            f"No fallback available (legacy monkey-patch has been removed)."
         )
-        return _apply_patch_safely()
+        return False
 
 
 def _configure_middleware(app: FastAPI) -> None:
@@ -586,12 +561,34 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 3. Service discovery (informational only, never blocks startup)
     await _probe_services()
 
+    # 4. Start eval pipeline background loop if enabled
+    eval_pipeline = None
+    try:
+        from ..eval_pipeline import get_eval_pipeline
+
+        eval_pipeline = get_eval_pipeline()
+        if eval_pipeline is not None:
+            await eval_pipeline.start_background_loop()
+            logger.info("Eval pipeline background loop started")
+    except ImportError:
+        logger.debug("Eval pipeline module not available")
+    except Exception as exc:
+        logger.warning("Eval pipeline startup failed: %s", exc)
+
     logger.info("RouteIQ Gateway ready")
 
     yield
 
     # === SHUTDOWN ===
     logger.info("RouteIQ Gateway shutting down...")
+
+    # 0. Stop eval pipeline background loop
+    if eval_pipeline is not None:
+        try:
+            await eval_pipeline.stop()
+            logger.info("Eval pipeline stopped")
+        except Exception as exc:
+            logger.warning("Eval pipeline shutdown error: %s", exc)
 
     # 1. Graceful drain — let in-flight requests finish
     try:

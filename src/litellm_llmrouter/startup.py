@@ -116,37 +116,17 @@ def register_strategies():
     """Log available LLMRouter strategies.
 
     Enumerates and logs the available strategy names at startup.
-    When using the plugin strategy (default), strategies are activated via
-    ``RouteIQRoutingStrategy`` (``custom_routing_strategy.py``).
-    When using the legacy monkey-patch (deprecated), strategies are activated
-    via ``routing_strategy_patch.py``.
+    Strategies are activated via ``RouteIQRoutingStrategy``
+    (``custom_routing_strategy.py``).
     """
-    try:
-        from litellm_llmrouter.settings import get_settings
-
-        settings = get_settings()
-        use_plugin = settings.routing.use_plugin_strategy
-    except Exception:
-        use_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY", "true").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
-
     try:
         from litellm_llmrouter.strategies import register_llmrouter_strategies
 
         strategies = register_llmrouter_strategies()
-        if use_plugin:
-            print(
-                f"✅ {len(strategies)} LLMRouter strategies available "
-                f"(activated via plugin strategy — RouteIQRoutingStrategy)"
-            )
-        else:
-            print(
-                f"✅ {len(strategies)} LLMRouter strategies available "
-                f"(activated via legacy monkey-patch — DEPRECATED)"
-            )
+        print(
+            f"\u2705 {len(strategies)} LLMRouter strategies available "
+            f"(activated via plugin strategy \u2014 RouteIQRoutingStrategy)"
+        )
         return strategies
     except ImportError as e:
         print(f"⚠️ Could not load strategies: {e}")
@@ -249,34 +229,15 @@ def start_config_sync_if_enabled():
 
 
 def resolve_worker_count(cli_workers: int | None = None) -> int:
-    """Resolve the number of uvicorn workers based on strategy mode.
+    """Resolve the number of uvicorn workers.
 
     Resolution order:
     1. ``ROUTEIQ_WORKERS`` env var (if set and valid)
     2. *cli_workers* argument (from ``--workers`` CLI flag)
     3. Default: ``1``
 
-    When using the **legacy monkey-patch** mode
-    (``ROUTEIQ_USE_PLUGIN_STRATEGY=false``), workers is always forced to 1.
-    A warning is emitted if the user attempted to configure > 1 in that mode.
-
-    When using the **plugin strategy** (default), the resolved value is
-    returned as-is, allowing multi-worker deployments.
-
     Invalid values (non-integer, zero, negative) are silently coerced to 1.
     """
-    # Resolve use_plugin: env var first, then settings
-    _env_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY")
-    if _env_plugin is not None:
-        use_plugin = _env_plugin.lower() in ("true", "1", "yes")
-    else:
-        try:
-            from litellm_llmrouter.settings import get_settings
-
-            use_plugin = get_settings().routing.use_plugin_strategy
-        except Exception:
-            use_plugin = True  # default
-
     # --- resolve the raw desired worker count ---
     workers = 1  # default
     source = "default"
@@ -303,23 +264,11 @@ def resolve_worker_count(cli_workers: int | None = None) -> int:
         workers = cli_workers
         source = "--workers CLI"
 
-    # --- enforce single-worker in legacy monkey-patch mode ---
-    if not use_plugin:
-        if workers > 1:
-            logger.warning(
-                "ROUTEIQ_WORKERS=%d requested but legacy monkey-patch mode is active "
-                "(ROUTEIQ_USE_PLUGIN_STRATEGY=false). Forcing workers=1. "
-                "Enable the plugin strategy to use multiple workers.",
-                workers,
-            )
-        workers = 1
-        logger.info("Legacy monkey-patch mode: using 1 worker")
-    else:
-        logger.info(
-            "Plugin strategy mode: using %d worker(s) (source: %s)",
-            workers,
-            source,
-        )
+    logger.info(
+        "Plugin strategy mode: using %d worker(s) (source: %s)",
+        workers,
+        source,
+    )
 
     return workers
 
@@ -778,8 +727,7 @@ def main():
     """
     import argparse
 
-    # Import patch status check - does NOT apply patch
-    from litellm_llmrouter import is_patch_applied
+    from litellm_llmrouter import is_patch_applied  # no-op stub (always False)
 
     parser = argparse.ArgumentParser(
         description="RouteIQ Gateway",
@@ -869,38 +817,20 @@ Examples:
     # Resolve worker count (env var overrides CLI, legacy mode forces 1)
     workers = resolve_worker_count(cli_workers=args.workers)
 
-    # Determine routing mode for display
-    _env_plugin = os.getenv("ROUTEIQ_USE_PLUGIN_STRATEGY")
-    if _env_plugin is not None:
-        use_plugin = _env_plugin.lower() in ("true", "1", "yes")
-    else:
-        try:
-            from litellm_llmrouter.settings import get_settings as _gs_main
-
-            use_plugin = _gs_main().routing.use_plugin_strategy
-        except Exception:
-            use_plugin = True  # default
-
     own_app = _use_own_app()
 
-    print("🚀 Starting RouteIQ Gateway...")
+    print("\U0001f680 Starting RouteIQ Gateway...")
     if own_app:
-        print("   App mode: own-app (ADR-0012 — RouteIQ owns FastAPI, LiteLLM at /v1/)")
-    else:
         print(
-            "   App mode: legacy (LiteLLM owns FastAPI — opt-in via ROUTEIQ_OWN_APP=false)"
-        )
-    if use_plugin:
-        print(
-            "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"
+            "   App mode: own-app (ADR-0012 \u2014 RouteIQ owns FastAPI, LiteLLM at /v1/)"
         )
     else:
         print(
-            "   Routing: legacy monkey-patch (DEPRECATED — set ROUTEIQ_USE_PLUGIN_STRATEGY=true to upgrade)"
+            "   App mode: legacy (LiteLLM owns FastAPI \u2014 opt-in via ROUTEIQ_OWN_APP=false)"
         )
-        print(
-            f"   Patch status: {'✅ applied' if is_patch_applied() else '⏳ pending (will be applied at startup)'}"
-        )
+    print(
+        "   Routing: plugin strategy (RouteIQRoutingStrategy via CustomRoutingStrategyBase)"
+    )
     print(f"   Config: {args.config or '(none)'}")
     print(f"   Host: {args.host}")
     print(f"   Port: {args.port}")

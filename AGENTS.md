@@ -58,7 +58,7 @@ RouteIQ/
 │   │   └── models.py              # Model management routes
 │   ├── strategies.py              # ML routing strategies (18+ algorithms)
 │   ├── strategy_registry.py       # A/B testing, hot-swap, routing pipeline
-│   ├── routing_strategy_patch.py  # Monkey-patch to LiteLLM's Router for ML strategies
+│   ├── custom_routing_strategy.py # Plugin-based routing via LiteLLM's CustomRoutingStrategyBase
 │   ├── router_decision_callback.py # TG4.1 telemetry: router.* span attributes
 │   ├── mcp_gateway.py             # MCP protocol: server registry, tool discovery
 │   ├── mcp_tracing.py             # OpenTelemetry instrumentation for MCP
@@ -310,14 +310,15 @@ uv run python -m litellm_llmrouter.startup --config config/config.yaml --port 40
 
 ### 2. Routing Strategies
 
-18+ ML strategies registered via the strategy registry. Strategies are monkey-patched
-into LiteLLM's Router class via `routing_strategy_patch.py`:
+18+ ML strategies registered via the strategy registry. Strategies are installed
+via the plugin-based `RouteIQRoutingStrategy` class using LiteLLM's official
+`CustomRoutingStrategyBase` API:
 
 ```python
-from litellm_llmrouter import patch_litellm_router, register_llmrouter_strategies
+from litellm_llmrouter import install_routeiq_strategy
 
-patch_litellm_router()          # Must be called BEFORE creating Router instances
-register_llmrouter_strategies() # Register all llmrouter-* strategies
+# After creating a LiteLLM Router instance:
+install_routeiq_strategy(router, strategy_name="llmrouter-knn")
 ```
 
 **A/B testing** via the routing pipeline:
@@ -441,10 +442,9 @@ The `reference/litellm/` directory is a git submodule containing upstream LiteLL
 
 ### 4. Monkey-Patch Constraint
 
-LiteLLM's Router is patched at runtime via `routing_strategy_patch.py`. This means:
-- **When using legacy monkey-patch mode** (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`), only 1 uvicorn worker is supported. When using the plugin strategy (default), multiple workers can be configured via `ROUTEIQ_WORKERS`.
-- **Call `patch_litellm_router()` BEFORE creating Router instances**
-- The `create_app()` factory handles this automatically
+RouteIQ uses LiteLLM's official `CustomRoutingStrategyBase` plugin API for routing.
+- Multiple uvicorn workers can be configured via `ROUTEIQ_WORKERS`.
+- The `create_gateway_app()` factory handles strategy installation automatically.
 
 ### 5. Branding & Attribution
 
@@ -528,7 +528,7 @@ Development follows a Task Group pattern with quality gates:
 | `ROUTEIQ_CORS_ORIGINS` | No | Allowed CORS origins |
 | `ROUTEIQ_SKIP_ENV_VALIDATION` | No | Skip startup env validation |
 | `ROUTEIQ_EVALUATOR_ENABLED` | No | Enable LLM-as-judge evaluator plugin |
-| `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Use plugin routing strategy instead of monkey-patch (default: true) |
+| `ROUTEIQ_USE_PLUGIN_STRATEGY` | No | Always true. Legacy monkey-patch mode has been removed. |
 | `ROUTEIQ_WORKERS` | No | Number of uvicorn workers (default: 1, multi-worker requires plugin strategy) |
 | `ROUTEIQ_CENTROID_ROUTING` | No | Enable centroid routing fallback (default: true) |
 | `ROUTEIQ_ROUTING_PROFILE` | No | Default routing profile: auto/eco/premium/free/reasoning (default: auto) |
@@ -567,10 +567,9 @@ Development follows a Task Group pattern with quality gates:
 
 1. **In-process uvicorn is mandatory**: `startup.py` uses `uvicorn.run(app=app)` instead
    of `os.execvp()`. This is critical because `os.execvp()` replaces the process and would
-   lose all monkey-patches to LiteLLM's Router class. When using the plugin strategy
-   (default), multiple workers are supported via `ROUTEIQ_WORKERS` since `os.fork()`
-   preserves the app state including installed strategies. Legacy monkey-patch mode
-   is restricted to 1 worker.
+   lose the in-process app state.  Multiple workers are supported via
+   ``ROUTEIQ_WORKERS`` since ``os.fork()`` preserves the app state including
+   installed routing strategies.
 2. **BackpressureMiddleware is the innermost middleware**: It is registered first via
    `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app
    directly (replaces `app.app`). This is required because `BaseHTTPMiddleware` does NOT
@@ -611,10 +610,11 @@ Development follows a Task Group pattern with quality gates:
 12. **SSE uses async queues**: POST to `/mcp/messages` pushes to an asyncio.Queue and returns
     202 immediately. The response is emitted on the SSE stream.
 
-13. **`routing_strategy_patch.py` is deprecated**: The legacy monkey-patch approach is
-    superseded by the plugin strategy (`ROUTEIQ_USE_PLUGIN_STRATEGY=true`, the default).
-    The monkey-patch module remains for backward compatibility but should not be used in
-    new deployments.
+13. **`routing_strategy_patch.py` has been removed**: The legacy monkey-patch module
+    has been deleted.  The plugin-based routing strategy (``RouteIQRoutingStrategy``
+    in ``custom_routing_strategy.py``) is the only supported routing path.
+    ``patch_litellm_router()`` and ``unpatch_litellm_router()`` are no-op stubs
+    in ``__init__.py`` for backward compatibility.
 
 14. **Service discovery probes at startup**: `service_discovery.py` probes for Redis,
     Postgres, and other backing services at startup to populate health status and log

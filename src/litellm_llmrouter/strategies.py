@@ -3155,22 +3155,18 @@ def register_llmrouter_strategies():
     Despite its name, this function does NOT register strategies in any
     runtime registry.  The ``llmrouter-*`` strategies are activated at
     request time through the monkey-patch system in
-    ``routing_strategy_patch.py`` (see :func:`patch_litellm_router`).
+    ``custom_routing_strategy.py`` (see :func:`install_routeiq_strategy`).
 
     This function exists to:
     1. Enumerate the known strategy names at startup for diagnostics.
     2. Log them so operators can confirm which strategies are available.
 
-    The function name is preserved for **backward compatibility** — callers
-    (e.g., ``startup.py``) rely on it to obtain the strategy list and log
-    readiness.  A future major version may rename or deprecate it.
-
     Returns:
         List of available strategy name strings (e.g. ["llmrouter-knn", ...]).
     """
     verbose_proxy_logger.info(
-        f"✅ {len(LLMROUTER_STRATEGIES)} LLMRouter strategies available "
-        "(activated via routing_strategy_patch)"
+        f"\u2705 {len(LLMROUTER_STRATEGIES)} LLMRouter strategies available "
+        "(activated via RouteIQRoutingStrategy plugin)"
     )
 
     # Log available strategies

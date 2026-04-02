@@ -1,6 +1,6 @@
 # ADR-0014: Extract RouteIQ Value into Independently Installable Packages
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-04-02
 **Decision Makers**: RouteIQ Core Team
 
