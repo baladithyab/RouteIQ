@@ -104,7 +104,7 @@ jobs:
       - name: Install dependencies from lockfile
         run: |
           # Use frozen install for reproducibility
-          uv sync --frozen --extra dev
+          uv sync --frozen --extra dev --extra oidc
           # Install LLMRouter at pinned commit (matches docker/Dockerfile)
           uv pip install --python .venv/bin/python git+https://github.com/ulab-uiuc/LLMRouter.git@7890cd9d36951a3c73fec83619321f3704a7aaa8
 

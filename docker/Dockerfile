@@ -182,19 +182,19 @@ COPY src/ /app/src/
 #   "otel,cloud,a2a,hotreload,oidc" = slim variant without KNN/Prisma
 # INSTALL_LLMROUTER controls whether the LLMRouter wheel is installed
 RUN --mount=type=cache,target=/root/.cache/uv \
-    UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+    set -e && \
     # Install LLMRouter wheel if built (not in lockfile, built from source at pinned commit)
     if [ "${INSTALL_LLMROUTER}" = "true" ] && ls /wheels/*.whl 1>/dev/null 2>&1; then \
+        UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
         uv pip install --system /wheels/*.whl; \
-    fi \
+    fi && \
     # Install project dependencies with configured extras
-    # --system ensures packages go to system Python, not a venv
-    && cd /app && UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    uv pip install --system -e ".[${ROUTEIQ_EXTRAS}]" \
+    cd /app && UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+    uv pip install --system -e ".[${ROUTEIQ_EXTRAS}]" && \
     # Cleanup wheels and temp files
-    && rm -rf /wheels \
+    rm -rf /wheels && \
     # Remove build-essential (no longer needed after compilation)
-    && apt-get purge -y --auto-remove build-essential \
+    apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-generate Prisma client and fix permissions on LiteLLM directories
