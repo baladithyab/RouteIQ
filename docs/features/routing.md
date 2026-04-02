@@ -58,6 +58,42 @@ ML-based strategies from [LLMRouter](https://github.com/ulab-uiuc/LLMRouter):
 | `llmrouter-knn-multiround` | KNN agentic router |
 | `llmrouter-llm-multiround` | LLM agentic router |
 
+## Routing Decision Flow
+
+The following diagram shows how a request is routed from arrival through
+governance, guardrails, capability detection, profile selection, and
+personalized re-ranking to the final LLM deployment.
+
+```mermaid
+flowchart TD
+    REQ[Request arrives] --> GOV{Governance<br/>check}
+    GOV -->|Denied| R403[403 Forbidden]
+    GOV -->|Allowed| GUARD{Input<br/>guardrails}
+    GUARD -->|Denied| R446[446 Guardrail Denied]
+    GUARD -->|Passed| CAP[Detect required<br/>capabilities]
+    CAP --> FILTER[Filter deployments<br/>by capabilities]
+    FILTER --> SESSION{Session<br/>cache hit?}
+    SESSION -->|Hit| CACHED[Return cached model]
+    SESSION -->|Miss| PROFILE{Routing<br/>profile?}
+    PROFILE -->|eco| COST[Sort by cost<br/>cheapest first]
+    PROFILE -->|premium| QUALITY[Sort by quality<br/>best first]
+    PROFILE -->|auto| CENTROID[Centroid<br/>classify tier]
+    CENTROID --> VISION{Vision<br/>content?}
+    VISION -->|Yes, non-vision model| SWAP[Swap to vision model]
+    VISION -->|No or already vision| CTX{Context<br/>window OK?}
+    SWAP --> CTX
+    CTX -->|Exceeds| UPGRADE[Try larger model]
+    CTX -->|Fits| PERS{Personalized<br/>routing enabled?}
+    UPGRADE --> PERS
+    PERS -->|Yes + user_id| RERANK[Re-rank by<br/>user preference]
+    PERS -->|No| SELECT[Select deployment]
+    RERANK --> SELECT
+    COST --> SELECT
+    QUALITY --> SELECT
+    SELECT --> CACHE_STORE[Store in session cache]
+    CACHE_STORE --> LLM[Forward to LLM]
+```
+
 ## Configuration
 
 ```yaml

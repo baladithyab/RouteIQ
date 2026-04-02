@@ -39,6 +39,10 @@ Each ADR follows the standard format:
 | [0019](0019-otel-genai-conventions.md) | Adopt OpenTelemetry GenAI Semantic Conventions | Accepted | 2026-04-02 |
 | [0020](0020-governance-layer.md) | Governance Layer — Workspace Isolation & Dynamic Policies | Accepted | 2026-04-02 |
 | [0021](0021-externalized-state.md) | Externalize In-Process State to Redis for Multi-Worker Safety | Accepted | 2026-04-02 |
+| [0022](0022-governance-middleware-integration.md) | Governance Enforcement via Routing Strategy Hook | Accepted | 2026-04-02 |
+| [0023](0023-guardrail-policy-pipeline.md) | Guardrail Policy Enforcement via Callback Bridge | Accepted | 2026-04-02 |
+| [0024](0024-context-optimizer.md) | Context Optimization via Lossless Transform Pipeline | Accepted | 2026-04-02 |
+| [0025](0025-personalized-routing.md) | Personalized Per-User Routing via Preference Embeddings | Accepted | 2026-04-02 |
 
 ## Lifecycle
 

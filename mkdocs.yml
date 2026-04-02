@@ -44,6 +44,7 @@ nav:
     - Skills Gateway: features/skills-gateway.md
     - Context Optimization: features/context-optimizer.md
     - Prompt Management: features/prompt-management.md
+    - Plugin System: plugins.md
   - Governance:
     - Overview: governance/overview.md
     - Workspaces: governance/workspaces.md
@@ -56,6 +57,8 @@ nav:
     - Helm Chart: operations/helm.md
     - Docker: operations/docker.md
     - Security: operations/security.md
+    - MLOps Training: mlops-training.md
+    - AWS Production Guide: aws-production-guide.md
   - Architecture:
     - Overview: architecture/overview.md
     - ADRs: architecture/adrs.md
@@ -63,6 +66,9 @@ nav:
     - Gateway API: api/gateway.md
     - Governance API: api/governance.md
     - Routing API: api/routing.md
+  - Tutorials:
+    - HA Quickstart: tutorials/ha-quickstart.md
+    - Observability Quickstart: tutorials/observability-quickstart.md
   - Contributing: contributing.md
 
 markdown_extensions:

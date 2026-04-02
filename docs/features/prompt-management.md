@@ -51,6 +51,27 @@ curl -X POST http://localhost:4000/chat/completions \
   }'
 ```
 
+## A/B Testing Flow
+
+Prompt A/B testing allows you to split traffic between prompt versions using
+configurable weights. The selected variant is recorded in response metadata
+for analysis.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant PM as Prompt Manager
+    participant AB as A/B Selector
+    participant LLM as LLM
+    
+    C->>PM: Request with X-RouteIQ-Prompt: code-review
+    PM->>AB: Resolve version (weights: v1=90%, v2=10%)
+    AB-->>PM: Selected: v2
+    PM->>PM: Render template with {{variables}}
+    PM->>LLM: Forward rendered messages
+    LLM-->>C: Response (metadata: prompt_version=2, ab_variant=v2)
+```
+
 ## Integration with Routing
 
 Prompt metadata can influence routing decisions. For example, prompts tagged

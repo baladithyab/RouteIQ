@@ -15,11 +15,11 @@ enabling LLMs to:
 
 ## Surface Contract
 
-| Surface | Base Path | Protocol | Consumers |
-|---------|-----------|----------|-----------|
-| RouteIQ Management | `/llmrouter/mcp/*` | REST (JSON) | Admins, CI/CD |
-| Upstream Parity | `/v1/mcp/*` | REST (JSON) | LiteLLM-compatible clients |
-| Native MCP | `/mcp/*` | JSON-RPC / SSE | Claude Desktop, IDEs |
+| Surface | Base Path | Protocol | Consumers | Auth |
+|---------|-----------|----------|-----------|------|
+| RouteIQ Management | `/llmrouter/mcp/*` | REST (JSON) | Admins, CI/CD | Bearer (Master/Admin Key) |
+| Upstream Parity | `/v1/mcp/*` | REST (JSON) | LiteLLM-compatible clients | Bearer (User/Admin Key) |
+| Native MCP | `/mcp/*` | JSON-RPC / SSE | Claude Desktop, IDEs | Bearer (User Key) |
 
 ## Enabling MCP Gateway
 
@@ -36,6 +36,7 @@ MCP_GATEWAY_ENABLED=true
 | `MCP_SSE_LEGACY_MODE` | `false` | Legacy SSE mode |
 | `MCP_PROTOCOL_PROXY_ENABLED` | `false` | Protocol-level proxy (admin) |
 | `MCP_OAUTH_ENABLED` | `false` | OAuth for MCP |
+| `LLMROUTER_ENABLE_MCP_TOOL_INVOCATION` | `false` | Enable tool invocation |
 
 ## Registering an MCP Server
 
@@ -53,7 +54,6 @@ curl -X POST http://localhost:4000/llmrouter/mcp/servers \
 ## Tool Discovery
 
 ```bash
-# List all available tools
 curl http://localhost:4000/llmrouter/mcp/tools \
   -H "Authorization: Bearer $API_KEY"
 ```
@@ -74,10 +74,29 @@ curl -X POST http://localhost:4000/llmrouter/mcp/tools/call \
 
 ## Security
 
-- **SSRF Protection**: All registered server URLs are validated against SSRF attacks
+- **SSRF Protection**: All registered server URLs validated against SSRF attacks
 - **Dual validation**: URLs checked at registration time (no DNS) and invocation time (with DNS)
 - **Admin auth required**: Server management endpoints require admin API key
-- **Audit logging**: All MCP operations are logged for audit compliance
+- **Audit logging**: All MCP operations logged for compliance
+
+## Local Validation
+
+Validation script for testing MCP end-to-end:
+
+```bash
+# Start the local test stack
+docker compose -f docker-compose.local-test.yml up -d
+
+# Run validation
+LB_URL=http://localhost:4010 \
+MASTER_KEY=sk-test-master-key \
+ADMIN_API_KEY=sk-test-admin-key \
+HA_MODE=false \
+./scripts/validate_mcp_gateway_curl.sh
+```
+
+The validation tests: discovery, registration, tool aggregation, invocation,
+and HA sync (if enabled).
 
 !!! note
     Skills (Anthropic Computer Use, Bash, Text Editor) are distinct from MCP.
