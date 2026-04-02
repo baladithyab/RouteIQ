@@ -337,6 +337,31 @@ class RoutingSettings(BaseModel):
         None,
         description="JSON config for A/B experiment (parsed at runtime).",
     )
+    personalized_enabled: bool = Field(
+        False,
+        description=(
+            "Enable personalized routing.  Learns per-user/per-team model "
+            "preferences from feedback signals and adapts routing decisions."
+        ),
+    )
+    personalized_dim: int = Field(
+        128,
+        ge=16,
+        le=1024,
+        description="Dimensionality of user preference vectors.",
+    )
+    personalized_learning_rate: float = Field(
+        0.1,
+        ge=0.001,
+        le=1.0,
+        description="Learning rate for preference updates.",
+    )
+    personalized_decay: float = Field(
+        0.99,
+        ge=0.5,
+        le=1.0,
+        description="Per-day decay factor for stale preferences (1.0 = no decay).",
+    )
 
 
 class SecuritySettings(BaseModel):

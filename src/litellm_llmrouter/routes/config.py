@@ -1,5 +1,5 @@
 """
-Hot Reload, Config Sync, Governance, and Usage Policy Endpoints.
+Hot Reload, Config Sync, Governance, Usage Policy, and Guardrail Policy Endpoints.
 
 - POST /llmrouter/reload - Trigger config reload (sync manager)
 - POST /config/reload - Trigger config reload (hot reload manager)
@@ -7,6 +7,7 @@ Hot Reload, Config Sync, Governance, and Usage Policy Endpoints.
 - GET /router/info - Get routing configuration info
 - /api/v1/routeiq/governance/* - Workspace & key governance CRUD
 - /api/v1/routeiq/governance/policies/* - Usage policy CRUD & counters
+- /api/v1/routeiq/governance/guardrails/* - Guardrail policy CRUD
 """
 
 from fastapi import Depends, HTTPException
@@ -28,6 +29,13 @@ from ..usage_policies import (
     UsagePolicy,
     get_usage_policy_engine,
 )
+from ..guardrail_policies import (
+    GuardrailPolicy,
+    GuardrailPhase,
+    get_guardrail_policy_engine,
+)
+from fastapi import Request
+
 from .models import ReloadRequest
 from . import admin_router, llmrouter_router, health_router, handle_audit_write
 
@@ -861,3 +869,396 @@ async def reset_usage_policy_counters(
         "policy_id": policy_id,
         "group_key": group_key or "__global__",
     }
+
+
+# =============================================================================
+# Personalized Routing Feedback Endpoints
+# =============================================================================
+
+
+@llmrouter_router.post("/api/v1/routeiq/routing/feedback")
+async def submit_routing_feedback(request: Request):
+    """Submit feedback on a routing decision to improve personalization.
+
+    Accepts a JSON body with:
+    - ``user_id`` (str, required): The user or team identifier.
+    - ``model`` (str, required): The model that was used.
+    - ``score`` (float, required): Feedback score in [-1.0, 1.0].
+      Positive values indicate satisfaction, negative indicate dissatisfaction.
+    - ``request_id`` (str, optional): The original request ID for correlation.
+
+    Returns 200 with feedback confirmation, or 400/503 on error.
+    Requires user API key authentication (inherited from llmrouter_router).
+    """
+    from ..personalized_routing import get_personalized_router
+
+    router = get_personalized_router()
+    if router is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "personalized_routing_disabled",
+                "message": (
+                    "Personalized routing is not enabled. "
+                    "Set ROUTEIQ_PERSONALIZED_ROUTING=true to enable."
+                ),
+            },
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_json",
+                "message": "Request body must be valid JSON.",
+            },
+        )
+
+    user_id = body.get("user_id")
+    model = body.get("model")
+    score = body.get("score")
+
+    if not user_id or not isinstance(user_id, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_field",
+                "message": "'user_id' is required and must be a string.",
+            },
+        )
+    if not model or not isinstance(model, str):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_field",
+                "message": "'model' is required and must be a string.",
+            },
+        )
+    if score is None or not isinstance(score, (int, float)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_field",
+                "message": "'score' is required and must be a number.",
+            },
+        )
+
+    score = float(score)
+    if score < -1.0 or score > 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_value",
+                "message": "'score' must be between -1.0 and 1.0.",
+            },
+        )
+
+    await router.record_feedback(user_id, model, score)
+
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "model": model,
+        "score": score,
+        "request_id": body.get("request_id"),
+    }
+
+
+@llmrouter_router.get("/api/v1/routeiq/routing/preferences/{user_id}")
+async def get_user_preferences(user_id: str):
+    """Get the current routing preferences for a user.
+
+    Returns the user's preference state including interaction count,
+    per-model scores, and last update time. Returns 404 for cold-start
+    users with no preference data.
+
+    Requires user API key authentication.
+    """
+    from ..personalized_routing import get_personalized_router
+
+    router = get_personalized_router()
+    if router is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "personalized_routing_disabled",
+                "message": "Personalized routing is not enabled.",
+            },
+        )
+
+    pref = await router.store.get_preference(user_id)
+    if pref is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "no_preferences",
+                "message": f"No preference data found for user '{user_id}'.",
+            },
+        )
+
+    return {
+        "user_id": pref.user_id,
+        "interaction_count": pref.interaction_count,
+        "last_updated": pref.last_updated,
+        "model_scores": pref.model_scores,
+    }
+
+
+@admin_router.delete("/api/v1/routeiq/routing/preferences/{user_id}")
+async def delete_user_preferences(
+    user_id: str,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Delete all routing preference data for a user (GDPR/privacy).
+
+    Requires admin API key authentication.
+    """
+    from ..personalized_routing import get_personalized_router
+
+    router = get_personalized_router()
+    if router is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "personalized_routing_disabled",
+                "message": "Personalized routing is not enabled.",
+            },
+        )
+
+    request_id = get_request_id() or "unknown"
+    deleted = await router.delete_user_data(user_id)
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "routing_preferences",
+        user_id,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"deleted": deleted, "user_id": user_id}
+
+
+@admin_router.get("/api/v1/routeiq/routing/personalized/stats")
+async def get_personalized_routing_stats(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get personalized routing statistics.
+
+    Returns configuration, model count, and preference store stats.
+    Requires admin API key authentication.
+    """
+    from ..personalized_routing import get_personalized_router
+
+    router = get_personalized_router()
+    if router is None:
+        return {"enabled": False}
+
+    return {"enabled": True, **router.get_stats()}
+
+
+# =============================================================================
+# Guardrail Policy CRUD Endpoints
+# =============================================================================
+
+
+@admin_router.get("/api/v1/routeiq/governance/guardrails")
+async def list_guardrail_policies(
+    phase: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """List all guardrail policies. Optionally filter by phase and workspace_id.
+
+    Returns policies sorted by priority (lowest first).
+    Requires admin API key or user with system.config.reload permission.
+    """
+    engine = get_guardrail_policy_engine()
+
+    phase_enum = None
+    if phase is not None:
+        try:
+            phase_enum = GuardrailPhase(phase)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_phase",
+                    "message": f"Invalid phase '{phase}'. Must be 'input' or 'output'.",
+                    "request_id": get_request_id() or "unknown",
+                },
+            )
+
+    policies = engine.list_policies(phase=phase_enum, workspace_id=workspace_id)
+    return {
+        "guardrails": [p.model_dump() for p in policies],
+        "count": len(policies),
+    }
+
+
+@admin_router.post("/api/v1/routeiq/governance/guardrails", status_code=201)
+async def create_guardrail_policy(
+    policy: GuardrailPolicy,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Create or update a guardrail policy.
+
+    If a guardrail with the same guardrail_id already exists, it is overwritten.
+    The guardrail_id and name are required.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    request_id = get_request_id() or "unknown"
+
+    if not policy.guardrail_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_guardrail_id",
+                "message": "guardrail_id is required.",
+                "request_id": request_id,
+            },
+        )
+    if not policy.name:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_name",
+                "message": "name is required.",
+                "request_id": request_id,
+            },
+        )
+
+    engine = get_guardrail_policy_engine()
+    existing = engine.get_policy(policy.guardrail_id)
+    engine.add_policy(policy)
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "governance_guardrail",
+        policy.guardrail_id,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {
+        "guardrail_id": policy.guardrail_id,
+        "created": existing is None,
+        "guardrail": engine.get_policy(policy.guardrail_id).model_dump(),
+    }
+
+
+@admin_router.get("/api/v1/routeiq/governance/guardrails/{guardrail_id}")
+async def get_guardrail_policy(
+    guardrail_id: str,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get a guardrail policy by ID.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    engine = get_guardrail_policy_engine()
+    policy = engine.get_policy(guardrail_id)
+    if policy is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "guardrail_not_found",
+                "message": f"Guardrail policy '{guardrail_id}' not found.",
+                "request_id": get_request_id() or "unknown",
+            },
+        )
+    return {"guardrail": policy.model_dump()}
+
+
+@admin_router.put("/api/v1/routeiq/governance/guardrails/{guardrail_id}")
+async def update_guardrail_policy(
+    guardrail_id: str,
+    policy: GuardrailPolicy,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Update an existing guardrail policy. The guardrail_id in the path takes precedence.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    request_id = get_request_id() or "unknown"
+    engine = get_guardrail_policy_engine()
+
+    existing = engine.get_policy(guardrail_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "guardrail_not_found",
+                "message": f"Guardrail policy '{guardrail_id}' not found.",
+                "request_id": request_id,
+            },
+        )
+
+    # Ensure path guardrail_id is used + preserve created_at
+    policy.guardrail_id = guardrail_id
+    policy.created_at = existing.created_at
+    engine.add_policy(policy)
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "governance_guardrail",
+        guardrail_id,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"guardrail": engine.get_policy(guardrail_id).model_dump()}
+
+
+@admin_router.delete("/api/v1/routeiq/governance/guardrails/{guardrail_id}")
+async def delete_guardrail_policy(
+    guardrail_id: str,
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Delete a guardrail policy.
+
+    Requires admin API key or user with system.config.reload permission.
+    """
+    request_id = get_request_id() or "unknown"
+    engine = get_guardrail_policy_engine()
+
+    deleted = engine.remove_policy(guardrail_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "guardrail_not_found",
+                "message": f"Guardrail policy '{guardrail_id}' not found.",
+                "request_id": request_id,
+            },
+        )
+
+    await handle_audit_write(
+        AuditAction.CONFIG_RELOAD,
+        "governance_guardrail",
+        guardrail_id,
+        AuditOutcome.SUCCESS,
+        rbac_info,
+        request_id,
+    )
+
+    return {"deleted": True, "guardrail_id": guardrail_id}
+
+
+@admin_router.get("/api/v1/routeiq/governance/guardrails/status/summary")
+async def guardrail_policy_status(
+    rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
+):
+    """Get guardrail policy engine status summary.
+
+    Returns counts of total/enabled/input/output policies and registered check types.
+    Requires admin API key or user with system.config.reload permission.
+    """
+    engine = get_guardrail_policy_engine()
+    return engine.get_status()

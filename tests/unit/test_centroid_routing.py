@@ -505,6 +505,126 @@ class TestSessionCache:
         assert cache.size == 1
 
 
+class TestSessionCacheRedisBackend:
+    """Tests for SessionCache Redis backend with mocked Redis client."""
+
+    def _make_redis_cache(self, mock_client):
+        """Create a SessionCache that believes Redis is available."""
+        cache = SessionCache(ttl=300)
+        cache._redis_checked = True
+        cache._redis_available = True
+        return cache
+
+    @patch("litellm_llmrouter.centroid_routing.SessionCache._check_redis")
+    def test_uses_local_when_redis_unavailable(self, mock_check):
+        """Should use in-memory cache when Redis check returns False."""
+        mock_check.return_value = False
+        cache = SessionCache(ttl=60)
+
+        cache.put("k1", "gpt-4o", "complex")
+        result = cache.get("k1")
+
+        assert result == ("gpt-4o", "complex")
+        assert cache.size == 1  # stored locally
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_get_hit(self, mock_get_client):
+        """Should return value from Redis on cache hit."""
+        mock_client = MagicMock()
+        mock_client.get.return_value = "gpt-4o-mini|simple"
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        result = cache.get("abc123")
+
+        assert result == ("gpt-4o-mini", "simple")
+        mock_client.get.assert_called_once_with("routeiq:session:abc123")
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_get_miss(self, mock_get_client):
+        """Should return None from Redis on cache miss."""
+        mock_client = MagicMock()
+        mock_client.get.return_value = None
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        result = cache.get("nonexistent")
+
+        assert result is None
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_put(self, mock_get_client):
+        """Should write to Redis with correct key format and TTL."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        cache.put("abc123", "claude-sonnet", "complex")
+
+        mock_client.set.assert_called_once_with(
+            "routeiq:session:abc123",
+            "claude-sonnet|complex",
+            ex=300,
+        )
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_get_falls_back_on_error(self, mock_get_client):
+        """Should fall back to local cache on Redis GET error."""
+        mock_client = MagicMock()
+        mock_client.get.side_effect = ConnectionError("Redis down")
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        # Pre-populate local cache
+        cache._local_put("fallback_key", "gpt-4o", "simple")
+
+        result = cache.get("fallback_key")
+        assert result == ("gpt-4o", "simple")
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_put_falls_back_on_error(self, mock_get_client):
+        """Should fall back to local cache on Redis SET error."""
+        mock_client = MagicMock()
+        mock_client.set.side_effect = ConnectionError("Redis down")
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        cache.put("err_key", "gpt-4o", "complex")
+
+        # Should have been stored locally as fallback
+        result = cache._local_get("err_key")
+        assert result == ("gpt-4o", "complex")
+
+    @patch("litellm_llmrouter.redis_pool.get_sync_redis_client")
+    def test_redis_get_invalid_format(self, mock_get_client):
+        """Should return None for malformed Redis values."""
+        mock_client = MagicMock()
+        mock_client.get.return_value = "no-pipe-separator"
+        mock_get_client.return_value = mock_client
+
+        cache = self._make_redis_cache(mock_client)
+        result = cache.get("bad_key")
+
+        assert result is None
+
+    def test_check_redis_lazy_init(self):
+        """Should only check Redis availability once."""
+        cache = SessionCache()
+        assert cache._redis_checked is False
+
+        with patch(
+            "litellm_llmrouter.redis_pool.get_sync_redis_client"
+        ) as mock_get_client:
+            mock_get_client.return_value = None
+            result1 = cache._check_redis()
+            result2 = cache._check_redis()
+
+        assert result1 is False
+        assert result2 is False
+        # Should only call once due to caching
+        mock_get_client.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # TestRoutingProfile
 # ---------------------------------------------------------------------------

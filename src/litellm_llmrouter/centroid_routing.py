@@ -12,7 +12,8 @@ Features:
   multi-step execution, agentic keywords).
 - **ReasoningDetector**: Regex-based reasoning marker detection (step-by-step,
   chain-of-thought, proofs, etc.).
-- **SessionCache**: In-memory routing affinity cache with TTL and LRU eviction.
+- **SessionCache**: Routing affinity cache with TTL and LRU eviction.
+  Redis-backed when available (multi-worker safe), in-memory fallback.
 - **CentroidRoutingStrategy**: ``RoutingStrategy`` implementation that combines
   classification, agentic/reasoning detection, routing profiles, and session
   persistence for zero-config intelligent model routing.
@@ -920,25 +921,140 @@ class ReasoningDetector:
 
 
 class SessionCache:
-    """In-memory session-based routing affinity cache with LRU eviction.
+    """Session-based routing affinity cache with LRU eviction.
+
+    Uses Redis when available (multi-worker safe), falls back to in-memory
+    OrderedDict (single-worker). Both backends maintain the same synchronous
+    interface so callers (including the synchronous ``select_deployment``)
+    need no changes.
 
     Ported from NadirClaw's ``SessionCache``. Keyed by a hash of the
     system prompt + first user message. Expired entries are cleaned up
-    periodically (every 100 puts).
+    periodically (every 100 puts in the local backend; Redis uses native
+    TTL expiry via ``EX``).
     """
+
+    _REDIS_PREFIX = "routeiq:session:"
 
     def __init__(self, ttl: int = 1800, max_size: int = 10000):
         """Initialize session cache.
 
         Args:
             ttl: Time-to-live in seconds (default 30 minutes).
-            max_size: Maximum cache entries before LRU eviction.
+            max_size: Maximum cache entries before LRU eviction
+                (only applies to in-memory fallback; Redis uses TTL).
         """
+        # In-memory fallback
         self._cache: OrderedDict[str, Tuple[str, str, float]] = OrderedDict()
         self._ttl = ttl
         self._max_size = max_size
         self._put_counter = 0
         self._lock = threading.Lock()
+
+        # Redis state — lazily initialised on first call
+        self._redis_checked = False
+        self._redis_available = False
+
+    def _check_redis(self) -> bool:
+        """Lazily check for Redis availability (sync client).
+
+        Result is cached so the import + ping happens at most once.
+        """
+        if self._redis_checked:
+            return self._redis_available
+        self._redis_checked = True
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is not None:
+                client.ping()
+                self._redis_available = True
+                logger.info("SessionCache: using Redis backend")
+            else:
+                logger.debug("SessionCache: Redis not configured, using in-memory")
+        except Exception as exc:
+            logger.debug("SessionCache: Redis unavailable (%s), using in-memory", exc)
+        return self._redis_available
+
+    # ------------------------------------------------------------------
+    # Redis backend helpers
+    # ------------------------------------------------------------------
+
+    def _redis_get(self, key: str) -> Optional[Tuple[str, str]]:
+        """Get from Redis. Returns ``(model, tier)`` or ``None``."""
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is None:
+                return None
+            val = client.get(f"{self._REDIS_PREFIX}{key}")
+            if val is None:
+                return None
+            # Stored as "model|tier"
+            parts = val.split("|", 1)
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+        except Exception as exc:
+            logger.debug("SessionCache Redis GET failed: %s", exc)
+            # Fall through to local cache
+            return self._local_get(key)
+
+    def _redis_put(self, key: str, model: str, tier: str) -> None:
+        """Put into Redis with TTL."""
+        try:
+            from litellm_llmrouter.redis_pool import get_sync_redis_client
+
+            client = get_sync_redis_client()
+            if client is None:
+                return
+            client.set(
+                f"{self._REDIS_PREFIX}{key}",
+                f"{model}|{tier}",
+                ex=self._ttl,
+            )
+        except Exception as exc:
+            logger.debug("SessionCache Redis SET failed: %s", exc)
+            # Fall through to local cache
+            self._local_put(key, model, tier)
+
+    # ------------------------------------------------------------------
+    # Local (in-memory) backend helpers
+    # ------------------------------------------------------------------
+
+    def _local_get(self, key: str) -> Optional[Tuple[str, str]]:
+        """Retrieve from in-memory cache."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            model, tier, ts = entry
+            if time.time() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            self._touch(key)
+            return model, tier
+
+    def _local_put(self, key: str, model: str, tier: str) -> None:
+        """Store in in-memory cache."""
+        with self._lock:
+            self._put_counter += 1
+            if self._put_counter >= 100:
+                self._put_counter = 0
+                self._clear_expired()
+
+            if key in self._cache:
+                del self._cache[key]
+            self._cache[key] = (model, tier, time.time())
+
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
+    # ------------------------------------------------------------------
+    # Public API (unchanged signatures)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _make_key(system_message: str, first_user_message: str) -> str:
@@ -960,50 +1076,33 @@ class SessionCache:
     def get(self, key: str) -> Optional[Tuple[str, str]]:
         """Retrieve cached routing decision if not expired.
 
+        Uses Redis when available, otherwise falls back to in-memory.
+
         Args:
             key: Session key from :meth:`_make_key`.
 
         Returns:
             Tuple of ``(model, tier)`` if cache hit, ``None`` otherwise.
         """
-        with self._lock:
-            entry = self._cache.get(key)
-            if entry is None:
-                return None
-            model, tier, ts = entry
-            if time.time() - ts > self._ttl:
-                # Expired
-                del self._cache[key]
-                return None
-            # Touch for LRU — O(1) with OrderedDict
-            self._touch(key)
-            return model, tier
+        if self._check_redis():
+            return self._redis_get(key)
+        return self._local_get(key)
 
     def put(self, key: str, model: str, tier: str) -> None:
         """Store a routing decision for a session.
 
-        Periodically cleans up expired entries (every 100 puts) and
-        evicts LRU entries when over capacity.
+        Uses Redis when available (with native TTL), otherwise falls
+        back to in-memory with periodic cleanup and LRU eviction.
 
         Args:
             key: Session key from :meth:`_make_key`.
             model: Selected model name.
             tier: Selected tier (``"simple"`` or ``"complex"``).
         """
-        with self._lock:
-            self._put_counter += 1
-            if self._put_counter >= 100:
-                self._put_counter = 0
-                self._clear_expired()
-
-            # Remove first if exists so move_to_end works correctly
-            if key in self._cache:
-                del self._cache[key]
-            self._cache[key] = (model, tier, time.time())
-
-            # Evict oldest (LRU) if over capacity — O(1) with OrderedDict
-            while len(self._cache) > self._max_size:
-                self._cache.popitem(last=False)
+        if self._check_redis():
+            self._redis_put(key, model, tier)
+        else:
+            self._local_put(key, model, tier)
 
     def _touch(self, key: str) -> None:
         """Move key to end of LRU access order — O(1)."""
@@ -1019,7 +1118,12 @@ class SessionCache:
 
     @property
     def size(self) -> int:
-        """Current number of cached entries."""
+        """Current number of cached entries (in-memory only).
+
+        When Redis is the active backend this returns the local cache
+        size (likely 0) — not the Redis key count — because scanning
+        Redis for a count would be too expensive for a property.
+        """
         return len(self._cache)
 
 

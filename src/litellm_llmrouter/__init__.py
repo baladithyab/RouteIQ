@@ -133,6 +133,18 @@ try:
 except ImportError:
     pass  # centroid routing deps not installed
 
+# Personalized routing (per-user preference learning)
+try:
+    from .personalized_routing import (
+        PersonalizedRouter,
+        PreferenceStore,
+        UserPreference,
+        get_personalized_router,
+        reset_personalized_router,
+    )
+except ImportError:
+    pass  # personalized routing deps not installed
+
 try:
     from importlib.metadata import version as _get_version
 
@@ -171,6 +183,12 @@ __all__ = [
     "get_centroid_strategy",
     "reset_centroid_strategy",
     "warmup_centroid_classifier",
+    # Personalized routing (per-user preference learning)
+    "PersonalizedRouter",
+    "PreferenceStore",
+    "UserPreference",
+    "get_personalized_router",
+    "reset_personalized_router",
     # Strategies
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",
