@@ -9,12 +9,12 @@ def test_cors_parses_comma_separated_origins(monkeypatch):
     assert origins == ["https://a.com", "https://b.com"]
 
 
-def test_cors_default_wildcard(monkeypatch):
+def test_cors_default_empty(monkeypatch):
     monkeypatch.delenv("ROUTEIQ_CORS_ORIGINS", raising=False)
     from litellm_llmrouter.gateway.app import _parse_cors_origins
 
     origins = _parse_cors_origins()
-    assert origins == ["*"]
+    assert origins == [""]
 
 
 def test_cors_credentials_flag(monkeypatch):

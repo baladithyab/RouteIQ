@@ -235,7 +235,7 @@ Full design in [Cloud-Native Design](tg3-cloud-native-design.md).
 ```yaml
 services:
   routeiq:
-    image: ghcr.io/routeiq/routeiq-gateway:latest
+    image: ghcr.io/baladithyab/routeiq-gateway:latest
     ports: ["4000:4000"]
     volumes:
       - ./config:/app/config:ro

@@ -23,6 +23,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -1211,6 +1212,56 @@ class GuardrailPolicyEngine:
             "check_types": sorted({p.check_type.value for p in enabled}),
             "custom_handlers": sorted(self._custom_handlers.keys()),
         }
+
+
+# ---------------------------------------------------------------------------
+# File-Based Persistence
+# ---------------------------------------------------------------------------
+
+_GUARDRAIL_POLICIES_STATE_PATH = os.getenv("ROUTEIQ_GUARDRAIL_POLICIES_STATE_PATH", "")
+
+
+def save_guardrail_policies_state(engine: GuardrailPolicyEngine) -> None:
+    """Save guardrail policy definitions to file for persistence across restarts."""
+    if not _GUARDRAIL_POLICIES_STATE_PATH:
+        return
+    try:
+        import json as _json
+
+        state = {gid: p.model_dump() for gid, p in engine._policies.items()}
+        with open(_GUARDRAIL_POLICIES_STATE_PATH, "w") as f:
+            _json.dump(state, f, indent=2, default=str)
+        logger.debug(
+            "Guardrail policies state saved to %s", _GUARDRAIL_POLICIES_STATE_PATH
+        )
+    except Exception as exc:
+        logger.warning("Failed to save guardrail policies state: %s", exc)
+
+
+def load_guardrail_policies_state(engine: GuardrailPolicyEngine) -> int:
+    """Load guardrail policy definitions from file. Returns count loaded."""
+    if not _GUARDRAIL_POLICIES_STATE_PATH or not os.path.exists(
+        _GUARDRAIL_POLICIES_STATE_PATH
+    ):
+        return 0
+    try:
+        import json as _json
+
+        with open(_GUARDRAIL_POLICIES_STATE_PATH) as f:
+            state = _json.load(f)
+        count = 0
+        for policy_data in state.values():
+            engine.add_policy(GuardrailPolicy(**policy_data))
+            count += 1
+        logger.info(
+            "Loaded %d guardrail policies from %s",
+            count,
+            _GUARDRAIL_POLICIES_STATE_PATH,
+        )
+        return count
+    except Exception as exc:
+        logger.warning("Failed to load guardrail policies state: %s", exc)
+        return 0
 
 
 # ---------------------------------------------------------------------------

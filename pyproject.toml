@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "RouteIQ Gateway - Production AI Gateway with ML-based routing (built on LiteLLM + LLMRouter)"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     # Core application framework
     "fastapi>=0.109.0",
@@ -50,7 +50,6 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "hypothesis>=6.100.0",
-    "black>=26.1.0",
     "ruff>=0.14.13",
     "mypy>=1.8.0",
 ]
@@ -106,17 +105,13 @@ addopts = "-v"
 [tool.hypothesis]
 max_examples = 100
 
-[tool.black]
-line-length = 88
-target-version = ["py314"]
-
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py312"
 exclude = ["reference/"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 

@@ -614,6 +614,61 @@ class PromptManager:
 
 
 # ============================================================================
+# File-Based Persistence
+# ============================================================================
+
+_PROMPTS_STATE_PATH = os.getenv("ROUTEIQ_PROMPTS_STATE_PATH", "")
+
+
+def save_prompts_state(manager: PromptManager) -> None:
+    """Save prompt definitions to file for persistence across restarts."""
+    if not _PROMPTS_STATE_PATH:
+        return
+    try:
+        state = {key: p.model_dump() for key, p in manager._prompts.items()}
+        with open(_PROMPTS_STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        logger.debug("Prompts state saved to %s", _PROMPTS_STATE_PATH)
+    except Exception as exc:
+        logger.warning("Failed to save prompts state: %s", exc)
+
+
+def load_prompts_state(manager: PromptManager) -> int:
+    """Load prompt definitions from file. Returns count loaded."""
+    if not _PROMPTS_STATE_PATH or not os.path.exists(_PROMPTS_STATE_PATH):
+        return 0
+    try:
+        with open(_PROMPTS_STATE_PATH) as f:
+            state = json.load(f)
+        count = 0
+        for key, prompt_data in state.items():
+            try:
+                prompt = PromptDefinition.model_validate(prompt_data)
+                # Reconstruct int keys for versions dict
+                fixed_versions: Dict[int, PromptVersion] = {}
+                for k, v in prompt.versions.items():
+                    int_key = int(k)
+                    if isinstance(v, dict):
+                        fixed_versions[int_key] = PromptVersion.model_validate(v)
+                    else:
+                        fixed_versions[int_key] = v
+                prompt.versions = fixed_versions
+                if prompt.ab_versions:
+                    prompt.ab_versions = {
+                        int(k): v for k, v in prompt.ab_versions.items()
+                    }
+                manager._prompts[key] = prompt
+                count += 1
+            except Exception as exc:
+                logger.warning("Skipping invalid prompt during load: %s", exc)
+        logger.info("Loaded %d prompts from %s", count, _PROMPTS_STATE_PATH)
+        return count
+    except Exception as exc:
+        logger.warning("Failed to load prompts state: %s", exc)
+        return 0
+
+
+# ============================================================================
 # Singleton
 # ============================================================================
 

@@ -231,10 +231,15 @@ def _configure_middleware(app: FastAPI) -> None:
             cors_origins.append(ext_origin)
             logger.info("Added external UI origin to CORS: %s", ext_origin)
 
+    cors_credentials = _parse_cors_credentials()
+    if "*" in cors_origins:
+        # Wildcard + credentials is a browser security vulnerability
+        cors_credentials = False
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=_parse_cors_credentials(),
+        allow_credentials=cors_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=ROUTEIQ_RESPONSE_HEADERS,
@@ -558,7 +563,43 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 2. Plugin startup
     await _run_plugin_startup(app)
 
-    # 3. Service discovery (informational only, never blocks startup)
+    # 3. Load persisted governance state from disk
+    try:
+        from ..governance import (
+            get_governance_engine,
+            load_governance_state,
+        )
+        from ..usage_policies import (
+            get_usage_policy_engine,
+            load_usage_policies_state,
+        )
+        from ..guardrail_policies import (
+            get_guardrail_policy_engine,
+            load_guardrail_policies_state,
+        )
+        from ..prompt_management import (
+            get_prompt_manager,
+            load_prompts_state,
+        )
+
+        gov_count = load_governance_state(get_governance_engine())
+        up_count = load_usage_policies_state(get_usage_policy_engine())
+        gp_count = load_guardrail_policies_state(get_guardrail_policy_engine())
+        pm_count = load_prompts_state(get_prompt_manager())
+        total = gov_count + up_count + gp_count + pm_count
+        if total > 0:
+            logger.info(
+                "Loaded persisted state: governance=%d, usage_policies=%d, "
+                "guardrail_policies=%d, prompts=%d",
+                gov_count,
+                up_count,
+                gp_count,
+                pm_count,
+            )
+    except Exception as exc:
+        logger.warning("Failed to load persisted governance state: %s", exc)
+
+    # 4. Service discovery (informational only, never blocks startup)
     await _probe_services()
 
     # 4. Start eval pipeline background loop if enabled

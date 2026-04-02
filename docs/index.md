@@ -37,7 +37,7 @@ enterprise governance, and cloud-native infrastructure for LLM APIs. Built on
 === "Docker Compose"
 
     ```bash
-    git clone https://github.com/routeiq/routeiq.git
+    git clone https://github.com/baladithyab/RouteIQ.git
     cd routeiq
     docker compose up -d
     ```

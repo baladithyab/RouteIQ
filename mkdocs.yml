@@ -1,8 +1,8 @@
 site_name: RouteIQ Gateway
 site_description: Cloud-Native AI Gateway with Intelligent Routing
 site_url: https://routeiq.dev
-repo_url: https://github.com/routeiq/routeiq
-repo_name: routeiq/routeiq
+repo_url: https://github.com/baladithyab/RouteIQ
+repo_name: baladithyab/RouteIQ
 
 theme:
   name: material
@@ -98,4 +98,4 @@ plugins:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/routeiq/routeiq
+      link: https://github.com/baladithyab/RouteIQ

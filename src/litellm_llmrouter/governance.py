@@ -20,7 +20,9 @@ Storage:
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -633,6 +635,50 @@ class GovernanceEngine:
         }
 
 
+# -- File-Based Persistence --------------------------------------------------
+
+_GOVERNANCE_STATE_PATH = os.getenv("ROUTEIQ_GOVERNANCE_STATE_PATH", "")
+
+
+def save_governance_state(engine: GovernanceEngine) -> None:
+    """Save governance state to file for persistence across restarts."""
+    if not _GOVERNANCE_STATE_PATH:
+        return
+    state = {
+        "workspaces": {k: v.model_dump() for k, v in engine._workspaces.items()},
+        "key_governance": {
+            k: v.model_dump() for k, v in engine._key_governance.items()
+        },
+    }
+    try:
+        with open(_GOVERNANCE_STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        logger.debug("Governance state saved to %s", _GOVERNANCE_STATE_PATH)
+    except Exception as exc:
+        logger.warning("Failed to save governance state: %s", exc)
+
+
+def load_governance_state(engine: GovernanceEngine) -> int:
+    """Load governance state from file. Returns count of items loaded."""
+    if not _GOVERNANCE_STATE_PATH or not os.path.exists(_GOVERNANCE_STATE_PATH):
+        return 0
+    try:
+        with open(_GOVERNANCE_STATE_PATH) as f:
+            state = json.load(f)
+        count = 0
+        for ws_data in state.get("workspaces", {}).values():
+            engine.register_workspace(WorkspaceConfig(**ws_data))
+            count += 1
+        for kg_data in state.get("key_governance", {}).values():
+            engine.register_key_governance(KeyGovernance(**kg_data))
+            count += 1
+        logger.info("Loaded %d governance items from %s", count, _GOVERNANCE_STATE_PATH)
+        return count
+    except Exception as exc:
+        logger.warning("Failed to load governance state: %s", exc)
+        return 0
+
+
 # -- Singleton ---------------------------------------------------------------
 
 _engine: Optional[GovernanceEngine] = None
@@ -666,4 +712,7 @@ __all__ = [
     "GovernanceEngine",
     "get_governance_engine",
     "reset_governance_engine",
+    # Persistence
+    "save_governance_state",
+    "load_governance_state",
 ]

@@ -405,8 +405,8 @@ class SecuritySettings(BaseModel):
         description="Prefix applied to master/admin keys.",
     )
     cors_origins: str = Field(
-        "*",
-        description="Comma-separated allowed CORS origins.",
+        "",
+        description="Comma-separated allowed CORS origins. Empty = no CORS (must be explicitly configured).",
     )
     cors_credentials: bool = Field(
         False,

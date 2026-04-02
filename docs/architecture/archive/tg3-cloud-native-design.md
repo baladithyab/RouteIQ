@@ -429,7 +429,7 @@ For KNN strategies with large embedding models, consider:
 ```yaml
 services:
   routeiq:
-    image: ghcr.io/routeiq/routeiq-gateway:latest
+    image: ghcr.io/baladithyab/routeiq-gateway:latest
     ports:
       - "4000:4000"
     volumes:
@@ -541,7 +541,7 @@ services:
       - routeiq
 
   routeiq-gateway-1:
-    image: ghcr.io/routeiq/routeiq-gateway:latest
+    image: ghcr.io/baladithyab/routeiq-gateway:latest
     depends_on:
       postgres:
         condition: service_healthy
@@ -574,7 +574,7 @@ services:
       - routeiq
 
   routeiq-gateway-2:
-    image: ghcr.io/routeiq/routeiq-gateway:latest
+    image: ghcr.io/baladithyab/routeiq-gateway:latest
     depends_on:
       postgres:
         condition: service_healthy
@@ -688,7 +688,7 @@ networks:
 replicaCount: 3
 
 image:
-  repository: ghcr.io/routeiq/routeiq-gateway
+  repository: ghcr.io/baladithyab/routeiq-gateway
   tag: "1.0.0"
   pullPolicy: IfNotPresent
 
@@ -1102,7 +1102,7 @@ routing must remain centralized.**
    ```yaml
    # values-airgap.yaml
    image:
-     repository: internal-registry.corp.local/routeiq/routeiq-gateway
+     repository: internal-registry.corp.local/baladithyab/routeiq-gateway
      tag: "1.0.0"
      pullPolicy: Never  # Image must be pre-loaded
    ```

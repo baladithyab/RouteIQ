@@ -690,6 +690,50 @@ class UsagePolicyEngine:
 
 
 # =============================================================================
+# File-Based Persistence
+# =============================================================================
+
+_USAGE_POLICIES_STATE_PATH = os.getenv("ROUTEIQ_USAGE_POLICIES_STATE_PATH", "")
+
+
+def save_usage_policies_state(engine: UsagePolicyEngine) -> None:
+    """Save usage policy definitions to file for persistence across restarts."""
+    if not _USAGE_POLICIES_STATE_PATH:
+        return
+    try:
+        state = {pid: p.model_dump() for pid, p in engine._policies.items()}
+        with open(_USAGE_POLICIES_STATE_PATH, "w") as f:
+            import json
+
+            json.dump(state, f, indent=2, default=str)
+        logger.debug("Usage policies state saved to %s", _USAGE_POLICIES_STATE_PATH)
+    except Exception as exc:
+        logger.warning("Failed to save usage policies state: %s", exc)
+
+
+def load_usage_policies_state(engine: UsagePolicyEngine) -> int:
+    """Load usage policy definitions from file. Returns count loaded."""
+    if not _USAGE_POLICIES_STATE_PATH or not os.path.exists(_USAGE_POLICIES_STATE_PATH):
+        return 0
+    try:
+        import json
+
+        with open(_USAGE_POLICIES_STATE_PATH) as f:
+            state = json.load(f)
+        count = 0
+        for policy_data in state.values():
+            engine.add_policy(UsagePolicy(**policy_data))
+            count += 1
+        logger.info(
+            "Loaded %d usage policies from %s", count, _USAGE_POLICIES_STATE_PATH
+        )
+        return count
+    except Exception as exc:
+        logger.warning("Failed to load usage policies state: %s", exc)
+        return 0
+
+
+# =============================================================================
 # Singleton Management
 # =============================================================================
 

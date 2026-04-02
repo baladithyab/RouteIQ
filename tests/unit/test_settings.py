@@ -173,7 +173,7 @@ class TestDefaults:
         assert s.security.admin_api_keys is None
         assert s.security.admin_auth_enabled is True
         assert s.security.key_prefix == "sk-riq-"
-        assert s.security.cors_origins == "*"
+        assert s.security.cors_origins == ""
         assert s.security.cors_credentials is False
         assert s.security.enforce_signed_models is True
         assert s.security.allow_pickle_models is False
@@ -815,9 +815,9 @@ class TestConvenienceProperties:
         s = GatewaySettings()
         assert s.postgres_configured is False
 
-    def test_cors_origins_list_wildcard(self):
+    def test_cors_origins_list_default_empty(self):
         s = GatewaySettings()
-        assert s.cors_origins_list == ["*"]
+        assert s.cors_origins_list == [""]
 
     def test_cors_origins_list_multiple(self):
         s = GatewaySettings(

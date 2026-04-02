@@ -727,18 +727,20 @@ def _resolve_and_check_dns_sync(
                     url, f"resolved IP {resolved_ip} is blocked: {reason}"
                 )
 
-    except socket.gaierror:
-        # DNS resolution failed - let it through, will fail on actual connection
-        verbose_proxy_logger.debug(
-            f"SSRF: DNS resolution failed for {hostname}, allowing"
+    except socket.gaierror as e:
+        # DNS resolution failed — fail-closed (deny by default)
+        verbose_proxy_logger.warning(
+            "SSRF: DNS resolution failed for %s: %s — blocking request", hostname, e
         )
-        pass
+        raise ValueError(f"DNS resolution failed for {hostname}")
     except SSRFBlockedError:
         raise  # Re-raise SSRF errors
     except Exception as e:
-        # Other socket errors - log and allow
-        verbose_proxy_logger.debug(f"SSRF: DNS check failed for {hostname}: {e}")
-        pass
+        # Other socket errors — fail-closed
+        verbose_proxy_logger.warning(
+            "SSRF: DNS check failed for %s: %s — blocking request", hostname, e
+        )
+        raise ValueError(f"DNS check failed for {hostname}: {e}")
 
 
 async def _resolve_dns_async(
@@ -924,23 +926,25 @@ async def _resolve_and_check_dns_async(
                 )
 
     except asyncio.TimeoutError:
-        # DNS resolution timed out - log and allow (will fail on actual connection)
+        # DNS resolution timed out — fail-closed (deny by default)
         verbose_proxy_logger.warning(
-            f"SSRF: Async DNS resolution timed out for {hostname} after {dns_timeout}s, allowing"
+            "SSRF: DNS resolution timed out for %s — blocking request", hostname
         )
-        pass
-    except socket.gaierror:
-        # DNS resolution failed - let it through, will fail on actual connection
-        verbose_proxy_logger.debug(
-            f"SSRF: DNS resolution failed for {hostname}, allowing"
+        raise ValueError(f"DNS resolution timed out for {hostname}")
+    except socket.gaierror as e:
+        # DNS resolution failed — fail-closed (deny by default)
+        verbose_proxy_logger.warning(
+            "SSRF: DNS resolution failed for %s: %s — blocking request", hostname, e
         )
-        pass
+        raise ValueError(f"DNS resolution failed for {hostname}")
     except SSRFBlockedError:
         raise  # Re-raise SSRF errors
     except Exception as e:
-        # Other errors - log and allow
-        verbose_proxy_logger.debug(f"SSRF: Async DNS check failed for {hostname}: {e}")
-        pass
+        # Other errors — fail-closed
+        verbose_proxy_logger.warning(
+            "SSRF: Async DNS check failed for %s: %s — blocking request", hostname, e
+        )
+        raise ValueError(f"DNS check failed for {hostname}: {e}")
 
 
 async def is_url_safe_async(url: str, resolve_dns: bool = True) -> bool:

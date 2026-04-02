@@ -10,7 +10,7 @@ Get RouteIQ Gateway running in 5 minutes.
 ## 1. Clone and Configure
 
 ```bash
-git clone https://github.com/routeiq/routeiq.git
+git clone https://github.com/baladithyab/RouteIQ.git
 cd routeiq
 cp .env.example .env
 ```

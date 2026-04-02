@@ -206,20 +206,38 @@ class TestAsyncDNSResolution:
             assert "10.0.0.1" in exc_info.value.reason
 
     @pytest.mark.asyncio
-    async def test_async_dns_resolution_allows_public_ip(self, clean_env):
-        """Test that resolved public IPs are allowed during async DNS resolution."""
+    async def test_dns_gaierror_blocks_request(self, clean_env):
+        """Test that DNS resolution failure (gaierror) blocks the request (fail-closed)."""
         from litellm_llmrouter.url_security import validate_outbound_url_async
 
-        # Mock async DNS resolution to return a truly public IP (Google DNS)
-        mock_addr_info = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+        async def failing_getaddrinfo(*args, **kwargs):
+            raise socket.gaierror(8, "nodename nor servname provided")
 
         with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_addr_info)
+            mock_loop.return_value.getaddrinfo = failing_getaddrinfo
 
-            result = await validate_outbound_url_async(
-                "https://api.example.com/v1/chat", resolve_dns=True
-            )
-            assert result == "https://api.example.com/v1/chat"
+            # Should raise - DNS failure is fail-closed
+            with pytest.raises(ValueError, match="DNS resolution failed"):
+                await validate_outbound_url_async(
+                    "https://nonexistent.example.com/api", resolve_dns=True
+                )
+
+    @pytest.mark.asyncio
+    async def test_dns_generic_error_blocks_request(self, clean_env):
+        """Test that generic DNS errors block the request (fail-closed)."""
+        from litellm_llmrouter.url_security import validate_outbound_url_async
+
+        async def failing_getaddrinfo(*args, **kwargs):
+            raise OSError("Network unreachable")
+
+        with patch("asyncio.get_running_loop") as mock_loop:
+            mock_loop.return_value.getaddrinfo = failing_getaddrinfo
+
+            # Should raise - generic DNS errors are fail-closed
+            with pytest.raises(ValueError, match="DNS check failed"):
+                await validate_outbound_url_async(
+                    "https://api.example.com/v1/chat", resolve_dns=True
+                )
 
     @pytest.mark.asyncio
     async def test_async_dns_multi_answer_all_checked(self, clean_env):
@@ -376,8 +394,8 @@ class TestDNSTimeout:
         assert config.get("dns_timeout") == DEFAULT_DNS_TIMEOUT
 
     @pytest.mark.asyncio
-    async def test_dns_timeout_handled_gracefully(self, clean_env, monkeypatch):
-        """Test that DNS timeout is handled gracefully (allows through)."""
+    async def test_dns_timeout_blocks_request(self, clean_env, monkeypatch):
+        """Test that DNS timeout blocks the request (fail-closed)."""
         from litellm_llmrouter.url_security import (
             validate_outbound_url_async,
             clear_ssrf_config_cache,
@@ -394,71 +412,11 @@ class TestDNSTimeout:
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop.return_value.getaddrinfo = slow_getaddrinfo
 
-            # Should not raise - timeout is handled gracefully
-            result = await validate_outbound_url_async(
-                "https://api.example.com/v1/chat", resolve_dns=True
-            )
-            assert result == "https://api.example.com/v1/chat"
-
-
-class TestNonBlockingBehavior:
-    """Test that async DNS resolution doesn't block the event loop."""
-
-    @pytest.mark.asyncio
-    async def test_event_loop_progress_during_dns_resolution(self, clean_env):
-        """
-        Test that the event loop makes progress while DNS resolution is pending.
-
-        This test verifies that validate_outbound_url_async() doesn't block
-        the event loop by running a concurrent task that increments a counter.
-        """
-        from litellm_llmrouter.url_security import validate_outbound_url_async
-
-        progress_counter = 0
-        dns_resolution_started = asyncio.Event()
-        dns_resolution_complete = asyncio.Event()
-
-        async def slow_getaddrinfo(*args, **kwargs):
-            dns_resolution_started.set()
-            # Simulate slow DNS resolution
-            await asyncio.sleep(0.1)
-            dns_resolution_complete.set()
-            # Return truly public IP (Google DNS)
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
-
-        async def progress_task():
-            """Task that increments counter to prove event loop progress."""
-            nonlocal progress_counter
-            while not dns_resolution_complete.is_set():
-                progress_counter += 1
-                await asyncio.sleep(0.01)
-
-        with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value.getaddrinfo = slow_getaddrinfo
-
-            # Run both tasks concurrently
-            validation_task = asyncio.create_task(
-                validate_outbound_url_async(
+            # Should raise - DNS timeout is fail-closed
+            with pytest.raises(ValueError, match="DNS resolution timed out"):
+                await validate_outbound_url_async(
                     "https://api.example.com/v1/chat", resolve_dns=True
                 )
-            )
-            counter_task = asyncio.create_task(progress_task())
-
-            # Wait for validation to complete
-            result = await validation_task
-
-            # Cancel the counter task
-            counter_task.cancel()
-            try:
-                await counter_task
-            except asyncio.CancelledError:
-                pass
-
-        # Verify the event loop made progress (counter incremented)
-        assert progress_counter > 0, (
-            "Event loop should have made progress during DNS resolution"
-        )
-        assert result == "https://api.example.com/v1/chat"
 
     @pytest.mark.asyncio
     async def test_multiple_concurrent_validations(self, clean_env):
@@ -626,8 +584,8 @@ class TestAsyncDNSResolutionFailure:
     """Test handling of DNS resolution failures in async path."""
 
     @pytest.mark.asyncio
-    async def test_dns_gaierror_allows_through(self, clean_env):
-        """Test that DNS resolution failure (gaierror) allows through."""
+    async def test_dns_gaierror_blocks_request(self, clean_env):
+        """Test that DNS resolution failure (gaierror) blocks the request (fail-closed)."""
         from litellm_llmrouter.url_security import validate_outbound_url_async
 
         async def failing_getaddrinfo(*args, **kwargs):
@@ -636,15 +594,15 @@ class TestAsyncDNSResolutionFailure:
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop.return_value.getaddrinfo = failing_getaddrinfo
 
-            # Should not raise - DNS failure is handled gracefully
-            result = await validate_outbound_url_async(
-                "https://nonexistent.example.com/api", resolve_dns=True
-            )
-            assert result == "https://nonexistent.example.com/api"
+            # Should raise - DNS failure is fail-closed
+            with pytest.raises(ValueError, match="DNS resolution failed"):
+                await validate_outbound_url_async(
+                    "https://nonexistent.example.com/api", resolve_dns=True
+                )
 
     @pytest.mark.asyncio
-    async def test_dns_generic_error_allows_through(self, clean_env):
-        """Test that generic DNS errors are handled gracefully."""
+    async def test_dns_generic_error_blocks_request(self, clean_env):
+        """Test that generic DNS errors block the request (fail-closed)."""
         from litellm_llmrouter.url_security import validate_outbound_url_async
 
         async def failing_getaddrinfo(*args, **kwargs):
@@ -653,11 +611,11 @@ class TestAsyncDNSResolutionFailure:
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop.return_value.getaddrinfo = failing_getaddrinfo
 
-            # Should not raise - error is handled gracefully
-            result = await validate_outbound_url_async(
-                "https://api.example.com/v1/chat", resolve_dns=True
-            )
-            assert result == "https://api.example.com/v1/chat"
+            # Should raise - generic DNS errors are fail-closed
+            with pytest.raises(ValueError, match="DNS check failed"):
+                await validate_outbound_url_async(
+                    "https://api.example.com/v1/chat", resolve_dns=True
+                )
 
 
 class TestSSRFSecurityCorrectness:

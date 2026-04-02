@@ -20,12 +20,48 @@ import asyncio
 import json
 import os
 from typing import Any, AsyncIterator
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 # Mark all tests as async
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _bypass_ssrf_validation():
+    """
+    Bypass SSRF URL validation for streaming passthrough tests.
+
+    The SSRF fail-closed behavior rejects mock URLs (e.g. test.example.com)
+    because DNS resolution fails. These streaming tests use mock HTTP clients
+    and don't make real outbound requests, so SSRF validation is irrelevant.
+
+    After yield, we reload a2a_gateway so that subsequent test modules get
+    the real (unpatched) validate_outbound_url_async references.
+    """
+
+    async def _noop_validate(url, **kwargs):
+        return url
+
+    with (
+        patch(
+            "litellm_llmrouter.url_security.validate_outbound_url_async",
+            new=_noop_validate,
+        ),
+        patch(
+            "litellm_llmrouter.url_security.validate_outbound_url",
+            side_effect=lambda url, **kwargs: url,
+        ),
+    ):
+        yield
+
+    # Reload a2a_gateway so it picks up the restored (real) url_security functions.
+    # Without this, importlib.reload() calls inside tests leave stale mock references.
+    import importlib
+    import litellm_llmrouter.a2a_gateway as gateway_module
+
+    importlib.reload(gateway_module)
 
 
 # =============================================================================

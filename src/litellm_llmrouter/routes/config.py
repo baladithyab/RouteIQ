@@ -26,19 +26,23 @@ from ..governance import (
     WorkspaceConfig,
     KeyGovernance,
     get_governance_engine,
+    save_governance_state,
 )
 from ..usage_policies import (
     UsagePolicy,
     get_usage_policy_engine,
+    save_usage_policies_state,
 )
 from ..guardrail_policies import (
     GuardrailPolicy,
     GuardrailPhase,
     get_guardrail_policy_engine,
+    save_guardrail_policies_state,
 )
 from ..prompt_management import (
     get_prompt_manager,
     is_prompt_management_enabled,
+    save_prompts_state,
     CreatePromptRequest,
     UpdatePromptRequest,
     RollbackRequest,
@@ -357,6 +361,7 @@ async def create_workspace(
 
     existing = engine.get_workspace(config.workspace_id)
     engine.register_workspace(config)
+    save_governance_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -426,6 +431,7 @@ async def update_workspace(
     # Preserve original created_at
     config.created_at = existing.created_at
     engine.register_workspace(config)
+    save_governance_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -461,6 +467,7 @@ async def delete_workspace(
                 "request_id": request_id,
             },
         )
+    save_governance_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -536,6 +543,7 @@ async def update_key_governance(
             )
 
     engine.register_key_governance(governance)
+    save_governance_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -571,6 +579,7 @@ async def delete_key_governance(
                 "request_id": request_id,
             },
         )
+    save_governance_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -660,6 +669,7 @@ async def create_usage_policy(
     engine = get_usage_policy_engine()
     existing = engine.get_policy(policy.policy_id)
     engine.add_policy(policy)
+    save_usage_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -748,6 +758,7 @@ async def update_usage_policy(
     policy.policy_id = policy_id
     policy.created_at = existing.created_at
     engine.add_policy(policy)
+    save_usage_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -783,6 +794,7 @@ async def delete_usage_policy(
                 "request_id": request_id,
             },
         )
+    save_usage_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1147,6 +1159,7 @@ async def create_guardrail_policy(
     engine = get_guardrail_policy_engine()
     existing = engine.get_policy(policy.guardrail_id)
     engine.add_policy(policy)
+    save_guardrail_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1215,6 +1228,7 @@ async def update_guardrail_policy(
     policy.guardrail_id = guardrail_id
     policy.created_at = existing.created_at
     engine.add_policy(policy)
+    save_guardrail_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1250,6 +1264,7 @@ async def delete_guardrail_policy(
                 "request_id": request_id,
             },
         )
+    save_guardrail_policies_state(engine)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1356,6 +1371,8 @@ async def create_prompt(
             },
         )
 
+    save_prompts_state(manager)
+
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
         "prompt",
@@ -1436,6 +1453,8 @@ async def update_prompt(
             },
         )
 
+    save_prompts_state(manager)
+
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
         "prompt",
@@ -1472,6 +1491,7 @@ async def delete_prompt(
                 "request_id": request_id,
             },
         )
+    save_prompts_state(manager)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1514,6 +1534,8 @@ async def rollback_prompt(
                 "request_id": request_id,
             },
         )
+
+    save_prompts_state(manager)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1560,6 +1582,8 @@ async def start_ab_test(
             },
         )
 
+    save_prompts_state(manager)
+
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
         "prompt_ab_test",
@@ -1603,6 +1627,8 @@ async def stop_ab_test(
                 "request_id": request_id,
             },
         )
+
+    save_prompts_state(manager)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1659,6 +1685,7 @@ async def import_prompts(
     manager = get_prompt_manager()
 
     count = manager.import_prompts(body.prompts, workspace_id=body.workspace_id)
+    save_prompts_state(manager)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,

@@ -15,7 +15,7 @@ Thank you for your interest in contributing to RouteIQ Gateway!
 
 ```bash
 # Clone the repository
-git clone https://github.com/routeiq/routeiq.git
+git clone https://github.com/baladithyab/RouteIQ.git
 cd routeiq
 
 # Install dependencies
