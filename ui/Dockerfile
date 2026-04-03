@@ -2,6 +2,7 @@
 # RouteIQ Admin UI — Standalone Dockerfile
 # =============================================================================
 # Builds the React SPA and serves it via nginx.
+# Uses Bun for fast installs (~500ms vs ~15s with npm).
 # config.js can be replaced at runtime via volume mount or ConfigMap.
 #
 # Build:
@@ -15,12 +16,12 @@
 # =============================================================================
 
 # Stage 1: Build the UI
-FROM node:22-alpine AS builder
+FROM oven/bun:1-alpine AS builder
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 COPY . .
-RUN npm run build
+RUN bun run build
 
 # Stage 2: Serve via nginx
 FROM nginx:1.27-alpine

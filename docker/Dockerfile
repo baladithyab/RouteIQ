@@ -104,16 +104,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ==============================================================================
 # When BUILD_UI=false, this stage still runs but produces an empty /ui/dist.
 # Docker BuildKit may skip unused stages, but we keep this safe either way.
-FROM node:20-alpine AS ui-builder
+# Uses Bun for faster installs (~500ms vs ~15s with npm).
+FROM oven/bun:1-alpine AS ui-builder
 ARG BUILD_UI
 WORKDIR /ui
-# Copy package files first for layer caching
-COPY ui/package.json ui/package-lock.json ./
-RUN if [ "${BUILD_UI}" = "true" ]; then npm ci --production=false; fi
+# Copy package files + lockfile first for layer caching
+COPY ui/package.json ui/bun.lock ./
+RUN if [ "${BUILD_UI}" = "true" ]; then bun install --frozen-lockfile; fi
 # Copy source and build
 COPY ui/ ./
 RUN if [ "${BUILD_UI}" = "true" ]; then \
-        npm run build; \
+        bun run build; \
     else \
         mkdir -p /ui/dist && echo '<!DOCTYPE html><html><body>UI not included in slim build</body></html>' > /ui/dist/index.html; \
     fi
