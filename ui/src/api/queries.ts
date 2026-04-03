@@ -72,7 +72,7 @@ export function useUpdateRoutingConfig() {
 export function useWorkspaces() {
     return useQuery<Workspace[]>({
         queryKey: ['workspaces'],
-        queryFn: () => apiClient.get('/api/v1/routeiq/governance/workspaces').then(r => r.workspaces || r),
+        queryFn: () => apiClient.get('/api/v1/routeiq/governance/workspaces').then((r: any) => r.workspaces || r),
         refetchInterval: 30_000,
     })
 }
@@ -100,7 +100,7 @@ export function useDeleteWorkspace() {
 export function useUsagePolicies() {
     return useQuery<UsagePolicy[]>({
         queryKey: ['usage-policies'],
-        queryFn: () => apiClient.get('/api/v1/routeiq/governance/policies').then(r => r.policies || r),
+        queryFn: () => apiClient.get('/api/v1/routeiq/governance/policies').then((r: any) => r.policies || r),
         refetchInterval: 30_000,
     })
 }
@@ -150,7 +150,7 @@ export function useUpdateKeyGovernance() {
 export function useGuardrails() {
     return useQuery<GuardrailPolicy[]>({
         queryKey: ['guardrails'],
-        queryFn: () => apiClient.get('/api/v1/routeiq/governance/guardrails').then(r => r.guardrails || r),
+        queryFn: () => apiClient.get('/api/v1/routeiq/governance/guardrails').then((r: any) => r.guardrails || r),
         refetchInterval: 30_000,
     })
 }
@@ -191,7 +191,7 @@ export function useDeleteGuardrail() {
 export function useServiceStatus() {
     return useQuery<ServiceStatusResponse>({
         queryKey: ['service-status'],
-        queryFn: () => apiClient.get('/config/services').then(r => r.services || r),
+        queryFn: () => apiClient.get('/config/services').then((r: any) => r.services || r),
         refetchInterval: 15_000,
     })
 }
@@ -227,7 +227,7 @@ export function useRunEvalBatch() {
 export function usePrompts() {
     return useQuery<PromptDefinition[]>({
         queryKey: ['prompts'],
-        queryFn: () => apiClient.get('/api/v1/routeiq/prompts').then(r => r.prompts || r),
+        queryFn: () => apiClient.get('/api/v1/routeiq/prompts').then((r: any) => r.prompts || r),
         refetchInterval: 30_000,
     })
 }
