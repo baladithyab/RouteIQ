@@ -727,7 +727,6 @@ def main():
     """
     import argparse
 
-
     parser = argparse.ArgumentParser(
         description="RouteIQ Gateway",
         formatter_class=argparse.RawDescriptionHelpFormatter,
