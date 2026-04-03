@@ -1,3 +1,4 @@
+# ruff: noqa: E402  — module-level imports after no-op stub functions (intentional)
 """
 LiteLLM + LLMRouter Integration
 ================================

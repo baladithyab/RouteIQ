@@ -204,7 +204,6 @@ class PluginCallbackBridge:
             from litellm_llmrouter.guardrail_policies import (
                 get_guardrail_policy_engine,
                 GuardrailPhase,
-                GuardrailAction,
                 HTTP_446_GUARDRAIL_DENIED,
             )
 

@@ -755,11 +755,12 @@ def get_personalized_router() -> Optional[PersonalizedRouter]:
         lr = getattr(
             getattr(settings, "routing", None), "personalized_learning_rate", 0.1
         )
-        decay = getattr(getattr(settings, "routing", None), "personalized_decay", 0.99)
+        _unused_decay = getattr(
+            getattr(settings, "routing", None), "personalized_decay", 0.99
+        )  # noqa: F841 — reserved for future use
     except Exception:
         dim = int(os.getenv("ROUTEIQ_PREFERENCE_DIM", "128"))
         lr = float(os.getenv("ROUTEIQ_PREFERENCE_LEARNING_RATE", "0.1"))
-        decay = float(os.getenv("ROUTEIQ_PREFERENCE_DECAY", "0.99"))
 
     try:
         _router = PersonalizedRouter(
