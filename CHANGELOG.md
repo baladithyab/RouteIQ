@@ -34,11 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uv` is now the primary/recommended package manager (pip remains as alternative)
 - `routeiq-routing` standalone package bumped to 1.0.0rc1
 
-### Changed
-- Version bumped to 1.0.0-rc1 across all packages
-- `uv` is now the primary/recommended package manager (pip remains as alternative)
-- `routeiq-routing` standalone package bumped to 1.0.0rc1
-
 ## [0.2.0] — 2026-03-28
 
 ### Added

@@ -7,10 +7,10 @@ description: |
 type: application
 
 # Chart version - follows SemVer
-version: 0.2.0
+version: 1.0.0-rc1
 
 # Application version - matches RouteIQ package version in pyproject.toml
-appVersion: "0.2.0"
+appVersion: "1.0.0-rc1"
 
 # Keywords for discovery
 keywords:

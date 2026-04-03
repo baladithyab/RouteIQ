@@ -583,7 +583,7 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             from ..startup import install_plugin_routing_strategy
 
-            install_plugin_routing_strategy()
+            install_plugin_routing_strategy(app)
             logger.info("Plugin routing strategy installed on LiteLLM Router")
         except Exception as exc:
             logger.warning("Plugin routing strategy installation failed: %s", exc)

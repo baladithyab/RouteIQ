@@ -19,14 +19,18 @@ ADRs document significant architectural decisions for the RouteIQ Gateway projec
 | [0011](../../docs/adr/0011-pluggable-external-services.md) | Pluggable External Services | Accepted |
 | [0012](../../docs/adr/0012-own-fastapi-app.md) | RouteIQ Owns Its FastAPI Application | Accepted |
 | [0013](../../docs/adr/0013-pydantic-settings.md) | Pydantic Settings for Typed Configuration | Accepted |
-| [0014](../../docs/adr/0014-plugin-extraction.md) | Extract RouteIQ into Independently Installable Packages | Proposed |
+| [0014](../../docs/adr/0014-plugin-extraction.md) | Extract RouteIQ into Independently Installable Packages | Accepted |
 | [0015](../../docs/adr/0015-k8s-native-leader-election.md) | K8s-Native Leader Election via Lease API | Accepted |
 | [0016](../../docs/adr/0016-developer-experience-features.md) | Developer Experience Features | Accepted |
 | [0017](../../docs/adr/0017-leverage-litellm-upstream.md) | Leverage LiteLLM Upstream Capabilities | Accepted |
 | [0018](../../docs/adr/0018-disaggregated-ui.md) | Support Disaggregated UI Deployment | Accepted |
-| [0019](../../docs/adr/0019-otel-genai-conventions.md) | Adopt OpenTelemetry GenAI Semantic Conventions | Proposed |
+| [0019](../../docs/adr/0019-otel-genai-conventions.md) | Adopt OpenTelemetry GenAI Semantic Conventions | Accepted |
 | [0020](../../docs/adr/0020-governance-layer.md) | Governance Layer - Workspace Isolation & Dynamic Policies | Accepted |
 | [0021](../../docs/adr/0021-externalized-state.md) | Externalize In-Process State to Redis for Multi-Worker Safety | Accepted |
+| [0022](../../docs/adr/0022-governance-middleware-integration.md) | Governance Enforcement via Routing Strategy Hook | Accepted |
+| [0023](../../docs/adr/0023-guardrail-policy-pipeline.md) | Guardrail Policy Enforcement via Callback Bridge | Accepted |
+| [0024](../../docs/adr/0024-context-optimizer.md) | Context Optimization via Lossless Transform Pipeline | Accepted |
+| [0025](../../docs/adr/0025-personalized-routing.md) | Personalized Per-User Routing via Preference Embeddings | Accepted |
 
 ## ADR Format
 

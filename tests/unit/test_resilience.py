@@ -14,8 +14,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, patch
 
-# Mark all tests in this module as asyncio
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = "auto" in pyproject.toml handles async test detection
 
 
 class TestDrainManager:

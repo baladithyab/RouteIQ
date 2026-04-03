@@ -182,7 +182,7 @@ See the [Deployment Guide](docs/deployment.md) for production checklist.
 
 Strategies support **A/B testing** with deterministic hash-based assignment and **hot-reload** for zero-downtime model updates.
 
-> **Plugin Strategy** (default): `ROUTEIQ_USE_PLUGIN_STRATEGY=true` uses a `CustomRoutingStrategyBase` adapter enabling multi-worker deployments via `ROUTEIQ_WORKERS`. Legacy monkey-patch mode (`ROUTEIQ_USE_PLUGIN_STRATEGY=false`) is limited to 1 worker.
+Routing uses the plugin strategy (`CustomRoutingStrategyBase` adapter) by default, enabling multi-worker deployments via `ROUTEIQ_WORKERS`.
 
 See [Routing Strategies](docs/routing-strategies.md) for details.
 
@@ -221,8 +221,7 @@ See [Configuration Guide](docs/configuration.md) for all options.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LITELLM_MASTER_KEY` | — | Master API key for admin access |
-| `ROUTEIQ_USE_PLUGIN_STRATEGY` | `true` | Use plugin routing strategy instead of monkey-patch (enables multi-worker) |
-| `ROUTEIQ_WORKERS` | `1` | Number of uvicorn workers (requires plugin strategy) |
+| `ROUTEIQ_WORKERS` | `1` | Number of uvicorn workers |
 | `ROUTEIQ_CENTROID_ROUTING` | `true` | Enable centroid routing fallback |
 | `ROUTEIQ_ROUTING_PROFILE` | `auto` | Default routing profile: auto/eco/premium/free/reasoning |
 | `ROUTEIQ_ADMIN_UI_ENABLED` | `false` | Enable admin UI at `/ui/` |
