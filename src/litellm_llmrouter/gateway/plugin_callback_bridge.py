@@ -372,7 +372,7 @@ class PluginCallbackBridge:
                     content = message.get("content")
                 if isinstance(content, str):
                     return content
-        except AttributeError, IndexError, TypeError:
+        except (AttributeError, IndexError, TypeError):
             pass
 
         # Direct content key

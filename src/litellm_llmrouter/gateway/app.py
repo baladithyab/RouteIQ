@@ -556,6 +556,38 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # === STARTUP ===
     logger.info("RouteIQ Gateway starting (ADR-0012 own-app mode)...")
 
+    # 0. Initialize LiteLLM proxy (loads config, creates Router instance)
+    #    This MUST happen before strategy installation and plugin startup.
+    try:
+        import litellm.proxy.proxy_server as _proxy_server
+
+        config_path = os.environ.get("LITELLM_CONFIG_PATH") or os.environ.get(
+            "CONFIG_FILE_PATH"
+        )
+        if config_path:
+            await _proxy_server.initialize(
+                config=config_path,
+                telemetry=False,
+            )
+            logger.info("LiteLLM proxy initialized (config=%s)", config_path)
+        else:
+            logger.warning(
+                "No LITELLM_CONFIG_PATH set — LiteLLM proxy not initialized. "
+                "Model routing will not work until config is loaded."
+            )
+    except Exception as exc:
+        logger.error("LiteLLM initialization failed: %s", exc)
+
+    # 0b. Install RouteIQ plugin routing strategy on the LiteLLM Router
+    if getattr(app.state, "use_plugin_strategy", True):
+        try:
+            from ..startup import install_plugin_routing_strategy
+
+            install_plugin_routing_strategy()
+            logger.info("Plugin routing strategy installed on LiteLLM Router")
+        except Exception as exc:
+            logger.warning("Plugin routing strategy installation failed: %s", exc)
+
     # 1. HTTP client pool — must be ready before plugins that may issue requests
     await _run_http_pool_startup()
     logger.info("HTTP client pool initialized")

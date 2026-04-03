@@ -632,7 +632,7 @@ def extract_router_decision_from_span_event(
 
         return event
 
-    except json.JSONDecodeError, KeyError, TypeError:
+    except (json.JSONDecodeError, KeyError, TypeError):
         # Invalid payload, return None for backward compatibility
         return None
 
