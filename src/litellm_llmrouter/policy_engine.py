@@ -58,15 +58,9 @@ import yaml
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .auth import get_request_id
+from .telemetry_contracts import LLM_API_PATHS
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# LLM API Path Registry
-# =============================================================================
-
-from litellm_llmrouter.telemetry_contracts import LLM_API_PATHS
 
 # Re-export for backwards compatibility
 __all_llm_api_paths = LLM_API_PATHS
