@@ -83,7 +83,7 @@ all = ["routeiq[dev,db,otel,cloud,knn,a2a,hotreload,oidc]"]
 # Documentation site
 docs = [
     "mkdocs>=1.5",
-    "mkdocs-material>=9.5",
+    "mkdocs-material>=9.7.6",
     "mkdocs-autorefs>=0.5",
     "pymdown-extensions>=10.0",
 ]
