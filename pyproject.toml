@@ -67,7 +67,7 @@ otel = [
 # kubernetes: required for K8s Lease API leader election (ADR-0015)
 cloud = ["boto3>=1.42.32", "google-cloud-aiplatform>=1.134.0", "azure-identity>=1.15.0", "kubernetes>=31.0.0"]
 # A2A Protocol SDK (Agent-to-Agent communication)
-a2a = ["a2a-sdk>=0.2.0"]
+a2a = ["a2a-sdk>=0.3.26"]
 # Hot reload with filesystem watching
 hotreload = ["watchdog>=3.0.0"]
 # OIDC authentication support
