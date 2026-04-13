@@ -18,7 +18,7 @@ dependencies = [
     # LiteLLM core (provides Router, logging, etc.)
     # Note: Using litellm without [proxy] extra due to strict pinned dependencies in proxy extra
     # that conflict with project requirements. Adding needed proxy deps individually below.
-    "litellm==1.82.3",
+    "litellm==1.83.4",
     # APScheduler - required by litellm proxy for background scheduling
     "apscheduler>=3.10.0",
     # email-validator - required by pydantic.EmailStr (used by LiteLLM proxy SCIM)
