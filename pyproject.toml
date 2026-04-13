@@ -33,7 +33,7 @@ dependencies = [
     "redis>=5.0.0",
     # Configuration and utilities
     "pyyaml>=6.0",
-    "aiofiles>=23.0.0",
+    "aiofiles>=23.2.1",
     # Observability: OpenTelemetry core
     "prometheus-client>=0.24.1",
     "opentelemetry-api>=1.22.0",
