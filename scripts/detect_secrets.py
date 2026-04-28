@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -224,12 +225,42 @@ def scan_file(path: Path) -> list[Finding]:
     return findings
 
 
+def _list_git_tracked_files(root: Path) -> list[Path] | None:
+    """Return tracked files via `git ls-files`, or None if git is unavailable.
+
+    A secret scan for pre-push should only consider files git knows about —
+    untracked / gitignored files cannot be pushed and must not cause false
+    positives (e.g. `.claude/settings.local.json`, `.coverage`).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    return [
+        root / name
+        for name in result.stdout.decode("utf-8", errors="ignore").split("\0")
+        if name
+    ]
+
+
 def scan_directory(root: Path, max_files: int = 1000) -> list[Finding]:
-    """Scan a directory recursively for secrets."""
+    """Scan a directory recursively for secrets.
+
+    Prefers `git ls-files` so only tracked files are scanned; falls back to
+    `rglob` only if git is unavailable (non-repo or missing binary).
+    """
     findings: list[Finding] = []
     file_count = 0
 
-    for path in root.rglob("*"):
+    tracked = _list_git_tracked_files(root)
+    candidates = tracked if tracked is not None else root.rglob("*")
+
+    for path in candidates:
         if file_count >= max_files:
             print(
                 f"⚠️  Reached max file limit ({max_files}), stopping scan",

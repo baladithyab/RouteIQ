@@ -341,8 +341,8 @@ class RouterDecisionEventBuilder:
             .build())
     """
 
-    def __init__(self):
-        self._event = RouterDecisionEvent()
+    def __init__(self) -> None:
+        self._event: RouterDecisionEvent = RouterDecisionEvent()
 
     def with_strategy(
         self,

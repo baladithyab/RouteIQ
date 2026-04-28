@@ -1167,119 +1167,119 @@ class GatewaySettings(BaseSettings):
     # ------------------------------------------------------------------
 
     redis: RedisSettings = Field(
-        default_factory=RedisSettings,
+        default_factory=RedisSettings,  # type: ignore[arg-type]
         description="Redis connection settings.",
     )
     postgres: PostgresSettings = Field(
-        default_factory=PostgresSettings,
+        default_factory=PostgresSettings,  # type: ignore[arg-type]
         description="PostgreSQL connection settings.",
     )
     otel: OTelSettings = Field(
-        default_factory=OTelSettings,
+        default_factory=OTelSettings,  # type: ignore[arg-type]
         description="OpenTelemetry observability settings.",
     )
     oidc: OIDCSettings = Field(
-        default_factory=OIDCSettings,
+        default_factory=OIDCSettings,  # type: ignore[arg-type]
         description="OIDC / SSO integration settings.",
     )
     routing: RoutingSettings = Field(
-        default_factory=RoutingSettings,
+        default_factory=RoutingSettings,  # type: ignore[arg-type]
         description="ML routing strategy settings.",
     )
     security: SecuritySettings = Field(
-        default_factory=SecuritySettings,
+        default_factory=SecuritySettings,  # type: ignore[arg-type]
         description="Security and access control settings.",
     )
     policy: PolicySettings = Field(
-        default_factory=PolicySettings,
+        default_factory=PolicySettings,  # type: ignore[arg-type]
         description="Policy engine settings.",
     )
     audit: AuditSettings = Field(
-        default_factory=AuditSettings,
+        default_factory=AuditSettings,  # type: ignore[arg-type]
         description="Audit logging settings.",
     )
     quota: QuotaSettings = Field(
-        default_factory=QuotaSettings,
+        default_factory=QuotaSettings,  # type: ignore[arg-type]
         description="Quota enforcement settings.",
     )
     mcp: MCPSettings = Field(
-        default_factory=MCPSettings,
+        default_factory=MCPSettings,  # type: ignore[arg-type]
         description="MCP gateway settings.",
     )
     a2a: A2ASettings = Field(
-        default_factory=A2ASettings,
+        default_factory=A2ASettings,  # type: ignore[arg-type]
         description="A2A gateway settings.",
     )
     resilience: ResilienceSettings = Field(
-        default_factory=ResilienceSettings,
+        default_factory=ResilienceSettings,  # type: ignore[arg-type]
         description="Backpressure and resilience settings.",
     )
     config_sync: ConfigSyncSettings = Field(
-        default_factory=ConfigSyncSettings,
+        default_factory=ConfigSyncSettings,  # type: ignore[arg-type]
         description="Remote config sync settings.",
     )
     http_client: HTTPClientSettings = Field(
-        default_factory=HTTPClientSettings,
+        default_factory=HTTPClientSettings,  # type: ignore[arg-type]
         description="Shared HTTP client pool settings.",
     )
     ssrf: SSRFSettings = Field(
-        default_factory=SSRFSettings,
+        default_factory=SSRFSettings,  # type: ignore[arg-type]
         description="SSRF protection settings.",
     )
     conversation_affinity: ConversationAffinitySettings = Field(
-        default_factory=ConversationAffinitySettings,
+        default_factory=ConversationAffinitySettings,  # type: ignore[arg-type]
         description="Conversation routing affinity settings.",
     )
     plugins: PluginSettings = Field(
-        default_factory=PluginSettings,
+        default_factory=PluginSettings,  # type: ignore[arg-type]
         description="Plugin system settings.",
     )
     management: ManagementSettings = Field(
-        default_factory=ManagementSettings,
+        default_factory=ManagementSettings,  # type: ignore[arg-type]
         description="Management middleware settings.",
     )
     cache: CacheSettings = Field(
-        default_factory=CacheSettings,
+        default_factory=CacheSettings,  # type: ignore[arg-type]
         description="Caching plugin settings.",
     )
     ha: HASettings = Field(
-        default_factory=HASettings,
+        default_factory=HASettings,  # type: ignore[arg-type]
         description="High-availability settings.",
     )
     eval_pipeline: EvalPipelineSettings = Field(
-        default_factory=EvalPipelineSettings,
+        default_factory=EvalPipelineSettings,  # type: ignore[arg-type]
         description="Evaluation feedback loop pipeline settings.",
     )
     router_r1: RouterR1Settings = Field(
-        default_factory=RouterR1Settings,
+        default_factory=RouterR1Settings,  # type: ignore[arg-type]
         description="Router-R1 iterative reasoning router settings.",
     )
     context_optimizer: ContextOptimizerSettings = Field(
-        default_factory=ContextOptimizerSettings,
+        default_factory=ContextOptimizerSettings,  # type: ignore[arg-type]
         description="Context optimizer plugin settings.",
     )
     evaluator: EvaluatorSettings = Field(
-        default_factory=EvaluatorSettings,
+        default_factory=EvaluatorSettings,  # type: ignore[arg-type]
         description="Evaluator plugin settings.",
     )
     content_filter: ContentFilterSettings = Field(
-        default_factory=ContentFilterSettings,
+        default_factory=ContentFilterSettings,  # type: ignore[arg-type]
         description="Content/toxicity filter settings.",
     )
     agentic_pipeline: AgenticPipelineSettings = Field(
-        default_factory=AgenticPipelineSettings,
+        default_factory=AgenticPipelineSettings,  # type: ignore[arg-type]
         description="Agentic multi-round routing pipeline settings.",
     )
     prompt_management: PromptManagementSettings = Field(
-        default_factory=PromptManagementSettings,
+        default_factory=PromptManagementSettings,  # type: ignore[arg-type]
         description="Prompt management and versioning settings.",
     )
     cost_tracker: CostTrackerSettings = Field(
-        default_factory=CostTrackerSettings,
+        default_factory=CostTrackerSettings,  # type: ignore[arg-type]
         description="Cost tracker plugin settings.",
     )
     skills_discovery: SkillsDiscoverySettings = Field(
-        default_factory=SkillsDiscoverySettings,
+        default_factory=SkillsDiscoverySettings,  # type: ignore[arg-type]
         description="Skills discovery plugin settings.",
     )
 
