@@ -78,93 +78,190 @@ After `rr push`, always sync local: `git pull`
 
 ## Architecture Overview
 
+> **As of v1.0.0rc1 (2026-04-02).** Major rearchitecture (22-commit squash, 25 ADRs) shipped
+> via commit `ba89b9e`. Key inversions since v0.2.0: monkey-patch → plugin API (ADR-0002),
+> custom MCP surfaces → upstream LiteLLM delegation (ADR-0003, ADR-0017), embedded-in-LiteLLM
+> → own FastAPI app (ADR-0012), scattered `os.environ.get()` → Pydantic `BaseSettings`
+> (ADR-0013). See `docs/adr/` for all 25 decisions.
+
 ### Core Entry Points
 
-- **`startup.py`** - CLI entry point: `python -m litellm_llmrouter.startup`
-- **`gateway/app.py`** - App factory: `create_app()` (with LiteLLM) / `create_standalone_app()` (testing)
-- **`routes/`** - FastAPI routers split into focused modules (health, a2a, mcp, config)
+- **`cli.py`** - Unified CLI: `routeiq start|validate-config|version|probe-services` (project.scripts entry point)
+- **`startup.py`** - Legacy CLI entry: `python -m litellm_llmrouter.startup`
+- **`gateway/app.py`** - App factory: `create_app()` (own FastAPI; LiteLLM Router installed as plugin)
+- **`routes/`** - FastAPI routers: `health.py`, `a2a.py`, `mcp.py`, `config.py`, `models.py`, `admin_ui.py`
 
 ### Startup Load Order
 
-1. Apply LiteLLM Router monkey-patch (`routing_strategy_patch.py`)
-2. Get/create FastAPI app
-3. Add backpressure middleware (innermost, registered first)
-4. Configure middleware (CORS, RequestID, Policy, Management, Plugin, RouterDecision)
-5. Load plugins (discovery + validation)
-6. Register routes (health, llmrouter, admin, MCP surfaces)
-7. Setup lifecycle hooks (plugins, HTTP pool, drain)
+1. Load Pydantic `Settings` from env + YAML (`settings.py`)
+2. Probe optional external services (`service_discovery.py`) — feature availability report
+3. Initialize LiteLLM (`litellm.proxy.proxy_server.initialize()`)
+4. Install RouteIQ routing strategy on LiteLLM Router via `CustomRoutingStrategyBase` plugin API (`custom_routing_strategy.py`)
+5. Create own FastAPI app (ADR-0012)
+6. Add backpressure middleware (innermost, wraps ASGI directly)
+7. Configure middleware (CORS, RequestID, Policy, Governance, Management, Plugin, RouterDecision)
+8. Load gateway plugins (discovery + validation)
+9. Register routes (health, llmrouter, governance, prompts, eval, admin UI)
+10. Setup lifecycle hooks (plugin startup, HTTP pool, drain)
 
 ### Source Layout (`src/litellm_llmrouter/`)
 
+**Routing (dataplane):**
+
 | Module | Purpose |
 |--------|---------|
-| `gateway/app.py` | FastAPI app factory (composition root) |
+| `custom_routing_strategy.py` | LiteLLM `CustomRoutingStrategyBase` plugin — routing entry point (replaces deleted monkey-patch per ADR-0002) |
+| `strategies.py` | 18+ ML routing strategies (KNN, MLP, SVM, ELO, MF, hybrid) |
+| `strategy_registry.py` | A/B testing, hot-swap, routing pipeline |
+| `router_decision_callback.py` | Routing decision telemetry (TG4.1) |
+| `centroid_routing.py` | Zero-config centroid-based routing (ADR-0010) |
+| `personalized_routing.py` | Per-user preference learning via EMA + feedback endpoint (ADR-0025) |
+| `router_r1.py` | Router-R1 iterative reasoning router (NeurIPS 2025, native over LiteLLM) |
+| `conversation_affinity.py` | Conversation-based routing affinity |
+
+**Control plane (multi-tenant governance):**
+
+| Module | Purpose |
+|--------|---------|
+| `governance.py` | Workspaces, API keys, org hierarchy (ADR-0020) |
+| `usage_policies.py` | Dynamic rate limits + budgets with condition matching (ADR-0022) |
+| `guardrail_policies.py` | Config-driven input/output guardrails, 14 check types (ADR-0023) |
+| `oidc.py` | OIDC/SSO: Keycloak, Auth0, Okta, Azure AD (ADR-0008) |
+| `prompt_management.py` | Prompt templates + versioning + A/B + rollback |
+| `rbac.py` | Role-based access control |
+| `policy_engine.py` | OPA-style policy evaluation middleware |
+| `quota.py` | Per-team/per-key quota enforcement |
+| `audit.py` | Audit logging |
+| `management_classifier.py` | Classifies LiteLLM management endpoints |
+| `management_middleware.py` | RBAC/audit middleware for management ops |
+| `auth.py` | Admin auth, RequestID middleware (raw ASGI), secret scrubbing |
+
+**Gateway & plugins:**
+
+| Module | Purpose |
+|--------|---------|
+| `gateway/app.py` | Own FastAPI app factory (composition root, ADR-0012) |
 | `gateway/plugin_manager.py` | Plugin lifecycle with dependency resolution |
 | `gateway/plugin_adapters.py` | Plugin adapter implementations |
 | `gateway/plugin_callback_bridge.py` | Bridge between plugins and LiteLLM callbacks |
 | `gateway/plugin_middleware.py` | Plugin middleware integration |
 | `gateway/plugin_protocols.py` | Plugin protocol definitions (typing) |
-| `gateway/plugins/` | Built-in plugins (13 total) |
-| `startup.py` | CLI entry point, initialization orchestration |
-| `routes/` | API routers split into: `health.py`, `a2a.py`, `mcp.py`, `config.py`, `models.py` |
-| `strategies.py` | 18+ ML routing strategies (KNN, MLP, SVM, ELO, MF, hybrid) |
-| `strategy_registry.py` | A/B testing, hot-swap, routing pipeline |
-| `routing_strategy_patch.py` | Monkey-patch for LiteLLM Router integration |
-| `router_decision_callback.py` | Routing decision telemetry (TG4.1) |
-| `mcp_gateway.py` | MCP server registry and tool discovery |
-| `mcp_jsonrpc.py` | Native MCP JSON-RPC 2.0 (for Claude Desktop) |
-| `mcp_sse_transport.py` | MCP SSE streaming transport |
-| `mcp_parity.py` | Upstream-compatible `/v1/mcp/*` aliases |
+| `gateway/plugins/` | Built-in plugins (14 total — see Plugin System below) |
+| `semantic_cache.py` | Semantic caching for LLM responses |
+
+**MCP & A2A (delegated to upstream LiteLLM per ADR-0017):**
+
+| Module | Purpose |
+|--------|---------|
+| `mcp_gateway.py` | MCP server registry and tool discovery (REST) |
 | `mcp_tracing.py` | OTel instrumentation for MCP |
-| `a2a_gateway.py` | A2A agent registry (wraps LiteLLM) |
+| `a2a_gateway.py` | A2A agent registry |
 | `a2a_tracing.py` | OTel instrumentation for A2A |
+
+> Deleted in v1.0.0rc1 per ADR-0003: `mcp_jsonrpc.py`, `mcp_sse_transport.py`, `mcp_parity.py`.
+> MCP JSON-RPC + SSE are now served by upstream LiteLLM. Only REST gateway + tracing remain.
+
+**Evaluation & feedback loop:**
+
+| Module | Purpose |
+|--------|---------|
+| `eval_pipeline.py` | COLLECT / EVALUATE / AGGREGATE / FEEDBACK loop with LLM-as-judge |
+
+**Observability:**
+
+| Module | Purpose |
+|--------|---------|
 | `observability.py` | OpenTelemetry init (traces, metrics, logs) |
 | `metrics.py` | OTel metric helpers |
 | `telemetry_contracts.py` | Versioned telemetry event schemas |
-| `auth.py` | Admin auth, RequestID middleware (raw ASGI), secret scrubbing |
-| `rbac.py` | Role-based access control |
-| `policy_engine.py` | OPA-style policy evaluation middleware |
-| `quota.py` | Per-team/per-key quota enforcement |
-| `audit.py` | Audit logging |
+
+**Infra:**
+
+| Module | Purpose |
+|--------|---------|
+| `settings.py` | Pydantic `BaseSettings` — centralized config (ADR-0013, replaces scattered env lookups) |
+| `service_discovery.py` | Startup-time probing of Postgres/Redis/OTel/OIDC with graceful degradation (ADR-0011) |
+| `cli.py` | Unified CLI entry point |
 | `resilience.py` | Backpressure, drain manager, circuit breakers |
 | `http_client_pool.py` | Shared httpx.AsyncClient pool |
 | `hot_reload.py` | Filesystem-watching config hot-reload |
 | `config_loader.py` | YAML config + S3/GCS download |
-| `config_sync.py` | Background config sync (S3 ETag-based) |
+| `config_sync.py` | Background config sync (S3 ETag-based) — leader-only |
 | `model_artifacts.py` | ML model verification (hash, signature) |
-| `url_security.py` | SSRF protection |
+| `url_security.py` | SSRF protection (fail-closed DNS) |
 | `database.py` | Database connection helpers |
-| `migrations.py` | Database migration utilities |
-| `leader_election.py` | HA leader election (Redis-based) |
+| `migrations.py` | Database migration utilities (leader-only) |
+| `leader_election.py` | HA leader election — K8s Lease API primary, Redis fallback (ADR-0015) |
 | `redis_pool.py` | Redis connection pool |
 | `env_validation.py` | Startup env var validation (advisory only) |
-| `conversation_affinity.py` | Conversation-based routing affinity |
-| `management_classifier.py` | Classifies LiteLLM management endpoints |
-| `management_middleware.py` | RBAC/audit middleware for management ops |
-| `semantic_cache.py` | Semantic caching for LLM responses |
 
 ## Key Patterns
 
 ### Routing Strategy Integration
 
-LiteLLM's Router is monkey-patched at runtime to support `llmrouter-*` strategies.
-Critical constraint: **always run 1 uvicorn worker** (patches don't survive `os.execvp()`).
-`patch_litellm_router()` must be called BEFORE creating Router instances.
-`create_app()` handles this automatically.
+RouteIQ uses LiteLLM's official `CustomRoutingStrategyBase` plugin API
+(ADR-0002). `install_plugin_routing_strategy(app)` wires RouteIQ's strategy
+family into LiteLLM's Router at startup. **No monkey-patch required**;
+multi-worker safe.
 
-### MCP Multiple Surfaces
+Critical: `install_plugin_routing_strategy()` must receive the `app` arg —
+the TypeError is silently swallowed otherwise, and ML routing falls back to
+LiteLLM default without error. See commits `59f80e9` + `7844419` for the
+historical bug fix.
 
-MCP is exposed through 5 surfaces: JSON-RPC (`/mcp`), SSE (`/mcp/sse`),
-REST (`/mcp-rest/*`), parity (`/v1/mcp/*`), and proxy (`/mcp-proxy/*`).
-Each is feature-flagged via environment variables.
+### MCP Surfaces
+
+RouteIQ exposes the REST MCP gateway at `/llmrouter/mcp/*` and `/v1/llmrouter/mcp/*`
+(`routes/mcp.py`). JSON-RPC and SSE transports are served by **upstream LiteLLM**
+(ADR-0017). The RouteIQ-native `mcp_jsonrpc.py`, `mcp_sse_transport.py`,
+`mcp_parity.py` were deleted in v1.0.0rc1 (ADR-0003).
+
+MCP tool invocation is feature-flagged: `MCP_GATEWAY_ENABLED=true` +
+`LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true`.
 
 ### Plugin System
 
 Plugins extend the gateway via `GatewayPlugin` base class. They are loaded from
 config BEFORE routes (deterministic ordering) and started during app lifespan.
-Built-in plugins (13 total): evaluator, skills_discovery, upskill_evaluator,
-bedrock_agentcore_mcp, bedrock_guardrails, cache_plugin, content_filter,
-cost_tracker, guardrails_base, llamaguard_plugin, pii_guard, prompt_injection_guard.
+
+**14 built-in plugins:** `agentic_pipeline`, `bedrock_agentcore_mcp`,
+`bedrock_guardrails`, `cache_plugin`, `content_filter`, `context_optimizer`,
+`cost_tracker`, `evaluator`, `guardrails_base`, `llamaguard_plugin`,
+`pii_guard`, `prompt_injection_guard`, `skills_discovery`, `upskill_evaluator`.
+
+`context_optimizer` (ADR-0024) applies 6 lossless transforms to reduce tokens
+30–70%: JSON minification, tool schema dedup, system prompt dedup, whitespace
+norm, chat history trim, semantic dedup.
+
+### Governance Layer (ADR-0020)
+
+Multi-tenant primitives are RouteIQ-native (not LiteLLM-inherited):
+- Workspaces + API keys (`governance.py`)
+- Usage policies — dynamic rate limits + budgets with condition matching (`usage_policies.py`)
+- Guardrail policies — 14 check types, deny/log/alert actions (`guardrail_policies.py`)
+- OIDC/SSO — Keycloak, Auth0, Okta, Azure AD (`oidc.py`)
+
+State is file-backed by default; env paths: `ROUTEIQ_GOVERNANCE_STATE_PATH`,
+`ROUTEIQ_USAGE_POLICIES_STATE_PATH`, `ROUTEIQ_GUARDRAIL_POLICIES_STATE_PATH`,
+`ROUTEIQ_PROMPTS_STATE_PATH`. Auto-loaded at startup, saved after every CRUD
+mutation.
+
+### Evaluation & Feedback Loop
+
+`eval_pipeline.py` implements COLLECT → EVALUATE → AGGREGATE → FEEDBACK:
+- Collects routing decisions via `router_decision_callback.py`
+- Evaluates via `gateway/plugins/evaluator.py` (LLM-as-judge)
+- Aggregates quality scores per model/strategy
+- Feeds verdicts into `personalized_routing.py` + centroid weights
+
+API: `/api/v1/routeiq/eval/{stats,samples,run-batch,model-quality,push-feedback}`.
+Admin UI: Observability page renders model-quality rankings + run-batch trigger.
+
+### Settings (ADR-0013)
+
+Pydantic `BaseSettings` in `settings.py` replaces scattered `os.environ.get()`
+calls (124+ call sites collapsed). Supports profiles, validation, defaults.
+**Do not** reintroduce direct env lookups in new code.
 
 ### Policy Engine
 
@@ -208,12 +305,13 @@ Background sync via `config_sync.py`.
 
 ## Code Style
 
-- Python 3.14+ (target version in pyproject.toml)
-- Ruff formatter + linter (line-length: 88)
+- Python 3.12+ floor (`pyproject.toml` `requires-python = ">=3.12"`)
+- Ruff formatter + linter (line-length: 88); Black removed in v1.0.0rc1
 - Type hints required for public APIs
-- Pydantic v2 for data validation
+- Pydantic v2 for data validation; `pydantic-settings` for config (ADR-0013)
 - Async/await throughout FastAPI routes
 - No side effects on import
+- New config values go through `settings.py` (Pydantic `BaseSettings`), not direct `os.environ.get()`
 
 ## Development Workflow
 
@@ -271,14 +369,19 @@ uv run python -m litellm_llmrouter.startup --config config/config.local-test.yam
 
 These are critical gotchas that are easy to miss:
 
-- **In-process uvicorn is mandatory** - `startup.py` runs LiteLLM in-process (not via `os.execvp()`) to preserve monkey-patches. Always use 1 worker.
+- **Own FastAPI app, not embedded in LiteLLM** (ADR-0012). RouteIQ creates its own app and installs LiteLLM Router as a routing-strategy plugin — inverted from pre-v1.0 where RouteIQ mounted on top of `litellm.proxy.proxy_server.app`.
+- **`install_plugin_routing_strategy(app)` must receive `app`** — if the arg is missing, the TypeError is swallowed and ML routing silently falls back to LiteLLM default. Historical bug fixed in `59f80e9` + `7844419`; guard against regression.
+- **Multi-worker safe.** No monkey-patch to preserve. The `CustomRoutingStrategyBase` plugin registers per-worker.
 - **BackpressureMiddleware is the innermost middleware** registered first via `add_backpressure_middleware()` before `_configure_middleware()`, wrapping the ASGI app directly (replaces `app.app`). This is because `BaseHTTPMiddleware` breaks streaming.
 - **Plugin hooks live on `app.state`** as lambdas, not in lifespan, because LiteLLM manages its own lifespan.
 - **`/_health/ready` returns 200 for degraded state** (circuit breakers open), not 503.
-- **Two MCP systems exist**: `/llmrouter/mcp/*` (REST gateway) and `/mcp` (JSON-RPC for Claude Desktop) are separate.
-- **SSRF checks happen twice**: at registration (no DNS) and invocation (with DNS) to catch rebinding.
+- **MCP surfaces consolidated.** JSON-RPC / SSE now served by upstream LiteLLM (ADR-0003, ADR-0017). RouteIQ's remaining MCP surface is the REST gateway at `/llmrouter/mcp/*` and `/v1/llmrouter/mcp/*`.
+- **SSRF checks happen twice**: at registration (no DNS) and invocation (with DNS) to catch rebinding. DNS failures are fail-closed (security fix in v1.0.0rc1).
 - **MCP tool invocation is off by default** even when `MCP_GATEWAY_ENABLED=true`. Needs `LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true`.
-- **Config sync only runs on HA leader** - non-leader replicas skip it.
+- **Config sync only runs on HA leader** — K8s Lease API primary, Redis fallback (ADR-0015). Non-leader replicas skip it.
+- **Prisma migrations are leader-gated** via `ROUTEIQ_LEADER_MIGRATIONS`.
+- **Governance state is file-backed by default.** Auto-loaded at startup, saved after every CRUD mutation. See env paths in the Governance Layer section.
+- **CORS default is `""` (deny-all)** as of v1.0.0rc1 — set `CORS_ORIGINS` explicitly. Previous `"*"` default is a CSRF vuln when combined with credentials.
 - **Singletons need `reset_*()`** - every subsystem uses singletons. Tests MUST call `reset_*()` in `autouse=True` fixtures.
 - **OTel provider reuse** - `ObservabilityManager` reuses existing TracerProvider if LiteLLM set one up.
 - **Unit test OTel** - use `shared_span_exporter` fixture from `tests/unit/conftest.py`, never call `trace.set_tracer_provider()` in test files.
@@ -351,3 +454,16 @@ This injects session context: rules, command reference, and workflows.
 2. File issues for remaining work: `sd create --title "..."`
 3. Sync and push: `sd sync && git push`
 <!-- seeds:end -->
+
+## gstack
+
+Use the `/browse` skill from gstack for **all web browsing**. Never use `mcp__claude-in-chrome__*` tools.
+
+### Available Skills
+
+`/office-hours` `/plan-ceo-review` `/plan-eng-review` `/plan-design-review`
+`/design-consultation` `/design-shotgun` `/review` `/ship` `/land-and-deploy`
+`/canary` `/benchmark` `/browse` `/connect-chrome` `/qa` `/qa-only`
+`/design-review` `/setup-browser-cookies` `/setup-deploy` `/retro`
+`/investigate` `/document-release` `/codex` `/cso` `/autoplan` `/careful`
+`/freeze` `/guard` `/unfreeze` `/gstack-upgrade`

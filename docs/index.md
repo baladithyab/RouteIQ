@@ -1,78 +1,113 @@
-# RouteIQ Gateway
+# RouteIQ Documentation
 
-**Cloud-Native AI Gateway with Intelligent Routing**
+> Comprehensive documentation for the RouteIQ AI Gateway — a cloud-native General AI Gateway
+> built on [LiteLLM](https://github.com/BerriAI/litellm) and [LLMRouter](https://github.com/ulab-uiuc/LLMRouter).
 
-RouteIQ is an open-source AI gateway that provides intelligent ML-based routing,
-enterprise governance, and cloud-native infrastructure for LLM APIs. Built on
-[LiteLLM](https://github.com/BerriAI/litellm) for proxy/API compatibility and
-[LLMRouter](https://github.com/ulab-uiuc/LLMRouter) for ML-based routing.
+---
 
-## Key Features
+## Getting Started
 
-- **18+ ML Routing Strategies** — KNN, SVM, MLP, ELO, MF, centroid, personalized
-- **Enterprise Governance** — Workspaces, budgets, rate limits, guardrails, OIDC/SSO
-- **MCP + A2A + Skills** — Full protocol support for model context, agents, and skills
-- **Context Optimization** — Token savings via lossless transforms
-- **Cloud-Native** — K8s-native, multi-worker, Redis-backed state, Helm charts
-- **Plugin System** — 13 built-in plugins, extensible architecture with lifecycle management
-- **Observability** — OpenTelemetry traces, metrics, and structured logging
+| Document | Description |
+|----------|-------------|
+| [Docker Compose Quickstart](quickstart-docker-compose.md) | Get RouteIQ running in 5 minutes with Docker Compose |
+| [Configuration Guide](configuration.md) | Configure models, routing strategies, and gateway features |
+| [Tutorial: High Availability](tutorials/ha-quickstart.md) | Step-by-step HA setup with Redis, Postgres, and Nginx |
+| [Tutorial: Observability](tutorials/observability-quickstart.md) | Set up OpenTelemetry tracing with Jaeger |
 
-## Quick Start
+## Product Vision & Strategy
 
-=== "uv (recommended)"
+| Document | Description |
+|----------|-------------|
+| [Product Vision](product-vision.md) | Why RouteIQ exists, competitive positioning, and the evidence-based routing thesis |
+| [Evidence Console Design](architecture/evidence-console-design.md) | Engineering design for the Routing Evidence Console (CPTC, experiments, judge, data model) |
 
-    ```bash
-    uv add routeiq
-    uv run routeiq start --config config.yaml
-    ```
+## Core Features
 
-=== "pip"
+> **Zero-Config Intelligent Routing** — Centroid-based routing provides ~2ms classification out of the box with routing profiles (auto, eco, premium, free, reasoning). No ML model training required. See [Routing Strategies](routing-strategies.md) for details.
 
-    ```bash
-    pip install routeiq
-    routeiq start --config config.yaml
-    ```
+| Document | Description |
+|----------|-------------|
+| [Routing Strategies](routing-strategies.md) | ML-based routing: KNN, MLP, SVM, ELO, MF, hybrid, and custom strategies |
+| [Plugin System](plugins.md) | Extensible plugin architecture with lifecycle management and development guide |
+| [MCP Gateway](mcp-gateway.md) | Model Context Protocol support (JSON-RPC, SSE, REST surfaces) |
+| [A2A Gateway](a2a-gateway.md) | Agent-to-Agent communication protocol |
+| [Skills Gateway](skills-gateway.md) | Anthropic Computer Use, Bash, and Text Editor skill execution |
+| [Vector Stores](vector-stores.md) | Vector store integration for RAG and semantic search |
 
-=== "Docker"
+## Deployment
 
-    ```bash
-    docker run -p 4000:4000 \
-      -e LITELLM_MASTER_KEY=sk-your-key \
-      routeiq:latest
-    ```
+> **Docker Examples**: The [`examples/docker/`](../examples/docker/) directory contains ready-to-use deployment scenarios (basic, HA, observability, full-stack, local-dev), each with its own `docker-compose.yml`, `.env.example`, and `README.md`.
 
-=== "Docker Compose"
+| Document | Description |
+|----------|-------------|
+| [Deployment Overview](deployment.md) | Docker, Kubernetes (Helm), and HA deployment options |
+| [AWS Production Guide](aws-production-guide.md) | Complete AWS production deployment with ECS, ALB, and CloudWatch |
+| [AWS Compute Options](deployment/aws.md) | ECS, EKS, Lambda, and EC2 deployment patterns |
+| [CloudFront + ALB](deployment/cloudfront-alb.md) | CloudFront distribution with Application Load Balancer |
+| [Air-Gapped Deployment](deployment/air-gapped.md) | Deploy RouteIQ in disconnected or restricted environments |
 
-    ```bash
-    git clone https://github.com/baladithyab/RouteIQ.git
-    cd routeiq
-    docker compose up -d
-    ```
+## Operations
 
-## Verify Installation
+| Document | Description |
+|----------|-------------|
+| [Observability Guide](observability.md) | OpenTelemetry traces, metrics, and logs configuration |
+| [Security Guide](security.md) | Authentication, RBAC, SSRF protection, and secret management |
+| [MLOps Training Pipeline](mlops-training.md) | Closed-loop MLOps: telemetry extraction, model training, deployment |
+| [Streaming Verification](streaming-verification.md) | SSE streaming correctness and performance verification report |
 
-```bash
-# Health check
-curl http://localhost:4000/_health/ready
+## Architecture
 
-# Make a request
-curl -X POST http://localhost:4000/chat/completions \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello from RouteIQ!"}]
-  }'
-```
+### Core Architecture
 
-## Documentation Overview
+| Document | Description |
+|----------|-------------|
+| [Architecture Overview](architecture/overview.md) | High-level system architecture and component diagram |
+| [Cloud-Native Architecture](architecture/cloud-native.md) | Cloud-native design principles and implementation |
+| [MLOps Loop Architecture](architecture/mlops-loop.md) | ML training loop architecture and data flow |
+| [Bedrock Discovery](architecture/bedrock-discovery.md) | AWS Bedrock model discovery and integration architecture |
 
-| Section | Description |
-|---------|-------------|
-| [Getting Started](getting-started/quickstart.md) | 5-minute quickstart, installation, and configuration |
-| [Features](features/routing.md) | Routing strategies, MCP, A2A, Skills, and more |
-| [Governance](governance/overview.md) | Workspaces, policies, guardrails, and identity |
-| [Operations](operations/deployment.md) | Deployment, observability, Docker, Helm, security |
-| [Architecture](architecture/overview.md) | System architecture and ADRs |
-| [API Reference](api/gateway.md) | Gateway, governance, and routing APIs |
-| [Contributing](contributing.md) | Development setup and contribution guidelines |
+### Architecture Reviews
+
+| Document | Description |
+|----------|-------------|
+| [Deep Review v0.2.0](architecture/deep-review-v0.2.0.md) | Deep architecture review for v0.2.0 release |
+| [Architecture Review (Feb 2026)](architecture/ROUTEIQ-ARCHITECTURE-REVIEW-2026-02.md) | Comprehensive February 2026 architecture review |
+| [TG2 Architecture Evaluation](architecture/tg2-architecture-evaluation.md) | Task Group 2 architecture evaluation and findings |
+
+### Product Architecture
+
+| Document | Description |
+|----------|-------------|
+| [Evidence Console Design](architecture/evidence-console-design.md) | Routing Evidence Console: CPTC metrics, A/B experiments, LLM-as-a-judge, data model, API surface |
+
+### TG3 Design Documents
+
+| Document | Description |
+|----------|-------------|
+| [TG3 Rearchitecture Proposal](architecture/tg3-rearchitecture-proposal.md) | Proposed rearchitecture for Task Group 3 |
+| [TG3 Alternative Patterns](architecture/tg3-alternative-patterns.md) | Alternative architecture patterns explored for TG3 |
+| [TG3 Admin UI Design](architecture/tg3-admin-ui-design.md) | Admin UI design specification |
+| [TG3 Cloud-Native Design](architecture/tg3-cloud-native-design.md) | Cloud-native design document for TG3 |
+| [TG3 NadirClaw Integration](architecture/tg3-nadirclaw-integration.md) | NadirClaw integration design and architecture |
+
+## Development
+
+| Document | Description |
+|----------|-------------|
+| [API Reference](api-reference.md) | Complete API endpoint reference for all gateway surfaces |
+| [Project State](project-state.md) | Current project state, known gaps, and status tracking |
+| [Road Runner Workflow](rr-workflow.md) | Remote push workflow for code deployment |
+| [HA CI Gate](ha-ci-gate.md) | High-availability continuous integration gate documentation |
+| [Load & Soak Test Gates](load-soak-gates.md) | Load testing and soak testing quality gates |
+
+## Planning
+
+| Document | Description |
+|----------|-------------|
+| [Implementation Decomposition](../plans/implementation-decomposition.md) | Master task decomposition and implementation plan |
+| [v0.1.0 Design Document](plans/2026-02-13-routeiq-v0.1.0-design.md) | Original v0.1.0 design specification |
+| [v0.1.0 Implementation Plan](plans/2026-02-13-routeiq-v0.1.0-implementation.md) | v0.1.0 implementation plan and milestones |
+
+---
+
+*See also: [README](../README.md) · [Contributing](../CONTRIBUTING.md) · [Agent Instructions](../AGENTS.md)*

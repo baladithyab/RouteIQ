@@ -105,3 +105,4 @@ temp/
 # Admin UI build artifacts (also covered by ui/.gitignore)
 ui/node_modules/
 ui/dist/
+.gstack/
