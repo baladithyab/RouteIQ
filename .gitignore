@@ -102,6 +102,15 @@ temp/
 .ruff_format_check*.txt
 .ruff_format_diff*.txt
 
+# Test / CI run artifacts (local, regenerated per run)
+.coverage
+.coverage.*
+htmlcov/
+ha-gate-report.json
+
+# Deep-work-loop / hyperresearch scratch (workflow-generated; promote durable output to docs/)
+research/
+
 # Admin UI build artifacts (also covered by ui/.gitignore)
 ui/node_modules/
 ui/dist/
@@ -109,3 +118,7 @@ ui/dist/
 
 # Claude Code local settings (never commit; may contain tool approvals)
 .claude/settings.local.json
+.claude/
+
+# Hyperresearch local vault (workflow-generated research DB + exports)
+.hyperresearch/
