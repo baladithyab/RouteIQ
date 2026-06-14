@@ -119,15 +119,37 @@ Dependency edges filed: `P1→P0`, `P2→P0`, `P3→P1`, `P3→P2`, `P4→P3`.
 **By complexity / dependency**: P0 is the gate. P1 and P2 are independent of each other
 (can overlap) but both gate P3. P4 is last.
 
-### 2.4 Granular P0 child seeds — deferred to research
+### 2.4 Granular P0 child seeds — FILED (research+plan complete)
 
-P0's *child* tasks (one per VSR construct port + stack wiring + tests) are intentionally
-**not hand-authored here**. Exactly which constructs, with which acceptance criteria, and
-the load-bearing **IRSA-via-CfnJson vs EKS Pod Identity** decision, are the questions the
-research+plan phases of the deep-work-loop answer authoritatively. They are filed as a
-batch from `research/p0/child-seeds.json` once the P0 proposal
-(`31-p0-cdk-foundation-proposal.md`) is reviewed and accepted. This honors the handoff's
-non-negotiable: **propose the P0 plan before writing any CDK.**
+P0's *child* tasks were produced by the deep-work-loop's research+plan phases (a B2
+mega-workflow: 5 Opus codebase dives + the hyperresearch pipeline + a 4-lens critique
+panel) and are now **filed as 7 seeds** under epic `RouteIQ-5a85`, with a dependency DAG
+that surfaces the two leaf tasks (network + ecr) as `sd ready`:
+
+| Seed | Task | Depends on |
+|---|---|---|
+| `RouteIQ-9bb6` | port `network_construct.py` (VPC + SGs + 6 endpoints incl `BEDROCK_RUNTIME` + S3 gw) | — |
+| `RouteIQ-6988` | port `ecr_construct.py` (GHCR pull-through + `RepositoryCreationTemplate` governance on the cached repo) | — |
+| `RouteIQ-aa58` | port `eks_cluster_construct.py` **with EKS Pod Identity (not IRSA)** + defensive agent addon | network |
+| `RouteIQ-f701` | `RouteIqStack` wiring + `app.py` + `cdk.json` `routeiq:` keys (ONE stack) | network, eks, ecr |
+| `RouteIQ-d65b` | chart seams: `loadBalancerSourceRanges` + Pod-Identity SA binding + `AWS_REGION` + `EcrGhcrPrefix` image override | eks |
+| `RouteIQ-cbeb` | cdk-nag evidenced suppressions | stack |
+| `RouteIQ-dfd4` | cred-free `pytest` synth + nag + snapshot suite | stack, nag |
+
+The authoritative spec is **`31-p0-cdk-foundation-proposal.md`** (with discovery findings
++ the research report under `p0-discovery/`, and the seed spec at
+`p0-discovery/child-seeds-spec.json`). This honored the handoff's non-negotiable —
+**propose the P0 plan before writing any CDK** — and the proposal writes **zero `.py`**;
+the build is the next operator-gated wave.
+
+**The load-bearing research outcome**: the proposal **flips ADR-0030's IRSA assumption to
+EKS Pod Identity** (research verdict, *"very high confidence"*; ADR-0030 amended). On the
+L1 `CfnCluster` Auto Mode path this deletes the entire `CfnJson` token-keyed-trust /
+`OpenIdConnectProvider` surface and the `.replace("https://")` silent-no-op trap — Pod
+Identity uses a static `pods.eks.amazonaws.com` trust with no OIDC. A defensive
+`eks-pod-identity-agent` `CfnAddon` is added (the production VSR construct installs it by
+hand — verified at `eks_cluster_construct.py:391-398`), so the association resolves
+regardless of the "built into Auto Mode" claim.
 
 ---
 

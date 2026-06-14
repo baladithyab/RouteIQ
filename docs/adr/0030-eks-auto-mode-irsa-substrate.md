@@ -1,8 +1,42 @@
 # ADR-0030: EKS Auto Mode + IRSA as the Deployment Substrate
 
-**Status**: Proposed
+**Status**: Proposed — **AMENDED 2026-06-14: pod IAM mechanism flipped IRSA → EKS Pod Identity** (see Amendment below)
 **Date**: 2026-06-14
 **Decision Makers**: RouteIQ Core Team
+
+> ## ⚠️ Amendment (2026-06-14) — Pod Identity supersedes IRSA for the pod-IAM mechanism
+>
+> The P0 CDK Foundation proposal
+> (`docs/architecture/aws-rearchitecture/31-p0-cdk-foundation-proposal.md`, §3) and its
+> research report (`.../p0-discovery/research-report-irsa-vs-podidentity.md`,
+> *"very high confidence"*) **supersede this ADR's IRSA decision with EKS Pod Identity**.
+> What changes, and what does NOT:
+>
+> - **CHANGED — pod-IAM mechanism.** The pod→role binding is a single CDK-side
+>   `eks.CfnPodIdentityAssociation` over a **static `pods.eks.amazonaws.com` trust** —
+>   NOT IRSA. This **deletes** the `OpenIdConnectProvider`, the `oidc_provider_issuer`
+>   derivation, and the **`CfnJson` token-keyed trust map** this ADR describes below.
+>   The `irsa_role()` factory becomes a `pod_identity_association()` helper. A defensive
+>   `eks-pod-identity-agent` `CfnAddon` (`resolve_conflicts="OVERWRITE"`, `DependsOn` the
+>   cluster) is emitted so the association resolves regardless of the "built into Auto
+>   Mode" claim (the production VSR construct installs it by hand at
+>   `eks_cluster_construct.py:391-398` — verified).
+> - **CHANGED — chart seam.** With Pod Identity the chart needs **NO
+>   `eks.amazonaws.com/role-arn` ServiceAccount annotation**. The binding is keyed on a
+>   stable `(namespace, serviceAccount)` pinned by the CDK. This **moots** lesson #2
+>   (the `.replace("https://")` token no-op) and the IAM slice of lesson #6
+>   (`apply -k` clobbers the SA annotation) below — there is no annotation to clobber.
+> - **UNCHANGED.** Everything else in this ADR stands: the L1 `eks.CfnCluster`, the three
+>   Auto Mode blocks, `bootstrap_self_managed_addons=False`, `CfnAccessEntry` for
+>   cluster access, `enable_container_insights`, the CDK→Helm boundary, and lessons
+>   #1/#3/#7/#8. The L1-vs-L2 rationale below should be read as *a choice* (aws-cdk-lib's
+>   newer `aws-eks-v2` now offers Auto Mode on an L2), not a hard constraint — but L1 is
+>   retained per the VSR port. Why Pod Identity wins on L1: the L1 path strips the L2
+>   `addServiceAccount` helper that would hide IRSA's complexity, so on L1 the gap
+>   between trivial Pod Identity and hand-rolled IRSA+CfnJson is at its widest.
+>
+> The filename (`0030-eks-auto-mode-irsa-substrate.md`) is retained for link stability;
+> read "IRSA" in the title as "pod-to-AWS IAM," now realized via Pod Identity.
 
 ## Context
 
