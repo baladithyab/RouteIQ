@@ -43,6 +43,11 @@ Each ADR follows the standard format:
 | [0023](0023-guardrail-policy-pipeline.md) | Guardrail Policy Enforcement via Callback Bridge | Accepted | 2026-04-02 |
 | [0024](0024-context-optimizer.md) | Context Optimization via Lossless Transform Pipeline | Accepted | 2026-04-02 |
 | [0025](0025-personalized-routing.md) | Personalized Per-User Routing via Preference Embeddings | Accepted | 2026-04-02 |
+| [0026](0026-appconfig-gitops-config-delivery.md) | AWS AppConfig as the GitOps Config-Delivery Plane | Proposed | 2026-06-14 |
+| [0027](0027-otel-amp-amg-observability-on-aws.md) | AWS-Native Observability — AMP + AMG + CloudWatch over OTel GenAI | Proposed | 2026-06-14 |
+| [0028](0028-aurora-postgres-serverless-v2-state.md) | Aurora PostgreSQL Serverless v2 for Persistent State | Proposed | 2026-06-14 |
+| [0029](0029-elasticache-serverless-valkey-cache.md) | ElastiCache Serverless (Valkey) for Cache + Rate-Limit State | Proposed | 2026-06-14 |
+| [0030](0030-eks-auto-mode-irsa-substrate.md) | EKS Auto Mode + IRSA as the Deployment Substrate | Proposed | 2026-06-14 |
 
 ## Lifecycle
 

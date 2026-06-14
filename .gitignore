@@ -106,3 +106,6 @@ temp/
 ui/node_modules/
 ui/dist/
 .gstack/
+
+# Claude Code local settings (never commit; may contain tool approvals)
+.claude/settings.local.json
