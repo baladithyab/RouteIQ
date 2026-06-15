@@ -3007,6 +3007,7 @@ db = [
 ]
 dev = [
     { name = "authlib" },
+    { name = "boto3" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -3102,6 +3103,7 @@ requires-dist = [
     { name = "azure-identity", marker = "extra == 'cloud'", specifier = ">=1.15.0" },
     { name = "backoff", specifier = ">=2.0.0" },
     { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.42.32" },
+    { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.42.32" },
     { name = "cdk-nag", marker = "extra == 'cdk'", specifier = ">=2.27.0,<3.0.0" },
     { name = "constructs", marker = "extra == 'cdk'", specifier = ">=10.0.0,<11.0.0" },
     { name = "email-validator", specifier = ">=2.0.0" },

@@ -67,6 +67,12 @@ dev = [
     # before mock patches run when authlib is absent. authlib stays an OPTIONAL
     # runtime dependency (see the `oidc`/`prod`/`all` extras below).
     "authlib>=1.5.0",
+    # boto3: litellm 1.89.0 added an eager module-level boto3 import reachable
+    # from litellm.proxy.proxy_server, so importing it under a bare
+    # `uv sync --extra dev` (no `cloud`) raises ModuleNotFoundError: boto3.
+    # PROD/Docker are unaffected (the `prod` extra pulls `cloud`, which carries
+    # boto3). Lower bound matches the `cloud` extra (RouteIQ-fbda).
+    "boto3>=1.42.32",
 ]
 # Database support (PostgreSQL with asyncpg and Prisma client for LiteLLM)
 db = ["asyncpg>=0.29.0", "prisma>=0.13.0"]
