@@ -988,3 +988,144 @@ class TestCentroidRegistration:
             ),
         ):
             assert register_centroid_strategy() is False
+
+
+# ======================================================================
+# TestPreScoringCandidateFilter — RouteIQ-99e8 (cooldown) + RouteIQ-badb (gov-ban)
+# ======================================================================
+#
+# The seed bug lived in custom_routing_strategy.py: the custom-strategy path
+# (set_custom_routing_strategy hot-swaps async_get_available_deployment) BYPASSES
+# LiteLLM's built-in healthy-deployment pipeline (_get_healthy_deployments ->
+# _filter_cooldown_deployments) AND its async_filter_deployments hook. So every
+# RouteIQ candidate source read the STATIC `healthy_deployments` alias, which is
+# neither cooldown-aware nor gov-ban-aware. RouteIQRoutingStrategy then scored
+# over that full static set and could select a cooled-down / gov-banned arm,
+# failing only AFTER selection (reactive retry, not proactive exclusion).
+#
+# These tests assert the fix THROUGH the custom_routing_strategy.py seam itself:
+# _get_model_list (the direct ML-routing candidate path) and _fallback_deployment
+# (the final fallback) now run filter_routable_candidates() BEFORE returning the
+# candidate set, so a cooled-down / gov-banned arm never enters the scored set.
+
+
+class TestPreScoringCandidateFilter:
+    """RouteIQ-99e8 + RouteIQ-badb at the custom_routing_strategy.py seam."""
+
+    _FABLE5 = "bedrock/global.anthropic.claude-fable-5"
+
+    @staticmethod
+    def _dep(model_name: str, arm: str, dep_id: str) -> Dict[str, Any]:
+        return {
+            "model_name": model_name,
+            "litellm_params": {"model": arm},
+            "model_info": {"id": dep_id},
+        }
+
+    # ------------------------------------------------------------------
+    # RouteIQ-99e8 — cooldown excluded from _get_model_list candidate set
+    # ------------------------------------------------------------------
+
+    def test_get_model_list_excludes_cooled_down_arm(self, monkeypatch) -> None:
+        """99e8 acceptance: a cooled-down deployment is EXCLUDED from the
+        candidate set _get_model_list returns to the strategy (not retried
+        after selection)."""
+        live = self._dep("gpt-4", "openai/gpt-4", "d1")
+        cooled = self._dep("gpt-4", "anthropic/claude-3-opus", "d2")
+        router = _make_mock_router(
+            model_list=[live, cooled],
+            healthy_deployments=[live, cooled],
+        )
+        # d2 is in LiteLLM's live cooldown set.
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: {"d2"},
+        )
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        model_list, _ = strategy._get_model_list("gpt-4")
+        # The cooled-down arm's litellm model is gone from the scored set;
+        # the healthy arm remains.
+        assert "openai/gpt-4" in model_list
+        assert "anthropic/claude-3-opus" not in model_list
+
+    def test_get_model_list_cooldown_fail_open_when_all_cooled(
+        self, monkeypatch
+    ) -> None:
+        """If EVERY arm is cooled down, _get_model_list still returns candidates
+        (fail-open: availability over a zero-candidate dead-end)."""
+        a = self._dep("gpt-4", "openai/gpt-4", "d1")
+        b = self._dep("gpt-4", "anthropic/claude-3-opus", "d2")
+        router = _make_mock_router(model_list=[a, b], healthy_deployments=[a, b])
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: {"d1", "d2"},
+        )
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        model_list, _ = strategy._get_model_list("gpt-4")
+        assert set(model_list) == {"openai/gpt-4", "anthropic/claude-3-opus"}
+
+    def test_fallback_deployment_skips_cooled_down_arm(self, monkeypatch) -> None:
+        """_fallback_deployment (the final fallback) also never returns a
+        cooled-down arm — the fallback path also bypasses LiteLLM's pipeline."""
+        cooled = self._dep("gpt-4", "openai/gpt-4", "d1")
+        live = self._dep("gpt-4", "anthropic/claude-3-opus", "d2")
+        router = _make_mock_router(
+            model_list=[cooled, live], healthy_deployments=[cooled, live]
+        )
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: {"d1"},  # the FIRST listed arm is cooled
+        )
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        result = strategy._fallback_deployment("gpt-4")
+        # Without the fix the first (cooled) arm would be returned; the fix
+        # skips it and returns the live arm.
+        assert result is not None
+        assert result["litellm_params"]["model"] == "anthropic/claude-3-opus"
+
+    # ------------------------------------------------------------------
+    # RouteIQ-badb — gov-banned arm never enters the candidate set
+    # ------------------------------------------------------------------
+
+    def test_get_model_list_excludes_gov_banned_arm(self) -> None:
+        """badb acceptance: a gov-banned arm (Fable 5) never appears in the
+        candidate set _get_model_list returns to the strategy/bandit."""
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings(governance={"banned_models": [self._FABLE5]})
+        legal = self._dep("g", "bedrock/anthropic.claude-3-sonnet", "d1")
+        banned = self._dep("g", self._FABLE5, "d2")
+        router = _make_mock_router(
+            model_list=[legal, banned], healthy_deployments=[legal, banned]
+        )
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        model_list, _ = strategy._get_model_list("g")
+        assert "bedrock/anthropic.claude-3-sonnet" in model_list
+        assert self._FABLE5 not in model_list
+
+    def test_fallback_deployment_never_returns_gov_banned_sole_arm(self) -> None:
+        """Compliance fail-closed-to-removal: when the only candidate is gov-
+        banned, _fallback_deployment returns None — never a banned arm."""
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings(governance={"banned_models": [self._FABLE5]})
+        banned = self._dep("g", self._FABLE5, "d1")
+        router = _make_mock_router(model_list=[banned], healthy_deployments=[banned])
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        assert strategy._fallback_deployment("g") is None
+
+    def test_get_model_list_default_no_ban_byte_stable(self) -> None:
+        """Default-empty ban + no cooldown -> the candidate set is unchanged
+        (byte-stable no-op); both arms remain scorable."""
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings()  # default GovernanceSettings -> banned_models == []
+        a = self._dep("g", "bedrock/a", "d1")
+        b = self._dep("g", "bedrock/b", "d2")
+        router = _make_mock_router(model_list=[a, b], healthy_deployments=[a, b])
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+        model_list, _ = strategy._get_model_list("g")
+        assert set(model_list) == {"bedrock/a", "bedrock/b"}

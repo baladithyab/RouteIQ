@@ -755,12 +755,21 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             self._router, "healthy_deployments", self._router.model_list
         )
 
+        # RouteIQ-99e8 (cooldown) + RouteIQ-badb (gov-ban): the custom-strategy
+        # path bypasses LiteLLM's healthy-deployment pipeline, so the static
+        # ``healthy_deployments`` alias is NOT cooldown-aware and never applies a
+        # gov-ban. Filter cooled-down / gov-banned arms out of the group-matched
+        # subset BEFORE returning the candidate set the strategy scores.
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
+        routable = filter_routable_candidates(self._router, group_matched)
+
         model_list: List[str] = []
-        for deployment in healthy_deployments:
-            if deployment.get("model_name") == model:
-                litellm_model = deployment.get("litellm_params", {}).get("model", "")
-                if litellm_model:
-                    model_list.append(litellm_model)
+        for deployment in routable:
+            litellm_model = deployment.get("litellm_params", {}).get("model", "")
+            if litellm_model:
+                model_list.append(litellm_model)
 
         return model_list, healthy_deployments
 
@@ -855,13 +864,19 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         return self._pipeline
 
     def _fallback_deployment(self, model: str) -> Optional[Dict]:
-        """Return first healthy deployment for the given model group."""
+        """Return first routable deployment for the given model group.
+
+        RouteIQ-99e8 / RouteIQ-badb: never fall back to a cooled-down or
+        gov-banned arm (the fallback path also bypasses LiteLLM's pipeline).
+        """
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
         healthy_deployments = getattr(
             self._router, "healthy_deployments", self._router.model_list
         )
-        for deployment in healthy_deployments:
-            if deployment.get("model_name") == model:
-                return deployment
+        group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
+        for deployment in filter_routable_candidates(self._router, group_matched):
+            return deployment
         return None
 
 

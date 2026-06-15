@@ -15,7 +15,9 @@ from hypothesis import strategies as st
 
 from litellm_llmrouter.kumaraswamy_thompson import (
     KumaraswamyThompsonStrategy,
+    fit_kumaraswamy_moments,
     kumaraswamy_cdf,
+    kumaraswamy_mean_var,
     kumaraswamy_quantile,
 )
 from litellm_llmrouter.strategy_registry import RoutingContext
@@ -161,3 +163,27 @@ def test_seeded_selection_deterministic(seed):
         for i in range(10)
     ]
     assert picks1 == picks2
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-f9e9 — moment-fit Beta(alpha,beta) -> Kumaraswamy(a,b)
+# ---------------------------------------------------------------------------
+
+
+@given(
+    alpha=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
+    beta=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
+)
+@settings(max_examples=100)
+def test_moment_fit_mean_within_tolerance(alpha, beta):
+    # The fitted Kumaraswamy mean approximates the Beta mean across the whole
+    # (alpha, beta) band, and the fit always returns valid Kumaraswamy params.
+    # 5e-2 is a robust band including the ultra-low-variance extremes where the
+    # fit saturates at the box-guard (correct degradation: right mean, slightly
+    # too-large variance, never the shortcut's wrong mean).
+    a, b = fit_kumaraswamy_moments(alpha, beta)
+    fit_mean, fit_var = kumaraswamy_mean_var(a, b)
+    assert abs(fit_mean - alpha / (alpha + beta)) < 5e-2
+    assert a > 0.0 and b > 0.0
+    assert math.isfinite(a) and math.isfinite(b)
+    assert math.isfinite(fit_mean) and math.isfinite(fit_var)

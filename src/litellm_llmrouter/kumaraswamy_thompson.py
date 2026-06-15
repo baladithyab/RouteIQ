@@ -156,6 +156,158 @@ def sample_kumaraswamy(a: float, b: float, rng: random.Random) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Moment-fit Beta(alpha,beta) -> Kumaraswamy(a,b)  (doc-20 §3.1 option-2)
+# ---------------------------------------------------------------------------
+#
+# The §3.1 option-1 ``a=alpha, b=beta`` shortcut (``Posterior.shape()``) does
+# NOT preserve the posterior mean: ``Kumaraswamy(a,b)`` is intrinsically
+# right-skewed for ``a > 1``, so a symmetric peaked Beta gets its mass pushed
+# toward 1 (Beta(51,51) mean 0.5 -> Kumaraswamy mean 0.9155). That distortion
+# can INVERT the Thompson exploit decision (an over-concentrated symmetric arm
+# beats a genuinely-better but less-concentrated arm).
+#
+# Option-2 maps Beta(alpha,beta) -> Kumaraswamy(a,b) by matching the mean
+# ``alpha/(alpha+beta)`` and variance ``alpha*beta/((alpha+beta)^2*(alpha+beta+1))``
+# to the Kumaraswamy moments ``E[X^n] = b*B(1+n/a, b)``. There is no closed
+# form, so this is a 5-iteration damped log-space Newton solve. The log-space
+# coordinates + log-variance residual + damping + a NON-shortcut warm start are
+# each required: a naive raw-coordinate Newton seeded from the shortcut
+# DIVERGES on the symmetric peaked posteriors a bandit produces most (it
+# collapses ``a -> ~1e-3`` into a degenerate corner). Pure stdlib ``math`` only
+# (no numpy), consistent with the module's no-numpy constraint.
+
+
+def _lbeta(x: float, y: float) -> float:
+    """``ln B(x, y)`` via stdlib ``lgamma`` (no numpy)."""
+    return math.lgamma(x) + math.lgamma(y) - math.lgamma(x + y)
+
+
+def _kuma_raw_moment(n: int, a: float, b: float) -> float:
+    """``E[X^n] = b * B(1 + n/a, b)`` for ``Kumaraswamy(a, b)`` (log-space)."""
+    return math.exp(math.log(b) + _lbeta(1.0 + n / a, b))
+
+
+def kumaraswamy_mean_var(a: float, b: float) -> Tuple[float, float]:
+    """Exact mean and variance of ``Kumaraswamy(a, b)``.
+
+    ``mean = E[X] = b*B(1+1/a, b)``;
+    ``var  = E[X^2] - E[X]^2`` (floored at ``1e-15`` for log-stability).
+    """
+    m1 = _kuma_raw_moment(1, a, b)
+    m2 = _kuma_raw_moment(2, a, b)
+    return m1, max(m2 - m1 * m1, 1e-15)
+
+
+def _solve_b_for_mean(a: float, target_mean: float, iters: int = 30) -> float:
+    """1-D log-bisection for ``b`` matching ``mean_K(a, b) = target_mean``.
+
+    ``mean_K`` is strictly monotone-decreasing in ``b`` at fixed ``a``, so a
+    log-space bisection over ``[1e-6, 1e12]`` converges robustly. Used to build
+    a warm start that lands inside Newton's basin of attraction.
+    """
+    lo, hi = 1e-6, 1e12
+    for _ in range(iters):
+        mid = math.sqrt(lo * hi)
+        m, _ = kumaraswamy_mean_var(a, mid)
+        lo, hi = (mid, hi) if m > target_mean else (lo, mid)
+    return math.sqrt(lo * hi)
+
+
+def fit_kumaraswamy_moments(alpha: float, beta: float) -> Tuple[float, float]:
+    """Map ``Beta(alpha, beta) -> Kumaraswamy(a, b)`` (doc-20 §3.1 option-2).
+
+    Matches the mean ``alpha/(alpha+beta)`` and variance to the Kumaraswamy
+    moments via a 5-iteration damped log-space Newton solve with a 1-D
+    log-bisection warm start. Pure deterministic function of ``(alpha, beta)``
+    (no RNG, no global state). Returns valid params (``a > 0``, ``b > 0``) for
+    all inputs.
+
+    Numerical structure (each element is required, validated against a grid):
+    - Exact special-case short-circuits (``Kuma(1,b)=Beta(1,b)``,
+      ``Kuma(a,1)=Beta(a,1)``) -> byte-stable corners.
+    - Log-space coordinates ``(ln a, ln b)`` -> params positive by construction.
+    - Log-variance residual -> conditions the 2x2 Jacobian (peaked posteriors
+      have tiny variances that otherwise make the system ill-conditioned).
+    - Damped step (``|delta| <= 1.5``) + box-guard -> prevents the single
+      overshoot into the degenerate ``a -> 0`` corner.
+    - Singular-Jacobian guard (``|det| < 1e-14`` -> break, keep best iterate).
+    - Best-iterate tracking on the MEAN (mean-error first, variance-error tie-
+      break). Kumaraswamy has a *minimum achievable variance* for a given mean;
+      on high-evidence near-symmetric posteriors (e.g. Beta(185,190)) the target
+      variance is below that floor, so Newton — chasing an infeasible variance —
+      walks the mean off the warm start (which already nails the mean). Keeping
+      the smallest-mean-error iterate is the doc's stated degradation contract:
+      the right mean with a slightly-too-large variance (more exploration),
+      NEVER the shortcut's wrong mean. Without it the fit returns a mean error of
+      ~0.14 in that regime — the very distortion this fixes.
+    """
+    # Exact special cases (byte-stable corners). alpha==beta==1 falls out here.
+    if abs(alpha - 1.0) < 1e-12:
+        return (1.0, beta)
+    if abs(beta - 1.0) < 1e-12:
+        return (alpha, 1.0)
+
+    s = alpha + beta
+    t_mean = alpha / s
+    t_var = (alpha * beta) / (s * s * (s + 1.0))
+
+    # Warm start: a0 = sqrt(alpha) (NOT the shortcut), b0 from the mean eqn.
+    a = max(0.1, math.sqrt(alpha))
+    b = _solve_b_for_mean(a, t_mean)
+    la, lb = math.log(a), math.log(b)
+
+    h = 1e-5
+    log_t_var = math.log(t_var)
+    # Track the best iterate by (mean error, variance error) — mean is the
+    # load-bearing quantity, so it dominates the comparison.
+    best_la, best_lb = la, lb
+    best_m, best_v = kumaraswamy_mean_var(a, b)
+    best_key = (abs(best_m - t_mean), abs(math.log(best_v) - log_t_var))
+    for _ in range(5):
+        a, b = math.exp(la), math.exp(lb)
+        m, v = kumaraswamy_mean_var(a, b)
+        key = (abs(m - t_mean), abs(math.log(v) - log_t_var))
+        if key < best_key:
+            best_key = key
+            best_la, best_lb = la, lb
+        r0 = m - t_mean
+        r1 = math.log(v) - log_t_var
+        m_a, v_a = kumaraswamy_mean_var(math.exp(la + h), b)
+        m_b, v_b = kumaraswamy_mean_var(a, math.exp(lb + h))
+        j00 = (m_a - m) / h
+        j01 = (m_b - m) / h
+        j10 = (math.log(v_a) - math.log(v)) / h
+        j11 = (math.log(v_b) - math.log(v)) / h
+        det = j00 * j11 - j01 * j10
+        if abs(det) < 1e-14:
+            break  # singular -> keep best iterate seen
+        d_la = (j11 * r0 - j01 * r1) / det
+        d_lb = (-j10 * r0 + j00 * r1) / det
+        d_la = max(-1.5, min(1.5, d_la))  # damping
+        d_lb = max(-1.5, min(1.5, d_lb))
+        la -= d_la
+        lb -= d_lb
+        la = max(min(la, 20.0), -8.0)  # box-guard
+        lb = max(min(lb, 25.0), -8.0)
+    # Final post-loop iterate may also be the best — check it.
+    a, b = math.exp(la), math.exp(lb)
+    m, v = kumaraswamy_mean_var(a, b)
+    if (abs(m - t_mean), abs(math.log(v) - log_t_var)) < best_key:
+        best_la, best_lb = la, lb
+    return (math.exp(best_la), math.exp(best_lb))
+
+
+def strength_bucket(s: float, base: float = 2.0) -> int:
+    """Log-spaced evidence bucket ``floor(log_base(max(s, 1e-9)))``.
+
+    Boundaries land at ``s in {2, 4, 8, 16, ...}`` for ``base=2``: the moment
+    fit is refreshed once per doubling of evidence -> ``O(log(total evidence))``
+    fits over an arm's lifetime, amortized to ~0 on the hot path.
+    """
+    return int(math.floor(math.log(max(s, 1e-9), base)))
+
+
+# ---------------------------------------------------------------------------
 # Posterior state + backend Protocol (in-memory DEFAULT; tests need no DB)
 # ---------------------------------------------------------------------------
 
@@ -165,22 +317,43 @@ class Posterior:
     """Conjugate Beta posterior counts for one ``(bucket, arm)`` pair.
 
     ``alpha``/``beta`` are the pseudo-counts; ``mean()`` is the posterior mean
-    reward estimate. Per the design's §3.1 shortcut the Kumaraswamy shape
-    parameters are taken directly as ``(a, b) = (alpha, beta)``.
+    reward estimate. :meth:`shape` returns the Kumaraswamy shape ``(a, b)``:
+    the §3.1 option-1 ``(a, b) = (alpha, beta)`` shortcut by default, or the
+    §3.1 option-2 moment-fit when ``moment_fit=True`` (cached on the three
+    ``_fit_*`` fields below, refreshed only when the evidence ``alpha+beta``
+    crosses a log-spaced bucket boundary).
     """
 
     alpha: float = 1.0
     beta: float = 1.0
     last_update: float = 0.0
+    # Cached moment-fit (RouteIQ-f9e9). 0.0 a => unset; refreshed when the
+    # strength bucket changes. Per-instance -> reset with the backend, no
+    # module-level singleton.
+    _fit_a: float = 0.0
+    _fit_b: float = 0.0
+    _fit_bucket: int = -(2**31)
 
     def mean(self) -> float:
         """Posterior mean reward ``alpha / (alpha + beta)``."""
         total = self.alpha + self.beta
         return self.alpha / total if total > 0 else 0.5
 
-    def shape(self) -> Tuple[float, float]:
-        """Kumaraswamy shape ``(a, b)`` — the ``a=alpha, b=beta`` shortcut."""
-        return (self.alpha, self.beta)
+    def shape(self, *, moment_fit: bool = False) -> Tuple[float, float]:
+        """Kumaraswamy shape ``(a, b)``.
+
+        ``moment_fit=False`` (default): the §3.1 option-1 ``a=alpha, b=beta``
+        shortcut -- unchanged, byte-stable. ``moment_fit=True``: the §3.1
+        option-2 Newton moment-fit (cached; recomputed only when the strength
+        bucket ``floor(log2(alpha+beta))`` differs from the cached fit).
+        """
+        if not moment_fit:
+            return (self.alpha, self.beta)  # option-1 shortcut (default)
+        bucket = strength_bucket(self.alpha + self.beta)
+        if self._fit_a <= 0.0 or bucket != self._fit_bucket:
+            self._fit_a, self._fit_b = fit_kumaraswamy_moments(self.alpha, self.beta)
+            self._fit_bucket = bucket
+        return (self._fit_a, self._fit_b)
 
     def strength(self) -> float:
         """Total pseudo-count ``alpha + beta`` (concentration / evidence)."""
@@ -332,6 +505,7 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
         w_latency: float = 0.1,
         decay_gamma: float = 0.99,
         cold_start_kappa: float = 5.0,
+        moment_fit: bool = False,
         settings: Any = None,
         bucket_log_capacity: int = 4096,
         **kwargs: Any,
@@ -340,6 +514,8 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
         # RNG threaded as an object — never the global ``random`` module.
         self._rng = random.Random(seed)
         self._seed = seed
+        # RouteIQ-f9e9: use the moment-fit shape on the scoring path when on.
+        self._moment_fit = bool(moment_fit)
 
         # Reward weights, sum-normalized.
         weights = (max(0.0, w_quality), max(0.0, w_cost), max(0.0, w_latency))
@@ -519,7 +695,14 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
 
     def select_deployment(self, context: RoutingContext) -> Optional[Dict]:
         """Thompson-sample over live candidate arms and pick the argmax draw."""
-        cands = self._drop_open_breakers(self._candidates(context))
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        cands = self._candidates(context)
+        # RouteIQ-99e8 (cooldown) + RouteIQ-badb (gov-ban): remove cooled-down /
+        # gov-banned arms BEFORE scoring, so a cooled-down/unhealthy or banned
+        # arm is never scored or selected (proactive, not retried-after-failure).
+        cands = filter_routable_candidates(context.router, cands)
+        cands = self._drop_open_breakers(cands)
         if not cands:
             return None
         if len(cands) == 1:
@@ -531,7 +714,7 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
         best_draw = -1.0
         for dep in cands:
             model = self._arm_key(dep)
-            a, b = self._get_posterior(bucket, model).shape()
+            a, b = self._get_posterior(bucket, model).shape(moment_fit=self._moment_fit)
             x = sample_kumaraswamy(a, b, self._rng)
             if x > best_draw:
                 best_draw, best = x, dep
@@ -734,6 +917,7 @@ def register_kumaraswamy_thompson_strategy() -> bool:
             w_latency=getattr(kts, "w_latency", 0.1),
             decay_gamma=getattr(kts, "decay_gamma", 0.99),
             cold_start_kappa=getattr(kts, "cold_start_kappa", 5.0),
+            moment_fit=getattr(kts, "moment_fit", False),
         )
         registry = get_routing_registry()
         manifest_dict: Dict[str, Any] = {}

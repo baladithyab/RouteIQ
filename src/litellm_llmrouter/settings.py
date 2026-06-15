@@ -610,6 +610,20 @@ class GovernanceSettings(BaseModel):
             "limit is configured but the store cannot confirm current usage."
         ),
     )
+    banned_models: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Models removed from the routable candidate set BEFORE the routing "
+            "strategy/bandit scores (data-retention / compliance ban, e.g. "
+            "Fable 5). Matched against ``litellm_params.model`` (the bandit arm "
+            "key) and ``model_name`` (the group name). Enforced RouteIQ-native "
+            "(see ``candidate_filter.py``), NOT via LiteLLM's "
+            "``async_filter_deployments`` hook -- that hook lives on the "
+            "built-in selection path the custom strategy bypasses. Default empty "
+            "(no ban) -> byte-stable no-op. "
+            "Env: ``ROUTEIQ_GOVERNANCE__BANNED_MODELS``."
+        ),
+    )
 
 
 class MCPSettings(BaseModel):
@@ -1235,6 +1249,21 @@ class KumaraswamyThompsonSettings(BaseModel):
     seed: Optional[int] = Field(
         None,
         description="RNG seed for deterministic sampling in tests/replay.",
+    )
+    moment_fit: bool = Field(
+        False,
+        description=(
+            "Use the doc-20 §3.1 option-2 cached Newton moment-fit "
+            "Beta(alpha,beta) -> Kumaraswamy(a,b) mapping (matches mean + "
+            "variance) instead of the option-1 ``a=alpha, b=beta`` shortcut. "
+            "The shortcut distorts the posterior mean (Beta(51,51) mean 0.5 -> "
+            "Kumaraswamy 0.9155) and can invert the exploit decision; the "
+            "moment-fit restores the correct mean. Cached per-posterior and "
+            "refreshed only when ``alpha+beta`` crosses a log-spaced threshold, "
+            "keeping the hot path at ~1 uniform draw + the quantile. Default "
+            "off for byte-stable backward-compat. "
+            "Env: ``ROUTEIQ_KUMARASWAMY_THOMPSON__MOMENT_FIT``."
+        ),
     )
 
 

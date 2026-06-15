@@ -21,10 +21,13 @@ from litellm_llmrouter.kumaraswamy_thompson import (
     KumaraswamyThompsonStrategy,
     Posterior,
     _q_naive,
+    fit_kumaraswamy_moments,
     kumaraswamy_cdf,
+    kumaraswamy_mean_var,
     kumaraswamy_quantile,
     register_kumaraswamy_thompson_strategy,
     sample_kumaraswamy,
+    strength_bucket,
 )
 from litellm_llmrouter.strategy_registry import RoutingContext, get_routing_registry
 
@@ -459,3 +462,294 @@ def test_export_load_artifact_round_trip(tmp_path):
     ref = ArtifactRef(path=str(path), payload=artifact)
     assert s2.load_artifact(ref) is True
     assert s2._backend.get("g", "bedrock/a").alpha == pytest.approx(2.0)
+
+
+# ===========================================================================
+# 10. RouteIQ-f9e9 — Kumaraswamy Newton moment-fit (doc-20 §3.1 option-2)
+# ===========================================================================
+#
+# The option-1 ``a=alpha, b=beta`` shortcut distorts the posterior mean
+# (Beta(51,51) mean 0.5 -> Kumaraswamy 0.9155) and can INVERT the exploit
+# decision. The cached 5-iteration Newton moment-fit maps Beta(alpha,beta) ->
+# Kumaraswamy(a,b) matching mean + variance, restoring the correct mean while
+# keeping the hot path at ~1 uniform draw + the quantile.
+
+
+@pytest.mark.parametrize(
+    "alpha,beta",
+    [
+        (1, 1),
+        (51, 51),
+        (40, 40),
+        (6, 4),
+        (2, 5),
+        (10, 3),
+        (80, 20),
+        (20, 80),
+        (0.5, 0.5),
+        (3, 3),
+        (100, 2),
+        (2, 100),
+        (7, 7),
+    ],
+)
+def test_moment_fit_mean_matches_beta(alpha, beta):
+    # The fitted Kumaraswamy mean approximates the Beta mean across [0,1].
+    # Worst real-regime error is ~1e-12; 1e-2 is a comfortable unit tolerance.
+    a, b = fit_kumaraswamy_moments(float(alpha), float(beta))
+    fit_mean, _ = kumaraswamy_mean_var(a, b)
+    beta_mean = alpha / (alpha + beta)
+    assert abs(fit_mean - beta_mean) < 1e-2
+    assert a > 0.0 and b > 0.0  # always valid Kumaraswamy params
+
+
+def test_moment_fit_special_cases_exact():
+    # The three exact Beta==Kumaraswamy corners short-circuit to (a,b) exactly
+    # (byte-stable, no iteration): Kuma(1,b)=Beta(1,b), Kuma(a,1)=Beta(a,1),
+    # Kuma(1,1)=Beta(1,1)=Uniform.
+    assert fit_kumaraswamy_moments(1.0, 5.0) == (1.0, 5.0)
+    assert fit_kumaraswamy_moments(5.0, 1.0) == (5.0, 1.0)
+    assert fit_kumaraswamy_moments(1.0, 1.0) == (1.0, 1.0)
+
+
+def test_moment_fit_beats_shortcut_on_exploit_inversion():
+    """Shortcut ranks Beta(40,40) [true 0.5] above Beta(6,4) [true 0.6] (WRONG);
+    the moment-fit restores the correct ranking and Thompson over the fitted
+    shapes picks the genuinely-better arm the majority of the time."""
+    import random
+
+    A1, A2 = (40.0, 40.0), (6.0, 4.0)  # arm2 genuinely better (0.6 > 0.5)
+
+    # Shortcut MEANS invert the ranking (the bug):
+    sm1, _ = kumaraswamy_mean_var(*A1)
+    sm2, _ = kumaraswamy_mean_var(*A2)
+    assert sm1 > sm2  # shortcut WRONGLY prefers the over-concentrated arm1
+
+    # Moment-fit MEANS restore the correct ranking:
+    a1, b1 = fit_kumaraswamy_moments(*A1)
+    a2, b2 = fit_kumaraswamy_moments(*A2)
+    fm1, _ = kumaraswamy_mean_var(a1, b1)
+    fm2, _ = kumaraswamy_mean_var(a2, b2)
+    assert fm1 == pytest.approx(0.5, abs=1e-2)
+    assert fm2 == pytest.approx(0.6, abs=1e-2)
+    assert fm2 > fm1  # CORRECT ranking restored
+
+    # Thompson over the fitted shapes picks the better arm the majority:
+    rng = random.Random(123)
+    fit_wins = sum(
+        kumaraswamy_quantile(rng.random(), a2, b2)
+        > kumaraswamy_quantile(rng.random(), a1, b1)
+        for _ in range(20000)
+    )
+    # Measured ~0.74 for the moment-fit vs ~0.06 for the shortcut.
+    assert fit_wins / 20000 > 0.5
+
+    # And the shortcut shapes pick the WORSE arm the vast majority (regression
+    # guard: proves the moment-fit is what flips the decision, not the seed).
+    rng = random.Random(123)
+    shortcut_wins = sum(
+        kumaraswamy_quantile(rng.random(), *A2)
+        > kumaraswamy_quantile(rng.random(), *A1)
+        for _ in range(20000)
+    )
+    assert shortcut_wins / 20000 < 0.2
+
+
+def test_moment_fit_cache_refreshes_on_log_threshold():
+    # Within a strength bucket the fit is cached (identical); crossing a
+    # log-spaced bucket boundary (alpha+beta doubling) triggers a refit.
+    p = Posterior(alpha=4.0, beta=4.0)  # s=8 -> bucket floor(log2(8))=3
+    a1, b1 = p.shape(moment_fit=True)
+    a1b, b1b = p.shape(moment_fit=True)  # same bucket -> cached, identical
+    assert (a1, b1) == (a1b, b1b)
+    assert strength_bucket(8.0) == 3
+    p.alpha += 8.0  # s=16 -> bucket floor(log2(16))=4 -> refit
+    assert strength_bucket(16.0) == 4
+    a2, b2 = p.shape(moment_fit=True)
+    assert (a2, b2) != (a1, b1)
+
+
+def test_moment_fit_deterministic():
+    # Pure deterministic function of (alpha, beta): no RNG, no global state.
+    assert fit_kumaraswamy_moments(40.0, 40.0) == fit_kumaraswamy_moments(40.0, 40.0)
+    assert fit_kumaraswamy_moments(6.0, 4.0) == fit_kumaraswamy_moments(6.0, 4.0)
+
+
+@pytest.mark.parametrize(
+    "alpha,beta",
+    [
+        (185.25, 190.0),  # the hypothesis-found infeasible-variance regression
+        (190.0, 185.25),
+        (200.0, 200.0),
+        (150.0, 160.0),
+        (1000.0, 1000.0),
+        (199.0, 200.0),
+    ],
+)
+def test_moment_fit_mean_holds_on_high_evidence_near_symmetric(alpha, beta):
+    # High-evidence near-symmetric posteriors sit below Kumaraswamy's minimum
+    # achievable variance, so Newton chasing the infeasible variance would walk
+    # the mean off the warm start (~0.14 error). Best-iterate tracking keeps the
+    # right mean (the doc's degradation contract: right mean, larger variance,
+    # never the shortcut's wrong mean). Regression guard for the property-test
+    # falsifying example.
+    a, b = fit_kumaraswamy_moments(alpha, beta)
+    fit_mean, _ = kumaraswamy_mean_var(a, b)
+    assert abs(fit_mean - alpha / (alpha + beta)) < 1e-2
+
+
+def test_moment_fit_extreme_params_stay_valid():
+    # Numerical guards: no overflow / nan, always valid (a>0, b>0) at extremes.
+    import math
+
+    for alpha, beta in [
+        (0.3, 0.3),
+        (0.3, 200.0),
+        (200.0, 0.3),
+        (1000.0, 1000.0),
+        (2000.0, 1.5),
+        (0.5, 500.0),
+    ]:
+        a, b = fit_kumaraswamy_moments(alpha, beta)
+        assert a > 0.0 and b > 0.0
+        assert math.isfinite(a) and math.isfinite(b)
+        q = kumaraswamy_quantile(0.5, a, b)
+        assert 0.0 < q < 1.0 and math.isfinite(q)
+
+
+def test_shortcut_default_unchanged():
+    # Default shape() path is byte-stable (no-flag == old option-1 behavior).
+    p = Posterior(alpha=40.0, beta=40.0)
+    assert p.shape() == (40.0, 40.0)  # option-1 shortcut, unchanged
+    assert p.shape(moment_fit=False) == (40.0, 40.0)
+
+
+def test_moment_fit_flag_off_by_default_in_strategy():
+    # The strategy defaults to the shortcut; flag is opt-in.
+    strat = KumaraswamyThompsonStrategy()
+    assert strat._moment_fit is False
+    strat_on = KumaraswamyThompsonStrategy(moment_fit=True)
+    assert strat_on._moment_fit is True
+
+
+def test_moment_fit_selection_seeded_deterministic():
+    # Seeded determinism preserved on the moment-fit scoring path.
+    router = _FakeRouter([_dep("g", "bedrock/a"), _dep("g", "bedrock/b")])
+    s1 = KumaraswamyThompsonStrategy(seed=7, moment_fit=True)
+    s2 = KumaraswamyThompsonStrategy(seed=7, moment_fit=True)
+    picks1 = [
+        s1.select_deployment(_ctx(router, model="g", request_id=f"r{i}"))[
+            "litellm_params"
+        ]["model"]
+        for i in range(10)
+    ]
+    picks2 = [
+        s2.select_deployment(_ctx(router, model="g", request_id=f"r{i}"))[
+            "litellm_params"
+        ]["model"]
+        for i in range(10)
+    ]
+    assert picks1 == picks2
+
+
+# ===========================================================================
+# 11. RouteIQ-99e8 + RouteIQ-badb — pre-scoring filter THROUGH the bandit seam
+# ===========================================================================
+#
+# These assert the filter runs BEFORE the bandit's scoring loop (not retried
+# after a failed selection): a cooled-down / gov-banned arm is excluded from the
+# scored candidate set, so it is never returned across many seeded draws.
+
+from litellm_llmrouter.settings import get_settings as _get_settings  # noqa: E402
+from litellm_llmrouter.settings import reset_settings as _reset_settings  # noqa: E402
+
+_FABLE5 = "bedrock/global.anthropic.claude-fable-5"
+
+
+def _dep_id(model_name: str, arm: str, dep_id: str) -> dict:
+    """Deployment dict carrying model_info.id (the cooldown match key)."""
+    return {
+        "model_name": model_name,
+        "litellm_params": {"model": arm},
+        "model_info": {"id": dep_id},
+    }
+
+
+def test_bandit_excludes_cooled_down_arm(monkeypatch):
+    """RouteIQ-99e8 through the bandit: a cooled-down arm is EXCLUDED from the
+    scored candidate set -- never returned across many seeded draws."""
+    monkeypatch.setattr(
+        "litellm_llmrouter.candidate_filter.cooled_down_ids",
+        lambda router: {"d2"},  # d2 is cooled down
+    )
+    router = _FakeRouter(
+        [_dep_id("g", "bedrock/a", "d1"), _dep_id("g", "bedrock/b", "d2")]
+    )
+    strat = KumaraswamyThompsonStrategy(seed=99)
+    chosen_arms = set()
+    for i in range(200):
+        chosen = strat.select_deployment(_ctx(router, model="g", request_id=f"r{i}"))
+        assert chosen is not None
+        chosen_arms.add(chosen["litellm_params"]["model"])
+    assert "bedrock/b" not in chosen_arms  # cooled-down arm never scored/selected
+    assert chosen_arms == {"bedrock/a"}
+
+
+def test_bandit_cooldown_fail_open_when_all_cooled(monkeypatch):
+    """If every arm is cooled down, the bandit still routes (fail-open)."""
+    monkeypatch.setattr(
+        "litellm_llmrouter.candidate_filter.cooled_down_ids",
+        lambda router: {"d1", "d2"},
+    )
+    router = _FakeRouter(
+        [_dep_id("g", "bedrock/a", "d1"), _dep_id("g", "bedrock/b", "d2")]
+    )
+    strat = KumaraswamyThompsonStrategy(seed=5)
+    assert strat.select_deployment(_ctx(router, model="g")) is not None
+
+
+def test_bandit_never_selects_gov_banned_arm():
+    """RouteIQ-badb through the bandit: a gov-banned arm (Fable 5) is REMOVED
+    before scoring and never returned across many seeded draws."""
+    _reset_settings()
+    _get_settings(governance={"banned_models": [_FABLE5]})
+    router = _FakeRouter(
+        [
+            _dep_id("g", "bedrock/anthropic.claude-3-sonnet", "d1"),
+            _dep_id("g", _FABLE5, "d2"),
+        ]
+    )
+    strat = KumaraswamyThompsonStrategy(seed=123)
+    chosen_arms = set()
+    for i in range(200):
+        chosen = strat.select_deployment(_ctx(router, model="g", request_id=f"r{i}"))
+        assert chosen is not None
+        chosen_arms.add(chosen["litellm_params"]["model"])
+    assert _FABLE5 not in chosen_arms
+    assert chosen_arms == {"bedrock/anthropic.claude-3-sonnet"}
+
+
+def test_bandit_gov_banned_sole_arm_returns_none():
+    """A gov-banned arm that is the SOLE candidate -> no selection (compliance
+    fail-closed-to-removal; never route to a banned model)."""
+    _reset_settings()
+    _get_settings(governance={"banned_models": [_FABLE5]})
+    router = _FakeRouter([_dep_id("g", _FABLE5, "d1")])
+    strat = KumaraswamyThompsonStrategy(seed=1)
+    assert strat.select_deployment(_ctx(router, model="g")) is None
+
+
+def test_bandit_default_no_ban_byte_stable():
+    """Default-empty ban config -> both arms remain selectable (byte-stable)."""
+    _reset_settings()
+    _get_settings()  # no banned_models
+    router = _FakeRouter(
+        [_dep_id("g", "bedrock/a", "d1"), _dep_id("g", "bedrock/b", "d2")]
+    )
+    strat = KumaraswamyThompsonStrategy(seed=42)
+    chosen_arms = set()
+    for i in range(200):
+        chosen = strat.select_deployment(_ctx(router, model="g", request_id=f"r{i}"))
+        assert chosen is not None
+        chosen_arms.add(chosen["litellm_params"]["model"])
+    assert chosen_arms == {"bedrock/a", "bedrock/b"}

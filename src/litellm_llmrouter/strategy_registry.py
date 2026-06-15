@@ -476,12 +476,20 @@ class DefaultStrategy(RoutingStrategy):
         router = context.router
         healthy_deployments = getattr(router, "healthy_deployments", router.model_list)
 
-        for deployment in healthy_deployments:
-            if deployment.get("model_name") == context.model:
-                litellm_model = deployment.get("litellm_params", {}).get("model", "")
-                if litellm_model:
-                    model_list.append(litellm_model)
-                    deployment_map[litellm_model] = deployment
+        # RouteIQ-99e8 (cooldown) + RouteIQ-badb (gov-ban): the custom-strategy
+        # path bypasses LiteLLM's healthy-deployment pipeline, so filter
+        # cooled-down / gov-banned arms out of the group-matched subset BEFORE
+        # building the deployment map the strategy scores.
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        group_matched = [
+            d for d in healthy_deployments if d.get("model_name") == context.model
+        ]
+        for deployment in filter_routable_candidates(router, group_matched):
+            litellm_model = deployment.get("litellm_params", {}).get("model", "")
+            if litellm_model:
+                model_list.append(litellm_model)
+                deployment_map[litellm_model] = deployment
 
         return model_list, deployment_map
 
