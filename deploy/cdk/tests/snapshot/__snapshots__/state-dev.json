@@ -1,0 +1,1472 @@
+{
+  "Mappings": {
+    "ReplayStoreConstructClusterRotationSingleUserSARMappingE24486AF": {
+      "aws": {
+        "applicationId": "arn:aws:serverlessrepo:us-east-1:297356227824:applications/SecretsManagerRDSPostgreSQLRotationSingleUser",
+        "semanticVersion": "1.1.671"
+      },
+      "aws-cn": {
+        "applicationId": "arn:aws-cn:serverlessrepo:cn-north-1:193023089310:applications/SecretsManagerRDSPostgreSQLRotationSingleUser",
+        "semanticVersion": "1.1.440"
+      },
+      "aws-us-gov": {
+        "applicationId": "arn:aws-us-gov:serverlessrepo:us-gov-west-1:023102451235:applications/SecretsManagerRDSPostgreSQLRotationSingleUser",
+        "semanticVersion": "1.1.397"
+      }
+    }
+  },
+  "Outputs": {
+    "CacheEndpoint": {
+      "Description": "ElastiCache serverless endpoint address. Map to chart externalRedis.host (--set externalRedis.host=...). Always-on TLS: also set externalRedis.ssl=true (REDIS_SSL=true).",
+      "Value": {
+        "Fn::GetAtt": [
+          "CacheConstructServerlessCacheCCA75A3C",
+          "Endpoint.Address"
+        ]
+      }
+    },
+    "CacheIamUserName": {
+      "Description": "ElastiCache IAM-auth user name (user_id == user_name). The pod must present THIS name as the cache user on the SigV4 connect.",
+      "Value": "routeiq-dev-cache-iam-user"
+    },
+    "CachePort": {
+      "Description": "ElastiCache serverless endpoint port. Map to chart externalRedis.port.",
+      "Value": {
+        "Fn::GetAtt": [
+          "CacheConstructServerlessCacheCCA75A3C",
+          "Endpoint.Port"
+        ]
+      }
+    },
+    "DbClusterEndpoint": {
+      "Description": "Aurora WRITER endpoint. Map to chart externalPostgresql.host (--set externalPostgresql.host=...). The gateway WRITES, so it targets the writer.",
+      "Value": {
+        "Fn::GetAtt": [
+          "ReplayStoreConstructCluster6FA3B14B",
+          "Endpoint.Address"
+        ]
+      }
+    },
+    "DbClusterReaderEndpoint": {
+      "Description": "Aurora READER endpoint (read-replica reads; optional chart wiring)",
+      "Value": {
+        "Fn::GetAtt": [
+          "ReplayStoreConstructCluster6FA3B14B",
+          "ReadEndpoint.Address"
+        ]
+      }
+    },
+    "DbClusterResourceId": {
+      "Description": "Aurora cluster RESOURCE id (DbiResourceId) used to build the rds-db:connect dbuser ARN. Confirm the grant targets this id.",
+      "Value": {
+        "Fn::GetAtt": [
+          "ReplayStoreConstructCluster6FA3B14B",
+          "DBClusterResourceId"
+        ]
+      }
+    },
+    "DbRuntimeUser": {
+      "Description": "Aurora runtime IAM-auth DB user (= chart externalPostgresql.username). The pod role holds rds-db:connect on dbuser .../routeiq.",
+      "Value": "routeiq"
+    },
+    "DbSecretArn": {
+      "Description": "Aurora MASTER secret ARN (break-glass + schema-bootstrap only). The runtime pod IAM-auths as routeiq and does NOT read this.",
+      "Value": {
+        "Ref": "ReplayStoreConstructClusterSecretAttachment963A58C7"
+      }
+    }
+  },
+  "Parameters": {
+    "BootstrapVersion": {
+      "Default": "/cdk-bootstrap/hnb659fds/version",
+      "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]",
+      "Type": "AWS::SSM::Parameter::Value<String>"
+    }
+  },
+  "Resources": {
+    "CacheConstructDefaultUserF1AFE346": {
+      "Properties": {
+        "AccessString": "off ~keys* -@all",
+        "AuthenticationMode": {
+          "Passwords": [
+            "RouteIqDefaultUserDisabledPlaceholderPw01"
+          ],
+          "Type": "password"
+        },
+        "Engine": "valkey",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "UserId": "routeiq-dev-cache-default",
+        "UserName": "default"
+      },
+      "Type": "AWS::ElastiCache::User"
+    },
+    "CacheConstructIamUser43E31088": {
+      "Properties": {
+        "AccessString": "on ~* +@all",
+        "AuthenticationMode": {
+          "Type": "iam"
+        },
+        "Engine": "valkey",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "UserId": "routeiq-dev-cache-iam-user",
+        "UserName": "routeiq-dev-cache-iam-user"
+      },
+      "Type": "AWS::ElastiCache::User"
+    },
+    "CacheConstructRedisSg17D4D52E": {
+      "Properties": {
+        "GroupDescription": "ElastiCache Valkey serverless cache ENIs (ingress 6379 from pod_sg only)",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "VpcId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcBD6FBFF50BD549F7"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "CacheConstructRedisSgfromRouteIqStackdevNetworkConstructPodSg0B6296EC637992ACDDB2": {
+      "Properties": {
+        "Description": "Valkey 6379 from RouteIQ gateway pod to ElastiCache serverless cache",
+        "FromPort": 6379,
+        "GroupId": {
+          "Fn::GetAtt": [
+            "CacheConstructRedisSg17D4D52E",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputFnGetAttNetworkConstructPodSg56CA1658GroupIdD39BCBEA"
+        },
+        "ToPort": 6379
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "CacheConstructServerlessCacheCCA75A3C": {
+      "DeletionPolicy": "Delete",
+      "DependsOn": [
+        "CacheConstructUserGroupFA00C33A"
+      ],
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-AEC6",
+              "reason": "Redis AUTH tokens are intentionally NOT used; the serverless Valkey cache authenticates via IAM (Valkey 7.2+). IAM auth produces short-lived AWS SigV4 signatures from the gateway pod's Pod Identity principal, strictly stronger than a static AUTH token (no rotation gap, scoped to one AWS principal, CloudTrail audit trail). The IAM-auth user (routeiq-<env>-cache-iam-user) is attached to the cache user group; the default user is disabled. In-transit TLS is always-on for serverless caches. Owner: RouteIqStateStack (CacheConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "DailySnapshotTime": "03:00",
+        "Description": "RouteIQ dev hot rate-limiter and governance counter cache (serverless)",
+        "Engine": "valkey",
+        "KmsKeyId": {
+          "Ref": "StateCmkF8D4F4DA"
+        },
+        "MajorEngineVersion": "8",
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "CacheConstructRedisSg17D4D52E",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServerlessCacheName": "routeiq-dev-cache-sl",
+        "SnapshotRetentionLimit": 7,
+        "SubnetIds": [
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivatedataSubnet1SubnetCA4BDB98D2D595E1"
+          },
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivatedataSubnet2SubnetDF525881E5CBE9F1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "UserGroupId": "routeiq-dev-cache-ug"
+      },
+      "Type": "AWS::ElastiCache::ServerlessCache",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "CacheConstructUserGroupFA00C33A": {
+      "DependsOn": [
+        "CacheConstructDefaultUserF1AFE346",
+        "CacheConstructIamUser43E31088"
+      ],
+      "Properties": {
+        "Engine": "valkey",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "UserGroupId": "routeiq-dev-cache-ug",
+        "UserIds": [
+          "routeiq-dev-cache-default",
+          "routeiq-dev-cache-iam-user"
+        ]
+      },
+      "Type": "AWS::ElastiCache::UserGroup"
+    },
+    "PodStateGrantsBA9E6643": {
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "rds-db:connect",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":rds-db:",
+                    {
+                      "Ref": "AWS::Region"
+                    },
+                    ":",
+                    {
+                      "Ref": "AWS::AccountId"
+                    },
+                    ":dbuser:",
+                    {
+                      "Fn::GetAtt": [
+                        "ReplayStoreConstructCluster6FA3B14B",
+                        "DBClusterResourceId"
+                      ]
+                    },
+                    "/routeiq"
+                  ]
+                ]
+              },
+              "Sid": "RdsIamDbConnectRouteIqState"
+            },
+            {
+              "Action": "elasticache:Connect",
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "CacheConstructServerlessCacheCCA75A3C",
+                    "ARN"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":elasticache:",
+                      {
+                        "Ref": "AWS::Region"
+                      },
+                      ":",
+                      {
+                        "Ref": "AWS::AccountId"
+                      },
+                      ":user:routeiq-dev-cache-iam-user"
+                    ]
+                  ]
+                }
+              ],
+              "Sid": "ElastiCacheConnectRouteIqState"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "PodStateGrantsBA9E6643",
+        "Roles": [
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefPodRole29A926005A8989EC"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ReplayStoreConstructCluster6FA3B14B": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "BackupRetentionPeriod": 7,
+        "CopyTagsToSnapshot": true,
+        "DBClusterParameterGroupName": "default.aurora-postgresql16",
+        "DBSubnetGroupName": {
+          "Ref": "ReplayStoreConstructSubnetGroup65A0F10C"
+        },
+        "DatabaseName": "litellm",
+        "DeletionProtection": false,
+        "EnableCloudwatchLogsExports": [
+          "postgresql"
+        ],
+        "EnableIAMDatabaseAuthentication": true,
+        "Engine": "aurora-postgresql",
+        "EngineVersion": "16.13",
+        "KmsKeyId": {
+          "Fn::GetAtt": [
+            "StateCmkF8D4F4DA",
+            "Arn"
+          ]
+        },
+        "MasterUserPassword": {
+          "Fn::Join": [
+            "",
+            [
+              "{{resolve:secretsmanager:",
+              {
+                "Ref": "RouteIqStateStackdevReplayStoreConstructClusterSecretF957A1383fdaad7efa858a3daf9490cf0a702aeb"
+              },
+              ":SecretString:password::}}"
+            ]
+          ]
+        },
+        "MasterUsername": "postgres",
+        "Port": 5432,
+        "PreferredBackupWindow": "03:00-04:00",
+        "PreferredMaintenanceWindow": "sun:04:30-sun:05:30",
+        "ServerlessV2ScalingConfiguration": {
+          "MaxCapacity": 2,
+          "MinCapacity": 0.5
+        },
+        "StorageEncrypted": true,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "VpcSecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "ReplayStoreConstructReplayStoreSgAB749FA1",
+              "GroupId"
+            ]
+          }
+        ]
+      },
+      "Type": "AWS::RDS::DBCluster",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructClusterRotationSingleUser8E0FD172": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "Location": {
+          "ApplicationId": {
+            "Fn::FindInMap": [
+              "ReplayStoreConstructClusterRotationSingleUserSARMappingE24486AF",
+              {
+                "Ref": "AWS::Partition"
+              },
+              "applicationId"
+            ]
+          },
+          "SemanticVersion": {
+            "Fn::FindInMap": [
+              "ReplayStoreConstructClusterRotationSingleUserSARMappingE24486AF",
+              {
+                "Ref": "AWS::Partition"
+              },
+              "semanticVersion"
+            ]
+          }
+        },
+        "Parameters": {
+          "endpoint": {
+            "Fn::Join": [
+              "",
+              [
+                "https://secretsmanager.us-west-2.",
+                {
+                  "Ref": "AWS::URLSuffix"
+                }
+              ]
+            ]
+          },
+          "excludeCharacters": " %+~`#$&*()|[]{}:;<>?!'/@\"\\",
+          "functionName": "ateStackdevReplayStoreConstructClusterRotationSingleUser526F8098",
+          "kmsKeyArn": {
+            "Fn::GetAtt": [
+              "StateCmkF8D4F4DA",
+              "Arn"
+            ]
+          },
+          "vpcSecurityGroupIds": {
+            "Fn::GetAtt": [
+              "ReplayStoreConstructClusterRotationSingleUserSecurityGroup460C1882",
+              "GroupId"
+            ]
+          },
+          "vpcSubnetIds": {
+            "Fn::Join": [
+              "",
+              [
+                {
+                  "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivateappSubnet1SubnetF000DF210FE9DEF3"
+                },
+                ",",
+                {
+                  "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivateappSubnet2Subnet2F9875629E309F3B"
+                }
+              ]
+            ]
+          }
+        },
+        "Tags": {
+          "routeiq:env": "dev",
+          "routeiq:plane": "state"
+        }
+      },
+      "Type": "AWS::Serverless::Application",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructClusterRotationSingleUserSecurityGroup460C1882": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "GroupDescription": "RouteIqStateStack-dev/ReplayStoreConstruct/Cluster/RotationSingleUser/SecurityGroup",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "VpcId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcBD6FBFF50BD549F7"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "ReplayStoreConstructClusterSecretAttachment963A58C7": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "SecretId": {
+          "Ref": "RouteIqStateStackdevReplayStoreConstructClusterSecretF957A1383fdaad7efa858a3daf9490cf0a702aeb"
+        },
+        "TargetId": {
+          "Ref": "ReplayStoreConstructCluster6FA3B14B"
+        },
+        "TargetType": "AWS::RDS::DBCluster"
+      },
+      "Type": "AWS::SecretsManager::SecretTargetAttachment"
+    },
+    "ReplayStoreConstructClusterSecretAttachmentPolicyCCB79825": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "ResourcePolicy": {
+          "Statement": [
+            {
+              "Action": "secretsmanager:DeleteSecret",
+              "Effect": "Deny",
+              "Principal": {
+                "AWS": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":iam::123456789012:root"
+                    ]
+                  ]
+                }
+              },
+              "Resource": "*"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "SecretId": {
+          "Ref": "ReplayStoreConstructClusterSecretAttachment963A58C7"
+        }
+      },
+      "Type": "AWS::SecretsManager::ResourcePolicy"
+    },
+    "ReplayStoreConstructClusterSecretAttachmentRotationScheduleCC984828": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "RotationLambdaARN": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructClusterRotationSingleUser8E0FD172",
+            "Outputs.RotationLambdaARN"
+          ]
+        },
+        "RotationRules": {
+          "ScheduleExpression": "rate(30 days)"
+        },
+        "SecretId": {
+          "Ref": "ReplayStoreConstructClusterSecretAttachment963A58C7"
+        }
+      },
+      "Type": "AWS::SecretsManager::RotationSchedule"
+    },
+    "ReplayStoreConstructClusterreader161CB18F9": {
+      "DeletionPolicy": "Delete",
+      "DependsOn": [
+        "ReplayStoreConstructClusterwriterC29BC578"
+      ],
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "DBClusterIdentifier": {
+          "Ref": "ReplayStoreConstructCluster6FA3B14B"
+        },
+        "DBInstanceClass": "db.serverless",
+        "Engine": "aurora-postgresql",
+        "PromotionTier": 1,
+        "PubliclyAccessible": false,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::RDS::DBInstance",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructClusterwriterC29BC578": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "DBClusterIdentifier": {
+          "Ref": "ReplayStoreConstructCluster6FA3B14B"
+        },
+        "DBInstanceClass": "db.serverless",
+        "Engine": "aurora-postgresql",
+        "PromotionTier": 0,
+        "PubliclyAccessible": false,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::RDS::DBInstance",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructReplayStoreSgAB749FA1": {
+      "Properties": {
+        "GroupDescription": "Aurora Postgres RouteIQ control-plane cluster ENIs (ingress 5432 from pod_sg only)",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "VpcId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcBD6FBFF50BD549F7"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "ReplayStoreConstructReplayStoreSgfromRouteIqStackdevNetworkConstructPodSg0B6296EC5432D9576AD6": {
+      "Properties": {
+        "Description": "Postgres 5432 from RouteIQ gateway pod to Aurora",
+        "FromPort": 5432,
+        "GroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructReplayStoreSgAB749FA1",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputFnGetAttNetworkConstructPodSg56CA1658GroupIdD39BCBEA"
+        },
+        "ToPort": 5432
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "ReplayStoreConstructReplayStoreSgfromRouteIqStateStackdevReplayStoreConstructClusterRotationSingleUserSecurityGroupD3194649IndirectPort07402810": {
+      "Properties": {
+        "Description": "from RouteIqStateStackdevReplayStoreConstructClusterRotationSingleUserSecurityGroupD3194649:{IndirectPort}",
+        "FromPort": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructCluster6FA3B14B",
+            "Endpoint.Port"
+          ]
+        },
+        "GroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructReplayStoreSgAB749FA1",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructClusterRotationSingleUserSecurityGroup460C1882",
+            "GroupId"
+          ]
+        },
+        "ToPort": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructCluster6FA3B14B",
+            "Endpoint.Port"
+          ]
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "ReplayStoreConstructReplayStoreSgfromRouteIqStateStackdevReplayStoreConstructReplayStoreSg36042D755432E5185AB8": {
+      "Properties": {
+        "Description": "Postgres 5432 from schema-bootstrap Lambda (same SG)",
+        "FromPort": 5432,
+        "GroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructReplayStoreSgAB749FA1",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructReplayStoreSgAB749FA1",
+            "GroupId"
+          ]
+        },
+        "ToPort": 5432
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "ReplayStoreConstructSchemaBootstrapCr94F7BE8A": {
+      "DeletionPolicy": "Delete",
+      "DependsOn": [
+        "ReplayStoreConstructClusterreader161CB18F9",
+        "ReplayStoreConstructCluster6FA3B14B",
+        "ReplayStoreConstructClusterRotationSingleUser8E0FD172",
+        "ReplayStoreConstructClusterRotationSingleUserSecurityGroup460C1882",
+        "ReplayStoreConstructClusterSecretAttachmentPolicyCCB79825",
+        "ReplayStoreConstructClusterSecretAttachment963A58C7",
+        "ReplayStoreConstructClusterSecretAttachmentRotationScheduleCC984828",
+        "RouteIqStateStackdevReplayStoreConstructClusterSecretF957A1383fdaad7efa858a3daf9490cf0a702aeb",
+        "ReplayStoreConstructClusterwriterC29BC578"
+      ],
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructSchemaBootstrapProviderframeworkonEvent28A2447F",
+            "Arn"
+          ]
+        },
+        "db_host": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructCluster6FA3B14B",
+            "Endpoint.Address"
+          ]
+        },
+        "db_name": "litellm",
+        "db_port": "5432",
+        "schema_version": "1"
+      },
+      "Type": "AWS::CloudFormation::CustomResource",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructSchemaBootstrapFn44A3856C": {
+      "DependsOn": [
+        "ReplayStoreConstructSchemaBootstrapFnServiceRoleDefaultPolicy6597D25C",
+        "ReplayStoreConstructSchemaBootstrapFnServiceRoleB7131D41"
+      ],
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-L1",
+              "reason": "The schema-bootstrap Lambda runtime is pinned (python3.13) for reproducible custom-resource behavior; bumped in lockstep with the aws-cdk-lib upgrade cadence. It runs once at deploy to provision the runtime IAM user and apply idempotent DDL, never on the data path. Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapFn)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "Code": {
+          "ZipFile": "def lambda_handler(event, context):\n    raise RuntimeError(\n        'routeiq-schema-bootstrap Lambda asset is unavailable; the \\n'\n        'stack was deployed with a placeholder. Re-run cdk deploy \\n'\n        'after lambda/routeiq-schema-bootstrap/handler.py is present.'\n    )\n"
+        },
+        "Description": "Bootstraps the RouteIQ control-plane schema in the Aurora cluster. Provisions the runtime IAM user routeiq, then applies idempotent CREATE TABLE IF NOT EXISTS DDL. Invoked by the schema-bootstrap CFN custom resource on Create AND Update.",
+        "Environment": {
+          "Variables": {
+            "DB_HOST": {
+              "Fn::GetAtt": [
+                "ReplayStoreConstructCluster6FA3B14B",
+                "Endpoint.Address"
+              ]
+            },
+            "DB_NAME": "litellm",
+            "DB_PORT": "5432",
+            "DB_RUNTIME_USER": "routeiq",
+            "DB_SECRET_ARN": {
+              "Ref": "ReplayStoreConstructClusterSecretAttachment963A58C7"
+            },
+            "ENV_NAME": "dev",
+            "LOG_LEVEL": "INFO"
+          }
+        },
+        "FunctionName": "routeiq-dev-schema-bootstrap",
+        "Handler": "index.lambda_handler",
+        "MemorySize": 512,
+        "Role": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructSchemaBootstrapFnServiceRoleB7131D41",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.13",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "Timeout": 300,
+        "VpcConfig": {
+          "SecurityGroupIds": [
+            {
+              "Fn::GetAtt": [
+                "ReplayStoreConstructReplayStoreSgAB749FA1",
+                "GroupId"
+              ]
+            }
+          ],
+          "SubnetIds": [
+            {
+              "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivateappSubnet1SubnetF000DF210FE9DEF3"
+            },
+            {
+              "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivateappSubnet2Subnet2F9875629E309F3B"
+            }
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ReplayStoreConstructSchemaBootstrapFnServiceRoleB7131D41": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "AWSLambdaBasicExecutionRole + AWSLambdaVPCAccessExecutionRole are the AWS-canonical execution roles CDK auto-attaches to a VPC-attached lambda.Function. The schema-bootstrap Lambda's additional permissions (secret read + KMS decrypt) are explicit per-statement adds (secret.grant_read). Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapFn)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ReplayStoreConstructSchemaBootstrapFnServiceRoleDefaultPolicy6597D25C": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Resource::*"
+              ],
+              "id": "AwsSolutions-IAM5",
+              "reason": "secret.grant_read on a Secrets-Manager secret encrypted by a KMS CMK requires kms:Decrypt against the key with no resource-level scoping (the key ARN itself is the resource). The '*' here expresses 'the encryption key for this secret', not an open kms:Decrypt grant. Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapFn master-secret read)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Ref": "ReplayStoreConstructClusterSecretAttachment963A58C7"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "ReplayStoreConstructSchemaBootstrapFnServiceRoleDefaultPolicy6597D25C",
+        "Roles": [
+          {
+            "Ref": "ReplayStoreConstructSchemaBootstrapFnServiceRoleB7131D41"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ReplayStoreConstructSchemaBootstrapLogGroupD872407F": {
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/aws/lambda/",
+              {
+                "Ref": "ReplayStoreConstructSchemaBootstrapFn44A3856C"
+              }
+            ]
+          ]
+        },
+        "RetentionInDays": 30,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::LogGroup",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ReplayStoreConstructSchemaBootstrapProviderframeworkonEvent28A2447F": {
+      "DependsOn": [
+        "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRoleDefaultPolicyA32220F3",
+        "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRole1F6AF5DA"
+      ],
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-L1",
+              "reason": "CDK's cr.Provider framework-onEvent Lambda is CDK-owned boilerplate (aws-cdk-lib custom-resources provider); its runtime is set by the library, not by us. Runs only during CR lifecycle, never on the data path. Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapProvider)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-123456789012-us-west-2",
+          "S3Key": "e16ffb3b34af185b8b30c88fdb19faa13b6c42bb38580485c4e84b384ee48b63.zip"
+        },
+        "Description": "AWS CDK resource provider framework - onEvent (RouteIqStateStack-dev/ReplayStoreConstruct/SchemaBootstrapProvider)",
+        "Environment": {
+          "Variables": {
+            "USER_ON_EVENT_FUNCTION_ARN": {
+              "Fn::GetAtt": [
+                "ReplayStoreConstructSchemaBootstrapFn44A3856C",
+                "Arn"
+              ]
+            }
+          }
+        },
+        "Handler": "framework.onEvent",
+        "LoggingConfig": {
+          "ApplicationLogLevel": "FATAL",
+          "LogFormat": "JSON"
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRole1F6AF5DA",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs24.x",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ],
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRole1F6AF5DA": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "AWSLambdaBasicExecutionRole is the AWS-canonical execution role for the cr.Provider framework-onEvent Lambda; aws-cdk-lib's custom-resources Provider auto-attaches it. Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapProvider framework-onEvent)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRoleDefaultPolicyA32220F3": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Resource::*"
+              ],
+              "id": "AwsSolutions-IAM5",
+              "reason": "The cr.Provider framework default policy includes a lambda:InvokeFunction grant that resolves to <schema-bootstrap-fn>:* (alias/version wildcard). It is scoped to the single CDK-managed bootstrap function, not an open grant. Owner: RouteIqStateStack (ReplayStoreConstruct SchemaBootstrapProvider framework-onEvent DefaultPolicy)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "lambda:InvokeFunction",
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ReplayStoreConstructSchemaBootstrapFn44A3856C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ReplayStoreConstructSchemaBootstrapFn44A3856C",
+                          "Arn"
+                        ]
+                      },
+                      ":*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": "lambda:GetFunction",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ReplayStoreConstructSchemaBootstrapFn44A3856C",
+                  "Arn"
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRoleDefaultPolicyA32220F3",
+        "Roles": [
+          {
+            "Ref": "ReplayStoreConstructSchemaBootstrapProviderframeworkonEventServiceRole1F6AF5DA"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ReplayStoreConstructSubnetGroup65A0F10C": {
+      "Properties": {
+        "DBSubnetGroupDescription": "RouteIQ dev Aurora control-plane subnet group (PRIVATE_ISOLATED, Multi-AZ)",
+        "SubnetIds": [
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivatedataSubnet1SubnetCA4BDB98D2D595E1"
+          },
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefNetworkConstructVpcprivatedataSubnet2SubnetDF525881E5CBE9F1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::RDS::DBSubnetGroup"
+    },
+    "RouteIqStateStackdevReplayStoreConstructClusterSecretF957A1383fdaad7efa858a3daf9490cf0a702aeb": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-RDS10",
+              "reason": "Deletion protection is intentionally OFF in dev so the dev state stack can be torn down and re-created cleanly between PRs (the ~30-min-rollback rule, ADR-0028). Non-dev envs set deletion_protection=True in code (replay_store_construct.py: env_name != 'dev'). Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            },
+            {
+              "id": "AwsSolutions-RDS14",
+              "reason": "Aurora Backtrack is not supported on Aurora Postgres (only Aurora MySQL). Point-in-time recovery via automated backups (7d dev, 14d non-dev) covers the same recovery surface. Owner: RouteIqStateStack (ReplayStoreConstruct)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "Description": {
+          "Fn::Join": [
+            "",
+            [
+              "Generated by the CDK for stack: ",
+              {
+                "Ref": "AWS::StackName"
+              }
+            ]
+          ]
+        },
+        "GenerateSecretString": {
+          "ExcludeCharacters": " %+~`#$&*()|[]{}:;<>?!'/@\"\\",
+          "GenerateStringKey": "password",
+          "PasswordLength": 30,
+          "SecretStringTemplate": "{\"username\":\"postgres\"}"
+        },
+        "KmsKeyId": {
+          "Fn::GetAtt": [
+            "StateCmkF8D4F4DA",
+            "Arn"
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::SecretsManager::Secret",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "StateCmkF8D4F4DA": {
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "Description": "RouteIQ dev state-plane CMK (Aurora at-rest + ElastiCache at-rest)",
+        "EnableKeyRotation": true,
+        "KeyPolicy": {
+          "Statement": [
+            {
+              "Action": "kms:*",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":iam::123456789012:root"
+                    ]
+                  ]
+                }
+              },
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "kms:Decrypt",
+                "kms:Encrypt",
+                "kms:ReEncrypt*",
+                "kms:GenerateDataKey*"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "kms:ViaService": "secretsmanager.us-west-2.amazonaws.com"
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":iam::123456789012:root"
+                    ]
+                  ]
+                }
+              },
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "kms:CreateGrant",
+                "kms:DescribeKey"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "kms:ViaService": "secretsmanager.us-west-2.amazonaws.com"
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":iam::123456789012:root"
+                    ]
+                  ]
+                }
+              },
+              "Resource": "*"
+            },
+            {
+              "Action": "kms:Decrypt",
+              "Condition": {
+                "StringEquals": {
+                  "kms:ViaService": "secretsmanager.us-west-2.amazonaws.com"
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::GetAtt": [
+                    "ReplayStoreConstructSchemaBootstrapFnServiceRoleB7131D41",
+                    "Arn"
+                  ]
+                }
+              },
+              "Resource": "*"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:plane",
+            "Value": "state"
+          }
+        ]
+      },
+      "Type": "AWS::KMS::Key",
+      "UpdateReplacePolicy": "Delete"
+    }
+  },
+  "Rules": {
+    "CheckBootstrapVersion": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Contains": [
+                  [
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5"
+                  ],
+                  {
+                    "Ref": "BootstrapVersion"
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+        }
+      ]
+    }
+  },
+  "Transform": "AWS::Serverless-2016-10-31"
+}

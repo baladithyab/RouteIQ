@@ -192,6 +192,86 @@ networkPolicy:
     allowHttpsExternal: true
 ```
 
+## RouteIQ-on-AWS state plane (P1: Aurora + ElastiCache)
+
+The managed state plane (Aurora Postgres Serverless v2 — ADR-0028; ElastiCache
+Serverless Valkey — ADR-0029) is provisioned by the **separate** `RouteIqStateStack`
+CDK stack (NOT the P0 `RouteIqStack`; the two are separate stacks per the
+~30-minute-rollback rule). The chart consumes that stack's `CfnOutput`s as
+`helm upgrade --set` flags — the same "CfnOutput string → `--set` value" seam P0
+uses for `EcrGhcrPrefix` / `ClusterName`, never a CDK-side `HelmChart` resource.
+
+### Wire the chart host seams from the state-stack CfnOutputs
+
+```bash
+STACK=RouteIqStateStack-<env>
+q() { aws cloudformation describe-stacks --stack-name "$STACK" \
+        --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+
+helm upgrade routeiq deploy/charts/routeiq-gateway \
+  --set externalPostgresql.host="$(q DbClusterEndpoint)" \
+  --set externalRedis.host="$(q CacheEndpoint)" \
+  --set externalRedis.port="$(q CachePort)" \
+  --set-string externalRedis.ssl=true        # serverless Valkey = TLS-mandatory
+```
+
+State-stack outputs: `DbClusterEndpoint` (Aurora writer → `externalPostgresql.host`),
+`DbClusterReaderEndpoint`, `DbSecretArn` (master/break-glass only — the pod
+IAM-auths and does NOT read it), `DbRuntimeUser` (= `externalPostgresql.username`
+= `routeiq`), `DbClusterResourceId`, `CacheEndpoint` / `CachePort`
+(→ `externalRedis.host`/`.port`), `CacheIamUserName` (the cache IAM user the pod
+presents on connect; `user_id == user_name`).
+
+The seam is one-directional and inert until `host` is non-empty: leave `host`
+empty and the gateway degrades gracefully (no DB, no Redis); set it and the whole
+state-plane wiring turns on.
+
+### IAM-auth boot-render (no static password)
+
+> **⚠️ Runtime code not yet shipped (tracked seed, P1-completion).** The in-process
+> token-minting below is the **intended** ADR-0028/0029 design. Today
+> `database.py:get_database_url()` returns `DATABASE_URL` verbatim (no SigV4 splice)
+> and `redis_pool.py` reads only `REDIS_HOST/PORT/PASSWORD/SSL/DB` (no IAM token
+> path). **Until `ROUTEIQ_DB_IAM_AUTH` / `ROUTEIQ_REDIS_IAM_AUTH` land, the empty-
+> `existingSecret` IAM path renders credentials the gateway cannot authenticate
+> with** — use the static-password / static-AUTH interim (Shape B, `existingSecret`
+> set) for a working deploy. The CDK substrate (RouteIqStateStack) is complete and
+> correct; only the app-side token minting remains.
+
+On the ADR-0028/0029 IAM-auth path there is **no static credential** (INTENDED).
+Leave `externalPostgresql.existingSecret` / `externalRedis.existingSecret`
+**empty**: the chart renders a complete, password-less `DATABASE_URL` at
+boot-render time and the app (`database.py` / `redis_pool.py`) **will** mint the
+15-min `rds-db:connect` / `elasticache:Connect` token in-process via the Pod
+Identity credentials. Do **not** rely on K8s `$(VAR)` env interpolation to
+assemble the URL — K8s only expands a `$(VAR)` defined earlier in the env list, so
+the legacy `$(POSTGRES_PASSWORD)` splice was left literal (an auth failure). The
+static-password interim (Shape B, `existingSecret` set) now emits
+`POSTGRES_PASSWORD` **before** `DATABASE_URL` so the expansion fires.
+
+### External Secrets Operator (ClusterSecretStore prerequisite)
+
+The chart references the `ClusterSecretStore` by name (`aws-secrets-manager`) but
+**does not create it**, and neither does the P0/P1 CDK. The ESO controller + a
+`ClusterSecretStore` of that exact name (with the ESO controller's **own** Pod
+Identity association — distinct from RouteIQ's `PodRole`) are a platform
+prerequisite. The name is load-bearing and string-matched. On the IAM-auth path,
+sync only `LITELLM_MASTER_KEY` / `ADMIN_API_KEYS` / non-Bedrock provider keys
+(`routeiq/<name>` convention); `POSTGRES_PASSWORD` / `REDIS_PASSWORD` /
+`DATABASE_URL` are retired.
+
+### Pod-role grants (stack-composition note)
+
+The `rds-db:connect` (Aurora dbuser `…/routeiq`) and `elasticache:Connect` (cache
+ARN + IAM-user ARN) grants the gateway pod needs are applied by the
+`RouteIqStateStack` as a **separate `iam.Policy` attached to the P0 `PodRole`**
+(NOT a mutation of the P0 role's default policy — that would close a cross-stack
+dependency cycle, since the state stack already imports the P0 VPC). This happens
+automatically when the state stack is given `foundation=<RouteIqStack>` in the same
+CDK app. When the two stacks are deployed from **separate** apps/pipelines (no
+`foundation`), the grants are skipped and must be attached to the pod role
+out-of-band (both are ARN-scoped, no wildcard).
+
 ## Security Defaults
 
 This chart implements security best practices by default:

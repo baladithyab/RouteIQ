@@ -76,6 +76,54 @@ def template_for(**flags: Any) -> Template:
     return Template.from_stack(make_stack(**flags))
 
 
+def make_state_stack(
+    *,
+    env_name: str = "dev",
+    min_acu: float | None = None,
+    max_acu: float | None = None,
+    cache_engine_version: str = "8.0",
+    construct_id: str | None = None,
+    foundation_id: str | None = None,
+):
+    """Build a P0 ``RouteIqStack`` + the P1 ``RouteIqStateStack`` wired to it.
+
+    Both stacks share ONE ``cdk.App`` with the dummy env, so the cross-stack
+    references the state stack reads off the P0 foundation resolve at synth time
+    into ``Export`` / ``Fn::ImportValue`` -- cred-free, no ``from_lookup``, no
+    AWS API call. Returns ``(app, foundation, state_stack)``.
+
+    Imported here (not at module top) so this harness imports cleanly while the
+    stacks are still being authored in the construct stage.
+    """
+    from lib.routeiq_stack import RouteIqStack
+    from lib.routeiq_state_stack import RouteIqStateStack
+
+    app = cdk.App()
+    foundation = RouteIqStack(
+        app,
+        foundation_id or f"RouteIqStack-{env_name}",
+        env=dummy_env(),
+        env_name=env_name,
+    )
+    state = RouteIqStateStack(
+        app,
+        construct_id or f"RouteIqStateStack-{env_name}",
+        env=dummy_env(),
+        env_name=env_name,
+        foundation=foundation,
+        min_acu=min_acu,
+        max_acu=max_acu,
+        cache_engine_version=cache_engine_version,
+    )
+    return app, foundation, state
+
+
+def state_template_for(**flags: Any) -> Template:
+    """Synthesize the ``RouteIqStateStack`` (offline) and return its ``Template``."""
+    _app, _foundation, state = make_state_stack(**flags)
+    return Template.from_stack(state)
+
+
 @pytest.fixture
 def stack_template() -> Template:
     """Default flag-surface ``Template`` for assertion-style unit tests."""

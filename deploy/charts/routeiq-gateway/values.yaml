@@ -341,28 +341,93 @@ routeiq:
 
 # External PostgreSQL (enables persistence, DB-backed keys, teams)
 # Set postgresql.enabled=false in a sub-chart scenario and configure here
+#
+# RouteIQ-on-AWS P1 (Aurora Postgres Serverless v2, ADR-0028): the `host` below
+# is INTENTIONALLY empty by default (account-agnostic; the chart degrades
+# gracefully with no DB until host is non-empty). The operator wires it from the
+# RouteIqStateStack CfnOutput at `helm upgrade` time, mirroring the P0
+# EcrGhcrPrefix / ClusterName CfnOutput -> --set pattern (CfnOutput string ->
+# --set value, NOT a CDK-side HelmChart):
+#
+#     DB_HOST=$(aws cloudformation describe-stacks \
+#       --stack-name RouteIqStateStack-<env> \
+#       --query "Stacks[0].Outputs[?OutputKey=='DbClusterEndpoint'].OutputValue" \
+#       --output text)
+#     helm upgrade ... --set externalPostgresql.host="$DB_HOST"
+#
+# ⚠️ NOT YET IMPLEMENTED IN RUNTIME CODE (seed RouteIQ — P1-completion): the
+# in-process IAM-token minting described below is the INTENDED ADR-0028 design,
+# but database.py:get_database_url() today returns os.getenv("DATABASE_URL")
+# verbatim with NO SigV4 splice. Until the ROUTEIQ_DB_IAM_AUTH token-mint code
+# lands, the IAM-auth path (empty existingSecret) renders a PASSWORD-LESS URL the
+# gateway CANNOT authenticate with — use the static-password interim (Shape B,
+# existingSecret set) for a working deploy. Tracking seed filed at P1 merge.
+#
+# IAM-AUTH BOOT-RENDER (ADR-0028, INTENDED): on the Aurora IAM-auth path there is
+# NO static DB password. `existingSecret` stays EMPTY so the chart renders a
+# complete, password-less DATABASE_URL at Helm-template (boot-render) time
+# (postgresql://routeiq@<host>:5432/litellm?sslmode=require) and the app
+# (database.py) WILL mint the 15-min rds-db:connect token in-process via the Pod
+# Identity creds and splice it into the URL IN PYTHON. Do NOT rely on K8s
+# $(VAR) env-var interpolation to assemble the URL: K8s only expands a $(VAR)
+# defined EARLIER in the env list and does no second pass, so the legacy
+# $(POSTGRES_PASSWORD) splice is left LITERAL (a guaranteed auth failure). See
+# research/p1/discover-chart-state.md section 3.
 externalPostgresql:
   # Host of your managed PostgreSQL (e.g., mydb.abc123.rds.amazonaws.com)
+  # P1: set from RouteIqStateStack CfnOutput DbClusterEndpoint at deploy time.
   host: ""
   port: 5432
   database: "litellm"
-  username: "routeiq"
-  # K8s secret containing the password
+  username: "routeiq"   # = RouteIqStateStack CfnOutput DbRuntimeUser (IAM-auth DB user)
+  # K8s secret containing the password. LEAVE EMPTY on the ADR-0028 IAM-auth
+  # path (no static password; the app mints an rds-db:connect token). Set only
+  # for the static-password interim (Shape B), in which case POSTGRES_PASSWORD
+  # MUST be ordered before DATABASE_URL in _helpers.tpl.
   existingSecret: ""         # Secret name
   existingSecretKey: "password"  # Key within the secret
   # SSL mode: disable, allow, prefer, require, verify-ca, verify-full
   sslMode: "require"
 
 # External Redis (enables caching, HA leader election, rate limiting)
+#
+# RouteIQ-on-AWS P1 (ElastiCache Serverless Valkey, ADR-0029): wire host + port
+# from the RouteIqStateStack CfnOutputs at `helm upgrade` time. Serverless Valkey
+# is TLS-MANDATORY, so `ssl` MUST be set true at deploy (REDIS_SSL=true). The
+# default stays false here to keep the account-agnostic chart byte-stable for a
+# no-Redis deploy:
+#
+#     CACHE_HOST=$(aws cloudformation describe-stacks --stack-name RouteIqStateStack-<env> \
+#       --query "Stacks[0].Outputs[?OutputKey=='CacheEndpoint'].OutputValue" --output text)
+#     CACHE_PORT=$(aws cloudformation describe-stacks --stack-name RouteIqStateStack-<env> \
+#       --query "Stacks[0].Outputs[?OutputKey=='CachePort'].OutputValue" --output text)
+#     helm upgrade ... \
+#       --set externalRedis.host="$CACHE_HOST" \
+#       --set externalRedis.port="$CACHE_PORT" \
+#       --set-string externalRedis.ssl=true
+#
+# ⚠️ NOT YET IMPLEMENTED IN RUNTIME CODE (seed RouteIQ — P1-completion): the
+# elasticache:Connect SigV4 minting below is the INTENDED ADR-0029 design;
+# redis_pool.py:_redis_settings() today reads only REDIS_HOST/PORT/PASSWORD/SSL/DB
+# (no username, no SigV4 CredentialProvider). Until ROUTEIQ_REDIS_IAM_AUTH lands,
+# the empty-existingSecret path yields a no-AUTH Redis config the gateway cannot
+# authenticate with against the IAM-only cache — use a static AUTH interim for now.
+#
+# IAM-AUTH (ADR-0029, INTENDED): like Postgres, `existingSecret` stays EMPTY (no
+# static AUTH token). The app (redis_pool.py) WILL mint an elasticache:Connect
+# SigV4 token and present the IAM user name (RouteIqStateStack CfnOutput
+# CacheIamUserName, where user_id == user_name) as the cache user on the connect.
 externalRedis:
   # Host of your managed Redis (e.g., mycluster.abc123.cache.amazonaws.com)
+  # P1: set from RouteIqStateStack CfnOutput CacheEndpoint at deploy time.
   host: ""
   port: 6379
-  # K8s secret containing the password
+  # K8s secret containing the password. LEAVE EMPTY on the ADR-0029 IAM-auth path.
   existingSecret: ""
   existingSecretKey: "password"
   db: 0
-  # Enable TLS/SSL for Redis connections
+  # Enable TLS/SSL for Redis connections. P1 (ADR-0029): serverless Valkey is
+  # TLS-MANDATORY -- set true at deploy (--set-string externalRedis.ssl=true).
   ssl: false
 
 # External OTel Collector (enables distributed tracing and metrics export)
@@ -419,19 +484,50 @@ secrets:
     REDIS_PASSWORD: ""
 
 # External Secrets configuration (if using External Secrets Operator)
+#
+# RouteIQ-on-AWS P1 wiring NOTE (research/p1/discover-chart-state.md section 2):
+# the chart REFERENCES the ClusterSecretStore by name (`aws-secrets-manager`)
+# but NEVER creates it. Two things must pre-exist OUT-OF-BAND for the rendered
+# ExternalSecret to resolve (a platform/Helm prerequisite, NOT shipped by this
+# chart and NOT by the P0/P1 CDK stacks):
+#
+#   1. The ESO controller (CRDs + controller pods) installed in the cluster.
+#   2. A `ClusterSecretStore` named EXACTLY `aws-secrets-manager` (the name is
+#      load-bearing + string-matched; a drift is a silent sync failure), wired to
+#      AWS Secrets Manager with the ESO controller's OWN AWS identity granting
+#      secretsmanager:GetSecretValue + kms:Decrypt. On the EKS Pod Identity
+#      substrate that identity is a SECOND CfnPodIdentityAssociation for the ESO
+#      controller ServiceAccount (e.g. external-secrets/external-secrets) bound to
+#      an ESO controller role -- DISTINCT from RouteIQ's PodRole. RouteIQ's
+#      PodRole SecretsRead statement is for the pod's OWN direct GetSecretValue,
+#      not for ESO's sync (different principals).
+#
+# Secret-naming convention is `routeiq/<name>` (P0 PodRole SecretsRead defaults to
+# the secretsmanager:...:secret:routeiq/* wildcard). On the ADR-0028/0029 IAM-auth
+# path do NOT sync POSTGRES_PASSWORD / REDIS_PASSWORD / DATABASE_URL (retired by
+# IAM tokens); sync only LITELLM_MASTER_KEY, ADMIN_API_KEYS, and non-Bedrock
+# provider keys. Bedrock needs no key (Pod Identity + bedrock:InvokeModel on the
+# PodRole). The rendered target secret (<fullname>-secrets) is consumed via
+# envFrom.secretRef + the db-migrate initContainer.
 externalSecrets:
   enabled: false
   refreshInterval: "1h"
   secretStoreRef:
+    # LOAD-BEARING, string-matched: must equal the pre-provisioned
+    # ClusterSecretStore name. Do NOT rename without renaming the store.
     name: aws-secrets-manager
     kind: ClusterSecretStore
   # Target secret name (defaults to release-name-secrets)
   targetSecretName: ""
-  # Remote references
+  # Remote references. On the IAM-auth path: only the keys that survive (NOT
+  # POSTGRES_PASSWORD / REDIS_PASSWORD / DATABASE_URL).
   data: []
     # - secretKey: LITELLM_MASTER_KEY
     #   remoteRef:
     #     key: routeiq/master-key
+    # - secretKey: ADMIN_API_KEYS
+    #   remoteRef:
+    #     key: routeiq/admin-keys
     # - secretKey: OPENAI_API_KEY
     #   remoteRef:
     #     key: routeiq/openai-key

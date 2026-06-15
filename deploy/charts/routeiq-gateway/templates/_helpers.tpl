@@ -135,17 +135,32 @@ imagePullSecrets:
 
 {{/*
 Database-only environment variables (for init containers like db-migrate)
+
+RouteIQ-on-AWS P1 (ADR-0028) BOOT-RENDER NOTE: on the Aurora IAM-auth path
+(externalPostgresql.existingSecret empty) this renders a COMPLETE, password-less
+DATABASE_URL (postgresql://routeiq@<host>:5432/litellm?sslmode=require) and the
+app (database.py) mints the 15-min rds-db:connect token in-process and splices it
+in IN PYTHON -- the $(POSTGRES_PASSWORD) substring below only appears in the
+static-password interim (Shape B). Do NOT trust K8s $(VAR) interpolation to
+assemble the URL: K8s only expands a $(VAR) defined EARLIER in the env list and
+does no second pass, so DATABASE_URL emitted before POSTGRES_PASSWORD leaves the
+$(POSTGRES_PASSWORD) substring LITERAL. For Shape B the referent MUST be ordered
+first. See research/p1/discover-chart-state.md section 3 (the highest-risk seam).
 */}}
 {{- define "routeiq-gateway.databaseEnv" -}}
 {{- if .Values.externalPostgresql.host }}
-- name: DATABASE_URL
-  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- if .Values.externalPostgresql.existingSecret }}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ .Values.externalPostgresql.existingSecret }}
       key: {{ .Values.externalPostgresql.existingSecretKey | default "password" }}
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+{{- else }}
+# IAM-auth (ADR-0028): password-less complete URL; app mints rds-db:connect token.
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- end }}
 {{- else if .Values.secrets.values.DATABASE_URL }}
 - name: DATABASE_URL
@@ -271,19 +286,30 @@ Environment variables for gateway configuration
       fieldPath: metadata.namespace
 
 # External PostgreSQL
+# P1 (ADR-0028) BOOT-RENDER: IAM-auth (existingSecret empty) renders a complete
+# password-less URL (app mints the rds-db:connect token in Python); Shape-B
+# interim orders POSTGRES_PASSWORD BEFORE DATABASE_URL so the K8s $(VAR) expansion
+# actually fires (it does not for a $(VAR) defined later). See databaseEnv above.
 {{- if .Values.externalPostgresql.host }}
-- name: DATABASE_URL
-  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- if .Values.externalPostgresql.existingSecret }}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ .Values.externalPostgresql.existingSecret }}
       key: {{ .Values.externalPostgresql.existingSecretKey | default "password" }}
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+{{- else }}
+# IAM-auth (ADR-0028): password-less complete URL; app mints rds-db:connect token.
+- name: DATABASE_URL
+  value: {{ printf "postgresql://%s@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- end }}
 {{- end }}
 
 # External Redis
+# P1 (ADR-0029): serverless Valkey is TLS-mandatory (set externalRedis.ssl=true ->
+# REDIS_SSL=true) + IAM-auth (existingSecret empty; app mints elasticache:Connect
+# token and presents CacheIamUserName as the cache user).
 {{- if .Values.externalRedis.host }}
 - name: REDIS_HOST
   value: {{ .Values.externalRedis.host | quote }}

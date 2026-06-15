@@ -1,0 +1,14 @@
+# RouteIQ schema-bootstrap Lambda dependencies (P1, ADR-0028).
+#
+# asyncpg ships a manylinux2014_x86_64 / cp313 wheel, so the docker-free
+# _LocalPipBundler can fetch the Linux/py3.13 build from any host (incl. macOS)
+# with --platform/--only-binary -- no docker required. This matches RouteIQ's
+# own asyncpg pool driver (src/litellm_llmrouter/database.py), so the DDL the
+# handler vendors runs against the same driver the runtime uses.
+#
+# boto3 ships in the managed Lambda runtime, so it is NOT pinned here (adding it
+# would only bloat the asset); the handler imports it for the master-secret
+# fetch. NO prisma: LiteLLM's Prisma schema stays the app-startup leader
+# (ROUTEIQ_LEADER_MIGRATIONS), per build-outline D3 -- shipping the node/prisma
+# engine binary into a Python Lambda is explicitly out of scope.
+asyncpg>=0.29,<1.0

@@ -23,6 +23,7 @@ from cdk_nag import AwsSolutionsChecks
 
 from lib.routeiq_observability_stack import RouteIqObservabilityStack
 from lib.routeiq_stack import RouteIqStack
+from lib.routeiq_state_stack import RouteIqStateStack
 
 
 def _ctx(app: cdk.App, key: str, default):
@@ -84,12 +85,26 @@ def main() -> None:
     config_s3_bucket = _ctx(app, "routeiq:config_s3_bucket", None) or None
     secret_arns = _split_csv_or_list(_ctx(app, "routeiq:secret_arns", []))
 
+    # P1 state-plane context keys (ADR-0028 Aurora + ADR-0029 ElastiCache). The
+    # state stack is a SEPARATE stack/CI-stage per the ~30-min-rollback rule, so
+    # it is gated on enable_state_stack (default true) and is byte-stable off.
+    # routeiq:state_pg_version is read INSIDE ReplayStoreConstruct via
+    # node.try_get_context (the context propagates to the child stack), so it is
+    # NOT threaded as a constructor arg here. state_min_acu / state_max_acu /
+    # cache_engine_version ARE constructor args.
+    enable_state_stack = _bool_ctx(app, "routeiq:enable_state_stack", True)
+    _state_min = _ctx(app, "routeiq:state_min_acu", None)
+    _state_max = _ctx(app, "routeiq:state_max_acu", None)
+    state_min_acu = float(_state_min) if _state_min not in (None, "") else None
+    state_max_acu = float(_state_max) if _state_max not in (None, "") else None
+    cache_engine_version = str(_ctx(app, "routeiq:cache_engine_version", "8.0"))
+
     env = cdk.Environment(
         account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=os.environ.get("CDK_DEFAULT_REGION"),
     )
 
-    RouteIqStack(
+    foundation = RouteIqStack(
         app,
         f"RouteIqStack-{env_name}",
         env=env,
@@ -106,6 +121,21 @@ def main() -> None:
         config_s3_bucket=config_s3_bucket,
         secret_arns=secret_arns,
     )
+
+    # P1 state stack (Aurora + ElastiCache), wired cross-stack to the P0
+    # foundation BY REFERENCE (cred-free; CDK emits Export/Fn::ImportValue at
+    # synth, never from_lookup). Separate stack = independent ~30-min rollback.
+    if enable_state_stack:
+        RouteIqStateStack(
+            app,
+            f"RouteIqStateStack-{env_name}",
+            env=env,
+            env_name=env_name,
+            foundation=foundation,
+            min_acu=state_min_acu,
+            max_acu=state_max_acu,
+            cache_engine_version=cache_engine_version,
+        )
 
     # P2 (ADR-0026/0027): the SEPARATE config-state + observability + data-lake
     # stack. Flag-gated off by default so the default synth carries only the P0

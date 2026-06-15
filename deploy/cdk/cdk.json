@@ -17,6 +17,11 @@
     "routeiq:enable_amg": false,
     "routeiq:enable_data_lake": false,
     "routeiq:routing_log_group_name": null,
-    "routeiq:notify_emails": []
+    "routeiq:notify_emails": [],
+    "routeiq:enable_state_stack": true,
+    "routeiq:state_pg_version": null,
+    "routeiq:state_min_acu": null,
+    "routeiq:state_max_acu": null,
+    "routeiq:cache_engine_version": "8.0"
   }
 }
