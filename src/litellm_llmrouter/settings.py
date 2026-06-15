@@ -1625,6 +1625,28 @@ class GatewaySettings(BaseSettings):
                 # the flag only when it was left at its default.
                 if getattr(current, "iam_auth", False) is False:
                     data[section] = current.model_copy(update={"iam_auth": True})
+
+        # Map the OTel-STANDARD endpoint env var onto otel.endpoint (RouteIQ-cfe3).
+        # The whole deploy surface (entrypoints, docker-compose, every config/*.yaml,
+        # the docs, service_discovery.py) uses OTEL_EXPORTER_OTLP_ENDPOINT, and
+        # ADR-0013 explicitly migrated it -- but the nested field only binds the
+        # ROUTEIQ_OTEL__ENDPOINT form (nobody sets it), so post-migration the
+        # ObservabilityManager silently exported to localhost while service
+        # discovery probed the real collector (split brain). pydantic-settings
+        # won't resolve a flat env var onto a nested BaseModel field, so inject it
+        # here. The nested ROUTEIQ_OTEL__ENDPOINT form WINS if both are set.
+        otlp_endpoint = _os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if otlp_endpoint:
+            current = data.get("otel")
+            if current is None:
+                data["otel"] = {"endpoint": otlp_endpoint}
+            elif isinstance(current, dict):
+                current.setdefault("endpoint", otlp_endpoint)
+            elif isinstance(current, BaseModel):
+                if getattr(current, "endpoint", None) is None:
+                    data["otel"] = current.model_copy(
+                        update={"endpoint": otlp_endpoint}
+                    )
         return data
 
     @field_validator("litellm_master_key")

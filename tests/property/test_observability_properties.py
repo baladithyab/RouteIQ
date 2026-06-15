@@ -37,6 +37,12 @@ spec.loader.exec_module(observability)
 ObservabilityManager = observability.ObservabilityManager
 init_observability = observability.init_observability
 
+# The ObservabilityManager resolves its OTLP endpoint via the cached
+# get_settings() singleton (ADR-0013), so env-var-driven endpoint tests must
+# reset it inside the patched context or they observe a stale cached Settings
+# (CLAUDE.md: "Singletons need reset_*()"). Imported lazily-safe at module load.
+from litellm_llmrouter.settings import reset_settings  # noqa: E402
+
 
 # Test Data Generators
 strategy_name_strategy = st.sampled_from(
@@ -240,7 +246,12 @@ class TestObservabilitySpanAndLogEmissionProperty:
             enable_metrics=False,
         )
 
-        # Capture log output
+        # Capture log output. NOTE: log_routing_decision emits TWO logger.info
+        # lines -- the human "Routing decision made" line (with the extra= dict
+        # validated below) AND the ADR-0027 structured routing_decision JSON line
+        # (a flat JSON string on the dedicated logger). A global Logger.info mock
+        # captures both, and call_args returns only the LAST, so search
+        # call_args_list for the specific human line rather than assuming order.
         with patch("logging.Logger.info") as mock_log:
             manager.log_routing_decision(
                 strategy=routing_ctx["strategy"],
@@ -251,14 +262,20 @@ class TestObservabilitySpanAndLogEmissionProperty:
             # Verify log was called
             assert mock_log.called
 
-            # Get the log call
-            call_args = mock_log.call_args
+            # Find the human-readable "Routing decision made" call specifically.
+            human_calls = [
+                c
+                for c in mock_log.call_args_list
+                if c.args and "Routing decision made" in c.args[0]
+            ]
+            assert human_calls, (
+                "expected a 'Routing decision made' logger.info call; "
+                f"got {[c.args[0] if c.args else c for c in mock_log.call_args_list]}"
+            )
+            call_args = human_calls[0]
 
-            # Verify message
-            assert "Routing decision made" in call_args[0][0]
-
-            # Verify extra context
-            extra = call_args[1].get("extra", {})
+            # Verify extra context on the human line.
+            extra = call_args.kwargs.get("extra", {})
             assert extra["event"] == "routing.decision"
             assert extra["strategy"] == routing_ctx["strategy"]
             assert extra["selected_model"] == routing_ctx["selected_model"]
@@ -595,8 +612,12 @@ class TestObservabilityConfiguration:
         test_endpoint = "http://test-collector:4317"
 
         with patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_ENDPOINT": test_endpoint}):
-            manager = ObservabilityManager()
-            assert manager.otlp_endpoint == test_endpoint
+            reset_settings()  # re-read the patched env (singleton, ADR-0013)
+            try:
+                manager = ObservabilityManager()
+                assert manager.otlp_endpoint == test_endpoint
+            finally:
+                reset_settings()  # don't leak the patched Settings to later tests
 
     def test_default_otlp_endpoint_fallback(self):
         """
@@ -606,8 +627,12 @@ class TestObservabilityConfiguration:
         the manager should use a default localhost endpoint.
         """
         with patch.dict(os.environ, {}, clear=True):
-            manager = ObservabilityManager()
-            assert manager.otlp_endpoint == "http://localhost:4317"
+            reset_settings()  # re-read the cleared env (singleton, ADR-0013)
+            try:
+                manager = ObservabilityManager()
+                assert manager.otlp_endpoint == "http://localhost:4317"
+            finally:
+                reset_settings()
 
 
 class TestPerTeamObservabilityProperty:
