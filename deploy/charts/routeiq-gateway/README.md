@@ -228,20 +228,20 @@ state-plane wiring turns on.
 
 ### IAM-auth boot-render (no static password)
 
-> **⚠️ Runtime code not yet shipped (tracked seed, P1-completion).** The in-process
-> token-minting below is the **intended** ADR-0028/0029 design. Today
-> `database.py:get_database_url()` returns `DATABASE_URL` verbatim (no SigV4 splice)
-> and `redis_pool.py` reads only `REDIS_HOST/PORT/PASSWORD/SSL/DB` (no IAM token
-> path). **Until `ROUTEIQ_DB_IAM_AUTH` / `ROUTEIQ_REDIS_IAM_AUTH` land, the empty-
-> `existingSecret` IAM path renders credentials the gateway cannot authenticate
-> with** — use the static-password / static-AUTH interim (Shape B, `existingSecret`
-> set) for a working deploy. The CDK substrate (RouteIqStateStack) is complete and
-> correct; only the app-side token minting remains.
+> **✅ Shipped in P1-fix (RouteIQ-d3a4).** The in-process token-minting below is
+> now implemented and DEFAULTS OFF. `database.py:get_db_pool()` mints a 15-min
+> `rds-db:connect` token per connection and passes it to asyncpg as a callable
+> password (refresh-per-reconnect) behind `ROUTEIQ_DB_IAM_AUTH`; `redis_pool.py`
+> presents `REDIS_USERNAME` + a short-lived `elasticache:Connect` SigV4 token as
+> the Redis AUTH behind `ROUTEIQ_REDIS_IAM_AUTH`. The chart emits both flags
+> automatically on the empty-`existingSecret` IAM path (and `REDIS_USERNAME` from
+> `externalRedis.iamUserName`). Both flags default OFF, so the static-password /
+> static-AUTH interim (Shape B, `existingSecret` set) remains fully supported.
 
-On the ADR-0028/0029 IAM-auth path there is **no static credential** (INTENDED).
+On the ADR-0028/0029 IAM-auth path there is **no static credential**.
 Leave `externalPostgresql.existingSecret` / `externalRedis.existingSecret`
 **empty**: the chart renders a complete, password-less `DATABASE_URL` at
-boot-render time and the app (`database.py` / `redis_pool.py`) **will** mint the
+boot-render time and the app (`database.py` / `redis_pool.py`) mints the
 15-min `rds-db:connect` / `elasticache:Connect` token in-process via the Pod
 Identity credentials. Do **not** rely on K8s `$(VAR)` env interpolation to
 assemble the URL — K8s only expands a `$(VAR)` defined earlier in the env list, so

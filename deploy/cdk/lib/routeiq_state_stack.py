@@ -103,6 +103,12 @@ class RouteIqStateStack(Stack):
         private_data_subnets: Sequence[ec2.ISubnet] | None = None,
         pod_sg: ec2.ISecurityGroup | None = None,
         pod_role: iam.IRole | None = None,
+        # The P0 shared interface-endpoint SG (network.vpce_sg). Used to admit the
+        # schema-bootstrap Lambda's SG to the Secrets Manager endpoint on 443
+        # (RouteIQ-8374). OPTIONAL even in separate-pipeline mode: when absent the
+        # 443 ingress rule is skipped and applied out-of-band (same posture as the
+        # pod-role grants). On the foundation path it is read from foundation.network.
+        vpce_sg: ec2.ISecurityGroup | None = None,
         # Aurora ACU window overrides (default 0.5 warm floor; max 2.0 dev / 8.0
         # otherwise inside the construct). Pass min_acu=0 (with the construct's
         # 24h auto-pause) for the cost-sensitive dev scale-to-zero path.
@@ -121,16 +127,22 @@ class RouteIqStateStack(Stack):
 
         # Resolve the cross-stack inputs. foundation (by-reference) wins; otherwise
         # the explicit handles must all be present. ASCII-only error text.
-        resolved_vpc, resolved_data_subnets, resolved_pod_sg, resolved_pod_role = (
-            self._resolve_foundation(
-                foundation=foundation,
-                vpc=vpc,
-                private_data_subnets=private_data_subnets,
-                pod_sg=pod_sg,
-                pod_role=pod_role,
-            )
+        (
+            resolved_vpc,
+            resolved_data_subnets,
+            resolved_pod_sg,
+            resolved_pod_role,
+            resolved_vpce_sg,
+        ) = self._resolve_foundation(
+            foundation=foundation,
+            vpc=vpc,
+            private_data_subnets=private_data_subnets,
+            pod_sg=pod_sg,
+            pod_role=pod_role,
+            vpce_sg=vpce_sg,
         )
         self._pod_role = resolved_pod_role
+        self._vpce_sg = resolved_vpce_sg
 
         # Stack tags. Cost tags emitted ONLY when supplied so the default synth
         # stays byte-stable for the snapshot test (mirrors the P0 RouteIqStack).
@@ -176,6 +188,39 @@ class RouteIqStateStack(Stack):
             min_acu=min_acu,
             max_acu=max_acu,
         )
+
+        # -- 2b. Cross-stack: bootstrap Lambda -> Secrets Manager endpoint (RouteIQ-8374)
+        # The schema-bootstrap Lambda runs in replay_store_sg in the private-app tier
+        # and must reach the P0 Secrets Manager interface endpoint (private_dns_enabled,
+        # so the SM DNS resolves to the endpoint ENI) on 443 to read the master secret.
+        # The P0 vpce_sg admits 443 from pod_sg only; the Lambda is NOT in pod_sg, so
+        # without this rule GetSecretValue hangs and the custom resource times out at
+        # deploy.
+        #
+        # CYCLE AVOIDANCE: we do NOT call resolved_vpce_sg.add_ingress_rule(...). That
+        # L2 helper attaches the rendered AWS::EC2::SecurityGroupIngress to the SG's
+        # OWN stack (P0, since vpce_sg is a P0 construct), and that ingress references
+        # replay_store_sg.GroupId (a State-stack SG) -- a P0 -> State edge, while State
+        # already imports P0 (State -> P0). That closes a DependencyCycle at synth
+        # (exactly the pod-role-grant hazard). Instead we instantiate a STANDALONE
+        # ec2.CfnSecurityGroupIngress scoped to THIS (State) stack: the ingress resource
+        # lives in the State template, group_id is the imported P0 vpce_sg id (a
+        # State -> P0 import, which already exists), and source_security_group_id is the
+        # in-stack replay_store_sg. Only cross-stack edge stays State -> P0; no cycle.
+        # ASCII-only description. Skipped (apply out-of-band) when vpce_sg is not
+        # reachable (separate-pipeline mode), same posture as the pod-role grants.
+        self.vpce_bootstrap_ingress: ec2.CfnSecurityGroupIngress | None = None
+        if resolved_vpce_sg is not None:
+            self.vpce_bootstrap_ingress = ec2.CfnSecurityGroupIngress(
+                self,
+                "VpceBootstrapSecretsIngress443",
+                ip_protocol="tcp",
+                from_port=443,
+                to_port=443,
+                group_id=resolved_vpce_sg.security_group_id,
+                source_security_group_id=self.replay_store.replay_store_sg.security_group_id,
+                description="HTTPS from schema-bootstrap Lambda to Secrets Manager endpoint",
+            )
 
         # -- 3. ElastiCache Serverless Valkey (ADR-0029) -----------------------
         # Serverless cache in the SAME private-data subnets; always-on TLS; IAM-auth
@@ -262,18 +307,27 @@ class RouteIqStateStack(Stack):
         private_data_subnets: Sequence[ec2.ISubnet] | None,
         pod_sg: ec2.ISecurityGroup | None,
         pod_role: iam.IRole | None,
-    ) -> tuple[ec2.IVpc, Sequence[ec2.ISubnet], ec2.ISecurityGroup, iam.IRole | None]:
+        vpce_sg: ec2.ISecurityGroup | None,
+    ) -> tuple[
+        ec2.IVpc,
+        Sequence[ec2.ISubnet],
+        ec2.ISecurityGroup,
+        iam.IRole | None,
+        ec2.ISecurityGroup | None,
+    ]:
         """Resolve the cross-stack network/role inputs from foundation or explicit args.
 
         foundation (the P0 RouteIqStack, by reference) is the primary path: it
-        carries network.vpc / network.private_data_subnets / network.pod_sg and
-        pod_role. Reading these construct handles in the SAME CDK app makes CDK
-        emit Export / Fn::ImportValue at synth time (cred-free, no from_lookup).
+        carries network.vpc / network.private_data_subnets / network.pod_sg /
+        network.vpce_sg and pod_role. Reading these construct handles in the SAME
+        CDK app makes CDK emit Export / Fn::ImportValue at synth time (cred-free,
+        no from_lookup).
 
-        When foundation is None the four explicit handles take over (the
+        When foundation is None the explicit handles take over (the
         separate-pipeline deploy mode). vpc + private_data_subnets + pod_sg are
-        MANDATORY in that mode; pod_role is optional (grants are skipped without
-        it, applied out-of-band). ASCII-only error text.
+        MANDATORY in that mode; pod_role AND vpce_sg are optional (the grants /
+        the Secrets Manager 443 ingress are skipped without them, applied
+        out-of-band). ASCII-only error text.
         """
         if foundation is not None:
             network = foundation.network
@@ -282,16 +336,18 @@ class RouteIqStateStack(Stack):
                 list(network.private_data_subnets),
                 network.pod_sg,
                 getattr(foundation, "pod_role", None) or pod_role,
+                getattr(network, "vpce_sg", None) or vpce_sg,
             )
         if vpc is None or private_data_subnets is None or pod_sg is None:
             raise ValueError(
                 "RouteIqStateStack needs either foundation=<RouteIqStack> "
                 "(cross-stack by reference) OR all of vpc + private_data_subnets "
-                "+ pod_sg (the separate-pipeline mode). pod_role is optional; "
-                "without it the rds-db:connect / elasticache:Connect grants are "
-                "skipped and must be applied out-of-band."
+                "+ pod_sg (the separate-pipeline mode). pod_role and vpce_sg are "
+                "optional; without pod_role the rds-db:connect / elasticache:Connect "
+                "grants are skipped, and without vpce_sg the bootstrap-Lambda 443 "
+                "ingress is skipped -- both applied out-of-band."
             )
-        return vpc, list(private_data_subnets), pod_sg, pod_role
+        return vpc, list(private_data_subnets), pod_sg, pod_role, vpce_sg
 
     # --------------------------------------------------------------- outputs
     def _add_outputs(self) -> None:

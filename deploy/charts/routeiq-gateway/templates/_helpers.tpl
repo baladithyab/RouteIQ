@@ -159,8 +159,11 @@ first. See research/p1/discover-chart-state.md section 3 (the highest-risk seam)
   value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- else }}
 # IAM-auth (ADR-0028): password-less complete URL; app mints rds-db:connect token.
+# The flag is DERIVED from an empty existingSecret (single source of truth).
 - name: DATABASE_URL
   value: {{ printf "postgresql://%s@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+- name: ROUTEIQ_DB_IAM_AUTH
+  value: "true"
 {{- end }}
 {{- else if .Values.secrets.values.DATABASE_URL }}
 - name: DATABASE_URL
@@ -301,8 +304,11 @@ Environment variables for gateway configuration
   value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
 {{- else }}
 # IAM-auth (ADR-0028): password-less complete URL; app mints rds-db:connect token.
+# The flag is DERIVED from an empty existingSecret (single source of truth).
 - name: DATABASE_URL
   value: {{ printf "postgresql://%s@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
+- name: ROUTEIQ_DB_IAM_AUTH
+  value: "true"
 {{- end }}
 {{- end }}
 
@@ -319,6 +325,18 @@ Environment variables for gateway configuration
   value: {{ .Values.externalRedis.db | quote }}
 - name: REDIS_SSL
   value: {{ .Values.externalRedis.ssl | quote }}
+{{- if .Values.externalRedis.iamUserName }}
+# IAM user the pod presents on connect (= RouteIqStateStack CfnOutput
+# CacheIamUserName; user_id == user_name). Read directly by redis_pool.
+- name: REDIS_USERNAME
+  value: {{ .Values.externalRedis.iamUserName | quote }}
+{{- end }}
+{{- if .Values.externalRedis.iamAuth }}
+# ADR-0029 IAM-auth: redis_pool mints an elasticache:Connect SigV4 token as the
+# AUTH (15-min, refreshed per client build) instead of a static REDIS_PASSWORD.
+- name: ROUTEIQ_REDIS_IAM_AUTH
+  value: "true"
+{{- end }}
 {{- if .Values.externalRedis.existingSecret }}
 - name: REDIS_PASSWORD
   valueFrom:

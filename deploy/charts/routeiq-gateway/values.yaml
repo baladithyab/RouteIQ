@@ -355,15 +355,15 @@ routeiq:
 #       --output text)
 #     helm upgrade ... --set externalPostgresql.host="$DB_HOST"
 #
-# ⚠️ NOT YET IMPLEMENTED IN RUNTIME CODE (seed RouteIQ — P1-completion): the
-# in-process IAM-token minting described below is the INTENDED ADR-0028 design,
-# but database.py:get_database_url() today returns os.getenv("DATABASE_URL")
-# verbatim with NO SigV4 splice. Until the ROUTEIQ_DB_IAM_AUTH token-mint code
-# lands, the IAM-auth path (empty existingSecret) renders a PASSWORD-LESS URL the
-# gateway CANNOT authenticate with — use the static-password interim (Shape B,
-# existingSecret set) for a working deploy. Tracking seed filed at P1 merge.
+# SHIPPED (RouteIQ-d3a4): the in-process IAM-token minting described below is now
+# implemented. database.py:get_db_pool() mints a 15-min rds-db:connect token (via
+# boto3 generate_db_auth_token) per connection and passes it to asyncpg as a
+# callable password (refresh-per-reconnect) when ROUTEIQ_DB_IAM_AUTH is set. The
+# chart emits ROUTEIQ_DB_IAM_AUTH=true automatically on the IAM-auth path (empty
+# externalPostgresql.existingSecret). The flag DEFAULTS OFF, so the static-password
+# interim (Shape B, existingSecret set) remains fully supported and unchanged.
 #
-# IAM-AUTH BOOT-RENDER (ADR-0028, INTENDED): on the Aurora IAM-auth path there is
+# IAM-AUTH BOOT-RENDER (ADR-0028): on the Aurora IAM-auth path there is
 # NO static DB password. `existingSecret` stays EMPTY so the chart renders a
 # complete, password-less DATABASE_URL at Helm-template (boot-render) time
 # (postgresql://routeiq@<host>:5432/litellm?sslmode=require) and the app
@@ -406,14 +406,16 @@ externalPostgresql:
 #       --set externalRedis.port="$CACHE_PORT" \
 #       --set-string externalRedis.ssl=true
 #
-# ⚠️ NOT YET IMPLEMENTED IN RUNTIME CODE (seed RouteIQ — P1-completion): the
-# elasticache:Connect SigV4 minting below is the INTENDED ADR-0029 design;
-# redis_pool.py:_redis_settings() today reads only REDIS_HOST/PORT/PASSWORD/SSL/DB
-# (no username, no SigV4 CredentialProvider). Until ROUTEIQ_REDIS_IAM_AUTH lands,
-# the empty-existingSecret path yields a no-AUTH Redis config the gateway cannot
-# authenticate with against the IAM-only cache — use a static AUTH interim for now.
+# SHIPPED (RouteIQ-d3a4): the elasticache:Connect SigV4 minting below is now
+# implemented. redis_pool.py reads REDIS_USERNAME directly and, when
+# ROUTEIQ_REDIS_IAM_AUTH is set, mints a short-lived (900s) elasticache:Connect
+# SigV4 token in-process and presents REDIS_USERNAME (CacheIamUserName) + the
+# token as the Redis AUTH on the connect (refreshed per client build). Set
+# externalRedis.iamUserName + externalRedis.iamAuth=true to enable it; the chart
+# then emits REDIS_USERNAME + ROUTEIQ_REDIS_IAM_AUTH=true. iamAuth DEFAULTS false,
+# so the static-AUTH path (existingSecret set) remains supported and unchanged.
 #
-# IAM-AUTH (ADR-0029, INTENDED): like Postgres, `existingSecret` stays EMPTY (no
+# IAM-AUTH (ADR-0029): like Postgres, `existingSecret` stays EMPTY (no
 # static AUTH token). The app (redis_pool.py) WILL mint an elasticache:Connect
 # SigV4 token and present the IAM user name (RouteIqStateStack CfnOutput
 # CacheIamUserName, where user_id == user_name) as the cache user on the connect.
@@ -425,6 +427,14 @@ externalRedis:
   # K8s secret containing the password. LEAVE EMPTY on the ADR-0029 IAM-auth path.
   existingSecret: ""
   existingSecretKey: "password"
+  # IAM user name the pod presents on connect (= RouteIqStateStack CfnOutput
+  # CacheIamUserName; user_id == user_name). Set on the ADR-0029 IAM-auth path;
+  # emitted as REDIS_USERNAME so redis_pool.py presents it on the SigV4 connect.
+  iamUserName: ""
+  # Mint an elasticache:Connect SigV4 token in-process instead of a static AUTH
+  # (ADR-0029). Emitted as ROUTEIQ_REDIS_IAM_AUTH=true. Default false keeps the
+  # static-AUTH path unchanged.
+  iamAuth: false
   db: 0
   # Enable TLS/SSL for Redis connections. P1 (ADR-0029): serverless Valkey is
   # TLS-MANDATORY -- set true at deploy (--set-string externalRedis.ssl=true).

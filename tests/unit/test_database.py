@@ -732,3 +732,143 @@ class TestSingletons:
 
     def test_activity_tracker_is_correct_type(self):
         assert isinstance(get_a2a_activity_tracker(), A2AActivityTracker)
+
+
+# =============================================================================
+# IAM-auth runtime (ADR-0028) -- rds-db:connect token as a callable password
+# =============================================================================
+#
+# boto3 + asyncpg are NOT importable in the dev test env, so both are mocked:
+# asyncpg via sys.modules (the in-function `import asyncpg`), and _mint_db_token
+# is monkeypatch-stubbed (so boto3 is never imported). All cred-free. The pool
+# singleton (_pool) is reset by the global autouse conftest fixture
+# (reset_database_singletons -> reset_db_pool) + reset_settings.
+
+import sys  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+from litellm_llmrouter.database import (  # noqa: E402
+    _region_from_rds_host,
+    get_db_pool,
+)
+from litellm_llmrouter.settings import reset_settings  # noqa: E402
+
+# Placeholder only -- NEVER a real token value (RouteIQ-d3a4 discipline).
+_FAKE_DB_TOKEN = "TOKEN-15MIN"  # noqa: S105 - test placeholder, not a secret
+_RDS_URL = "postgresql://routeiq@db.cluster-xyz.us-east-1.rds.amazonaws.com:5432/litellm?sslmode=require"
+
+
+def _mock_asyncpg():
+    """A mock asyncpg module whose create_pool is an AsyncMock."""
+    mod = MagicMock()
+    mod.create_pool = AsyncMock(return_value=MagicMock(name="pool"))
+    return mod
+
+
+class TestRegionFromRdsHost:
+    def test_parses_region_from_rds_host(self):
+        host = "db.cluster-xyz.us-east-1.rds.amazonaws.com"
+        assert _region_from_rds_host(host) == "us-east-1"
+
+    def test_non_rds_host_returns_none(self):
+        assert _region_from_rds_host("localhost") is None
+        assert _region_from_rds_host(None) is None
+
+
+class TestGetDbPoolIamAuth:
+    async def test_iam_auth_passes_callable_password(self, monkeypatch):
+        """ROUTEIQ_DB_IAM_AUTH=true -> create_pool gets a callable password."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "_mint_db_token", lambda **kw: _FAKE_DB_TOKEN)
+        mock_asyncpg = _mock_asyncpg()
+        env = {
+            "DATABASE_URL": _RDS_URL,
+            "ROUTEIQ_DB_IAM_AUTH": "true",
+            "AWS_REGION": "us-east-1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            # Rebuild settings under THIS env (the conftest only resets in
+            # teardown, so the first test in a run would otherwise see a leaked
+            # iam_auth=False singleton).
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                await get_db_pool()
+
+        kwargs = mock_asyncpg.create_pool.call_args.kwargs
+        assert "password" in kwargs, kwargs
+        pw = kwargs["password"]
+        assert callable(pw)
+        # asyncpg invokes it per connection -> proves 15-min refresh-per-call.
+        assert pw() == _FAKE_DB_TOKEN
+        assert pw() == _FAKE_DB_TOKEN
+
+    async def test_iam_auth_mint_args(self, monkeypatch):
+        """The callable invokes _mint_db_token with host/port/user/region parsed."""
+        import litellm_llmrouter.database as db_mod
+
+        spy = MagicMock(return_value=_FAKE_DB_TOKEN)
+        monkeypatch.setattr(db_mod, "_mint_db_token", spy)
+        mock_asyncpg = _mock_asyncpg()
+        env = {
+            "DATABASE_URL": _RDS_URL,
+            "ROUTEIQ_DB_IAM_AUTH": "true",
+            "AWS_REGION": "us-east-1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                await get_db_pool()
+
+        pw = mock_asyncpg.create_pool.call_args.kwargs["password"]
+        pw()  # trigger the mint
+        spy.assert_called_with(
+            host="db.cluster-xyz.us-east-1.rds.amazonaws.com",
+            port=5432,
+            user="routeiq",
+            region="us-east-1",
+        )
+
+    async def test_static_path_no_token_when_flag_off(self, monkeypatch):
+        """Flag OFF (default) -> NO password kwarg; _mint_db_token never called."""
+        import litellm_llmrouter.database as db_mod
+
+        called = {"mint": False}
+
+        def _should_not_mint(**kw):
+            called["mint"] = True
+            return _FAKE_DB_TOKEN
+
+        monkeypatch.setattr(db_mod, "_mint_db_token", _should_not_mint)
+        mock_asyncpg = _mock_asyncpg()
+        env = {"DATABASE_URL": _RDS_URL}  # ROUTEIQ_DB_IAM_AUTH unset -> OFF
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                await get_db_pool()
+
+        kwargs = mock_asyncpg.create_pool.call_args.kwargs
+        assert "password" not in kwargs, kwargs
+        assert called["mint"] is False
+
+    async def test_iam_setup_failure_falls_back_to_static(self, monkeypatch):
+        """A settings-read failure degrades softly: pool built, no password kwarg."""
+        import litellm_llmrouter.database as db_mod
+
+        def _boom():
+            raise RuntimeError("settings exploded")
+
+        # Force the IAM-setup block to raise BEFORE the callable is built.
+        monkeypatch.setattr(db_mod, "get_database_url", get_database_url)
+        import litellm_llmrouter.settings as settings_mod
+
+        monkeypatch.setattr(settings_mod, "get_settings", _boom)
+        mock_asyncpg = _mock_asyncpg()
+        env = {"DATABASE_URL": _RDS_URL, "ROUTEIQ_DB_IAM_AUTH": "true"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                pool = await get_db_pool()
+
+        assert pool is not None  # still built (fail-soft)
+        kwargs = mock_asyncpg.create_pool.call_args.kwargs
+        assert "password" not in kwargs, kwargs

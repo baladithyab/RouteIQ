@@ -115,6 +115,32 @@ class RedisSettings(BaseModel):
         le=15,
         description="Redis database index.",
     )
+    username: Optional[str] = Field(
+        None,
+        description=(
+            "Redis ACL/IAM username (REDIS_USERNAME). On the ADR-0029 IAM-auth path "
+            "this is the CacheIamUserName (user_id == user_name). Read directly from "
+            "the legacy REDIS_USERNAME env var by redis_pool._redis_settings()."
+        ),
+    )
+    iam_auth: bool = Field(
+        False,
+        description=(
+            "Mint an elasticache:Connect SigV4 token as the AUTH and present "
+            "username as the IAM user (ADR-0029) instead of a static REDIS_PASSWORD. "
+            "Env: ROUTEIQ_REDIS_IAM_AUTH (flat) -- mapped onto this nested field by "
+            "GatewaySettings._map_flat_iam_aliases. Default OFF (static-cred path "
+            "unchanged)."
+        ),
+    )
+    iam_region: Optional[str] = Field(
+        None,
+        description=(
+            "AWS region for the elasticache:Connect signer. Falls back to host "
+            "parse / AWS_REGION. Serverless endpoints use shortened region tokens "
+            "(use1), so set this or AWS_REGION explicitly on the serverless path."
+        ),
+    )
 
 
 class PostgresSettings(BaseModel):
@@ -145,6 +171,23 @@ class PostgresSettings(BaseModel):
         "prefer",
         description=(
             "SSL mode: disable, allow, prefer, require, verify-ca, verify-full."
+        ),
+    )
+    iam_auth: bool = Field(
+        False,
+        description=(
+            "Mint a short-lived (15-min) rds-db:connect IAM token per connection "
+            "instead of using a static password (ADR-0028). Env: ROUTEIQ_DB_IAM_AUTH "
+            "(flat) -- mapped onto this nested field by "
+            "GatewaySettings._map_flat_iam_aliases. Default OFF (static-cred path "
+            "unchanged)."
+        ),
+    )
+    iam_region: Optional[str] = Field(
+        None,
+        description=(
+            "AWS region for the rds-db:connect signer. Falls back to host parse "
+            "(.<region>.rds.amazonaws.com) / AWS_REGION."
         ),
     )
 
@@ -1305,6 +1348,50 @@ class GatewaySettings(BaseSettings):
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_flat_iam_aliases(cls, data: Any) -> Any:
+        """Map the flat IAM-auth env vars onto the nested settings fields.
+
+        The chart/README emit the FLAT env names ``ROUTEIQ_DB_IAM_AUTH`` and
+        ``ROUTEIQ_REDIS_IAM_AUTH`` (ADR-0028 / ADR-0029).  pydantic-settings
+        does NOT resolve a ``validation_alias`` on a nested ``BaseModel`` field
+        from a flat top-level env var (only the nested ``ROUTEIQ_POSTGRES__*`` /
+        ``ROUTEIQ_REDIS__*`` form would work, which the chart does not emit), so
+        we inject the flat values onto the nested ``postgres`` / ``redis`` dicts
+        here, before validation.  The flat env var is the source of truth the
+        chart already targets.  Both flags DEFAULT OFF (only set when the flat
+        env var is present and truthy), so the static-cred path is unchanged.
+        """
+        import os as _os
+
+        def _truthy(value: Any) -> bool:
+            return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+        if not isinstance(data, dict):
+            return data
+
+        flat_map = (
+            ("ROUTEIQ_DB_IAM_AUTH", "postgres"),
+            ("ROUTEIQ_REDIS_IAM_AUTH", "redis"),
+        )
+        for env_name, section in flat_map:
+            raw = _os.environ.get(env_name)
+            if raw is None or not _truthy(raw):
+                continue
+            current = data.get(section)
+            if current is None:
+                data[section] = {"iam_auth": True}
+            elif isinstance(current, dict):
+                # Do not clobber an explicit nested override if one was given.
+                current.setdefault("iam_auth", True)
+            elif isinstance(current, BaseModel):
+                # An already-constructed nested model (e.g. init kwargs); set
+                # the flag only when it was left at its default.
+                if getattr(current, "iam_auth", False) is False:
+                    data[section] = current.model_copy(update={"iam_auth": True})
+        return data
 
     @field_validator("litellm_master_key")
     @classmethod

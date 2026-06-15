@@ -49,6 +49,7 @@ def apply_state_nag_suppressions(stack: RouteIqStateStack) -> None:
     """
     _suppress_replay_store(stack)
     _suppress_cache(stack)
+    _suppress_vpce_ingress(stack)
 
 
 def _suppress_path(
@@ -295,6 +296,39 @@ def _suppress_cache(stack: RouteIqStateStack) -> None:
                     "group; the default user is disabled. In-transit TLS is "
                     "always-on for serverless caches. Owner: RouteIqStateStack "
                     "(CacheConstruct)."
+                ),
+            ),
+        ],
+    )
+
+
+# --------------------------------------------- vpce 443 bootstrap ingress (8374)
+
+
+def _suppress_vpce_ingress(stack: RouteIqStateStack) -> None:
+    """Suppress EC23 on the cross-stack 443 ingress (bootstrap Lambda -> SM endpoint).
+
+    The rule (RouteIQ-8374) admits tcp/443 from replay_store_sg to the P0 shared
+    vpce_sg. The peer is a stack-internal SG (replay_store_sg), NEVER the internet
+    (no CidrIp, no 0.0.0.0/0) -- same reasoning as the P0 vpce_sg pod_sg ingress
+    suppression. The rule is owned by the State stack (cycle avoidance), so the
+    suppression lives HERE, not in the P0 nag_suppressions. The rule renders as an
+    AWS::EC2::SecurityGroupIngress on the IMPORTED vpce_sg, so its CDK path is not
+    under a state-stack construct; a stack-level suppression (not path-scoped) is
+    used so it cannot drift on a synthesised logical path. ASCII-only reason.
+    """
+    NagSuppressions.add_stack_suppressions(
+        stack,
+        [
+            NagPackSuppression(
+                id="AwsSolutions-EC23",
+                reason=(
+                    "The cross-stack 443 ingress on the shared vpce_sg admits the "
+                    "schema-bootstrap Lambda's replay_store_sg only (SG-to-SG peer, "
+                    "no CidrIp, never 0.0.0.0/0) so it can read the Aurora master "
+                    "secret from the Secrets Manager interface endpoint at deploy "
+                    "(RouteIQ-8374). Stack-internal peer, not internet. Owner: "
+                    "RouteIqStateStack (vpce 443 bootstrap ingress)."
                 ),
             ),
         ],

@@ -274,6 +274,33 @@ def test_aurora_ingress_5432_from_app_sg() -> None:
     )
 
 
+def test_secrets_endpoint_ingress_443_from_bootstrap_sg() -> None:
+    """The P0 vpce_sg admits tcp/443 from the bootstrap Lambda's replay_store_sg.
+
+    Deploy-break guard (RouteIQ-8374): the schema-bootstrap Lambda runs in
+    replay_store_sg (private-app tier) and must reach the Secrets Manager interface
+    endpoint (private_dns_enabled) on 443 to read the master secret. The P0 vpce_sg
+    baseline ingress is 443-from-pod_sg only; this asserts the cross-stack rule that
+    ALSO admits replay_store_sg was wired -- without it GetSecretValue hangs and the
+    custom resource times out at deploy. The rule is owned by the STATE stack (adding
+    it in P0 would close a DependencyCycle), so it renders in the state template.
+    """
+    template = _state_template()
+    ingress_443 = template.find_resources(
+        "AWS::EC2::SecurityGroupIngress",
+        {"Properties": {"FromPort": 443, "ToPort": 443, "IpProtocol": "tcp"}},
+    )
+    assert len(ingress_443) == 1, (
+        f"expected exactly one 443 ingress (bootstrap SG -> Secrets Manager "
+        f"endpoint); got {len(ingress_443)}: {list(ingress_443)}"
+    )
+    props = next(iter(ingress_443.values()))["Properties"]
+    assert "CidrIp" not in props, f"443 ingress must be SG-to-SG, not CIDR: {props}"
+    assert props.get("SourceSecurityGroupId"), props  # peer = replay_store_sg
+    assert props.get("GroupId"), props  # target = imported vpce_sg
+    assert props["SourceSecurityGroupId"] != props["GroupId"], props
+
+
 def test_cache_ingress_6379_from_app_sg() -> None:
     """The cache SG admits tcp/6379 from the imported P0 pod SG (attach_dependencies)."""
     template = _state_template()

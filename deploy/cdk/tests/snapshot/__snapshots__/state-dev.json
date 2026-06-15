@@ -15,6 +15,16 @@
       }
     }
   },
+  "Metadata": {
+    "cdk_nag": {
+      "rules_to_suppress": [
+        {
+          "id": "AwsSolutions-EC23",
+          "reason": "The cross-stack 443 ingress on the shared vpce_sg admits the schema-bootstrap Lambda's replay_store_sg only (SG-to-SG peer, no CidrIp, never 0.0.0.0/0) so it can read the Aurora master secret from the Secrets Manager interface endpoint at deploy (RouteIQ-8374). Stack-internal peer, not internet. Owner: RouteIqStateStack (vpce 443 bootstrap ingress)."
+        }
+      ]
+    }
+  },
   "Outputs": {
     "CacheEndpoint": {
       "Description": "ElastiCache serverless endpoint address. Map to chart externalRedis.host (--set externalRedis.host=...). Always-on TLS: also set externalRedis.ssl=true (REDIS_SSL=true).",
@@ -1439,6 +1449,24 @@
       },
       "Type": "AWS::KMS::Key",
       "UpdateReplacePolicy": "Delete"
+    },
+    "VpceBootstrapSecretsIngress443": {
+      "Properties": {
+        "Description": "HTTPS from schema-bootstrap Lambda to Secrets Manager endpoint",
+        "FromPort": 443,
+        "GroupId": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputFnGetAttNetworkConstructVpceSgB589DFE7GroupId41F9E621"
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::GetAtt": [
+            "ReplayStoreConstructReplayStoreSgAB749FA1",
+            "GroupId"
+          ]
+        },
+        "ToPort": 443
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
     }
   },
   "Rules": {

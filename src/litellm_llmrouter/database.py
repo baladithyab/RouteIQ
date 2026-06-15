@@ -44,6 +44,35 @@ def is_database_configured() -> bool:
     return get_database_url() is not None
 
 
+def _region_from_rds_host(host: str | None) -> str | None:
+    """Parse the AWS region out of an RDS/Aurora endpoint hostname.
+
+    ``<id>.<cluster-id>.<region>.rds.amazonaws.com`` -> ``<region>``.
+    Best-effort only; prefer ``settings.postgres.iam_region`` or ``AWS_REGION``.
+    """
+    if not host or ".rds.amazonaws.com" not in host:
+        return None
+    parts = host.split(".")
+    try:
+        return parts[-4]
+    except IndexError:
+        return None
+
+
+def _mint_db_token(*, host: str, port: int, user: str, region: str | None) -> str:
+    """Mint a 15-min ``rds-db:connect`` IAM auth token (SigV4, local, no network call).
+
+    Constructed inline (no module-level boto3 cache, so no new reset obligation).
+    NEVER log the returned token.
+    """
+    import boto3
+
+    client = boto3.session.Session().client("rds", region_name=region)
+    return client.generate_db_auth_token(
+        DBHostname=host, Port=port, DBUsername=user, Region=region
+    )
+
+
 # =============================================================================
 # Shared Connection Pool
 # =============================================================================
@@ -103,6 +132,46 @@ async def get_db_pool(db_url: Optional[str] = None):
                 max_size = 10
                 ssl_mode = "prefer"
 
+            # IAM auth (ADR-0028): when ROUTEIQ_DB_IAM_AUTH is set, mint a 15-min
+            # rds-db:connect token and pass it as a CALLABLE password. asyncpg
+            # invokes the callable per new physical connection AND on pool
+            # reconnects, so the token refreshes for free (no custom pool wrapper).
+            # Default OFF -> the static-URL path below is byte-for-byte unchanged.
+            # On any setup failure we log (NEVER the token) and fall through to the
+            # static URL so a misconfig degrades softly instead of crashing boot.
+            connect_kwargs: dict[str, Any] = {}
+            try:
+                from litellm_llmrouter.settings import get_settings as _gs
+
+                _pg = _gs().postgres
+                if _pg.iam_auth:
+                    from urllib.parse import urlsplit
+
+                    parts = urlsplit(url)
+                    host = parts.hostname
+                    port = parts.port or 5432
+                    user = parts.username  # "routeiq" / DbRuntimeUser
+                    region = (
+                        _pg.iam_region
+                        or _region_from_rds_host(host)
+                        or os.getenv("AWS_REGION")
+                    )
+
+                    def _password() -> str:
+                        # asyncpg calls this per new/replacement connection -> 15-min refresh.
+                        return _mint_db_token(
+                            host=host, port=port, user=user, region=region
+                        )
+
+                    connect_kwargs["password"] = _password
+                    verbose_proxy_logger.info(
+                        "DB IAM auth enabled: minting rds-db:connect token per connection"
+                    )  # no token value logged
+            except Exception as e:
+                verbose_proxy_logger.error(
+                    f"DB IAM token setup failed; using static URL: {e}"
+                )
+
             _pool = await asyncpg.create_pool(
                 url,
                 min_size=min_size,
@@ -110,6 +179,7 @@ async def get_db_pool(db_url: Optional[str] = None):
                 command_timeout=30,
                 # SSL enforcement when available
                 ssl=ssl_mode,
+                **connect_kwargs,
             )
             verbose_proxy_logger.info(
                 f"Database connection pool created (min={min_size}, max={max_size})"

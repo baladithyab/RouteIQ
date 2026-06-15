@@ -333,6 +333,8 @@ push via `rr push` if blocked.
 | `CONFIG_HOT_RELOAD` | `false` | Config hot-reload |
 | `LLMROUTER_ALLOW_PICKLE_MODELS` | `false` | ML model pickle loading |
 | `LLMROUTER_ROUTER_CALLBACK_ENABLED` | `true` | Routing telemetry |
+| `ROUTEIQ_DB_IAM_AUTH` | `false` | Mint a 15-min rds-db:connect IAM token per connection (ADR-0028) instead of a static DB password |
+| `ROUTEIQ_REDIS_IAM_AUTH` | `false` | Present `REDIS_USERNAME` + an elasticache:Connect SigV4 token as the Redis AUTH (ADR-0029) instead of `REDIS_PASSWORD` |
 
 ## Quick Reference
 

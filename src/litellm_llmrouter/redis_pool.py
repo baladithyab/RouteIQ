@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import warnings
 from typing import Any, Optional
 
@@ -78,15 +79,23 @@ def _redis_settings() -> dict[str, Any]:
     env_password = os.getenv("REDIS_PASSWORD")
     env_ssl = os.getenv("REDIS_SSL")
     env_db = os.getenv("REDIS_DB")
+    # REDIS_USERNAME stays in the legacy REDIS_* namespace (read directly here, not
+    # via get_settings) per the module's convention. On the ADR-0029 IAM-auth path
+    # this is the CacheIamUserName (user_id == user_name) the chart emits.
+    env_username = os.getenv("REDIS_USERNAME")
 
     # If any legacy env var is set, use env vars exclusively
-    if any(v is not None for v in (env_host, env_port, env_password, env_ssl, env_db)):
+    if any(
+        v is not None
+        for v in (env_host, env_port, env_password, env_ssl, env_db, env_username)
+    ):
         return {
             "host": env_host or "localhost",
             "port": int(env_port) if env_port else 6379,
             "password": env_password or None,
             "ssl": (env_ssl or "false").lower() in ("true", "1", "yes"),
             "db": int(env_db) if env_db else 0,
+            "username": env_username or None,
         }
 
     # Fall back to typed settings (reads ROUTEIQ_REDIS__* vars)
@@ -98,6 +107,7 @@ def _redis_settings() -> dict[str, Any]:
             "password": settings.redis.password,
             "ssl": settings.redis.ssl,
             "db": settings.redis.db,
+            "username": settings.redis.username,
         }
     except Exception:
         return {
@@ -106,11 +116,19 @@ def _redis_settings() -> dict[str, Any]:
             "password": None,
             "ssl": False,
             "db": 0,
+            "username": None,
         }
 
 
 def _warn_no_password() -> None:
     """Log a warning when Redis is configured without a password."""
+    # On the IAM-auth path a missing REDIS_PASSWORD is EXPECTED (the SigV4
+    # elasticache:Connect token is the AUTH), so suppress the warning entirely.
+    try:
+        if get_settings().redis.iam_auth:
+            return
+    except Exception:
+        pass
     has_password = bool(os.getenv("REDIS_PASSWORD"))
     if not has_password:
         try:
@@ -123,6 +141,58 @@ def _warn_no_password() -> None:
             "Redis connection configured without password (REDIS_PASSWORD not set). "
             "This is insecure for production deployments."
         )
+
+
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+
+
+def _region_from_cache_host(host: str | None) -> str | None:
+    """Best-effort region from an ElastiCache endpoint hostname.
+
+    Serverless endpoints use SHORTENED region tokens (``use1``, not
+    ``us-east-1``), so prefer ``settings.redis.iam_region`` / ``AWS_REGION``.
+    Returns the long-form region only when the host carries a label that
+    matches the canonical AWS region shape (``<area>-<word>-<num>``, e.g.
+    ``us-east-1``); otherwise None.
+
+    NOTE: a naive "two hyphens" heuristic is WRONG -- a cache-name label such
+    as ``routeiq-cache-sl`` also has two hyphens and would be mistaken for a
+    region, signing the SigV4 token with a bogus region and breaking auth even
+    when AWS_REGION is set. The strict regex avoids that (RouteIQ-d3a4).
+    """
+    if not host or ".cache.amazonaws.com" not in host:
+        return None
+    for p in host.split("."):
+        # Match only the canonical long-form region label (e.g. us-east-1,
+        # ap-southeast-2); never the shortened serverless token (use1) or a
+        # cache-name label that merely happens to contain hyphens.
+        if _AWS_REGION_RE.match(p):
+            return p
+    return None
+
+
+def _mint_elasticache_token(user: str, cache_name: str, region: str) -> str:
+    """Mint an ``elasticache:Connect`` SigV4-presigned AUTH token (local, no network).
+
+    Token = the SigV4-signed ``GET https://<cache-name>/?Action=connect&User=<user>``
+    URL with the ``https://`` scheme stripped. Valid 900s. Constructed inline (no
+    module-level cache -> no new reset obligation). NEVER log the returned token.
+    """
+    import boto3
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+
+    creds = boto3.session.Session().get_credentials()
+    if creds is None:
+        raise RuntimeError("no AWS credentials for elasticache:Connect token mint")
+    signer = SigV4QueryAuth(creds, "elasticache", region, expires=900)
+    req = AWSRequest(
+        method="GET",
+        url=f"https://{cache_name}/",
+        params={"Action": "connect", "User": user},
+    )
+    signer.add_auth(req)
+    return req.prepare().url.removeprefix("https://")
 
 
 # ---------------------------------------------------------------------------
@@ -178,10 +248,35 @@ async def get_async_redis_client() -> Optional[Any]:
         _warn_no_password()
 
         redis_cfg = _redis_settings()
+        username = redis_cfg.get("username")
+        password = redis_cfg["password"]
+        # IAM auth (ADR-0029): when ROUTEIQ_REDIS_IAM_AUTH is set, present
+        # REDIS_USERNAME (CacheIamUserName) + a short-lived elasticache:Connect
+        # SigV4 token AS the password (not in a URL, to avoid quoting the token).
+        # Minting fresh per client build gives the 15-min refresh (the singleton's
+        # 30s health-check + reconnect rebuilds -> re-mints). Default OFF -> the
+        # static path is unchanged. On mint failure we log (NEVER the token) and
+        # fall through to the static AUTH (fail-soft, matches the Redis pattern).
+        try:
+            rsettings = get_settings().redis
+            if rsettings.iam_auth:
+                region = (
+                    rsettings.iam_region
+                    or _region_from_cache_host(host)
+                    or os.getenv("AWS_REGION")
+                )
+                username = rsettings.username or username  # CacheIamUserName
+                cache_name = host.split(".")[0]
+                password = _mint_elasticache_token(username, cache_name, region)
+                logger.info("Redis IAM auth enabled (user=%s)", username)  # no token
+        except Exception as e:
+            logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
+
         _async_client = aioredis.Redis(
             host=redis_cfg["host"],
             port=redis_cfg["port"],
-            password=redis_cfg["password"],
+            username=username,
+            password=password,
             ssl=redis_cfg["ssl"],
             db=redis_cfg["db"],
             decode_responses=True,
@@ -247,10 +342,31 @@ def get_sync_redis_client() -> Optional[Any]:
     _warn_no_password()
 
     redis_cfg = _redis_settings()
+    username = redis_cfg.get("username")
+    password = redis_cfg["password"]
+    # IAM auth (ADR-0029): mirror the async splice. _mint_elasticache_token is
+    # sync (local SigV4 presign), fine for the sync client. Default OFF -> static
+    # path unchanged; mint failure falls through to the static AUTH (fail-soft).
+    try:
+        rsettings = get_settings().redis
+        if rsettings.iam_auth:
+            region = (
+                rsettings.iam_region
+                or _region_from_cache_host(host)
+                or os.getenv("AWS_REGION")
+            )
+            username = rsettings.username or username  # CacheIamUserName
+            cache_name = host.split(".")[0]
+            password = _mint_elasticache_token(username, cache_name, region)
+            logger.info("Redis IAM auth enabled (user=%s)", username)  # no token
+    except Exception as e:
+        logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
+
     _sync_client = redis.Redis(
         host=redis_cfg["host"],
         port=redis_cfg["port"],
-        password=redis_cfg["password"],
+        username=username,
+        password=password,
         ssl=redis_cfg["ssl"],
         db=redis_cfg["db"],
         decode_responses=True,
@@ -370,5 +486,14 @@ def build_redis_url() -> str:
     """
     settings = _redis_settings()
     scheme = "rediss" if settings["ssl"] else "redis"
-    auth = f":{settings['password']}@" if settings["password"] else ""
+    # Static-path URL only. NOT IAM-aware: a SigV4 token in a URL would need
+    # percent-quoting, so the IAM path presents username + token-as-password on
+    # the client kwargs instead (see get_async/sync_redis_client). username is
+    # spliced here when present (harmless for the static path: "user:pw@").
+    user = settings.get("username") or ""
+    pw = settings["password"] or ""
+    if user or pw:
+        auth = f"{user}:{pw}@"
+    else:
+        auth = ""
     return f"{scheme}://{auth}{settings['host']}:{settings['port']}/{settings['db']}"
