@@ -122,6 +122,10 @@ def _reset_all_singletons():
 
     reset_usage_policy_engine()
 
+    from litellm_llmrouter.governance_store import reset_governance_store
+
+    reset_governance_store()
+
     from litellm_llmrouter.router_r1 import reset_router_r1
 
     reset_router_r1()

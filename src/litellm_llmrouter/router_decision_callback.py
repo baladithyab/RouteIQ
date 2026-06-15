@@ -50,6 +50,23 @@ OVERRIDE_STRATEGY_NAME = os.getenv(
 )
 
 
+def _governance_spend_tracking_enabled() -> bool:
+    """Whether post-response governance spend tracking is enabled (default ON).
+
+    Read fresh each call (not module-level) so tests can toggle it via env
+    without re-import.  This is INDEPENDENT of ROUTER_CALLBACK_ENABLED (which is
+    OTEL-gated): the spend write path is the WRITER for the governance budget /
+    rpm counters and must work even when OTEL telemetry is off.  Env:
+    ``LLMROUTER_GOVERNANCE_SPEND_TRACKING`` (true/1/yes/on).
+    """
+    return os.getenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
 # =============================================================================
 # LLM API Path Registry
 # =============================================================================
@@ -633,8 +650,20 @@ class RouterDecisionCallback:
         start_time: float,
         end_time: float,
     ) -> None:
-        """Async version of log_success_event."""
-        self.log_success_event(kwargs, response_obj, start_time, end_time)
+        """Async version of log_success_event.
+
+        Also drives the governance/usage-policy spend WRITE path (P4) on a
+        feature gate INDEPENDENT of the OTEL-gated telemetry ``_enabled`` flag,
+        so budget/RPM counters are written even when OTEL is off.  Fail-open.
+        """
+        if self._enabled:
+            self.log_success_event(kwargs, response_obj, start_time, end_time)
+
+        if _governance_spend_tracking_enabled():
+            try:
+                await _record_post_response_spend(kwargs, response_obj)
+            except Exception as e:  # fail-open: never break the response path
+                logger.debug("Governance spend tracking skipped: %s", e)
 
     async def async_log_failure_event(
         self,
@@ -687,6 +716,92 @@ def _compute_duration(start_time: Any, end_time: Any) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:
+    """Derive the governance spend scope + scope_type from request metadata.
+
+    Precedence matches ``GovernanceEngine._get_current_spend``
+    (workspace_id -> key/user -> "global").  LiteLLM stamps user/key identifiers
+    under ``metadata`` (``_user``/``user_api_key_user_id`` etc.); we read the
+    workspace first, then a key/user identifier, else fall back to global.
+    """
+    workspace_id = metadata.get("workspace_id") or metadata.get("_workspace")
+    if workspace_id:
+        return str(workspace_id), "workspace"
+    key_id = (
+        metadata.get("user_api_key")
+        or metadata.get("_key")
+        or metadata.get("_user")
+        or metadata.get("user_api_key_user_id")
+    )
+    if key_id:
+        return str(key_id), "key"
+    return "global", "global"
+
+
+async def _record_post_response_spend(
+    kwargs: Dict[str, Any],
+    response_obj: Any,
+) -> None:
+    """Write post-response spend to the governance + usage-policy counters.
+
+    This is the WRITER that closes the latent gap where ``governance:spend:`` /
+    ``governance:rpm:`` were read but never written, and where
+    ``UsagePolicyEngine.record_usage`` had no call site.  Both are wired here
+    because this LiteLLM success callback is the only post-response seam that
+    carries cost (``kwargs["response_cost"]``) + tokens (``response_obj.usage``).
+
+    NEVER logs cost/token VALUES.  Fail-open is the caller's responsibility.
+    """
+    metadata = kwargs.get("metadata", {}) or {}
+
+    # Cost: LiteLLM stamps response_cost on kwargs post-response.
+    cost = kwargs.get("response_cost")
+    if cost is None:
+        cost = (kwargs.get("standard_logging_object", {}) or {}).get("response_cost")
+    cost = float(cost) if cost else 0.0
+
+    # Tokens from the response usage object.
+    input_tokens = 0
+    output_tokens = 0
+    usage = getattr(response_obj, "usage", None)
+    if usage is not None:
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    total_tokens = input_tokens + output_tokens
+
+    scope, scope_type = _derive_spend_scope(metadata)
+
+    # 1. Governance spend/rpm counters (ElastiCache hot + Aurora durable rollup).
+    from litellm_llmrouter.governance import record_governance_spend
+
+    await record_governance_spend(
+        scope,
+        scope_type,
+        cost=cost,
+        tokens=total_tokens,
+        requests=1,
+    )
+
+    # 2. Usage-policy cost/token counters (wires the previously-dead record_usage).
+    try:
+        from litellm_llmrouter.usage_policies import get_usage_policy_engine
+
+        request_context = {
+            "model": kwargs.get("model", ""),
+            "metadata": metadata,
+            "workspace_id": metadata.get("workspace_id"),
+        }
+        await get_usage_policy_engine().record_usage(
+            request_context,
+            tokens=total_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=cost,
+        )
+    except Exception as e:
+        logger.debug("Usage-policy record_usage skipped: %s", e)
 
 
 def register_router_decision_callback() -> Optional[RouterDecisionCallback]:

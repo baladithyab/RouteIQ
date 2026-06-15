@@ -98,6 +98,26 @@ class WorkspaceConfig(BaseModel):
     updated_at: Optional[float] = None
 
 
+# -- Organization Model -----------------------------------------------------
+
+
+class OrgConfig(BaseModel):
+    """First-class organization entity (top of the Org -> Workspace -> Key tree).
+
+    Before P4 the org was only a string field on ``WorkspaceConfig.org_id``;
+    this model makes the org a durable first-class row (Aurora-backed) so the
+    full hierarchy the roadmap names is persistable.  Kept intentionally small
+    -- workspaces still carry the ``org_id`` soft-reference; this just lets an
+    org carry a name + metadata of its own.
+    """
+
+    org_id: str
+    name: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+
+
 # -- API Key Governance -----------------------------------------------------
 
 
@@ -180,10 +200,37 @@ class GovernanceEngine:
     """
 
     def __init__(self) -> None:
+        self._orgs: Dict[str, OrgConfig] = {}
         self._workspaces: Dict[str, WorkspaceConfig] = {}
         self._key_governance: Dict[str, KeyGovernance] = {}
         self._cache_ttl = 60  # seconds
         self._cache: Dict[str, tuple[float, GovernanceContext]] = {}
+
+    # -- Org CRUD -----------------------------------------------------------
+
+    def register_org(self, config: OrgConfig) -> None:
+        """Register or update an organization (top of the hierarchy)."""
+        config.updated_at = time.time()
+        if config.created_at is None:
+            config.created_at = time.time()
+        self._orgs[config.org_id] = config
+        logger.info("Registered org %s (%s)", config.org_id, config.name)
+
+    def get_org(self, org_id: str) -> Optional[OrgConfig]:
+        """Get an organization by ID."""
+        return self._orgs.get(org_id)
+
+    def list_orgs(self) -> List[OrgConfig]:
+        """List all organizations."""
+        return list(self._orgs.values())
+
+    def delete_org(self, org_id: str) -> bool:
+        """Delete an organization.  Returns True if it existed.
+
+        Note: this does NOT cascade to workspaces (soft-FK model); orphaned
+        workspaces keep their ``org_id`` string reference.
+        """
+        return self._orgs.pop(org_id, None) is not None
 
     # -- Workspace CRUD -----------------------------------------------------
 
@@ -598,7 +645,38 @@ class GovernanceEngine:
             key = f"governance:spend:{scope}:{bucket}"
 
             value = await redis.get(key)
-            return float(value) if value else 0.0
+            if value:
+                return float(value)
+
+            # Redis returned no hot counter (e.g. cache flush / node replacement).
+            # Fall back to the durable Aurora rollup when the store is enabled so
+            # budgets survive a Redis loss.  Epoch-aligned period_start matches the
+            # Redis bucket (do NOT switch to calendar months -- byte-compatible).
+            durable = await self._get_durable_spend(scope, bucket)
+            if durable is not None:
+                return durable
+            return 0.0
+        except Exception:
+            return None
+
+    async def _get_durable_spend(self, scope: str, bucket: int) -> Optional[float]:
+        """Read the durable Aurora spend rollup for *scope* at *bucket*.
+
+        Returns ``None`` when the governance store is disabled (no DATABASE_URL)
+        or on any error -- callers degrade to the Redis/0.0 path.  The
+        ``period_start`` is the epoch-aligned bucket start so it is byte-
+        compatible with the Redis spend key bucketing.
+        """
+        try:
+            from datetime import datetime, timezone
+
+            from .governance_store import get_governance_store
+
+            store = get_governance_store()
+            if not store.enabled:
+                return None
+            period_start = datetime.fromtimestamp(bucket * 2_592_000, tz=timezone.utc)
+            return await store.get_spend(scope, "monthly", period_start)
         except Exception:
             return None
 
@@ -633,6 +711,78 @@ class GovernanceEngine:
             "cache_entries": len(self._cache),
             "cache_ttl_seconds": self._cache_ttl,
         }
+
+
+# -- Spend Write Path (ElastiCache hot counter + Aurora durable rollup) ------
+
+
+async def record_governance_spend(
+    scope: str,
+    scope_type: str,
+    *,
+    cost: float = 0.0,
+    tokens: int = 0,
+    requests: int = 1,
+) -> None:
+    """Record post-response spend for a governance *scope*.
+
+    This is the WRITE path for the ``governance:spend:`` / ``governance:rpm:``
+    keys that :meth:`GovernanceEngine._get_current_spend` /
+    :meth:`_get_current_rpm` already READ.  Before P4 nothing wrote these keys,
+    so durable budget + RPM enforcement was inert (always saw 0.0 -> fail-open).
+
+    Two stores, both fail-open (never break the response path):
+      * ElastiCache (hot, in-window): ``INCRBYFLOAT governance:spend:{scope}:{bucket}``
+        + ``EXPIRE`` ~30d, and ``INCR governance:rpm:{scope}:{minute_bucket}``
+        + ``EXPIRE 60``.  Key shape is byte-identical to the read side.
+      * Aurora (durable rollup, system-of-record): ``store.record_spend(...)``
+        accumulating into ``governance_spend`` (only when the store is enabled).
+
+    NEVER log cost/token VALUES (PII-adjacent); counts only, at debug.
+    ``scope`` is the workspace_id / key_id / "global" (governance scope
+    precedence); ``scope_type`` is "workspace" | "key" | "global".
+    """
+    # 1. ElastiCache hot counters (byte-identical key shape to the read path).
+    spend_bucket = int(time.time() // 2_592_000)
+    minute_bucket = int(time.time() // 60)
+    spend_key = f"governance:spend:{scope}:{spend_bucket}"
+    rpm_key = f"governance:rpm:{scope}:{minute_bucket}"
+    try:
+        from litellm_llmrouter.redis_pool import get_async_redis_client
+
+        redis = await get_async_redis_client()
+        if redis is not None:
+            if cost and cost > 0:
+                await redis.incrbyfloat(spend_key, float(cost))
+                await redis.expire(spend_key, 2_592_000)
+            if requests and requests > 0:
+                await redis.incrby(rpm_key, int(requests))
+                await redis.expire(rpm_key, 60)
+    except Exception as exc:  # fail-open: never break the response path
+        logger.debug("Governance spend redis write skipped: %s", exc)
+
+    # 2. Aurora durable rollup (epoch-aligned period_start == the Redis bucket).
+    try:
+        from datetime import datetime, timezone
+
+        from .governance_store import get_governance_store
+
+        store = get_governance_store()
+        if store.enabled:
+            period_start = datetime.fromtimestamp(
+                spend_bucket * 2_592_000, tz=timezone.utc
+            )
+            await store.record_spend(
+                scope,
+                scope_type,
+                "monthly",
+                period_start,
+                cost=float(cost or 0.0),
+                tokens=int(tokens or 0),
+                requests=int(requests or 0),
+            )
+    except Exception as exc:  # fail-open
+        logger.debug("Governance spend durable rollup skipped: %s", exc)
 
 
 # -- File-Based Persistence --------------------------------------------------
@@ -705,6 +855,7 @@ __all__ = [
     "OrgRole",
     "WorkspaceRole",
     # Models
+    "OrgConfig",
     "WorkspaceConfig",
     "KeyGovernance",
     "GovernanceContext",
@@ -712,6 +863,8 @@ __all__ = [
     "GovernanceEngine",
     "get_governance_engine",
     "reset_governance_engine",
+    # Spend write path
+    "record_governance_spend",
     # Persistence
     "save_governance_state",
     "load_governance_state",

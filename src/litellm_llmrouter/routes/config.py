@@ -33,6 +33,7 @@ from ..usage_policies import (
     get_usage_policy_engine,
     save_usage_policies_state,
 )
+from ..governance_store import get_governance_store
 from ..guardrail_policies import (
     GuardrailPolicy,
     GuardrailPhase,
@@ -362,6 +363,9 @@ async def create_workspace(
     existing = engine.get_workspace(config.workspace_id)
     engine.register_workspace(config)
     save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_workspace(engine.get_workspace(config.workspace_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -432,6 +436,9 @@ async def update_workspace(
     config.created_at = existing.created_at
     engine.register_workspace(config)
     save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_workspace(engine.get_workspace(workspace_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -468,6 +475,9 @@ async def delete_workspace(
             },
         )
     save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_workspace(workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -544,6 +554,9 @@ async def update_key_governance(
 
     engine.register_key_governance(governance)
     save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_key(engine.get_key_governance(key_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -580,6 +593,9 @@ async def delete_key_governance(
             },
         )
     save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_key(key_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -670,6 +686,9 @@ async def create_usage_policy(
     existing = engine.get_policy(policy.policy_id)
     engine.add_policy(policy)
     save_usage_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_policy(engine.get_policy(policy.policy_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -759,6 +778,9 @@ async def update_usage_policy(
     policy.created_at = existing.created_at
     engine.add_policy(policy)
     save_usage_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_policy(engine.get_policy(policy_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -795,6 +817,9 @@ async def delete_usage_policy(
             },
         )
     save_usage_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_policy(policy_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,

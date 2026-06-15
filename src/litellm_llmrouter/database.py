@@ -564,6 +564,11 @@ async def run_migrations() -> None:
 
         await run_audit_migrations()
 
+        # Run governance / usage-policy / spend migrations (P4, additive)
+        from .governance_store import run_governance_migrations
+
+        await run_governance_migrations()
+
     except Exception as e:
         verbose_proxy_logger.error(f"A2A DB: Error running migrations: {e}")
 

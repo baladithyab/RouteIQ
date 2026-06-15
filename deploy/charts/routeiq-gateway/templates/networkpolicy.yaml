@@ -65,6 +65,21 @@ spec:
         - protocol: TCP
           port: 80
     {{- end }}
+    {{- if .Values.networkPolicy.egress.inVpc.enabled }}
+    # In-VPC services (Aurora 5432, ElastiCache 6379, interface VPC endpoints
+    # 443: Bedrock runtime, Secrets Manager, ECR, CloudWatch Logs). The
+    # allowHttpsExternal rule above EXCLUDES RFC-1918, so these in-VPC targets
+    # (CDK vpc_cidr 10.40.0.0/16) need this explicit allow or the pod cannot
+    # reach its DB/cache/Bedrock when networkPolicy is enabled on AWS.
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.egress.inVpc.cidr }}
+      ports:
+        {{- range .Values.networkPolicy.egress.inVpc.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
     {{- with .Values.networkPolicy.egress.to }}
     # Additional egress rules
     {{- range . }}

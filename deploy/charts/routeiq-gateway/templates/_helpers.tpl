@@ -184,6 +184,25 @@ Environment variables for gateway configuration
 - name: PORT
   value: {{ .Values.gateway.port | quote }}
 
+# readOnlyRootFilesystem cache redirect (C6)
+# The container runs as HOME=/app (Dockerfile useradd -d /app) under
+# readOnlyRootFilesystem: true, so any library writing to $HOME/.cache
+# (HuggingFace transformers/tokenizers, matplotlib, fontconfig) would EROFS
+# because /app is read-only and /app/.cache is NOT a mounted volume. Redirect
+# every cache into the existing writable /app/data emptyDir mount (fsGroup 1000)
+# so the transformers/mmBERT routing strategies can load their models/tokenizers.
+# Emitted unconditionally -- harmless when the root FS is writable.
+- name: HF_HOME
+  value: /app/data/.cache/huggingface
+- name: HF_HUB_CACHE
+  value: /app/data/.cache/huggingface/hub
+- name: TRANSFORMERS_CACHE
+  value: /app/data/.cache/huggingface
+- name: XDG_CACHE_HOME
+  value: /app/data/.cache
+- name: MPLCONFIGDIR
+  value: /app/data/.cache/matplotlib
+
 # Feature flags
 - name: MCP_GATEWAY_ENABLED
   value: {{ .Values.gateway.features.mcpGatewayEnabled | quote }}

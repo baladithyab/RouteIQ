@@ -595,7 +595,21 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 2. Plugin startup
     await _run_plugin_startup(app)
 
-    # 3. Load persisted governance state from disk
+    # 3a. Run RouteIQ-native DB migrations at boot (P4, additive + idempotent).
+    #     Creates A2A/MCP/audit/governance/spend tables via CREATE ... IF NOT
+    #     EXISTS.  DB-optional: run_migrations() early-returns when no DATABASE_URL.
+    #     This also fixes the pre-existing gap that audit/A2A/MCP tables were only
+    #     migrated lazily.  Never blocks boot.
+    try:
+        from ..database import run_migrations as run_routeiq_migrations
+
+        await run_routeiq_migrations()
+    except Exception as exc:
+        logger.warning("RouteIQ DB migrations skipped/failed (non-fatal): %s", exc)
+
+    # 3b. Load persisted governance state.  DB-first (Aurora) when the store is
+    #     enabled; otherwise the JSON-file path (unchanged).  A DB hiccup degrades
+    #     to JSON, never blocks boot.
     try:
         from ..governance import (
             get_governance_engine,
@@ -613,9 +627,33 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             get_prompt_manager,
             load_prompts_state,
         )
+        from ..governance_store import get_governance_store
 
-        gov_count = load_governance_state(get_governance_engine())
-        up_count = load_usage_policies_state(get_usage_policy_engine())
+        store = get_governance_store()
+        if store.enabled:
+            gov = get_governance_engine()
+            for org in await store.load_all_orgs():
+                gov.register_org(org)
+            # Hydration order: orgs -> workspaces -> keys (keys soft-FK workspaces).
+            for ws in await store.load_all_workspaces():
+                gov.register_workspace(ws)
+            for kg in await store.load_all_keys():
+                gov.register_key_governance(kg)
+            up = get_usage_policy_engine()
+            for p in await store.load_all_policies():
+                up.add_policy(p)
+            gov_count = len(gov.list_workspaces()) + len(gov.list_orgs())
+            up_count = len(up.list_policies())
+            logger.info(
+                "Hydrated governance state from Aurora: workspaces+orgs=%d, "
+                "usage_policies=%d",
+                gov_count,
+                up_count,
+            )
+        else:
+            gov_count = load_governance_state(get_governance_engine())
+            up_count = load_usage_policies_state(get_usage_policy_engine())
+
         gp_count = load_guardrail_policies_state(get_guardrail_policy_engine())
         pm_count = load_prompts_state(get_prompt_manager())
         total = gov_count + up_count + gp_count + pm_count

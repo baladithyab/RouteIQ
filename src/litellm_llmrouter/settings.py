@@ -1374,6 +1374,14 @@ class GatewaySettings(BaseSettings):
         True,
         description="Emit router decision telemetry (TG4.1).",
     )
+    llmrouter_governance_spend_tracking: bool = Field(
+        True,
+        description=(
+            "Write post-response governance spend/RPM counters + usage-policy "
+            "cost/token counters (P4 spend write path; env "
+            "LLMROUTER_GOVERNANCE_SPEND_TRACKING).  Independent of OTEL/telemetry."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Sub-configurations (nested models)

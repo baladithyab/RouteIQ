@@ -52,6 +52,12 @@ dev = [
     "hypothesis>=6.100.0",
     "ruff>=0.14.13",
     "mypy>=1.8.0",
+    # authlib: required so the OIDC unit tests (tests/unit/test_oidc.py) can
+    # exercise the real token-validation code paths. The `authlib_available`
+    # guard in src/litellm_llmrouter/oidc.py short-circuits validate_token()
+    # before mock patches run when authlib is absent. authlib stays an OPTIONAL
+    # runtime dependency (see the `oidc`/`prod`/`all` extras below).
+    "authlib>=1.5.0",
 ]
 # Database support (PostgreSQL with asyncpg and Prisma client for LiteLLM)
 db = ["asyncpg>=0.29.0", "prisma>=0.13.0"]

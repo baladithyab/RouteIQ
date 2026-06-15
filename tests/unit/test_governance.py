@@ -5,6 +5,7 @@ import pytest
 from litellm_llmrouter.governance import (
     GovernanceEngine,
     GovernanceContext,
+    OrgConfig,
     WorkspaceConfig,
     KeyGovernance,
     OrgRole,
@@ -80,6 +81,35 @@ def test_workspace_roles():
 # ============================================================================
 # Workspace CRUD
 # ============================================================================
+
+
+def test_register_and_get_org(engine):
+    """First-class org CRUD (P4): register/get/list/delete, in-memory."""
+    org = OrgConfig(org_id="org-1", name="Org One", metadata={"tier": "gold"})
+    engine.register_org(org)
+    fetched = engine.get_org("org-1")
+    assert fetched is not None
+    assert fetched.name == "Org One"
+    assert fetched.created_at is not None  # stamped on register
+    assert fetched.updated_at is not None
+
+
+def test_list_and_delete_org(engine):
+    engine.register_org(OrgConfig(org_id="org-1", name="One"))
+    engine.register_org(OrgConfig(org_id="org-2", name="Two"))
+    assert {o.org_id for o in engine.list_orgs()} == {"org-1", "org-2"}
+    assert engine.delete_org("org-1") is True
+    assert engine.delete_org("org-1") is False
+    assert {o.org_id for o in engine.list_orgs()} == {"org-2"}
+
+
+def test_org_crud_does_not_affect_workspaces(engine, sample_workspace):
+    """Org operations are independent of workspace dicts (soft-FK, no cascade)."""
+    engine.register_org(OrgConfig(org_id="org-1", name="One"))
+    engine.register_workspace(sample_workspace)
+    engine.delete_org("org-1")
+    # Workspace survives org deletion (no cascade).
+    assert engine.get_workspace("ws-acme") is not None
 
 
 def test_register_and_get_workspace(engine, sample_workspace):

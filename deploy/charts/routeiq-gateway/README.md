@@ -372,6 +372,90 @@ the dedicated `/aws/containerinsights/<cluster>/routeiq-routing` group).
 
 Default `fluentBit.routingPromotion.enabled=false` keeps the chart byte-stable.
 
+## Public edge + OIDC SSO on AWS (P4)
+
+The public edge (ALB + ACM cert) and OIDC/SSO ship **inert and operator-flipped** —
+there is **no ALB/ACM construct in the CDK** (`deploy/cdk/` has zero
+`elbv2`/`acm`/`route53`; verified). The L7 ALB is **AWS-managed by EKS Auto Mode**,
+rendered from the chart `Ingress` when an operator turns it on. The app-layer
+OIDC/SSO (`oidc.py`) is **pure env-var config** with no CDK footprint — OIDC/SSO
+terminates **in the gateway app**, not at the ALB.
+
+> **Note on naming:** the EKS "OIDC provider" (IRSA workload identity) is a
+> different concept and is **not used here** — this substrate uses EKS Pod Identity.
+> The application OIDC/SSO below is unrelated to it.
+
+### Operator deploy-time steps
+
+1. **Provision the cert + register the IdP callback (out-of-band).** Issue an ACM
+   certificate for `routeiq.<domain>` and register
+   `https://routeiq.<domain>/sso/callback` as a redirect URI with your IdP
+   (Keycloak / Auth0 / Okta / Azure AD). The cert is **not** chart- or CDK-managed;
+   you pass its ARN as an Ingress annotation.
+
+2. **Turn on the ALB Ingress** (EKS Auto Mode managed ALB). The chart `Ingress`
+   template is provider-agnostic — supply the ALB/ACM annotations at deploy time
+   (account-agnostic placeholders below; substitute your own values):
+
+   ```bash
+   helm upgrade routeiq deploy/charts/routeiq-gateway \
+     --set ingress.enabled=true \
+     --set ingress.className=alb \
+     --set 'ingress.annotations.alb\.ingress\.kubernetes\.io/scheme=internet-facing' \
+     --set 'ingress.annotations.alb\.ingress\.kubernetes\.io/target-type=ip' \
+     --set 'ingress.annotations.alb\.ingress\.kubernetes\.io/listen-ports=[{"HTTPS":443}]' \
+     --set 'ingress.annotations.alb\.ingress\.kubernetes\.io/certificate-arn=arn:aws:acm:<region>:<acct>:certificate/<id>' \
+     --set ingress.hosts[0].host=routeiq.<domain>
+   ```
+
+   (The annotation path works under the **self-managed AWS Load Balancer
+   Controller**. Under **EKS Auto Mode** the AWS-level config inverts off
+   annotations into an `IngressClassParams` CR — `certificate-arn` becomes a
+   `spec.certificateARNs` list and `targetType` is explicit; that runbook is
+   tracked as **seed D5**. ALB-level OIDC `auth-type: oidc` is **unsupported on
+   Auto Mode** — which is fine, since OIDC terminates in the gateway app.)
+
+3. **Sync the OIDC client-secret via ESO and align the OIDC block.** Add the
+   `oidc-client-secret` ExternalSecret entry and point the `oidc` block at the ESO
+   target secret so the `secretKeyRef` resolves:
+
+   ```bash
+   helm upgrade routeiq deploy/charts/routeiq-gateway \
+     --set externalSecrets.enabled=true \
+     --set externalSecrets.data[0].secretKey=oidc-client-secret \
+     --set externalSecrets.data[0].remoteRef.key=routeiq/oidc-client-secret \
+     --set oidc.enabled=true \
+     --set oidc.issuerUrl=https://your-tenant.auth0.com/ \
+     --set oidc.clientId=<client-id> \
+     --set oidc.existingSecret=routeiq-routeiq-gateway-secrets \
+     --set oidc.existingSecretKey=oidc-client-secret
+   ```
+
+   The `externalSecrets.data[].secretKey` and `oidc.existingSecretKey` names are
+   **load-bearing** and must be identical (`oidc-client-secret`). If they drift the
+   chart still renders, but `ROUTEIQ_OIDC_CLIENT_SECRET` is silently absent and the
+   app falls back to OIDC public-client mode. Likewise `oidc.existingSecret` must
+   equal the ESO `target.name` (defaults to `<fullname>-secrets`,
+   i.e. `<release>-routeiq-gateway-secrets`).
+
+4. **Prerequisite: the `aws-secrets-manager` ClusterSecretStore + ESO's own Pod
+   Identity.** As with all ESO usage on this chart, the `ClusterSecretStore` named
+   **exactly** `aws-secrets-manager` is **referenced, not created** — it (and the
+   ESO controller) must pre-exist out-of-band, wired to Secrets Manager via the
+   **ESO controller's own** `CfnPodIdentityAssociation` (a *second*, distinct
+   principal from RouteIQ's `PodRole`). The name is string-matched; a drift is a
+   silent sync failure. The `routeiq/*` Secrets Manager id convention matches the
+   `PodRole` `SecretsRead` wildcard — but that wildcard is the **pod's own** direct
+   read, **not** ESO's sync grant.
+
+### Multi-pod caveat (seed D4)
+
+OIDC exchanged keys (`sk-oidc-*` minted by `/auth/token-exchange`) and the identity
+cache are **in-process only** today (bounded TTL dicts in `oidc.py`). With
+`replicaCount: 2` a key minted on pod A is unknown to pod B, so token-exchange +
+the `sk-oidc-` resolution path are effectively sticky-session-dependent. Moving
+them to a Redis-backed shared store is deferred as **seed D4**.
+
 ## Security Defaults
 
 This chart implements security best practices by default:
@@ -386,6 +470,19 @@ This chart implements security best practices by default:
 | `allowPrivilegeEscalation` | `false` | Prevents privilege escalation |
 | `capabilities.drop` | `["ALL"]` | Drops all Linux capabilities |
 | `seccompProfile.type` | `RuntimeDefault` | Uses default seccomp profile |
+
+> **readOnlyRootFilesystem cache redirect (P4 C6).** The container runs as
+> `HOME=/app` under a read-only root, so any library writing to `$HOME/.cache`
+> (HuggingFace transformers/tokenizers, matplotlib) would `EROFS` because
+> `/app/.cache` is **not** a mounted volume. The chart redirects `HF_HOME`,
+> `HF_HUB_CACHE`, `TRANSFORMERS_CACHE`, `XDG_CACHE_HOME`, and `MPLCONFIGDIR`
+> into the writable `/app/data` emptyDir (backed by `tmpVolume.enabled: true`,
+> which also mounts `/tmp` and `/app/models`). If you set any RouteIQ state path
+> (`ROUTEIQ_GOVERNANCE_STATE_PATH`, `ROUTEIQ_USAGE_POLICIES_STATE_PATH`,
+> `ROUTEIQ_GUARDRAIL_POLICIES_STATE_PATH`, `ROUTEIQ_PROMPTS_STATE_PATH`) via
+> `extraEnv`, it **must** live under `/app/data`. Optional pre-release check:
+> `docker run --read-only --tmpfs /tmp -v rw-data:/app/data -v rw-models:/app/models -u 1000:1000 -e HOME=/app <image>`
+> and exercise a transformers/mmBERT strategy to confirm no `EROFS`.
 
 ### Service Account
 
@@ -432,6 +529,43 @@ networkPolicy:
         ports:
           - port: 5432
 ```
+
+#### AWS substrate: enable `egress.inVpc` or it's an outage (P4 C5)
+
+> **Outage landmine.** The `allowHttpsExternal` rule carves OUT every RFC-1918
+> range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). On the RouteIQ-on-AWS
+> substrate the three things the pod MUST reach are **all inside RFC-1918**
+> (the CDK VPC CIDR is `10.40.0.0/16`):
+>
+> | Target | Port |
+> |--------|------|
+> | Aurora PostgreSQL Serverless v2 | 5432 |
+> | ElastiCache Serverless Valkey (TLS) | 6379 |
+> | Bedrock runtime + Secrets Manager + ECR + CloudWatch Logs **interface VPC endpoints** | 443 |
+>
+> Bedrock is the non-obvious killer: `private_dns_enabled` resolves
+> `bedrock-runtime.<region>.amazonaws.com` to an in-VPC ENI, so the rule
+> labelled "HTTPS to external LLM providers" **blocks the primary LLM
+> provider**. Flipping `networkPolicy.enabled=true` as-shipped on AWS fails boot
+> (DB migration / asyncpg connect) and every Bedrock call.
+
+Whenever you enable `networkPolicy.enabled` on AWS, also enable `egress.inVpc`:
+
+```yaml
+networkPolicy:
+  enabled: true
+  egress:
+    allowDns: true
+    allowHttpsExternal: true   # keep TRUE: covers S3 (gateway-endpoint, non-RFC-1918) + public LLM providers
+    inVpc:
+      enabled: true            # re-opens the in-VPC targets the carve-out blocks
+      cidr: "10.40.0.0/16"     # MUST equal the CDK vpc_cidr (network_construct.py:53)
+      ports: [5432, 6379, 443] # Aurora, ElastiCache, interface VPC endpoints
+```
+
+The `inVpc.cidr` is coupled to the CDK `vpc_cidr`; if an operator overrides the
+VPC CIDR, this value must move with it. `inVpc.enabled` defaults `false` so the
+chart stays account-agnostic and the default render is byte-stable.
 
 ### SSRF Protection
 

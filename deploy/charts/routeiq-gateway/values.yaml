@@ -90,6 +90,44 @@ service:
 # -----------------------------------------------------------------------------
 # Ingress configuration (optional)
 # -----------------------------------------------------------------------------
+# RouteIQ-on-AWS public edge (P4): SHIPS INERT (enabled: false), a deliberate
+# P0 carry-over -- the public edge is operator-flipped, not chart/CDK-provisioned.
+# There is NO ALB/ACM construct in deploy/cdk/ (verified: zero elbv2/acm/route53);
+# the L7 ALB is AWS-managed by EKS Auto Mode, rendered from THIS Ingress when an
+# operator flips ingress.enabled=true. TLS termination + HTTPS live at the ALB
+# via an ACM cert ARN the operator passes as an annotation (cert issued
+# out-of-band; account-agnostic by design).
+#
+# Conventional Auto-Mode / self-managed-LBC ALB shape (operator --set or values
+# override at `helm upgrade` time -- all values below are operator-supplied,
+# account-agnostic placeholders; the chart neither prescribes nor validates them):
+#
+#   ingress:
+#     enabled: true
+#     className: alb                       # Auto Mode's built-in IngressClass
+#     annotations:
+#       alb.ingress.kubernetes.io/scheme: internet-facing
+#       alb.ingress.kubernetes.io/target-type: ip
+#       alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+#       # ACM cert ARN (issued out-of-band; <region>/<acct>/<id> are operator values):
+#       alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<acct>:certificate/<id>
+#       # Optional HTTP->HTTPS redirect:
+#       # alb.ingress.kubernetes.io/ssl-redirect: '443'
+#     hosts:
+#       - host: routeiq.<domain>
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#
+# NOTE (EKS Auto Mode inverts this model -- see README "Public edge + OIDC SSO on
+# AWS" and seed D5): under Auto Mode, AWS-level ALB config moves OFF Ingress
+# annotations INTO an IngressClassParams CR (certificate-arn -> spec.certificateARNs
+# list; explicit spec.targetType). The annotation path ABOVE works under the
+# SELF-MANAGED AWS Load Balancer Controller; the IngressClassParams runbook is the
+# edge wave's concern. ALB-level OIDC (auth-type: oidc) is UNSUPPORTED on Auto Mode
+# -- OIDC/SSO terminates IN THE GATEWAY APP (oidc.py), which is the wiring P4 ships.
+# The /sso/callback URL MUST be a public callback registered with the IdP, which
+# needs this edge ON.
 ingress:
   enabled: false
   className: ""
@@ -97,6 +135,11 @@ ingress:
     # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
     # nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # --- EKS Auto Mode ALB (see commented shape above) ---
+    # alb.ingress.kubernetes.io/scheme: internet-facing
+    # alb.ingress.kubernetes.io/target-type: ip
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<acct>:certificate/<id>
   hosts:
     - host: routeiq.example.com
       paths:
@@ -448,13 +491,42 @@ externalOtel:
   protocol: "grpc"
 
 # OIDC / SSO Configuration (enables single sign-on for admin UI)
+#
+# RouteIQ-on-AWS P4: the application-layer OIDC/SSO (oidc.py: JWKS discovery,
+# /sso/login, /sso/callback, /auth/token-exchange) is PURE ENV-VAR CONFIG -- it
+# has NO CDK footprint (the EKS "OIDC" provider is workload-identity/IRSA, a
+# DIFFERENT concept; the substrate uses Pod Identity, not IRSA). When oidc.enabled,
+# the chart emits ROUTEIQ_OIDC_ENABLED / _ISSUER_URL / _CLIENT_ID (see _helpers.tpl)
+# and ROUTEIQ_OIDC_CLIENT_SECRET via a secretKeyRef -- ONLY if existingSecret is set.
+#
+# CLIENT-SECRET WIRING (ESO -> Secrets Manager, P4 core path):
+#   1. ESO syncs Secrets Manager id `routeiq/oidc-client-secret` into the K8s
+#      Secret <fullname>-secrets under key `oidc-client-secret` (see
+#      externalSecrets.data example below).
+#   2. Point THIS block at that ESO target so the secretKeyRef resolves:
+#        oidc:
+#          existingSecret: <release>-routeiq-gateway-secrets   # = ESO target.name
+#          existingSecretKey: oidc-client-secret               # = ESO data[].secretKey
+#      The existingSecretKey MUST equal the ESO `secretKey` (name-alignment is
+#      load-bearing; a drift renders fine but leaves the env var ABSENT, silently
+#      degrading to OIDC public-client mode).
+#
+# /sso/callback is a PUBLIC callback URL that must be (a) reachable via the ALB
+# edge (ingress.enabled=true; see the ingress block) and (b) registered with the
+# IdP out-of-band. Multi-pod note (replicaCount=2 default): minted sk-oidc-* keys
+# + the identity cache are in-process only today (sticky-session-dependent); a
+# Redis-backed shared store is deferred as seed D4.
 oidc:
   enabled: false
   # OIDC issuer URL (e.g., https://your-tenant.auth0.com/)
   issuerUrl: ""
   clientId: ""
-  # K8s secret containing the client_secret
+  # K8s secret containing the client_secret. On the ESO path set this to the ESO
+  # target secret (<release>-routeiq-gateway-secrets) so the secretKeyRef resolves
+  # the synced key. Leave empty for OIDC public-client mode (no client secret).
   existingSecret: ""
+  # Key WITHIN existingSecret. MUST match the ESO data[].secretKey
+  # (oidc-client-secret) -- see externalSecrets.data example.
   existingSecretKey: "oidc-client-secret"
 
 # -----------------------------------------------------------------------------
@@ -541,6 +613,17 @@ externalSecrets:
     # - secretKey: OPENAI_API_KEY
     #   remoteRef:
     #     key: routeiq/openai-key
+    # --- OIDC client-secret (P4 SSO path) ---
+    # Syncs Secrets Manager id `routeiq/oidc-client-secret` into the ESO target
+    # secret (<fullname>-secrets) under key `oidc-client-secret`. To reach the
+    # ROUTEIQ_OIDC_CLIENT_SECRET env var, ALIGN the oidc block:
+    #   oidc.existingSecret:    <release>-routeiq-gateway-secrets  (= ESO target.name)
+    #   oidc.existingSecretKey: oidc-client-secret                 (= the secretKey below)
+    # The secretKey <-> oidc.existingSecretKey names are load-bearing: a drift
+    # renders fine but leaves the env var absent (silent public-client fallback).
+    # - secretKey: oidc-client-secret
+    #   remoteRef:
+    #     key: routeiq/oidc-client-secret
 
 # -----------------------------------------------------------------------------
 # ConfigMap configuration
@@ -655,7 +738,16 @@ extraVolumeMounts: []
   #   mountPath: /app/custom-config
   #   readOnly: true
 
-# Required for readOnlyRootFilesystem
+# Required for readOnlyRootFilesystem.
+# When enabled, mounts three writable emptyDir volumes that back the read-only
+# root: /tmp, /app/data, /app/models. ALL runtime writes must target one of
+# these. The chart already redirects HF/XDG/matplotlib caches into /app/data
+# (see _helpers.tpl "routeiq-gateway.envVars"). If you set any RouteIQ state
+# path (ROUTEIQ_GOVERNANCE_STATE_PATH, ROUTEIQ_USAGE_POLICIES_STATE_PATH,
+# ROUTEIQ_GUARDRAIL_POLICIES_STATE_PATH, ROUTEIQ_PROMPTS_STATE_PATH) via extraEnv,
+# it MUST live under /app/data when readOnlyRootFilesystem: true, or the save
+# will EROFS. NOTE: /app/.cache and /app/custom_routers are NOT mounted and are
+# read-only at runtime (loaded-from, not written-to).
 tmpVolume:
   enabled: true
   sizeLimit: 256Mi
@@ -671,6 +763,18 @@ tmpVolume:
 # - DNS resolution (to kube-dns)
 # - HTTPS (443) and HTTP (80) to external IPs (excludes private ranges)
 # This allows LLM API calls while blocking access to internal services.
+#
+# OUTAGE LANDMINE (RouteIQ-on-AWS substrate): the allowHttpsExternal rule carves
+# OUT every RFC-1918 range (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). On AWS
+# the three things the pod MUST reach are ALL inside RFC-1918 (the CDK VPC CIDR
+# is 10.40.0.0/16, network_construct.py:53): Aurora 5432, ElastiCache 6379, and
+# the Bedrock/Secrets Manager/ECR/CloudWatch Logs INTERFACE VPC endpoints over
+# 443. Bedrock is the non-obvious killer: private_dns_enabled resolves
+# bedrock-runtime.<region>.amazonaws.com to an in-VPC ENI, so the rule labelled
+# "HTTPS to external LLM providers" BLOCKS the primary provider. Net: flipping
+# networkPolicy.enabled=true as-shipped on AWS is an OUTAGE (boot fails at DB
+# migration / asyncpg connect; Bedrock calls fail). Set egress.inVpc.enabled=true
+# WHENEVER you enable networkPolicy on AWS; inVpc.cidr MUST equal the CDK vpc_cidr.
 #
 # To enforce strict egress (default-deny with explicit allows), set:
 #   egress.allowHttpsExternal: false
@@ -693,9 +797,27 @@ networkPolicy:
   egress:
     # Allow DNS resolution (required for most functionality)
     allowDns: true
-    # Allow HTTPS/HTTP to external services (LLM providers)
+    # Allow HTTPS/HTTP to external services (LLM providers).
+    # Covers S3 (gateway-endpoint traffic routes to AWS-owned S3 prefixes, NOT
+    # the VPC CIDR, so the RFC-1918 carve-out does NOT block S3) + public LLM
+    # providers. Keep TRUE on AWS so S3 layer/config download stays reachable;
+    # pair it with inVpc below for the in-VPC services.
     # This blocks access to private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
     allowHttpsExternal: true
+    # In-VPC targets that allowHttpsExternal's RFC-1918 carve-out would BLOCK:
+    # Aurora (5432), ElastiCache (6379), and the in-VPC Bedrock/Secrets Manager/
+    # ECR/CloudWatch Logs interface endpoints (one 443 CIDR rule covers all ENIs).
+    # Default OFF to keep the chart account-agnostic + byte-stable; flip ON
+    # together with networkPolicy.enabled on the AWS substrate (see header).
+    inVpc:
+      # Default OFF; flip ON WITH networkPolicy.enabled on the AWS substrate.
+      enabled: false
+      # MUST equal the CDK vpc_cidr (network_construct.py:53 default
+      # "10.40.0.0/16"). If an operator overrides vpc_cidr, override this too.
+      cidr: "10.40.0.0/16"
+      # TCP ports allowed to the in-VPC CIDR: Aurora 5432, ElastiCache 6379,
+      # interface VPC endpoints (Bedrock/Secrets/ECR/Logs) 443.
+      ports: [5432, 6379, 443]
     # Additional egress rules for internal services (database, Redis, etc.)
     to: []
       # - namespaceSelector:
