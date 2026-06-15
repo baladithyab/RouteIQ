@@ -89,11 +89,21 @@ hotreload = ["watchdog>=3.0.0"]
 oidc = ["authlib>=1.5.0"]
 # Callback integrations (langfuse, etc.)
 callbacks = ["langfuse>=3.0.0"]
-# KNN routing inference dependencies (sentence-transformers for embeddings)
-knn = ["sentence-transformers>=5.2.0", "scikit-learn>=1.3.0"]
-# Production extras (for Docker builds) - all optional features without dev tools
-prod = ["routeiq[db,otel,cloud,callbacks,knn,a2a,hotreload,oidc]"]
-# All optional dependencies (including dev tools)
+# KNN/ML routing inference dependencies (torch + embeddings + sklearn).
+# torch is a DIRECT dep here so the pytorch-cpu source ([tool.uv.sources],
+# RouteIQ-07ef) actually binds — [tool.uv.sources] only applies to direct
+# deps. This is the only place torch enters the resolution; pulling it into
+# `knn` keeps the base/prod closure torch-free (RouteIQ-ba11).
+knn = ["torch", "sentence-transformers>=5.2.0", "scikit-learn>=1.3.0"]
+# Production extras (for Docker builds) — TORCH-FREE. Centroid routing
+# (ADR-0010, the default routing path) needs no torch, so the default prod
+# image carries no torch/sentence-transformers/CUDA stack (RouteIQ-ba11).
+prod = ["routeiq[db,otel,cloud,callbacks,a2a,hotreload,oidc]"]
+# Production + ML tier — adds the KNN/ML routing strategies (pulls torch-cpu +
+# sentence-transformers + sklearn via the `knn` extra). Use for deployments
+# that need the KNN/ML strategy family on top of the torch-free prod base.
+prod-ml = ["routeiq[prod,knn]"]
+# All optional dependencies (including dev tools) — dev superset, keeps knn.
 all = ["routeiq[dev,db,otel,cloud,knn,a2a,hotreload,oidc]"]
 # Documentation site
 docs = [
@@ -113,6 +123,31 @@ cdk = [
 
 [project.scripts]
 routeiq = "litellm_llmrouter.cli:main"
+
+# =============================================================================
+# uv torch-CPU index pin (RouteIQ-07ef)
+# =============================================================================
+# torch ships ~900MB of CUDA wheels (15 nvidia-*-cu12 + triton) on amd64 by
+# default. RouteIQ's default routing path (ADR-0010 centroid) is torch-FREE;
+# only the KNN/ML strategy tier needs torch, and it runs fine on CPU.
+#
+# `UV_EXTRA_INDEX_URL` (set in the Dockerfile) only *adds* an index — PyPI still
+# satisfies the pin, so the CUDA stack is pulled regardless. The deterministic
+# fix is an explicit pytorch-cpu index + a [tool.uv.sources] binding.
+#
+# LOAD-BEARING: [tool.uv.sources] binds a package ONLY when it is a DIRECT
+# project/extra dependency. torch is transitive-only today (via
+# sentence-transformers), so this pin would silently no-op. The fix therefore
+# ALSO declares `torch` as a direct dependency inside the `knn` extra (below),
+# which is the only place torch enters the resolution.
+#   explicit=true keeps the cpu index from being consulted for non-torch pkgs.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

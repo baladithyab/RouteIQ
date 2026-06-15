@@ -7,7 +7,13 @@
 # Supports: linux/amd64, linux/arm64
 #
 # Build optimization:
-# - Lockfile-driven installs via `uv sync --frozen` for reproducibility
+# - Lockfile-driven installs via `uv sync --frozen --no-editable` (RouteIQ-ba11)
+#   — the resolved env (including the torch-CPU pin, RouteIQ-07ef) comes
+#   straight from uv.lock; `--no-editable` makes the .venv self-contained and
+#   copyable across stages. The old `uv pip install -e` bypassed uv.lock and
+#   re-resolved against indexes, so the torch-CPU pin was non-deterministic.
+# - Native compilation stays in the BUILDER; the runtime copies only /app/.venv
+#   and carries no compilers (RouteIQ-30e9 / authority move #5).
 # - BuildKit cache mounts for uv to avoid baking caches into layers
 # - All cleanup in same RUN statements to minimize layer size
 # - Dependencies installed before app source for better layer reuse
@@ -16,7 +22,7 @@
 # - Pinned base images via sha256 digest for supply-chain integrity
 # - Lockfile verification (--frozen flag fails on mismatch)
 # - Non-root user execution
-# - Minimal base image (slim variant)
+# - Chainguard Wolfi (glibc, minimal-CVE) runtime base (RouteIQ-30e9)
 # - Read-only filesystem compatible
 # - Health checks for orchestrators
 #
@@ -25,22 +31,29 @@
 #   UV_VERSION        - uv package manager version (default: 0.9)
 #   LITELLM_VERSION   - LiteLLM version (default: 1.89.0)
 #   LLMROUTER_COMMIT  - LLMRouter git commit hash
-#   ROUTEIQ_EXTRAS    - Comma-separated pip extras (default: "prod")
+#   ROUTEIQ_EXTRAS    - Comma-separated pip extras (default: "prod", torch-free).
+#                       Reshaped into repeated `uv sync --extra` flags at build
+#                       time, so both single ("prod") and comma ("otel,cloud")
+#                       forms work. Use "prod-ml" for the KNN/ML (torch-cpu) tier.
 #   BUILD_UI          - Build and include admin UI (default: "true")
 #   INSTALL_LLMROUTER - Build and install LLMRouter wheel (default: "true")
 #
 # Build variants:
-#   Full (default):
-#     docker build -f docker/Dockerfile .
-#   Slim (~500MB, no KNN/PyTorch/Prisma):
+#   Full / default (torch-free prod — centroid routing, ADR-0010):
+#     docker build -f docker/Dockerfile -t routeiq:prod .
+#   ML tier (adds KNN/ML strategies — torch-cpu, sentence-transformers, sklearn):
+#     docker build -f docker/Dockerfile \
+#       --build-arg ROUTEIQ_EXTRAS="prod-ml" -t routeiq:prod-ml .
+#   Slim (no KNN/PyTorch/Prisma/UI):
 #     docker build -f docker/Dockerfile \
 #       --build-arg ROUTEIQ_EXTRAS="otel,cloud,a2a,hotreload,oidc" \
 #       --build-arg BUILD_UI=false \
 #       --build-arg INSTALL_LLMROUTER=false .
 #
 # Reproducible Builds:
-#   This Dockerfile uses uv.lock for deterministic dependency resolution.
-#   Run `uv lock --check` locally to verify lockfile is up-to-date before building.
+#   This Dockerfile uses uv.lock for deterministic dependency resolution via
+#   `uv sync --frozen` (fails on lock drift). Run `uv lock --check` locally to
+#   verify the lockfile is up-to-date before building.
 # =============================================================================
 
 ARG PYTHON_VERSION=3.14
@@ -52,8 +65,9 @@ ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 # ==============================================================================
 # Configurable build variants
 # ==============================================================================
-# ROUTEIQ_EXTRAS: pip extras to install. "prod" includes everything.
-#   Slim variant: "otel,cloud,a2a,hotreload,oidc" (no knn, no db/Prisma)
+# ROUTEIQ_EXTRAS: pip extras to install. "prod" is torch-free (centroid routing).
+#   ML tier:    "prod-ml" (adds knn -> torch-cpu + sentence-transformers + sklearn)
+#   Slim:       "otel,cloud,a2a,hotreload,oidc" (no knn, no db/Prisma)
 ARG ROUTEIQ_EXTRAS="prod"
 # BUILD_UI: set to "false" to skip the admin UI React build stage
 ARG BUILD_UI="true"
@@ -62,30 +76,36 @@ ARG INSTALL_LLMROUTER="true"
 
 # ==============================================================================
 # Base image digests for reproducibility
-# To update: docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
+# To update the builder/ui digests:
+#   docker pull <image> && docker inspect --format='{{index .RepoDigests 0}}' <image>
+# To update the runtime (Wolfi) digest:
+#   docker buildx imagetools inspect cgr.dev/chainguard/wolfi-base:latest
 # ==============================================================================
 ARG BUILDER_DIGEST=sha256:d414e96d3cc71a71164ad83402f91c4531a4e451505e2d481579b69dfe0a3986
-ARG RUNTIME_DIGEST=sha256:f37be263fb880ce4ed918e487d84576462fb4fafa934dbd08d216ab4cf058808
+# Chainguard Wolfi (glibc) multi-arch index digest (RouteIQ-30e9).
+ARG RUNTIME_DIGEST=sha256:34977aa13765da89f60fee8fe5230e2bb1c55192df08e383c58221ee0d1277fb
 
 # ==============================================================================
-# Stage 1: Builder - Clone repos and build wheels with uv
+# Stage 1: Builder - Clone LLMRouter, build its wheel, and sync the .venv
 # ==============================================================================
-# Skipped entirely when INSTALL_LLMROUTER=false (slim builds)
+# All native compilation (uvloop, manylinux wheels) happens HERE on the Astral
+# uv/Debian toolchain image; the runtime copies only the resulting /app/.venv.
 FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm@${BUILDER_DIGEST} AS builder
 
 ARG LLMROUTER_COMMIT
 ARG LITELLM_VERSION
 ARG INSTALL_LLMROUTER
-
-WORKDIR /build
+ARG ROUTEIQ_EXTRAS
 
 # Install git for cloning LLMRouter (apt cleanup in same layer)
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
-# Clone and build LLMRouter wheel from GitHub at pinned commit
-# All git operations and cleanup in single RUN to prevent .git in layer
-# When INSTALL_LLMROUTER=false, create empty /wheels dir and skip build
+# --- 1a. Build the LLMRouter wheel (not on PyPI / not in uv.lock) -------------
+# Clone at the pinned commit and build a wheel into /wheels. All git operations
+# and cleanup in a single RUN to keep .git out of the layer. When
+# INSTALL_LLMROUTER=false, create an empty /wheels dir and skip the build.
+WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/uv \
     mkdir -p /wheels && \
     if [ "${INSTALL_LLMROUTER}" = "true" ]; then \
@@ -98,6 +118,38 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     else \
         echo "Skipping LLMRouter build (INSTALL_LLMROUTER=false)"; \
     fi
+
+# --- 1b. Sync the project .venv from the lockfile (frozen, non-editable) ------
+# Copy the lockfile + project metadata + source first (deps before nothing-else,
+# this is the whole install). `uv sync --frozen` installs EXACTLY what uv.lock
+# pins (fails on drift) so the torch-CPU pin (RouteIQ-07ef) is deterministic in
+# the image; `--no-editable` installs the project into site-packages (not a .pth
+# back to /app/src) so the .venv is self-contained and copyable to the runtime.
+# ROUTEIQ_EXTRAS (comma-separated) is reshaped into repeated `--extra` flags.
+WORKDIR /app
+COPY pyproject.toml uv.lock /app/
+COPY src/ /app/src/
+COPY README.md /app/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -e && \
+    EXTRA_FLAGS="" && \
+    OLD_IFS="$IFS"; IFS=','; \
+    for e in ${ROUTEIQ_EXTRAS}; do \
+        [ -n "$e" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --extra ${e}"; \
+    done; \
+    IFS="$OLD_IFS"; \
+    echo "uv sync extras: ${EXTRA_FLAGS}" && \
+    # UV_EXTRA_INDEX_URL is a defense-in-depth fallback; the deterministic
+    # torch-CPU enforcement is the [tool.uv.sources] pin baked into uv.lock.
+    UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+    uv sync --frozen --no-editable --no-dev ${EXTRA_FLAGS} && \
+    # Install the LLMRouter wheel into the SAME .venv (it is not in uv.lock, so
+    # it cannot ride the frozen sync). It carries no torch dependency itself.
+    if [ "${INSTALL_LLMROUTER}" = "true" ] && ls /wheels/*.whl 1>/dev/null 2>&1; then \
+        UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+        uv pip install --python /app/.venv/bin/python /wheels/*.whl; \
+    fi && \
+    rm -rf /wheels
 
 # ==============================================================================
 # Stage 2: UI Builder (optional) - Build admin UI React SPA
@@ -120,9 +172,15 @@ RUN if [ "${BUILD_UI}" = "true" ]; then \
     fi
 
 # ==============================================================================
-# Stage 3: Runtime - Production image with uv and OTEL support
+# Stage 3: Runtime - Chainguard Wolfi (glibc) production image (RouteIQ-30e9)
 # ==============================================================================
-FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-bookworm-slim@${RUNTIME_DIGEST} AS runtime
+# Wolfi over Debian: minimal-CVE, glibc (so torch/scipy/sklearn manylinux wheels
+# install as binaries — musl/Alpine would force source builds). Wolfi over
+# distroless: the entrypoint is #!/bin/bash with shell-only constructs (seq,
+# bit-shift arithmetic, [ ] tests, background &, command -v, heredocs) plus the
+# prisma CLI, the curl healthcheck, and tini — all of which need a shell.
+# Shell-less distroless is a HARD build-breaker; Wolfi ships a shell + apk.
+FROM cgr.dev/chainguard/wolfi-base:latest@${RUNTIME_DIGEST} AS runtime
 
 ARG LITELLM_VERSION
 ARG LLMROUTER_COMMIT
@@ -141,84 +199,89 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.revision="${VCS_REF}"
 LABEL org.opencontainers.image.vendor="RouteIQ"
 LABEL org.opencontainers.image.title="RouteIQ Gateway"
+LABEL org.opencontainers.image.base.name="cgr.dev/chainguard/wolfi-base:latest"
 LABEL litellm.version="${LITELLM_VERSION}"
 LABEL llmrouter.commit="${LLMROUTER_COMMIT}"
 LABEL build.reproducible="true"
 LABEL build.lockfile-driven="uv.lock"
 
-# Security: Create non-root user with specific UID/GID for consistency
+# Install minimal runtime dependencies via apk (Wolfi), all in a single layer.
+# NO build-essential / compilers — native compilation lives in the builder and
+# only the copied .venv is used at runtime (authority move #5).
+#   bash            - entrypoint shebang (#!/bin/bash) + shell-only constructs
+#   curl            - HEALTHCHECK
+#   ca-certificates - TLS to providers / S3 / OIDC
+#   tini            - init for signal handling (lands at /usr/bin/tini)
+#   libgcc/libstdc++- glibc C++ runtime for native wheels (torch/scipy on ML tier)
+#   python-3.14     - base interpreter the copied .venv resolves against
+#   shadow          - groupadd/useradd (used below)
+# nodejs-22 is added for prisma's query-engine generation on db/prod tiers only.
+# NOTE: Wolfi/Chainguard ships VERSIONED node packages (nodejs-16 .. nodejs-26);
+# a bare `nodejs` is NOT a valid apk package and fails the build. Pin the LTS
+# (nodejs-22). Confirmed via a live `docker build` on this worktree.
+RUN apk add --no-cache \
+        bash \
+        curl \
+        ca-certificates \
+        tini \
+        libgcc \
+        libstdc++ \
+        python-3.14 \
+        shadow \
+    && if echo "${ROUTEIQ_EXTRAS}" | grep -qE '(prod|db)'; then \
+        apk add --no-cache nodejs-22; \
+    fi \
+    # The builder's .venv interpreter symlinks (python / python3 / python3.14)
+    # and pyvenv.cfg `home` point into /usr/local/bin (Astral image layout).
+    # Wolfi installs python at /usr/bin/python3.14, so provide compat symlinks
+    # for ALL three interpreter names at /usr/local/bin -> the Wolfi interpreter
+    # (same 3.14 minor => ABI compatible) to make the copied .venv relocatable.
+    && mkdir -p /usr/local/bin \
+    && ln -sf /usr/bin/python3.14 /usr/local/bin/python3.14 \
+    && ln -sf /usr/bin/python3.14 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.14 /usr/local/bin/python \
+    && rm -rf /var/cache/apk/*
+
+# Security: Create non-root user with specific UID/GID for consistency.
+# Wolfi provides groupadd/useradd via the `shadow` apk package, so the original
+# Debian invocation is kept verbatim (lower diff).
 RUN groupadd -r -g 1000 litellm && \
     useradd -r -u 1000 -g litellm -d /app -s /sbin/nologin litellm
 
 WORKDIR /app
 
-# Install minimal runtime dependencies in single layer (cleanup in same RUN)
-# Note: build-essential installed temporarily for uvloop compilation, then removed
-# Note: libatomic1 needed for Prisma/Node.js on slim images (skip for slim builds without db)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    ca-certificates \
-    tini \
-    && if echo "${ROUTEIQ_EXTRAS}" | grep -qE '(prod|db)'; then \
-        apt-get install -y --no-install-recommends libatomic1; \
-    fi \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* /root/.cache
+# Make the copied .venv the default interpreter resolution path.
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH=/app/.venv/bin:$PATH
 
-# Copy wheels from builder (can be cleaned after install)
-COPY --from=builder /wheels /wheels
+# Copy the fully-resolved, self-contained .venv from the builder. No compilers,
+# no uv, no re-resolution happen in the runtime — the env is exactly uv.lock.
+COPY --from=builder /app/.venv /app/.venv
 
-# =============================================================================
-# Lockfile-driven dependency installation for reproducibility
-# =============================================================================
-# Copy lockfile and project metadata first for layer caching
-COPY pyproject.toml uv.lock /app/
-COPY src/ /app/src/
-
-# Install all Python dependencies using uv pip install --system
-# --system: Install to system Python (not a venv) so packages are available at runtime
-# UV_EXTRA_INDEX_URL: Use CPU-only PyTorch to avoid shipping ~3GB CUDA libraries
-# ROUTEIQ_EXTRAS controls which optional dependencies are installed:
-#   "prod" (default) = all production extras including KNN/PyTorch/Prisma
-#   "otel,cloud,a2a,hotreload,oidc" = slim variant without KNN/Prisma
-# INSTALL_LLMROUTER controls whether the LLMRouter wheel is installed
-RUN --mount=type=cache,target=/root/.cache/uv \
-    set -e && \
-    # Install LLMRouter wheel if built (not in lockfile, built from source at pinned commit)
-    if [ "${INSTALL_LLMROUTER}" = "true" ] && ls /wheels/*.whl 1>/dev/null 2>&1; then \
-        UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-        uv pip install --system /wheels/*.whl; \
-    fi && \
-    # Install project dependencies with configured extras
-    cd /app && UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    uv pip install --system -e ".[${ROUTEIQ_EXTRAS}]" && \
-    # Cleanup wheels and temp files
-    rm -rf /wheels && \
-    # Remove build-essential (no longer needed after compilation)
-    apt-get purge -y --auto-remove build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Pre-generate Prisma client and fix permissions on LiteLLM directories
-# This is done as root to avoid runtime permission errors
-# Security: Use least-privilege permissions instead of 777
-# Skipped when db extra is not installed (slim builds without Prisma)
+# Pre-generate Prisma client and fix permissions on LiteLLM directories.
+# Done as root to avoid runtime permission errors. Repathed to the copied .venv
+# site-packages (self-contained, python3.14-minor-aligned with Wolfi 3.14.6).
+# Skipped when db extra is not installed (slim builds without Prisma).
 RUN if echo "${ROUTEIQ_EXTRAS}" | grep -qE '(prod|db)'; then \
-        SCHEMA_PATH=$(python -c "import litellm; import os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
+        SITE_PACKAGES=$(/app/.venv/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") && \
+        SCHEMA_PATH=$(/app/.venv/bin/python -c "import litellm, os; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy', 'schema.prisma'))") && \
         if [ -f "$SCHEMA_PATH" ]; then \
             echo "Generating Prisma client from $SCHEMA_PATH..." && \
-            python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
+            /app/.venv/bin/python -m prisma generate --schema="$SCHEMA_PATH" || echo "Warning: prisma generate failed"; \
         fi && \
-        # Fix permissions on LiteLLM directories that need write access at runtime
-        # Using least-privilege: litellm user owns directories with 755 (rwxr-xr-x)
-        chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
-        chmod -R 755 /usr/local/lib/python3.14/site-packages/prisma/ 2>/dev/null || true && \
-        chown -R litellm:litellm /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true && \
-        chmod -R 755 /usr/local/lib/python3.14/site-packages/litellm/proxy/_experimental/out/ 2>/dev/null || true; \
+        # Fix permissions on LiteLLM directories that need write access at runtime.
+        # Least-privilege: litellm user owns directories with 755 (rwxr-xr-x).
+        chown -R litellm:litellm "$SITE_PACKAGES/prisma/" 2>/dev/null || true && \
+        chmod -R 755 "$SITE_PACKAGES/prisma/" 2>/dev/null || true && \
+        chown -R litellm:litellm "$SITE_PACKAGES/litellm/proxy/_experimental/out/" 2>/dev/null || true && \
+        chmod -R 755 "$SITE_PACKAGES/litellm/proxy/_experimental/out/" 2>/dev/null || true; \
     else \
         echo "Skipping Prisma generation (db extra not installed)"; \
     fi
 
-# Copy application files (after dependencies for better layer caching)
+# Copy application files (after dependencies for better layer caching).
+# NOTE: the project is installed non-editable into the .venv; this source copy
+# is what PYTHONPATH=/app resolves for in-tree runtime assets / overrides.
 COPY --chown=litellm:litellm src/litellm_llmrouter /app/litellm_llmrouter
 COPY --chown=litellm:litellm docker/entrypoint.sh /app/entrypoint.sh
 COPY --chown=litellm:litellm config/ /app/config/
@@ -296,6 +359,6 @@ USER litellm
 #       mountPath: /app/data
 # =============================================================================
 
-# Use tini as init system for proper signal handling
+# Use tini as init system for proper signal handling (lands at /usr/bin/tini on Wolfi)
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--config", "/app/config/config.yaml", "--port", "4000"]
