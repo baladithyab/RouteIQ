@@ -25,9 +25,13 @@ Key facts:
   arm's exploration. The default ``kumaraswamy_quantile`` uses
   ``-math.expm1(math.log1p(-u)/b)`` which stays positive. ``_q_naive`` is kept
   ONLY as a reference for the divergence unit test.
-- **In-memory backend is the default** so the core bandit + every unit test run
-  with NO external deps. Redis (hot) / Aurora (durable) backends are wired
-  behind flags for the live substrate (P1/P2), default off.
+- **In-memory backend is the ONLY backend.** ``InMemoryPosteriorBackend`` is the
+  sole concrete implementation; the core bandit + every unit test run with NO
+  external deps. Durable backends (Redis hot / Aurora durable) are NOT yet built
+  — the ``backend`` / ``durable`` settings fields are reserved placeholders for
+  the planned live substrate (P1/P2) and currently have NO consumer
+  (``register_kumaraswamy_thompson_strategy`` does not read them). Do not assume
+  a non-memory store is available.
 - Determinism: the RNG is threaded as a ``random.Random`` *object*, never the
   global ``random`` module — seeded for tests/replay, no global-state pollution.
 

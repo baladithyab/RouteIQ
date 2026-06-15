@@ -555,6 +555,48 @@ def test_moment_fit_beats_shortcut_on_exploit_inversion():
     assert shortcut_wins / 20000 < 0.2
 
 
+def test_default_path_argmax_picks_better_arm_near_half():
+    """RouteIQ-1817: assert the ACTUAL shipped draw/argmax behavior in the ~0.5
+    inversion zone.
+
+    The other strong tests assert on ``alpha/(alpha+beta)`` (the Beta MEAN), but
+    ``select_deployment`` routes on ``sample_kumaraswamy(a, b)`` over the SHIPPED
+    DEFAULT mapping (``Posterior.shape(moment_fit=False) -> (alpha, beta)``,
+    i.e. ``Kumaraswamy(alpha, beta)``) — not the mean. This pins that the actual
+    sampled argmax favors the genuinely-better arm when the two Beta means
+    STRADDLE 0.5 (the zone the 0.79-0.95 backtest never exercises).
+
+    Arms: worse ``Beta(2, 3)`` (mean 0.4 < 0.5) vs better ``Beta(3, 2)``
+    (mean 0.6 > 0.5). The loop mirrors ``select_deployment``'s argmax (draw per
+    arm, keep the max) over many SEEDED draws.
+    """
+    import random
+
+    worse = Posterior(alpha=2.0, beta=3.0)
+    better = Posterior(alpha=3.0, beta=2.0)
+    # The two Beta means genuinely straddle 0.5 (one arm is genuinely better).
+    assert worse.mean() < 0.5 < better.mean()
+
+    # Draw via the SHIPPED default mapping the hot path uses: moment_fit=False
+    # -> shape() -> (alpha, beta) -> sample_kumaraswamy(alpha, beta, rng).
+    aw, bw = worse.shape(moment_fit=False)
+    ab, bb = better.shape(moment_fit=False)
+    assert (aw, bw) == (2.0, 3.0)
+    assert (ab, bb) == (3.0, 2.0)
+
+    rng = random.Random(20240117)
+    n = 20000
+    better_wins = 0
+    for _ in range(n):
+        # Same argmax shape as select_deployment: one draw per arm, keep the max.
+        x_worse = sample_kumaraswamy(aw, bw, rng)
+        x_better = sample_kumaraswamy(ab, bb, rng)
+        if x_better > x_worse:
+            better_wins += 1
+    # Measured ~0.747 on this seed; the better arm wins the argmax majority.
+    assert better_wins / n > 0.5
+
+
 def test_moment_fit_cache_hit_when_counts_unchanged():
     # RouteIQ-f9e9 defect-1 fix: the fit is cached on the EXACT (alpha, beta),
     # so a repeat call with unchanged counts is a cache hit (identical result),
