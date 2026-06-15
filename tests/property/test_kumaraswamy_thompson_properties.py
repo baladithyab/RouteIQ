@@ -192,25 +192,37 @@ def test_moment_fit_mean_within_tolerance(alpha, beta):
     alpha=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
     beta=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
 )
-@settings(max_examples=200)
+@settings(max_examples=300)
 def test_moment_fit_variance_tracks_beta(alpha, beta):
     # RouteIQ-f9e9 defect-2: the fitted variance must TRACK the Beta variance.
     # The old 2-D Newton inflated it ~3-7x on peaked posteriors (over-
     # exploration); the 1-D fit (root-find a on the low-variance branch, mean
-    # held exactly) matches it across the whole (alpha, beta) band -- the worst
-    # observed deviation on a 3000-sample sweep is ~1e-4. When a target variance
-    # is genuinely below Kumaraswamy's achievable floor the fit returns the
-    # floor (variance ABOVE target = more exploration, never UNDER), but within
-    # the 0.3..200 evidence band that floor is always reachable, so the band is
-    # tight on both sides.
+    # held exactly) matches it across most of the (alpha, beta) band.
+    #
+    # The contract is asymmetric and that asymmetry is the SAFETY property:
+    #   * NEVER under-explore (ratio > ~1): under-variance over-exploits a
+    #     not-yet-proven arm — the dangerous direction. Held tight.
+    #   * over-exploration is BOUNDED: where the target variance sits below
+    #     Kumaraswamy's achievable floor (near-degenerate posteriors — extreme
+    #     asymmetry like Beta(195, 0.3), mean ~0.998), the fit returns the floor,
+    #     whose variance is ABOVE target. The mean is still held exactly (~1e-6),
+    #     which is the load-bearing quantity for the Thompson exploit decision;
+    #     the slightly-larger variance just explores a touch more. Hypothesis
+    #     finds the worst such straddle around Beta(~195, ~0.3) at ~1.34x, far
+    #     below the old solver's 3-7x — so the upper bound is 1.5x (catches a
+    #     regression to the old 2-D-Newton inflation; admits the legitimate
+    #     floor-straddle).
     s = alpha + beta
     beta_var = (alpha * beta) / (s * s * (s + 1.0))
     a, b = fit_kumaraswamy_moments(alpha, beta)
-    _, fit_var = kumaraswamy_mean_var(a, b)
+    fit_mean, fit_var = kumaraswamy_mean_var(a, b)
     ratio = fit_var / beta_var if beta_var > 0 else 1.0
-    # Never materially UNDER-explore (the dangerous direction: under-variance
-    # over-exploits a not-yet-proven arm).
+    # The mean is the load-bearing guarantee and is held exactly everywhere,
+    # INCLUDING the extreme-asymmetry floor-straddle (this is what makes the
+    # too-large variance there safe — right arm ranking, just more exploration).
+    assert abs(fit_mean - alpha / s) < 1e-3
+    # Never materially UNDER-explore.
     assert ratio > 0.99
-    # Bounded over-exploration: tracks ~1.0x (old solver hit 3-7x). 1.05x leaves
-    # headroom for the rare sub-floor straddle without admitting the old defect.
-    assert ratio < 1.05
+    # Bounded over-exploration: ~1.0x on the feasible interior, <=1.5x at the
+    # near-degenerate floor-straddle. The old defect was 3-7x.
+    assert ratio < 1.5

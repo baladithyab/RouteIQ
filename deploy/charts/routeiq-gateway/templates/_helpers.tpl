@@ -134,7 +134,12 @@ imagePullSecrets:
 {{- end }}
 
 {{/*
-Database-only environment variables (for init containers like db-migrate)
+External-PostgreSQL DATABASE_URL env block (RouteIQ-bed5: single source of truth).
+
+This is the ONE place the externalPostgresql.host DATABASE_URL logic lives. Both
+the db-migrate init container (via routeiq-gateway.databaseEnv) and the main
+container (via routeiq-gateway.envVars) reference it so the static-password (Shape
+B) and IAM-auth (ADR-0028) shapes can never drift between the two emission sites.
 
 RouteIQ-on-AWS P1 (ADR-0028) BOOT-RENDER NOTE: on the Aurora IAM-auth path
 (externalPostgresql.existingSecret empty) this renders a COMPLETE, password-less
@@ -147,8 +152,7 @@ does no second pass, so DATABASE_URL emitted before POSTGRES_PASSWORD leaves the
 $(POSTGRES_PASSWORD) substring LITERAL. For Shape B the referent MUST be ordered
 first. See research/p1/discover-chart-state.md section 3 (the highest-risk seam).
 */}}
-{{- define "routeiq-gateway.databaseEnv" -}}
-{{- if .Values.externalPostgresql.host }}
+{{- define "routeiq-gateway.externalPostgresqlEnv" -}}
 {{- if .Values.externalPostgresql.existingSecret }}
 - name: POSTGRES_PASSWORD
   valueFrom:
@@ -165,6 +169,19 @@ first. See research/p1/discover-chart-state.md section 3 (the highest-risk seam)
 - name: ROUTEIQ_DB_IAM_AUTH
   value: "true"
 {{- end }}
+{{- end }}
+
+{{/*
+Database-only environment variables (for init containers like db-migrate).
+
+Emits the externalPostgresql.host DATABASE_URL block (shared with the main
+container via routeiq-gateway.externalPostgresqlEnv, RouteIQ-bed5) plus the
+secrets.values.DATABASE_URL fallback used when no externalPostgresql.host is set
+(the init container has no envFrom secretRef pulling DATABASE_URL by default).
+*/}}
+{{- define "routeiq-gateway.databaseEnv" -}}
+{{- if .Values.externalPostgresql.host }}
+{{- include "routeiq-gateway.externalPostgresqlEnv" . }}
 {{- else if .Values.secrets.values.DATABASE_URL }}
 - name: DATABASE_URL
   valueFrom:
@@ -312,23 +329,11 @@ Environment variables for gateway configuration
 # password-less URL (app mints the rds-db:connect token in Python); Shape-B
 # interim orders POSTGRES_PASSWORD BEFORE DATABASE_URL so the K8s $(VAR) expansion
 # actually fires (it does not for a $(VAR) defined later). See databaseEnv above.
+{{- /* RouteIQ-bed5: emitted by the shared routeiq-gateway.externalPostgresqlEnv
+       template (single source of truth, also used by databaseEnv) so the two
+       sites can never drift. This Go-template comment does NOT render. */ -}}
 {{- if .Values.externalPostgresql.host }}
-{{- if .Values.externalPostgresql.existingSecret }}
-- name: POSTGRES_PASSWORD
-  valueFrom:
-    secretKeyRef:
-      name: {{ .Values.externalPostgresql.existingSecret }}
-      key: {{ .Values.externalPostgresql.existingSecretKey | default "password" }}
-- name: DATABASE_URL
-  value: {{ printf "postgresql://%s:$(POSTGRES_PASSWORD)@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
-{{- else }}
-# IAM-auth (ADR-0028): password-less complete URL; app mints rds-db:connect token.
-# The flag is DERIVED from an empty existingSecret (single source of truth).
-- name: DATABASE_URL
-  value: {{ printf "postgresql://%s@%s:%d/%s?sslmode=%s" .Values.externalPostgresql.username .Values.externalPostgresql.host (int .Values.externalPostgresql.port) .Values.externalPostgresql.database .Values.externalPostgresql.sslMode | quote }}
-- name: ROUTEIQ_DB_IAM_AUTH
-  value: "true"
-{{- end }}
+{{- include "routeiq-gateway.externalPostgresqlEnv" . }}
 {{- end }}
 
 # External Redis

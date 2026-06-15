@@ -422,6 +422,56 @@ async def _shutdown_http_client_pool() -> None:
     await shutdown_http_client_pool()
 
 
+def _register_adapter_loader_plugin(manager: Any) -> bool:
+    """Register the out-of-tree adapter loader behind a feature flag.
+
+    ``AdapterLoaderPlugin`` discovers ``routeiq.routing_adapters`` entry-point
+    adapters at startup (RouteIQ-a089).  It is gated by
+    ``settings.adapter_framework.entrypoint_discovery`` (default OFF) so the
+    default boot stays byte-stable — when the flag is off this is a no-op and
+    no entry-point enumeration happens.
+
+    Args:
+        manager: The plugin manager to register the loader into.
+
+    Returns:
+        True if the loader plugin was registered, False otherwise.
+    """
+    try:
+        settings = get_settings()
+        adapter_fw = settings.adapter_framework
+        discovery_on = adapter_fw.entrypoint_discovery
+    except Exception as exc:
+        logger.debug("Adapter-framework settings unavailable: %s", exc)
+        return False
+
+    if not discovery_on:
+        return False
+
+    try:
+        from ..adapters.loader import AdapterLoaderPlugin
+        from .plugin_manager import PluginCapability
+
+        # Capability negotiation, when enabled, restricts staged adapters to
+        # the routing-strategy capability (the allowlist the loader enforces
+        # per-adapter).  When negotiation is off, the loader allows all.
+        allowed = (
+            {PluginCapability.ROUTING_STRATEGY}
+            if adapter_fw.capability_negotiation
+            else None
+        )
+        manager.register(AdapterLoaderPlugin(allowed_capabilities=allowed))
+        logger.info(
+            "Registered adapter-loader plugin (entrypoint_discovery=on, "
+            "capability_negotiation=%s)",
+            adapter_fw.capability_negotiation,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Failed to register adapter-loader plugin: %s", exc)
+        return False
+
+
 def _load_plugins_before_routes() -> int:
     """
     Load plugins synchronously before routes are registered.
@@ -442,6 +492,12 @@ def _load_plugins_before_routes() -> int:
         return len(manager.plugins)
 
     loaded = manager.load_from_config()
+
+    # Register the built-in out-of-tree adapter loader (RouteIQ-a089) behind
+    # the entrypoint_discovery flag.  Default OFF => no-op => byte-stable boot.
+    if _register_adapter_loader_plugin(manager):
+        loaded += 1
+
     if loaded:
         logger.info(f"Pre-loaded {loaded} plugins (startup hooks will run later)")
 

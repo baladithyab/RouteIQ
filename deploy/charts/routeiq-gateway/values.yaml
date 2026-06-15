@@ -811,9 +811,45 @@ tmpVolume:
 # migration / asyncpg connect; Bedrock calls fail). Set egress.inVpc.enabled=true
 # WHENEVER you enable networkPolicy on AWS; inVpc.cidr MUST equal the CDK vpc_cidr.
 #
-# To enforce strict egress (default-deny with explicit allows), set:
-#   egress.allowHttpsExternal: false
-#   egress.to: [...explicit rules...]
+# EGRESS POSTURE DECISION (RouteIQ-da05) -- ACCEPTED: WIDE PUBLIC EGRESS BY DEFAULT
+# ---------------------------------------------------------------------------
+# allowHttpsExternal=true emits an egress rule to 0.0.0.0/0 (minus RFC-1918) on
+# 443/80. This is a WIDE public-internet allow -- i.e. a data-exfiltration surface
+# (a compromised pod can POST anywhere on 443/80). We accept it as the DEFAULT on
+# purpose because the common managed-gateway deploy needs reachability that no
+# tighter static CIDR can express:
+#   * S3 via the gateway VPC endpoint -- traffic egresses to AWS-owned S3 prefix
+#     ranges (NOT the VPC CIDR, so inVpc does NOT cover it). Used for ML model
+#     artifact + config-sync (S3) download. Breaking this bricks layer/config load.
+#   * Public LLM providers (OpenAI, Anthropic, etc.) on arbitrary public 443 IPs
+#     that rotate -- an allowlist would need constant maintenance.
+# A NetworkPolicy egress rule cannot match by DNS name or AWS prefix-list, so the
+# only way to keep BOTH of these working with a static rule is the wide 0.0.0.0/0
+# allow. Hence the accepted tradeoff: reachability + zero-maintenance over a tight
+# default. networkPolicy.enabled itself defaults FALSE, so this rule is INERT
+# until an operator opts into NetworkPolicy at all.
+#
+# HOW TO LOCK IT DOWN (strict default-deny egress) -- recommended for regulated /
+# Bedrock-only / no-public-LLM deployments where data-exfil risk outweighs the
+# convenience:
+#   1. egress.allowHttpsExternal: false      # drop the 0.0.0.0/0 rule entirely
+#   2. egress.inVpc.enabled: true            # keep Aurora/ElastiCache/VPC-endpoint
+#      egress.inVpc.cidr: "<your VPC CIDR>"  #   reachability (Bedrock via private DNS)
+#   3. egress.to: [...]                      # add an EXPLICIT allowlist for any
+#      # remaining public targets you still need, e.g. an S3 prefix-list CIDR set
+#      # or a forward-proxy egress IP. Example (S3 + a proxy):
+#      #   egress:
+#      #     allowHttpsExternal: false
+#      #     inVpc: { enabled: true, cidr: "10.40.0.0/16", ports: [5432, 6379, 443] }
+#      #     to:
+#      #       - ipBlock: { cidr: "52.219.0.0/16" }   # an S3 service prefix (region-specific)
+#      #         ports: [{ protocol: TCP, port: 443 }]
+#      #       - ipBlock: { cidr: "203.0.113.10/32" } # egress forward-proxy
+#      #         ports: [{ protocol: TCP, port: 443 }]
+# With allowHttpsExternal=false and no matching egress.to rule, all non-DNS,
+# non-inVpc egress is DENIED -- so verify your S3/provider targets are covered
+# BEFORE rolling out (an over-tight lockdown fails the same way the wide default
+# would: silent connection timeouts on layer/config download or provider calls).
 networkPolicy:
   enabled: false
   # Ingress rules - who can access the gateway

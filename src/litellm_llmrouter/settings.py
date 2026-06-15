@@ -1190,9 +1190,15 @@ class EvalPipelineSettings(BaseModel):
 class KumaraswamyThompsonSettings(BaseModel):
     """Kumaraswamy-Thompson online-bandit routing strategy configuration.
 
-    The core bandit runs with the in-memory backend and NO external deps;
-    Redis (hot) / Aurora (durable) backends are wired behind ``backend`` /
-    ``durable`` flags for the live substrate (P1/P2), default off.
+    The core bandit runs with the in-memory backend and NO external deps:
+    ``InMemoryPosteriorBackend`` is the ONLY backend that exists.
+
+    RESERVED / not yet wired (no consumer): the ``backend``, ``durable`` and
+    ``cost_reward_alpha`` fields below have ZERO readers.
+    ``register_kumaraswamy_thompson_strategy`` never reads them, and the durable
+    Redis (hot) / Aurora (durable) posterior backends they would select are NOT
+    built.  The fields are retained for env-var forward-compat only (RouteIQ-4654;
+    the module docstring in ``kumaraswamy_thompson.py`` documents the same).
 
     Env vars: ``ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED``,
     ``ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND``, etc. (``__`` nested delimiter).
@@ -1204,11 +1210,22 @@ class KumaraswamyThompsonSettings(BaseModel):
     )
     backend: str = Field(
         "memory",
-        description="Hot posterior backend: memory | redis.",
+        description=(
+            "RESERVED / not yet wired (no consumer): hot posterior backend "
+            "(memory | redis).  Only the in-memory backend exists; the durable "
+            "Redis posterior backend is NOT built and "
+            "``register_kumaraswamy_thompson_strategy`` never reads this field "
+            "(RouteIQ-4654).  Retained for env-var forward-compat."
+        ),
     )
     durable: str = Field(
         "none",
-        description="Durable posterior store: none | aurora.",
+        description=(
+            "RESERVED / not yet wired (no consumer): durable posterior store "
+            "(none | aurora).  The durable Aurora posterior backend is NOT built "
+            "and ``register_kumaraswamy_thompson_strategy`` never reads this "
+            "field (RouteIQ-4654).  Retained for env-var forward-compat."
+        ),
     )
     w_quality: float = Field(
         0.5,
@@ -1232,7 +1249,13 @@ class KumaraswamyThompsonSettings(BaseModel):
         0.5,
         ge=0.0,
         le=1.0,
-        description="Mixing rate of the cost term into the reward signal.",
+        description=(
+            "RESERVED / not yet wired (no consumer): mixing rate of the cost "
+            "term into the reward signal.  "
+            "``register_kumaraswamy_thompson_strategy`` never reads this field "
+            "(the strategy uses ``w_quality`` / ``w_cost`` / ``w_latency`` "
+            "instead) — RouteIQ-4654.  Retained for env-var forward-compat."
+        ),
     )
     decay_gamma: float = Field(
         0.99,
@@ -1439,10 +1462,18 @@ class GatewaySettings(BaseSettings):
     )
     llmrouter_governance_spend_tracking: bool = Field(
         True,
+        validation_alias="LLMROUTER_GOVERNANCE_SPEND_TRACKING",
         description=(
             "Write post-response governance spend/RPM counters + usage-policy "
             "cost/token counters (P4 spend write path; env "
-            "LLMROUTER_GOVERNANCE_SPEND_TRACKING).  Independent of OTEL/telemetry."
+            "LLMROUTER_GOVERNANCE_SPEND_TRACKING).  Independent of OTEL/telemetry.  "
+            "The ``validation_alias`` binds the bare env name (NOT the "
+            "``ROUTEIQ_``-prefixed form), making this field track the historical "
+            "env var so a future consumer can read it via ``get_settings()`` per "
+            "ADR-0013.  NOTE: the live reader ``router_decision_callback."
+            "_governance_spend_tracking_enabled()`` still reads ``os.getenv`` "
+            "directly (RouteIQ-9f9f); the alias keeps the two in lock-step on the "
+            "same env name + default until that consumer is migrated."
         ),
     )
 

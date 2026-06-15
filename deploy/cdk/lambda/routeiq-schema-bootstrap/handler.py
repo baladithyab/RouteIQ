@@ -39,13 +39,43 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+from typing import TYPE_CHECKING
 
-import asyncpg
-import boto3
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import asyncpg
 
 _LOG = logging.getLogger()
 _LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+# A PostgreSQL identifier we are willing to interpolate into DDL. The runtime
+# user is a fixed deploy-time construct value (never request-derived), so this is
+# hardening -- not a live SQLi vector -- but validating + quoting the identifier
+# means an unusual user string can never malform the DDL (RouteIQ-4d7c). Allow
+# the unquoted-identifier charset only: a leading letter/underscore then
+# letters/digits/underscores, length-bounded to PostgreSQL's NAMEDATALEN-1 (63).
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_IDENTIFIER_MAX_LEN = 63
+
+
+def _quote_identifier(name: str) -> str:
+    """Validate then double-quote a PostgreSQL identifier for safe DDL interpolation.
+
+    asyncpg cannot parameterise an identifier (only values), so role/database
+    names must be interpolated as text. We reject anything outside the plain
+    unquoted-identifier charset (so embedded quotes/semicolons/whitespace can
+    never break out of the statement), then wrap in double quotes. Raises
+    ``ValueError`` on a malformed name so a bad deploy-time value fails CLOSED at
+    the bootstrap (surfacing as a CloudFormation failure) rather than emitting
+    malformed or injectable DDL.
+    """
+    if not isinstance(name, str) or not (0 < len(name) <= _IDENTIFIER_MAX_LEN):
+        raise ValueError(f"invalid SQL identifier (length): {name!r}")
+    if not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"invalid SQL identifier (charset): {name!r}")
+    return f'"{name}"'
+
 
 # Cold-resume tolerance: a new / auto-paused Serverless v2 cluster may need
 # 15-30s+ before it accepts connections. Generous per-attempt timeout + bounded
@@ -150,6 +180,8 @@ _DDL_STATEMENTS = (
 
 def _fetch_master_credentials(secret_arn: str) -> dict:
     """Read the rotated Aurora master secret (username/password/host/port/dbname)."""
+    import boto3  # lazy: keeps the module importable for hermetic unit tests
+
     client = boto3.client("secretsmanager")
     resp = client.get_secret_value(SecretId=secret_arn)
     return json.loads(resp["SecretString"])
@@ -159,6 +191,8 @@ async def _connect_with_retry(
     *, host: str, port: int, user: str, password: str, database: str
 ) -> asyncpg.Connection:
     """Connect over TLS, retrying through a cold Serverless v2 resume."""
+    import asyncpg  # lazy: keeps the module importable for hermetic unit tests
+
     last_exc: Exception | None = None
     for attempt in range(1, _CONNECT_MAX_ATTEMPTS + 1):
         try:
@@ -206,30 +240,37 @@ async def _bootstrap(
     )
     try:
         # 1) Runtime IAM user (idempotent). asyncpg cannot parameterise an
-        #    identifier, but runtime_user is a fixed deploy-time construct value
-        #    (never request-derived), so the f-string is not an injection vector.
-        #    CREATE ROLE is not IF NOT EXISTS in PostgreSQL, so guard with a DO
-        #    block; GRANT rds_iam is what wires AWS IAM authentication onto the
-        #    role; the GRANTs make the role usable for the control-plane tables.
+        #    identifier, and runtime_user is a fixed deploy-time construct value
+        #    (never request-derived) -- but we still validate + double-quote it
+        #    (RouteIQ-4d7c) so an unusual user string can never malform the DDL.
+        #    The DO-block role-existence guard tests the BARE name (pg_roles.rolname
+        #    stores the unquoted identifier), so that branch uses a single-quoted
+        #    string LITERAL of the validated name; every identifier position uses
+        #    the double-quoted form. CREATE ROLE is not IF NOT EXISTS in
+        #    PostgreSQL, hence the DO block; GRANT rds_iam wires AWS IAM
+        #    authentication onto the role; the GRANTs make it usable for the
+        #    control-plane tables.
+        user_ident = _quote_identifier(runtime_user)
+        db_ident = _quote_identifier(db_name)
         await conn.execute(
             f"""
             DO $$
             BEGIN
                 IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{runtime_user}') THEN
-                    CREATE ROLE {runtime_user} WITH LOGIN;
+                    CREATE ROLE {user_ident} WITH LOGIN;
                 END IF;
             END
             $$;
             """
         )
-        await conn.execute(f"GRANT rds_iam TO {runtime_user};")
-        await conn.execute(f'GRANT ALL PRIVILEGES ON DATABASE "{db_name}" TO {runtime_user};')
-        await conn.execute(f"GRANT ALL ON SCHEMA public TO {runtime_user};")
+        await conn.execute(f"GRANT rds_iam TO {user_ident};")
+        await conn.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db_ident} TO {user_ident};")
+        await conn.execute(f"GRANT ALL ON SCHEMA public TO {user_ident};")
         await conn.execute(
-            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {runtime_user};"
+            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {user_ident};"
         )
         await conn.execute(
-            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {runtime_user};"
+            f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {user_ident};"
         )
         _LOG.info("runtime IAM user %s provisioned (rds_iam granted)", runtime_user)
 

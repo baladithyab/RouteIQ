@@ -1,6 +1,6 @@
-# ADR-0030: EKS Auto Mode + IRSA as the Deployment Substrate
+# ADR-0030: EKS Auto Mode + Pod Identity as the Deployment Substrate
 
-**Status**: Proposed — **AMENDED 2026-06-14: pod IAM mechanism flipped IRSA → EKS Pod Identity** (see Amendment below)
+**Status**: Proposed — **AMENDED 2026-06-14: pod IAM mechanism flipped IRSA → EKS Pod Identity** (see Amendment below); body reconciled with the shipped CDK 2026-06-15
 **Date**: 2026-06-14
 **Decision Makers**: RouteIQ Core Team
 
@@ -35,8 +35,12 @@
 >   `addServiceAccount` helper that would hide IRSA's complexity, so on L1 the gap
 >   between trivial Pod Identity and hand-rolled IRSA+CfnJson is at its widest.
 >
-> The filename (`0030-eks-auto-mode-irsa-substrate.md`) is retained for link stability;
-> read "IRSA" in the title as "pod-to-AWS IAM," now realized via Pod Identity.
+> The filename (`0030-eks-auto-mode-irsa-substrate.md`) is **retained for link
+> stability** — ADRs 0026/0027/0028/0029 all cross-link it, so the on-disk name is
+> kept and only the display text was corrected to "Pod Identity" (the lower-risk
+> path vs. a rename + four cross-link edits). The title and the body below have now
+> been reconciled with the shipped CDK (`deploy/cdk/lib/`): Pod Identity, no OIDC
+> provider, no `WebIdentityPrincipal`, no `CfnJson` trust map.
 
 ## Context
 
@@ -45,34 +49,37 @@ templates including `serviceaccount.yaml`, `deployment.yaml`, `hpa.yaml`,
 `pdb.yaml`, `networkpolicy.yaml`, `servicemonitor.yaml`, `prometheusrule.yaml`,
 `externalsecret.yaml`, `leader-election-rbac.yaml`, and `ingress.yaml`. The chart
 **presupposes a Kubernetes cluster it does not create**, and presupposes
-cluster-side machinery the chart cannot provision: an IRSA-annotated
-ServiceAccount, an external-secrets ClusterSecretStore, a Prometheus operator for
+cluster-side machinery the chart cannot provision: a ServiceAccount bound to an
+AWS IAM role, an external-secrets ClusterSecretStore, a Prometheus operator for
 the ServiceMonitor, and a load balancer for the ingress/service. On AWS, the
 operator stands all of this up by hand (`docs/deployment/aws.md`).
 
 This is RouteIQ's largest gap: **a chart with no cluster under it.** The peer
 ADRs in this set (0026 AppConfig, 0027 AMP/AMG, 0028 Aurora, 0029 ElastiCache)
-all assume a provisioned cluster with IRSA so workloads can call AWS services
-without static keys. This ADR provisions that cluster.
+all assume a provisioned cluster whose pods can call AWS services without static
+keys. This ADR provisions that cluster.
 
 vllm-sr-on-aws provisions it in `cdk/lib/eks_cluster_construct.py`: an EKS Auto
-Mode cluster (L1 `CfnCluster`) with an OIDC provider and an IRSA factory, where
-all Kubernetes objects are applied out-of-band via kubectl/Helm. That boundary —
-**CDK provisions cluster + IAM + OIDC; Helm deploys the app** — is exactly how
-RouteIQ's chart should land.
+Mode cluster (L1 `CfnCluster`) with a pod→IAM binding, where all Kubernetes
+objects are applied out-of-band via kubectl/Helm. That boundary — **CDK provisions
+cluster + IAM; Helm deploys the app** — is exactly how RouteIQ's chart should
+land. (VSR's reference used an OIDC provider + IRSA factory; RouteIQ's shipped
+port realizes the same pod→IAM binding via EKS Pod Identity — see the Amendment
+and the Decision below.)
 
 ## Decision
 
-Provision an **EKS Auto Mode** cluster in IaC with an **IRSA factory**, and
-deploy RouteIQ's existing Helm chart onto it. CDK owns the cluster, the OIDC
-provider, the node/cluster IAM roles, and a per-workload IRSA role; the chart and
-all manifests are applied by kubectl/Helm in CI, never by CDK.
+Provision an **EKS Auto Mode** cluster in IaC with an **EKS Pod Identity** pod→IAM
+binding, and deploy RouteIQ's existing Helm chart onto it. CDK owns the cluster,
+the node/cluster IAM roles, the defensive `eks-pod-identity-agent` add-on, and a
+per-workload pod role + `CfnPodIdentityAssociation`; the chart and all manifests
+are applied by kubectl/Helm in CI, never by CDK.
 
-### EKS Auto Mode cluster (`eks_cluster_construct.py:151-210`)
+### EKS Auto Mode cluster (`deploy/cdk/lib/eks_cluster_construct.py:161-208`)
 
 Use the **L1 `eks.CfnCluster`** (Auto Mode is not on the stable L2, and the alpha
-L2 is breaking-change-prone — `:16-22`). K8s 1.33 (`:62,155`). Three Auto Mode
-blocks toggled together (`:174-187`):
+L2 is breaking-change-prone). K8s 1.33 (`:67`). Three Auto Mode blocks toggled
+together (`:182-194`):
 
 - **ComputeConfig** `enabled=True`, `node_pools=["general-purpose","system"]`,
   `node_role_arn=<node role>` (`:175-179`) — Auto Mode manages capacity; the two
@@ -87,56 +94,64 @@ CoreDNS/kube-proxy/VPC-CNI. `access_config.authentication_mode="API"` with
 identities each get an explicit `CfnAccessEntry` (`:311-344`) — the creator-admin
 flag only covers the CFN exec role, not a human's kubectl identity.
 
-### OIDC provider + IRSA factory — the CfnJson gotcha (`eks_cluster_construct.py:219-309`)
+### Pod Identity binding — no OIDC, no CfnJson (`eks_cluster_construct.py:254-325`)
 
-An `iam.OpenIdConnectProvider` from the cluster's issuer attribute with
-`client_ids=["sts.amazonaws.com"]` (`:219-224`). The construct exposes
-`oidc_provider_issuer` — the **scheme-stripped, ARN-derived** issuer (`:226-240`).
+The shipped construct binds pods to IAM via **EKS Pod Identity**, not IRSA. Two
+pieces:
 
-**The load-bearing gotcha** (`:275-300`): an IRSA trust policy uses the OIDC
-issuer as a **map key** (`<oidc>:sub` / `<oidc>:aud`), and CloudFormation map
-keys must be literal strings at synth — a `Fn::GetAtt` token cannot be a key. The
-fix wraps the inner condition map in **`CfnJson`** so the keys resolve at deploy
-time:
+1. A defensive **`eks-pod-identity-agent` `CfnAddon`** (`:263-270`,
+   `resolve_conflicts="OVERWRITE"`, `DependsOn` the cluster). AWS docs claim the
+   agent is built into Auto Mode, but the production VSR construct installs it by
+   hand (`:391-398`, verified), so RouteIQ emits it explicitly and idempotently —
+   re-applying a built-in add-on is then a harmless no-op.
+2. A **`pod_identity_association(namespace, service_account, role)`** helper
+   (`:285-325`) that emits one `eks.CfnPodIdentityAssociation` keyed on
+   `(namespace, serviceAccount)`. It `DependsOn` the agent add-on so it never
+   races the agent (`:324`).
 
-```python
-string_equals = CfnJson(self, f"{cid}TrustKeys", value={
-    f"{oidc}:aud": "sts.amazonaws.com",
-    f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}",
-})
-role = iam.Role(..., assumed_by=iam.WebIdentityPrincipal(
-    self.oidc_provider_arn, conditions={"StringEquals": string_equals}))
-```
+The binding rests on a **static `pods.eks.amazonaws.com` service-principal
+trust** — the pod role's trust document grants `sts:AssumeRole` + `sts:TagSession`
+to `pods.eks.amazonaws.com` (`routeiq_stack.py:177-191`). There is **no
+`OpenIdConnectProvider`, no `oidc_provider_issuer` derivation, no `CfnJson`
+token-keyed trust map, and no `WebIdentityPrincipal`** — and because creds come
+from the pod-identity agent rather than an STS web-identity exchange,
+`sts:AssumeRoleWithWebIdentity` is **not** granted. That entire IRSA surface
+(OIDC provider, the `CfnJson(...)` condition-key wrapper, the
+`.replace("https://")` issuer-derivation no-op, the L2 `addServiceAccount`
+trade-off) is **deleted** on the Pod Identity path; it survives only as the
+*rejected* VSR reference (`irsa_role()` factory) the Amendment supersedes.
 
-Two silent-failure traps the construct documents (`:231-237,281-286`): (a)
-`issuer_url.replace("https://","")` is a **silent no-op on an unresolved CFN
-token** — it produced `https://...:sub` keys and `AssumeRoleWithWebIdentity`
-AccessDenied (root-caused live 2026-06-08); always use the ARN-derived
-`oidc_provider_issuer`. (b) The L2 `cluster.addServiceAccount` would hide all of
-this, but the L1 `CfnCluster` required for Auto Mode forces the manual CfnJson
-path.
+RouteIQ provisions a **single** pod role (`routeiq_stack.py:177-206`) bound to the
+gateway ServiceAccount, granted exactly what the peer ADRs need: `aps:RemoteWrite`
+(ADR-0027), `rds-db:connect` (ADR-0028), `elasticache:Connect` (ADR-0029),
+AppConfig read (ADR-0026), Bedrock invoke. The chart's `serviceaccount.yaml`
+needs **no `eks.amazonaws.com/role-arn` annotation** — the CDK-pinned
+`(namespace, serviceAccount)` is the entire key.
 
-For RouteIQ, an `irsa_role(namespace, service_account, ...)` factory mints one
-role per workload SA. The chart's `serviceaccount.yaml` is annotated with that
-role ARN (`eks.amazonaws.com/role-arn`), and the role is granted exactly what the
-peer ADRs need: `aps:RemoteWrite` (ADR-0027), `rds-db:connect` (ADR-0028),
-`elasticache:Connect` (ADR-0029), AppConfig read (ADR-0026), Bedrock invoke.
-
-### CDK/Helm boundary (`eks_cluster_construct.py:24-28,242-259`)
+### CDK/Helm boundary (`eks_cluster_construct.py:276-283`, `routeiq_stack.py:376-379`)
 
 This construct **does not** apply Kubernetes objects — no CDK `KubernetesManifest`
 or `HelmChart`. It emits CfnOutputs (`ClusterName`, `ClusterEndpoint`,
-`OidcProviderArn`, `OidcProviderIssuerUrl`, the per-SA IRSA role ARN) (`:242-259`)
-that RouteIQ's Helm chart consumes. The chart is applied by `helm upgrade` /
-`kubectl` in CI — the boundary RouteIQ already implicitly assumes.
+`NodeRoleName`, `KubectlConfigCommand`) (`eks_cluster_construct.py:276-283`) that
+RouteIQ's Helm chart / CI consume. The IRSA-only `OidcProviderArn` /
+`OidcProviderIssuerUrl` outputs are **dropped** — there is no OIDC provider on the
+Pod Identity path (`routeiq_stack.py:376-379`), and the pod→role binding is the
+CDK-side association, not a chart-consumed role ARN. The chart is applied by
+`helm upgrade` / `kubectl` in CI — the boundary RouteIQ already implicitly
+assumes.
 
-### Observability already wired (`eks_cluster_construct.py:346-967`)
+### Observability — P0-minimal, the rest deferred to P2 (`eks_cluster_construct.py:327-378`)
 
-The construct's `enable_container_insights` provisions the
-`amazon-cloudwatch-observability` addon, a CDK-created routing log group, the
-**per-model dimensioned `routing_latency_ms_by_model` metric filter**
-(`:757-767`, see ADR-0027), 7 alarms, a dashboard, and an SNS topic. RouteIQ's
-chart `servicemonitor.yaml` / `prometheusrule.yaml` complement this.
+The shipped `enable_container_insights` is **P0-minimal**: it installs the
+`amazon-cloudwatch-observability` add-on (per-pod/per-container Container Insights
++ Fluent Bit log forwarding) — its CloudWatch agent gets permissions via a Pod
+Identity association, reusing the same helper (`:374-378`) — and **CDK-creates the
+routing log group** the P2 metric filters attach to. It ships **no alarms, no
+dashboard, no SNS topic, and no routing MetricFilter** (`:338`); the per-model
+dimensioned filter and the CW-Logs-native alarms are **owned by P2**
+(`ObservabilityConstruct`, ADR-0027) — which ships **3** routing alarms, not the
+VSR ECS-substrate set. RouteIQ's chart `servicemonitor.yaml` /
+`prometheusrule.yaml` complement this.
 
 ### Three HA/ops lessons for the chart (app-layer, from `../architecture/aws-rearchitecture/vllmsr-patterns.md`)
 
@@ -152,10 +167,12 @@ gate a working RouteIQ deploy on Auto Mode:
    A ReadWriteOnce EBS PVC with a RollingUpdate strategy deadlocks (old pod holds
    the volume, new pod cannot attach). Any RouteIQ Deployment that mounts an RWO
    EBS PVC must set `strategy.type: Recreate`.
-3. **`kubectl apply -k` (kustomize) clobbers the IRSA SA annotation.** Kustomize
-   overwrites the ServiceAccount's `role-arn` annotation, breaking IRSA. Deploy
-   scripts must `envsubst` the annotation in (or use `helm upgrade`, which
-   templates it), never a bare `apply -k` on the SA.
+3. **(Mooted under Pod Identity) `kubectl apply -k` clobbering the SA role-arn
+   annotation.** Under IRSA, kustomize overwrote the ServiceAccount's
+   `eks.amazonaws.com/role-arn` annotation and broke the binding. With Pod
+   Identity the binding is keyed on `(namespace, serviceAccount)` by the CDK-side
+   association and there is **no SA annotation to clobber**, so this foot-gun no
+   longer applies (see the Amendment). Retained here for the IRSA-era record.
 
 ## Consequences
 
@@ -165,15 +182,20 @@ gate a working RouteIQ deploy on Auto Mode:
   deploys onto a provisioned EKS Auto Mode cluster with no manual setup.
 - **Auto Mode removes node ops.** No Karpenter templates, no node group sizing,
   no CoreDNS/CNI/kube-proxy management.
-- **IRSA, no static keys.** Every AWS dependency in ADRs 0026-0029 is reached via
-  a per-SA IRSA role; nothing needs a static AWS key.
+- **Pod Identity, no static keys.** Every AWS dependency in ADRs 0026-0029 is
+  reached via the pod role bound by a `CfnPodIdentityAssociation`; nothing needs a
+  static AWS key, and there is no OIDC provider or SA annotation to manage.
 - **Clean CDK/Helm split.** CDK owns infra + IAM; Helm owns the app — matching
   RouteIQ's chart-first reality and keeping app deploys fast and out-of-band.
 
 ### Negative
 
-- **L1 `CfnCluster` ergonomics.** Auto Mode forces the L1 escape hatch and the
-  manual CfnJson IRSA trust map — more verbose than the L2 `addServiceAccount`.
+- **L1 `CfnCluster` ergonomics.** Auto Mode is realized via the L1 escape hatch
+  (a choice inherited from the VSR port; aws-cdk-lib's newer `aws-eks-v2` now
+  offers Auto Mode on an L2). On L1 there is no `addServiceAccount` helper — but
+  with Pod Identity the pod→IAM wiring is a single `CfnPodIdentityAssociation`
+  plus the defensive agent add-on, far less verbose than the L1 IRSA + CfnJson
+  trust map the VSR reference required.
 - **Two-tool deploy.** CDK for infra + Helm/kubectl for the app means two deploy
   steps and access-entry management for the CI identity.
 - **Three app-layer foot-guns.** The CIDR-lock field, RWO+Recreate, and
@@ -185,7 +207,8 @@ gate a working RouteIQ deploy on Auto Mode:
 ### Alternative A: Manual `eksctl` / console cluster + manual Helm (status quo)
 
 - **Pros**: No CDK.
-- **Cons**: 100% manual; no reproducible IRSA, OIDC, or access entries — the gap.
+- **Cons**: 100% manual; no reproducible pod-IAM binding or access entries — the
+  gap.
 - **Rejected**: Manual provisioning is the gap.
 
 ### Alternative B: Standard EKS managed node groups (not Auto Mode)

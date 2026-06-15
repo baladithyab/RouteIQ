@@ -53,7 +53,7 @@ timeout should keep `min_capacity=0.5`. A writer + one reader, both
 static password. A `grant_iam_db_connect(role)` helper writes an `rds-db:connect`
 statement scoped to
 `arn:...:rds-db:...:dbuser:{cluster_resource_identifier}/{db_user}`
-(`:473-479`). For RouteIQ the workload IRSA role (ADR-0030) is granted, and
+(`:473-479`). For RouteIQ the workload's Pod Identity role (ADR-0030) is granted, and
 `database.py` builds a `DATABASE_URL` whose auth token is minted from IAM rather
 than a static secret. The Secrets Manager credential remains for break-glass DBA
 access only.
@@ -101,7 +101,7 @@ behind a slow database rollback.
 
 - **Managed, auto-scaling DB.** Scale-to-zero collapses idle cost; no instance
   sizing or failover management.
-- **No static DB password on the hot path.** IAM auth + IRSA; the secret is
+- **No static DB password on the hot path.** IAM auth + Pod Identity; the secret is
   break-glass only, and it rotates every 30 days.
 - **Schema is deploy-time, in-VPC.** The bootstrap Lambda runs RouteIQ's
   migrations at deploy, removing the first-boot migration race and giving every
@@ -158,4 +158,4 @@ behind a slow database rollback.
 - `src/litellm_llmrouter/migrations.py` — schema migrations (bootstrap reuse)
 - [ADR-0004: asyncpg Connection Pooling](0004-asyncpg-connection-pooling.md)
 - [ADR-0020: Governance Layer](0020-governance-layer.md)
-- [ADR-0030: EKS Auto Mode + IRSA Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)
+- [ADR-0030: EKS Auto Mode + Pod Identity Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)

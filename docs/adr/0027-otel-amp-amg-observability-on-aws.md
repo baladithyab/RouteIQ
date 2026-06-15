@@ -40,8 +40,8 @@ An `aps.CfnWorkspace` (alias `routeiq-{env}`). RouteIQ's pods already expose a
 Prometheus endpoint (the chart's `ServiceMonitor`); metrics reach AMP via an
 **ADOT collector sidecar `remote_write`** to the hand-built remote-write URL
 `https://aps-workspaces.{region}.amazonaws.com/workspaces/{wsid}/api/v1/remote_write`
-(`:329-332`). The workload's IRSA role (ADR-0030) needs `aps:RemoteWrite` on the
-workspace ARN.
+(`:329-332`). The workload's Pod Identity role (ADR-0030) needs `aps:RemoteWrite`
+on the workspace ARN.
 
 ### Amazon Managed Grafana (`observability_construct.py:335-403`)
 
@@ -80,16 +80,30 @@ metric family, e.g.
 share widget. Where a dimension is runtime-learned, use `SEARCH()` MathExpressions
 (`eks_cluster_construct.py:866-920`).
 
-### Alarms + SNS (`observability_construct.py:405-412,578-1116`)
+### Alarms + SNS (`observability_construct.py:405-449`)
 
-A single `routeiq-{env}-oncall` SNS topic (`:405-412`, TLS-enforced resource
-policy) is the action for every alarm: p99 latency (`:578-603`), error/throttle
-surge, semantic-cache hit-ratio collapse (`:714-754`), pod memory >90% OOMKill
-indicator (`eks_cluster_construct.py:616-638`), and an AnomalyDetectionAlarm for
-latency (`:827-841`). These map onto the RouteIQ metrics RouteIQ already exports
-via `metrics.py`. **The log group the filters read must be CDK-created** — a CFN
-MetricFilter requires the group to pre-exist, and Fluent Bit's `auto_create_group`
-only makes it at runtime (`eks_cluster_construct.py:712-721`).
+A single `routeiq-{env}-oncall` SNS topic (TLS-enforced resource policy) is the
+action for every alarm. **Three** CW-Logs-native alarms read the routing metric
+filters (`:367-449`): (1) a routing-latency ceiling — `routing_latency_ms`
+Maximum over a 30s absolute threshold (`:367-383`); (2) a router-error-log count
+— `router_error_log_count` Sum > 10 over 5min (`:393-408`); and (3) a
+routing-latency anomaly-detection alarm — a self-trained 3-sigma band on average
+`routing_latency_ms`, paging only on abnormally HIGH latency (`:422-437`). Each is
+wired to BOTH an alarm action and an OK action on the topic so recovery clears
+(`:439-449`). These read the metric filters over the routing log group and map
+onto the RouteIQ metrics RouteIQ exports via `metrics.py`.
+
+**The VSR ECS alarm set is dropped.** vllm-sr's ObservabilityConstruct also
+shipped a `cdk-monitoring-constructs` `MonitoringFacade` (ALB/Fargate alarms) and
+the blue/green `llm_*` rollback alarms (p99 / jailbreak / hallucination /
+semantic-cache hit-ratio). Those depend on an ECS/Fargate data plane and a
+running router; RouteIQ's substrate is EKS Auto Mode (ADR-0030), so that set was
+**not** ported — only the routing metric filters + the three CW-Logs-native
+alarms that read them are kept (`observability_construct.py:23-32`).
+
+**The log group the filters read must be CDK-created** — a CFN MetricFilter
+requires the group to pre-exist, and Fluent Bit's `auto_create_group` only makes
+it at runtime (`eks_cluster_construct.py:712-721`).
 
 ### Field-name reconciliation (important)
 
@@ -149,15 +163,21 @@ directly. This keeps one contract from span → metric filter → dashboard.
 
 ## References
 
-- `cdk/lib/observability_construct.py` (vllm-sr-on-aws) — AMP `CfnWorkspace`
-  (`:321-333`), AMG `grafana.CfnWorkspace` (`:335-403`), Metrics-Insights
-  dashboard (`:1228-1401`), metric filters (`:818-827`), alarms + SNS
-  (`:405-412,578-1116`)
+- `cdk/lib/observability_construct.py` (vllm-sr-on-aws, the upstream port source)
+  — AMP `CfnWorkspace` (`:321-333`), AMG `grafana.CfnWorkspace` (`:335-403`),
+  Metrics-Insights dashboard (`:1228-1401`), metric filters (`:818-827`), the full
+  VSR alarm + SNS surface (`:405-412,578-1116`)
+- `deploy/cdk/lib/observability_construct.py` (RouteIQ, the shipped port) — AMP +
+  flag-gated AMG + the single SNS topic + 3 metric filters + the **3** shipped
+  CW-Logs-native alarms (`:367-449`); the VSR ECS/blue-green alarm set is dropped
+  (port-trim rationale `:23-32`)
 - `cdk/lib/eks_cluster_construct.py` (vllm-sr-on-aws) — per-model dimensioned
   filter `routing_latency_ms_by_model` (`:757-767`), `SEARCH()` widgets
   (`:866-920`), CDK-created log-group ordering lesson (`:712-721`)
 - `../architecture/aws-rearchitecture/vllmsr-patterns.md` — "observability_construct.py: AMP (CfnWorkspace) +
-  AMG (grafana CfnWorkspace, gated) + CW dashboard + 9 alarms + 3 metric filters"
+  AMG (grafana CfnWorkspace, gated) + CW dashboard + 9 alarms + 3 metric filters".
+  The "9 alarms" is the VSR ECS-substrate count; RouteIQ's EKS port keeps the 3
+  metric filters but only the 3 routing alarms that read them (see body)
 - `src/litellm_llmrouter/telemetry_contracts.py` — `gen_ai.*` contract (`:664-680`)
 - `src/litellm_llmrouter/observability.py` — emitter of the structured
   `routing_decision` JSON line (`build_routing_decision_record` `:422`,
@@ -165,4 +185,4 @@ directly. This keeps one contract from span → metric filter → dashboard.
   `metrics.py` emit the OTel span + counters/histograms, not the JSON line
 - [ADR-0019: OpenTelemetry GenAI Semantic Conventions](0019-otel-genai-conventions.md)
 - [ADR-0008: OIDC/SSO Identity Integration](0008-oidc-identity-integration.md)
-- [ADR-0030: EKS Auto Mode + IRSA Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)
+- [ADR-0030: EKS Auto Mode + Pod Identity Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)

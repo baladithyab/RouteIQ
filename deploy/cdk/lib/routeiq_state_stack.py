@@ -209,6 +209,26 @@ class RouteIqStateStack(Stack):
         # in-stack replay_store_sg. Only cross-stack edge stays State -> P0; no cycle.
         # ASCII-only description. Skipped (apply out-of-band) when vpce_sg is not
         # reachable (separate-pipeline mode), same posture as the pod-role grants.
+        #
+        # POSTURE DECISION (RouteIQ-9ad6): the P0 vpce_sg is a SHARED interface-endpoint
+        # SG fronting all FIVE endpoints (ECR, ECR_DOCKER, CloudWatch-Logs,
+        # SecretsManager, Bedrock-Runtime -- see network_construct.py). Admitting
+        # replay_store_sg on 443 to vpce_sg therefore lets the bootstrap Lambda reach
+        # ALL FIVE endpoints, not just Secrets Manager (which is all it actually needs).
+        # A strict least-privilege split would carve a dedicated secrets-only endpoint
+        # SG and admit the Lambda only to that. We deliberately ACCEPT the shared-vpce
+        # posture instead, with this justification:
+        #   - the bootstrap Lambda is a transient, deploy-time-only break-glass leader
+        #     (runs on CFN Create/Update, then idles), not a long-lived data-plane role;
+        #   - the over-reach is endpoint REACHABILITY only -- it confers no IAM rights:
+        #     the Lambda's execution-role policy is still scoped to GetSecretValue on the
+        #     one master secret ARN (+ the secret's KMS key), so it cannot actually use
+        #     ECR/Logs/Bedrock even though their ENIs are network-reachable;
+        #   - splitting a per-endpoint SG (a second InterfaceVpcEndpoint set + SG + the
+        #     same cross-stack-cycle dance) is materially heavier P0 surface for a
+        #     reachability-only delta on a deploy-time actor.
+        # If the bootstrap is ever promoted to a standing/long-lived role, revisit and
+        # carve the dedicated secrets-only endpoint SG.
         self.vpce_bootstrap_ingress: ec2.CfnSecurityGroupIngress | None = None
         if resolved_vpce_sg is not None:
             self.vpce_bootstrap_ingress = ec2.CfnSecurityGroupIngress(

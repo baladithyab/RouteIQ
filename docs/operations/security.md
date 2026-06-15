@@ -235,9 +235,107 @@ securityContext:
       - ALL
 ```
 
+## OIDC / SSO Client Authentication
+
+When `oidc.enabled=true`, the chart wires the OIDC issuer URL, client ID, and
+(optionally) the client secret into the gateway. The client secret is only
+emitted when `oidc.existingSecret` is set:
+
+```yaml
+oidc:
+  enabled: true
+  issuerUrl: https://your-tenant.example.com/
+  clientId: routeiq-gateway
+  # Wire the confidential-client secret. Leave empty ONLY for a public-client IdP.
+  existingSecret: <release>-routeiq-gateway-secrets   # e.g. the ESO target secret
+  existingSecretKey: oidc-client-secret               # MUST match the synced key name
+```
+
+!!! warning "Silent public-client fallback (RouteIQ-3302)"
+    If `oidc.enabled=true` but `oidc.existingSecret` is unset — **or** the
+    `oidc.existingSecretKey` does not match the key actually present in the
+    referenced Secret — `ROUTEIQ_OIDC_CLIENT_SECRET` is never set and the gateway
+    silently runs OIDC in **public-client mode** (the authorization-code exchange
+    happens without client authentication). The Helm `NOTES` output prints a loud
+    warning on this path, but the deploy itself still succeeds. Only leave
+    `existingSecret` empty if you intentionally registered a public client at the
+    IdP. For a confidential client, wire the secret (via External Secrets Operator
+    or a pre-created K8s Secret) and confirm the key name alignment before relying
+    on SSO.
+
 ## Network Policies
 
-Restrict traffic using Kubernetes Network Policies:
+Restrict traffic using Kubernetes Network Policies (`networkPolicy.enabled=true`,
+**disabled by default**):
 
 - **Ingress**: Allow traffic only from application services or ingress controller
 - **Egress**: Allow traffic only to LLM provider APIs and internal dependencies (Redis, Postgres)
+
+### Egress posture: wide public egress by default (RouteIQ-da05)
+
+This is an **accepted, documented tradeoff**, not an oversight.
+
+When `networkPolicy.enabled=true`, the egress rule controlled by
+`networkPolicy.egress.allowHttpsExternal` (**default `true`**) emits an allow to
+`0.0.0.0/0` minus the RFC-1918 private ranges on TCP 443/80. That is a wide
+public-internet egress — a real **data-exfiltration surface**: a compromised pod
+can open outbound 443/80 connections to any public address.
+
+**Why the wide default exists.** A Kubernetes `NetworkPolicy` egress rule can only
+match by CIDR — it cannot match by DNS name or by an AWS managed prefix-list. The
+common managed-gateway deployment needs two kinds of public reachability that no
+tight static CIDR can express:
+
+- **S3 via the gateway VPC endpoint.** Gateway-endpoint traffic egresses to
+  AWS-owned S3 prefix ranges (not the VPC CIDR), so `egress.inVpc` does **not**
+  cover it. ML model-artifact downloads and S3 config-sync depend on this.
+- **Public LLM providers** (OpenAI, Anthropic, etc.) on rotating public 443 IPs
+  that an allowlist would have to chase continuously.
+
+So the wide `0.0.0.0/0` allow is the only static rule that keeps both working with
+zero maintenance. We accept reachability + low operational burden over a tight
+default. Because `networkPolicy.enabled` itself defaults to `false`, this rule is
+inert until an operator opts into NetworkPolicy at all.
+
+!!! danger "Enabling NetworkPolicy on AWS as-shipped is an outage"
+    `allowHttpsExternal`'s RFC-1918 carve-out blocks the three in-VPC targets the
+    pod must reach: Aurora (5432), ElastiCache (6379), and the in-VPC interface
+    endpoints for Bedrock / Secrets Manager / ECR / CloudWatch Logs (443). Bedrock
+    is the non-obvious one — `private_dns_enabled` resolves
+    `bedrock-runtime.<region>.amazonaws.com` to an in-VPC ENI, so the rule labelled
+    "HTTPS to external LLM providers" blocks the primary provider. Set
+    `egress.inVpc.enabled=true` (with `inVpc.cidr` = the CDK VPC CIDR, default
+    `10.40.0.0/16`) whenever you enable NetworkPolicy on AWS.
+
+### Locking down egress (strict default-deny)
+
+For regulated, Bedrock-only, or no-public-LLM deployments where the data-exfil
+risk outweighs the convenience, drop the wide rule and replace it with an explicit
+allowlist:
+
+```yaml
+networkPolicy:
+  enabled: true
+  egress:
+    allowDns: true
+    # 1. Drop the 0.0.0.0/0 public-egress rule entirely.
+    allowHttpsExternal: false
+    # 2. Keep in-VPC reachability (Aurora / ElastiCache / VPC-endpoint Bedrock).
+    inVpc:
+      enabled: true
+      cidr: "10.40.0.0/16"          # MUST equal the CDK vpc_cidr
+      ports: [5432, 6379, 443]
+    # 3. Add an EXPLICIT allowlist for any remaining public targets you still need.
+    to:
+      - ipBlock: { cidr: "52.219.0.0/16" }    # an S3 service prefix (region-specific)
+        ports: [{ protocol: TCP, port: 443 }]
+      - ipBlock: { cidr: "203.0.113.10/32" }  # egress forward-proxy
+        ports: [{ protocol: TCP, port: 443 }]
+```
+
+With `allowHttpsExternal=false` and no matching `egress.to` rule, all non-DNS,
+non-inVpc egress is **denied**. Verify your S3 prefixes and provider/proxy targets
+are covered **before** rollout: an over-tight lockdown fails the same way the wide
+default would — silent connection timeouts on layer/config download or provider
+calls. Source the current S3 service CIDRs from the AWS `ip-ranges.json` feed (the
+`S3` service in your region), and re-confirm them periodically since they change.

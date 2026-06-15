@@ -148,4 +148,4 @@ create-then-delete window.
 - `src/litellm_llmrouter/semantic_cache.py` — L2 Redis vector cache
 - [ADR-0005: Redis Singleton Client](0005-redis-singleton.md)
 - [ADR-0021: Externalize In-Process State to Redis](0021-externalized-state.md)
-- [ADR-0030: EKS Auto Mode + IRSA Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)
+- [ADR-0030: EKS Auto Mode + Pod Identity Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)

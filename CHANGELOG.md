@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Helm chart: env-var ordering bug where `DATABASE_URL` was emitted BEFORE
+  `POSTGRES_PASSWORD`. Kubernetes does a single-pass left-to-right `$(VAR)`
+  expansion over `env`, so the `$(POSTGRES_PASSWORD)` substring inside the
+  composed `DATABASE_URL` only resolves when `POSTGRES_PASSWORD` is declared
+  EARLIER in the list; otherwise it stays a literal and Postgres auth fails.
+  The chart's `_helpers.tpl` now orders `POSTGRES_PASSWORD` before
+  `DATABASE_URL` (fixed as a side effect of the P1 AWS data-plane work).
+
+### Notes
+- Back-port decision (RouteIQ-c469): the `DATABASE_URL`/`POSTGRES_PASSWORD`
+  ordering bug above shipped in the `1.0.0-rc1` chart. It is FIXED on `main`
+  and ships in the next release. We are NOT cutting a `1.0.0-rc1.x` patch for
+  it: `1.0.0-rc1` is a release candidate (pre-GA), the bug only affects the
+  Shape-B composed-`DATABASE_URL` external-Postgres path, and the documented
+  workaround is to order the two env vars correctly (or supply a pre-composed
+  `DATABASE_URL` secret). If a `1.0.0-rc1.x` patch is cut for an unrelated
+  reason, fold this `_helpers.tpl` ordering fix in.
+
 ## [1.0.0-rc1] — 2026-04-02
 
 ### Fixed

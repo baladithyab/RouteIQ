@@ -20,6 +20,12 @@ from typing import Any, Callable
 
 from litellm._logging import verbose_proxy_logger
 
+# Floor for the AppConfig server-hinted next-poll interval. The data-plane API
+# enforces a 15s minimum on RequiredMinimumPollIntervalInSeconds, so a smaller
+# (or zero) NextPollIntervalInSeconds should never occur in practice; clamping
+# defensively guards the sync thread against a busy-loop if it ever does.
+_APPCONFIG_MIN_POLL_INTERVAL_SECONDS = 15
+
 
 @dataclasses.dataclass
 class ConfigDiffResult:
@@ -129,6 +135,10 @@ class ConfigSyncManager:
         # logged: it is an opaque next-poll token, not a credential, but logging
         # it would leak a usable handle, so it stays out of every log statement.
         self._appconfig_token: str | None = None
+        # Server-recommended next-poll delay returned by the AppConfig data-plane
+        # in NextPollIntervalInSeconds. None until the first poll; the sync loop
+        # honors it (clamped to a floor) in preference to the static interval.
+        self._appconfig_next_poll_interval: int | None = None
         self._stop_event = threading.Event()
         self._sync_thread: threading.Thread | None = None
         self._reload_count = 0
@@ -347,6 +357,9 @@ class ConfigSyncManager:
         poll. The data plane returns an EMPTY ``Configuration`` body when the
         config is UNCHANGED (the same "no diff" semantics as the S3 ETag path) and
         a ``NextPollConfigurationToken`` that MUST be carried into the next call.
+        It also returns ``NextPollIntervalInSeconds`` — the server's recommended
+        delay before the next poll — which is captured (clamped to a floor) so the
+        sync loop can honor it instead of the static interval.
 
         Returns True when a changed body was written to ``local_config_path``.
 
@@ -386,6 +399,15 @@ class ConfigSyncManager:
             next_token = response.get("NextPollConfigurationToken")
             if next_token:
                 self._appconfig_token = next_token
+
+            # Honor the server's recommended next-poll delay. The data plane
+            # returns NextPollIntervalInSeconds on every response (changed or
+            # not); the sync loop uses it for the next sleep, clamped to a floor.
+            next_interval = response.get("NextPollIntervalInSeconds")
+            if next_interval:
+                self._appconfig_next_poll_interval = max(
+                    int(next_interval), _APPCONFIG_MIN_POLL_INTERVAL_SECONDS
+                )
 
             # An empty body means "unchanged" - the data plane only returns content
             # when it differs from what this token last saw (like the S3 ETag).
@@ -471,10 +493,23 @@ class ConfigSyncManager:
             except Exception as e:
                 verbose_proxy_logger.error(f"Config sync error: {e}")
 
-            # Wait for next sync interval
-            self._stop_event.wait(self.sync_interval)
+            # Wait for the next sync interval. AppConfig provides a per-poll
+            # server hint (NextPollIntervalInSeconds) that we honor in preference
+            # to the static interval; S3/GCS fall back to the static interval.
+            self._stop_event.wait(self._next_poll_delay())
 
         verbose_proxy_logger.info("Config sync stopped")
+
+    def _next_poll_delay(self) -> int:
+        """Delay (seconds) the sync loop should sleep before the next poll.
+
+        Honors the AppConfig data-plane's server-recommended
+        ``NextPollIntervalInSeconds`` (clamped to a floor) once a poll has
+        returned one; otherwise falls back to the static ``sync_interval``.
+        """
+        if self.appconfig_sync_enabled and self._appconfig_next_poll_interval:
+            return self._appconfig_next_poll_interval
+        return self.sync_interval
 
     def _trigger_reload(self):
         """Trigger config reload by sending SIGHUP."""

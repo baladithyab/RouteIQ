@@ -53,6 +53,27 @@ Then update the release:
 {{- end }}
 {{- end }}
 
+{{- if and .Values.oidc.enabled (not .Values.oidc.existingSecret) }}
+
+>>> WARNING (RouteIQ-3302): OIDC PUBLIC-CLIENT FALLBACK <<<
+  oidc.enabled=true but oidc.existingSecret is UNSET, so NO client secret is
+  wired (ROUTEIQ_OIDC_CLIENT_SECRET is absent). The gateway will run OIDC in
+  PUBLIC-CLIENT mode -- the IdP authorization-code exchange happens WITHOUT
+  client authentication. This is an intentional opt-in for public-client IdP
+  setups, but it is a SILENT downgrade if you expected a confidential client.
+
+  If your IdP issued a client secret, wire it before relying on SSO:
+    1. Sync the secret (e.g. via External Secrets Operator) into the K8s Secret
+         {{ include "routeiq-gateway.fullname" . }}-secrets
+       under a key (default: oidc-client-secret).
+    2. Re-run helm with:
+         --set oidc.existingSecret={{ include "routeiq-gateway.fullname" . }}-secrets \
+         --set oidc.existingSecretKey=oidc-client-secret
+  NOTE: oidc.existingSecretKey MUST match the synced key name exactly -- a
+  mismatch renders fine but leaves ROUTEIQ_OIDC_CLIENT_SECRET absent (same
+  public-client downgrade). See docs/operations/security.md (OIDC section).
+{{- end }}
+
 Documentation:
   - Chart README: deploy/charts/routeiq-gateway/README.md
   - Full deployment guide: docs/deployment.md

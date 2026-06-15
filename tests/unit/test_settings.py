@@ -23,6 +23,7 @@ from litellm_llmrouter.settings import (
     GovernanceSettings,
     HASettings,
     HTTPClientSettings,
+    KumaraswamyThompsonSettings,
     MCPSettings,
     ManagementSettings,
     OIDCSettings,
@@ -60,6 +61,8 @@ _ENV_VARS_TO_CLEAR = (
     "ROUTEIQ_LITELLM_HOST",
     "ROUTEIQ_LITELLM_DEBUG",
     "ROUTEIQ_LLMROUTER_ROUTER_CALLBACK_ENABLED",
+    # Bare alias (no ROUTEIQ_ prefix) — bound via validation_alias
+    "LLMROUTER_GOVERNANCE_SPEND_TRACKING",
     # Nested: redis
     "ROUTEIQ_REDIS__HOST",
     "ROUTEIQ_REDIS__PORT",
@@ -1000,3 +1003,84 @@ class TestEdgeCases:
         m = ManagementSettings()
         assert m.rbac_enabled is False
         assert m.otel_enabled is True
+
+
+# ============================================================================
+# Orphan / field-honesty regressions (RouteIQ-9f9f, RouteIQ-4654)
+# ============================================================================
+
+
+class TestGovernanceSpendTrackingAlias:
+    """``llmrouter_governance_spend_tracking`` binds the BARE env var via
+    ``validation_alias`` (RouteIQ-9f9f).
+
+    The historical reader ``router_decision_callback`` reads
+    ``LLMROUTER_GOVERNANCE_SPEND_TRACKING`` (no ``ROUTEIQ_`` prefix) via
+    ``os.getenv``.  The settings field must track that same env name + default so
+    the two stay in lock-step.
+    """
+
+    def test_default_is_true(self):
+        s = GatewaySettings()
+        assert s.llmrouter_governance_spend_tracking is True
+
+    def test_bare_env_var_binds(self, monkeypatch):
+        """The bare (unprefixed) env name flips the field."""
+        monkeypatch.setenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", "false")
+        s = GatewaySettings()
+        assert s.llmrouter_governance_spend_tracking is False
+
+    def test_bare_env_var_truthy_coercion(self, monkeypatch):
+        """Standard truthy strings coerce to True, matching the os.getenv reader."""
+        for value in ("true", "1", "yes", "on"):
+            monkeypatch.setenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", value)
+            reset_settings()
+            assert get_settings().llmrouter_governance_spend_tracking is True
+
+    def test_routeiq_prefixed_form_does_not_bind(self, monkeypatch):
+        """The validation_alias replaces the prefixed form: the ``ROUTEIQ_``
+        nested name is NOT what the live reader uses, so it must not silently
+        bind (the bare name is the single source of truth)."""
+        monkeypatch.setenv("ROUTEIQ_LLMROUTER_GOVERNANCE_SPEND_TRACKING", "false")
+        s = GatewaySettings()
+        # Alias wins: prefixed form is ignored, default True stands.
+        assert s.llmrouter_governance_spend_tracking is True
+
+
+class TestKumaraswamyThompsonReservedFields:
+    """RouteIQ-4654: backend / durable / cost_reward_alpha have ZERO consumers.
+
+    ``register_kumaraswamy_thompson_strategy`` never reads them and the durable
+    Redis/Aurora posterior backends are not built.  The fields are RESERVED (env
+    forward-compat) and their docstrings must say so.  These tests pin the
+    defaults (so the env-var compat surface is unchanged) and assert the
+    'RESERVED / not yet wired' marking is present.
+    """
+
+    def test_reserved_field_defaults(self):
+        kts = KumaraswamyThompsonSettings()
+        assert kts.backend == "memory"
+        assert kts.durable == "none"
+        assert kts.cost_reward_alpha == 0.5
+
+    def test_env_vars_still_accepted(self, monkeypatch):
+        """The fields are retained for env-var compat — they must still parse."""
+        monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND", "redis")
+        monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__DURABLE", "aurora")
+        monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__COST_REWARD_ALPHA", "0.7")
+        s = GatewaySettings()
+        assert s.kumaraswamy_thompson.backend == "redis"
+        assert s.kumaraswamy_thompson.durable == "aurora"
+        assert s.kumaraswamy_thompson.cost_reward_alpha == 0.7
+
+    def test_reserved_marking_in_descriptions(self):
+        fields = KumaraswamyThompsonSettings.model_fields
+        for name in ("backend", "durable", "cost_reward_alpha"):
+            desc = fields[name].description or ""
+            assert "RESERVED" in desc, f"{name} missing RESERVED marking"
+            assert "no consumer" in desc, f"{name} missing 'no consumer'"
+
+    def test_reserved_marking_in_class_docstring(self):
+        doc = KumaraswamyThompsonSettings.__doc__ or ""
+        assert "RESERVED" in doc
+        assert "no consumer" in doc

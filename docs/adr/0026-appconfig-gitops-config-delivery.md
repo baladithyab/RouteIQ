@@ -165,4 +165,4 @@ remains the fallback when AppConfig is not configured.
 - `src/litellm_llmrouter/config_sync.py` — current S3/ETag sync (to be extended)
 - `src/litellm_llmrouter/hot_reload.py` — in-process reload callback (reused)
 - `src/litellm_llmrouter/config_loader.py` — S3 download helper (validator reuse)
-- [ADR-0030: EKS Auto Mode + IRSA Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)
+- [ADR-0030: EKS Auto Mode + Pod Identity Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)

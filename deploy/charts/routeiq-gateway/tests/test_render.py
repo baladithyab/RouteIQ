@@ -74,6 +74,26 @@ def _main_container_env(rendered: str) -> list[dict]:
     return containers[0].get("env", [])
 
 
+def _init_container_env(rendered: str, name: str) -> list[dict]:
+    """Return the env list of the named init container (e.g. db-migrate)."""
+    spec = _deployment(rendered)["spec"]["template"]["spec"]
+    for c in spec.get("initContainers", []):
+        if c.get("name") == name:
+            return c.get("env", [])
+    raise AssertionError(f"no init container named {name!r} in render")
+
+
+def _database_env_entries(env: list[dict]) -> list[dict]:
+    """Subset of env entries the externalPostgresql DATABASE_URL block emits.
+
+    RouteIQ-bed5: the db-migrate init container and the main container must emit
+    an IDENTICAL externalPostgresql.host DATABASE_URL block (same single source of
+    truth in _helpers.tpl). This isolates just those entries for equality checks.
+    """
+    names = {"DATABASE_URL", "POSTGRES_PASSWORD", "ROUTEIQ_DB_IAM_AUTH"}
+    return [e for e in env if e.get("name") in names]
+
+
 def _env_value(env: list[dict], name: str) -> str | None:
     for e in env:
         if e.get("name") == name:
@@ -137,6 +157,52 @@ def test_oidc_existing_secret_key_override_is_honored() -> None:
     )
     ref = _env_secret_ref(_main_container_env(rendered), "ROUTEIQ_OIDC_CLIENT_SECRET")
     assert ref == {"name": "my-secrets", "key": "custom-oidc-key"}
+
+
+# ---------------------------------------------------------------------------
+# DATABASE_URL emission: init container == main container (RouteIQ-bed5 DRY)
+# ---------------------------------------------------------------------------
+
+
+def test_database_url_iam_auth_init_matches_main_container() -> None:
+    # IAM-auth shape (externalPostgresql.existingSecret empty): password-less URL
+    # + ROUTEIQ_DB_IAM_AUTH=true. The db-migrate init container and the main
+    # container MUST emit the identical block (shared template, no drift).
+    rendered = _helm_template(
+        "externalPostgresql.host=db.cluster.rds.amazonaws.com",
+        "migrations.enabled=true",
+    )
+    init_db = _database_env_entries(_init_container_env(rendered, "db-migrate"))
+    main_db = _database_env_entries(_main_container_env(rendered))
+
+    assert init_db == main_db, (
+        f"init/main DATABASE_URL blocks drifted:\ninit={init_db}\nmain={main_db}"
+    )
+    # Sanity: it really is the IAM-auth shape (password-less URL + flag).
+    assert _env_value(main_db, "ROUTEIQ_DB_IAM_AUTH") == "true"
+    url = _env_value(main_db, "DATABASE_URL")
+    assert url is not None and "$(POSTGRES_PASSWORD)" not in url
+
+
+def test_database_url_static_password_init_matches_main_container() -> None:
+    # Static-password shape (Shape B, existingSecret set): POSTGRES_PASSWORD
+    # secretKeyRef + $(POSTGRES_PASSWORD)-spliced URL. Both containers identical.
+    rendered = _helm_template(
+        "externalPostgresql.host=db.cluster.rds.amazonaws.com",
+        "externalPostgresql.existingSecret=db-secret",
+        "migrations.enabled=true",
+    )
+    init_db = _database_env_entries(_init_container_env(rendered, "db-migrate"))
+    main_db = _database_env_entries(_main_container_env(rendered))
+
+    assert init_db == main_db, (
+        f"init/main DATABASE_URL blocks drifted:\ninit={init_db}\nmain={main_db}"
+    )
+    # Shape B orders POSTGRES_PASSWORD before DATABASE_URL so K8s $(VAR) expands.
+    names = [e["name"] for e in main_db]
+    assert names.index("POSTGRES_PASSWORD") < names.index("DATABASE_URL")
+    url = _env_value(main_db, "DATABASE_URL")
+    assert url is not None and "$(POSTGRES_PASSWORD)" in url
 
 
 # ---------------------------------------------------------------------------
