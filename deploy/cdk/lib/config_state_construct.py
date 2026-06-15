@@ -333,7 +333,7 @@ class ConfigStateConstruct(Construct):
             growth_type="LINEAR",
             final_bake_time_in_minutes=5,
             replicate_to="NONE",
-            description="Linear 20% per 3 minutes (60% over 12min) + 5min final bake",
+            description="Linear 20% per step, 5 steps over 12min (100%) + 5min final bake",
         )
 
         initial_version = appconfig.CfnHostedConfigurationVersion(

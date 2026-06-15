@@ -159,7 +159,10 @@ directly. This keeps one contract from span → metric filter → dashboard.
 - `../architecture/aws-rearchitecture/vllmsr-patterns.md` — "observability_construct.py: AMP (CfnWorkspace) +
   AMG (grafana CfnWorkspace, gated) + CW dashboard + 9 alarms + 3 metric filters"
 - `src/litellm_llmrouter/telemetry_contracts.py` — `gen_ai.*` contract (`:664-680`)
-- `src/litellm_llmrouter/router_decision_callback.py` / `metrics.py` — emitters
+- `src/litellm_llmrouter/observability.py` — emitter of the structured
+  `routing_decision` JSON line (`build_routing_decision_record` `:422`,
+  `emit_routing_decision_log` `:485`); `router_decision_callback.py` /
+  `metrics.py` emit the OTel span + counters/histograms, not the JSON line
 - [ADR-0019: OpenTelemetry GenAI Semantic Conventions](0019-otel-genai-conventions.md)
 - [ADR-0008: OIDC/SSO Identity Integration](0008-oidc-identity-integration.md)
 - [ADR-0030: EKS Auto Mode + IRSA Deployment Substrate](0030-eks-auto-mode-irsa-substrate.md)

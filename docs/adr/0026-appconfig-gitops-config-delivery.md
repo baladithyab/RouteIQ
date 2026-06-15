@@ -50,8 +50,11 @@ the AppConfig polling contract instead of an ETag poll.
   for the YAML config (`:586-594`). The validator is attached as a
   `ValidatorsProperty(type="LAMBDA", content=<fn ARN>)` (`:631-636`) — a
   **Lambda-ARN validator, not a JSON_SCHEMA validator**, because RouteIQ's config
-  has cross-field rules (a `public` route must enable a guardrail plugin; no
-  inline secrets) that a flat JSON schema cannot express.
+  rules go beyond a flat schema: the validator parses the candidate as YAML,
+  enforces the RouteIQ-shape (a `model_list` of well-formed entries and/or a
+  `general:`/`router:` block), and denies inline secrets. (A future cross-field
+  rule such as "a `public` route must enable a guardrail plugin" is *not yet
+  enforced* by the validator — see `appconfig-validator/handler.py:114-179`.)
 - **`CfnDeploymentStrategy`** — `growth_type="LINEAR"`, `growth_factor=20`,
   `deployment_duration_in_minutes=12`, `final_bake_time_in_minutes=5`
   (`:638-648`). Config rolls out linearly with a 5-minute bake, not all-at-once.
@@ -66,10 +69,13 @@ the AppConfig polling contract instead of an ETag poll.
 
 A `lambda:InvokeFunction` `CfnPermission` grants principal
 `appconfig.amazonaws.com`, scoped to the profile ARN (`:611-624`). For RouteIQ the
-validator runs RouteIQ's own config parser (`config_loader` / settings validation)
-in a Python 3.13 Lambda (`:1171`, 15s/256MB) and **rejects on any parse error,
-inline secret, or guardrail-gating violation**. A bad config never becomes the
-deployed version — the deployment fails closed.
+validator re-implements RouteIQ's config rules inline (PyYAML only — it does NOT
+import `litellm_llmrouter`, so the asset stays self-contained;
+`appconfig-validator/handler.py`) in a Python 3.13 Lambda (`:1171`, 15s/256MB)
+and **rejects on any YAML parse error, an inline secret, or a malformed
+RouteIQ-shape** (the `model_list`/`general:`/`router:` shape check). Guardrail
+plugin gating for `public` routes is *not yet enforced* by the validator. A bad
+config never becomes the deployed version — the deployment fails closed.
 
 ### Day-2 GitOps path (`config_state_construct.py:929-1108`)
 

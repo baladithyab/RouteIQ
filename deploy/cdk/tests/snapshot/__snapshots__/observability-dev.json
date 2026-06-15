@@ -209,7 +209,7 @@
     "ConfigStateConstructAppConfigStrategy2A79B687": {
       "Properties": {
         "DeploymentDurationInMinutes": 12,
-        "Description": "Linear 20% per 3 minutes (60% over 12min) + 5min final bake",
+        "Description": "Linear 20% per step, 5 steps over 12min (100%) + 5min final bake",
         "FinalBakeTimeInMinutes": 5,
         "GrowthFactor": 20,
         "GrowthType": "LINEAR",
