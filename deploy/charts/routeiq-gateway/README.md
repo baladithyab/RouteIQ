@@ -272,6 +272,106 @@ CDK app. When the two stacks are deployed from **separate** apps/pipelines (no
 `foundation`), the grants are skipped and must be attached to the pod role
 out-of-band (both are ARN-scoped, no wildcard).
 
+## RouteIQ-on-AWS observability plane (P2: AMP + AppConfig + AWS_REGION)
+
+The P2 observability plane (Amazon Managed Prometheus — ADR-0027; AWS AppConfig
+runtime config retrieval — ADR-0026) is provisioned by the **separate**
+`RouteIqObservabilityStack` CDK stack. The chart consumes that stack's
+`CfnOutput`s as `helm upgrade --set` flags (the same "CfnOutput string → `--set`
+value" seam P1 uses), and emits `AWS_REGION` (RouteIQ-bf9f).
+
+### AWS_REGION (load-bearing on the AWS substrate)
+
+The chart emits **no** region by default. On the AWS substrate **every** boto3
+client (Bedrock invoke, AppConfig poll, AMP remote-write, S3 config sync, the
+`rds-db:connect` / `elasticache:Connect` token minting) needs a region or it
+fails. Set `aws.region` and the chart emits **both** `AWS_REGION` and
+`AWS_DEFAULT_REGION` (boto3 reads the former first, the latter as a fallback):
+
+```bash
+helm upgrade routeiq deploy/charts/routeiq-gateway --set aws.region=us-west-2
+```
+
+Default empty keeps the render byte-stable / cloud-agnostic.
+
+### Wire the AppConfig + AMP seams from the P2 CfnOutputs
+
+```bash
+STACK=RouteIqObservabilityStack-<env>
+q() { aws cloudformation describe-stacks --stack-name "$STACK" \
+        --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+
+helm upgrade routeiq deploy/charts/routeiq-gateway \
+  --set aws.region=us-west-2 \
+  --set aws.appConfig.enabled=true \
+  --set aws.appConfig.application="$(q AppConfigApplicationId)" \
+  --set aws.appConfig.environment=<env> \
+  --set aws.appConfig.profile=<profile> \
+  --set aws.amp.remoteWriteUrl="$(q AmpRemoteWriteUrl)"
+```
+
+P2-stack outputs: `AppConfigApplicationId` (→ `aws.appConfig.application`),
+`AppConfigProfileArn` / `AppConfigArn` (the polled configuration ARN),
+`AmpWorkspaceId`, `AmpRemoteWriteUrl` (→ `aws.amp.remoteWriteUrl`),
+`AlarmTopicArn`.
+
+`aws.appConfig.enabled=true` wires the gateway's `config_sync` AppConfig poll
+adapter (ADR-0026 / RouteIQ-4333) via its `ROUTEIQ_CONFIG_SYNC__APPCONFIG_*`
+settings; the pod-role grant (`appconfigdata:StartConfigurationSession` +
+`GetLatestConfiguration` scoped to the profile ARN) is **RouteIQ-569f**, applied
+CDK-side. `aws.amp.remoteWriteUrl` is emitted as `AMP_REMOTE_WRITE_URL` for an
+**ADOT collector sidecar** to read; the sidecar itself is a documented follow-up
+(`sidecars: []` is the seam) — this ships the env-var consume seam, not the
+collector. The pod-role `aps:RemoteWrite` grant is **RouteIQ-74c0/717b**, applied
+CDK-side.
+
+Every `aws.*` value defaults empty, so the env vars are emitted only when set and
+a non-AWS / no-observability deploy renders byte-identically.
+
+### Fluent Bit routing-JSON promotion (RouteIQ-27b6 / RouteIQ-547d)
+
+The P2 CloudWatch metric filters and the Glue/Athena data lake scan **top-level**
+JSON keys (`$.event`, `$.latency_ms`, `$.["gen_ai.response.model"]`, `$.level`).
+But the EKS Container Insights add-on's Fluent Bit **wraps** every container
+stdout line as a stringified `log` field, so those top-level keys resolve to
+`null` on a real cluster — the metric filters and the lake stay **inert** until a
+Fluent Bit JSON-parse-and-**merge** lifts the inner router JSON to the record top
+level.
+
+Enable the shipped promotion config:
+
+```bash
+helm template routeiq deploy/charts/routeiq-gateway \
+  --set fluentBit.routingPromotion.enabled=true \
+  --set fluentBit.routingPromotion.clusterName=routeiq-dev \
+  --set aws.region=us-west-2 \
+  --show-only templates/fluent-bit-config.yaml
+```
+
+This renders a `ConfigMap` carrying `parsers.conf` (a JSON `[PARSER]`) and
+`routeiq-routing.conf` (a full pipeline: a routing `[INPUT] tail`, a
+`kubernetes` filter, the load-bearing `[FILTER] parser`/`Merge_Log` that promotes
+the wrapped `log` JSON to top level, and a `cloudwatch_logs [OUTPUT]` targeting
+the dedicated `/aws/containerinsights/<cluster>/routeiq-routing` group).
+
+> **Deploy contract — read before relying on this.** The
+> `amazon-cloudwatch-observability` add-on's `extraFiles["application-log.conf"]`
+> **REPLACES** (does **not** append to) the default application-log pipeline.
+> Shipping only a `[FILTER]` would wipe the default `[INPUT]`/`[OUTPUT]` and break
+> **all** log delivery. So the rendered content carries the **full** pipeline, and
+> the operator must merge the `parsers.conf` + `routeiq-routing.conf` keys into the
+> add-on's `configurationValues` (`containerLogs.fluentBit.config.customParsers` +
+> `.extraFiles["application-log.conf"]`) at deploy time — this ConfigMap is **not**
+> auto-consumed by the add-on on its own.
+>
+> **Field population is live-validation-only.** `helm template` / `helm lint`
+> assert the config *shape* (the `[INPUT]`, the JSON parser, the `Merge_Log`, the
+> routing log group); they **cannot** prove the top-level keys actually populate.
+> Verify on a live cluster by sampling the routing log group after traffic flows
+> (skill `eks-container-insights-fluentbit-wraps-stdout`).
+
+Default `fluentBit.routingPromotion.enabled=false` keeps the chart byte-stable.
+
 ## Security Defaults
 
 This chart implements security best practices by default:

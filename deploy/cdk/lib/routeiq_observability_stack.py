@@ -28,14 +28,26 @@ the group is NOT imported via ``from_lookup`` (which needs creds) - it is either
     operator passes ``routing_log_group_name`` (the P0 output, the normal path);
     OR
   - if neither a name nor an ``ILogGroup`` is supplied, derived from the P0
-    naming convention (``/aws/containerinsights/routeiq-<env>/routeiq-routing``)
-    so a standalone synth + the cred-free tests proceed. The P0 stack OWNS the
-    group; this stack only references it.
+    naming convention via the shared ``lib.naming.routing_log_group_name`` helper
+    (RouteIQ-45fa: ONE source of truth) so a standalone synth + the cred-free tests
+    proceed. The P0 stack OWNS the group; this stack only references it.
 
-The P0 PodRole's ``aps:RemoteWrite`` grant lives in a separate stack, so it is
-NOT wired here (it would require referencing the P0 stack, breaking the cred-free
-boundary). ObservabilityConstruct.amp_remote_write_grant is the documented
-late-binding seam a combined app (or operator step) calls when both stacks exist.
+THE COMBINED-DEPLOY SEAM (``foundation=`` -- RouteIQ-569f / 81c4 / 74c0 / 717b):
+when ``app.py`` threads the P0 ``RouteIqStack`` by reference, this stack:
+  * references the REAL P0 ``ILogGroup`` (cross-stack ``Fn::ImportValue`` for the
+    filter ``LogGroupName``) + ``add_dependency(foundation)`` so CFN deploys P0
+    before P2 and a MetricFilter CREATE never races a missing group (81c4);
+  * owns a P2-stack ``iam.Policy`` ("PodObsGrants") attached to the imported P0
+    pod role, carrying the AppConfig runtime-poll grant (569f, the
+    ``appconfigdata`` data-plane actions ADR-0026 needs) + the ``aps:RemoteWrite``
+    grant (74c0/717b). The policy is OWNED HERE (not via
+    ``pod_role.add_to_principal_policy``) so it does not mutate the P0 role's
+    default policy cross-stack -- that would close a DependencyCycle (the
+    RouteIqStateStack ``PodStateGrants`` pattern).
+When ``foundation`` is None (the standalone / separate-pipeline path) every grant
+and the dependency are SKIPPED, so the default cred-free synth is byte-identical
+and the grants are applied out-of-band (the construct ``*_grant`` seams /
+``*_statement`` helpers, see the chart README stack-composition note).
 
 ATHENA WORKGROUP: neither the DataLakeConstruct nor the VSR source provisions an
 Athena workgroup (the construct exposes only ``athena_database``). The
@@ -61,15 +73,22 @@ CfnOutputs (the operator-visible P2 contract):
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from aws_cdk import CfnOutput, Stack, Tags
 from aws_cdk import aws_athena as athena
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from .config_state_construct import ConfigStateConstruct
 from .data_lake_construct import DataLakeConstruct
+from .naming import routing_log_group_name as _routing_log_group_name
 from .obs_nag_suppressions import apply_observability_nag_suppressions
 from .observability_construct import ObservabilityConstruct
+
+if TYPE_CHECKING:  # pragma: no cover - forward ref only
+    from .routeiq_stack import RouteIqStack
 
 
 class RouteIqObservabilityStack(Stack):
@@ -81,6 +100,20 @@ class RouteIqObservabilityStack(Stack):
         construct_id: str,
         *,
         env_name: str,
+        # The P0 stack, passed by REFERENCE for cred-free combined-deploy wiring
+        # (mirrors RouteIqStateStack.foundation). When given, the P2 stack:
+        #   * grants the P0 pod role the AppConfig poll actions (RouteIQ-569f) and
+        #     aps:RemoteWrite (RouteIQ-74c0/717b) via a P2-stack-owned iam.Policy
+        #     attached to the imported role (NOT pod_role.add_to_principal_policy,
+        #     which would mutate the P0 role's default policy = a P0->P2 edge =
+        #     DependencyCycle -- the exact state-stack trap);
+        #   * references the P0 ILogGroup so CDK emits a cross-stack Fn::ImportValue
+        #     for the filter LogGroupName, and add_dependency(foundation) so CFN
+        #     deploys P0 before P2 (RouteIQ-81c4: the MetricFilter CREATE can't race
+        #     a missing group).
+        # Optional so the default flag-off / standalone synth stays byte-identical
+        # (every grant + the dependency are guarded ``if foundation is not None``).
+        foundation: RouteIqStack | None = None,
         routing_log_group_name: str | None = None,
         enable_amg: bool = False,
         enable_data_lake: bool = False,
@@ -109,16 +142,30 @@ class RouteIqObservabilityStack(Stack):
                 Tags.of(self).add(_key, _value)
 
         # -- Reference the P0 routing log group (props-only, NEVER from_lookup) --
-        # Re-import by NAME (cred-free). Either the operator-supplied P0 output, or
-        # the P0 naming convention derived from env_name so a standalone synth +
-        # the cred-free tests proceed. The P0 stack OWNS the group; we only attach
-        # filters/subscriptions to it.
-        self.routing_log_group_name = (
-            routing_log_group_name or f"/aws/containerinsights/routeiq-{env_name}/routeiq-routing"
-        )
-        self.routing_log_group: logs.ILogGroup = logs.LogGroup.from_log_group_name(
-            self, "ImportedRoutingLogGroup", self.routing_log_group_name
-        )
+        # RouteIQ-81c4: prefer the REAL cross-stack reference when a combined-deploy
+        # app threads the P0 foundation. Reading foundation.eks_cluster.routing_log_group
+        # (a real ILogGroup in the SAME cdk.App) makes CDK emit an auto-generated
+        # Export / Fn::ImportValue for the group NAME at synth (cred-free, no
+        # from_lookup), so the P2 MetricFilter / lake SubscriptionFilter LogGroupName
+        # becomes an Fn::ImportValue token AND a stack-level dependency is recorded
+        # via add_dependency(foundation) below -- CFN then deploys P0 (the group)
+        # before P2 (the filters), so a MetricFilter CREATE can never race a missing
+        # group. The by-NAME fallback (operator-supplied name or the P0 naming
+        # convention) is KEPT for the standalone / separate-pipeline path so the
+        # default cred-free synth stays byte-identical.
+        self.foundation = foundation
+        if foundation is not None:
+            self.routing_log_group = foundation.eks_cluster.routing_log_group
+            self.routing_log_group_name = foundation.eks_cluster.routing_log_group_name
+            # CFN enforces P0-before-P2 (the MetricFilter CREATE needs the group).
+            self.add_dependency(foundation)
+        else:
+            self.routing_log_group_name = routing_log_group_name or _routing_log_group_name(
+                env_name
+            )
+            self.routing_log_group = logs.LogGroup.from_log_group_name(
+                self, "ImportedRoutingLogGroup", self.routing_log_group_name
+            )
 
         # -- 1. AppConfig config-state -----------------------------------------
         self.config_state = ConfigStateConstruct(
@@ -154,11 +201,61 @@ class RouteIqObservabilityStack(Stack):
             )
             self.athena_workgroup = self._build_athena_workgroup(self.data_lake)
 
+        # -- 3b. Cross-stack pod-role grants (the combined-deploy seam) ---------
+        # RouteIQ-569f (AppConfig runtime poll) + RouteIQ-74c0/717b (aps:RemoteWrite).
+        # Applied ONLY when the P0 foundation is threaded (combined deploy). Guarded
+        # so the default flag-off / standalone synth stays byte-identical.
+        self.pod_obs_grants: iam.Policy | None = None
+        if foundation is not None:
+            self.pod_obs_grants = self._grant_pod_role(foundation.pod_role)
+
         # -- 4. Operator-visible CfnOutputs ------------------------------------
         self._add_outputs()
 
         # -- 5. cdk-nag suppressions (LAST, by path) ---------------------------
         self._suppress_nag()
+
+    def _grant_pod_role(self, pod_role: iam.IRole) -> iam.Policy:
+        """Attach the P2 pod-role grants via a P2-STACK-OWNED iam.Policy.
+
+        RouteIQ-569f + RouteIQ-74c0/717b. The combined-deploy seam: the P0 pod role
+        lives in the P0 stack, so it is threaded in by reference (foundation.pod_role)
+        and CDK resolves its ARN as a cross-stack Fn::ImportValue.
+
+        CRITICAL CROSS-STACK CYCLE AVOIDANCE (the exact RouteIqStateStack pattern,
+        routeiq_state_stack.py:249-293): we do NOT call the construct grant helpers'
+        ``pod_role.add_to_principal_policy`` form here. That mutates the imported P0
+        role's DEFAULT policy, which is synthesised IN THE P0 STACK -- pushing this
+        P2 stack's resource ARNs (the AppConfig profile ARN, the AMP workspace ARN)
+        into a P0-stack resource creates a P0 -> P2 dependency, while P2 already
+        depends on P0 (the log-group import + add_dependency). That closes a
+        DependencyCycle at synth. Instead this stack OWNS a separate ``iam.Policy``
+        and ``attach_to_role`` the imported role: the policy + the P2-owned ARNs stay
+        in the P2 template, the only cross-stack edge is P2 -> P0 (the role import),
+        which already exists. Equivalent runtime grant, no cycle.
+
+        The statements are sourced from the constructs that own the resources
+        (ConfigStateConstruct.appconfig_poll_statement / ObservabilityConstruct.
+        amp_remote_write_statement) so each ARN scope stays with its owner. Both are
+        ARN-scoped (never ``*``), so no new nag suppression is needed on the P0 role.
+        """
+        policy = iam.Policy(
+            self,
+            "PodObsGrants",
+            statements=[
+                # RouteIQ-569f: AppConfig runtime-poll, scoped to the env-scoped
+                # profile ARN (NOT ``*``). Carries the appconfigdata data-plane
+                # actions the boto3 AppConfigData client uses (the gateway's runtime
+                # poll), plus the control-plane GET for SDK-path tolerance.
+                self.config_state.appconfig_poll_statement(),
+                # RouteIQ-74c0/717b: aps:RemoteWrite scoped to the AMP workspace ARN
+                # (the previously-defined-but-never-called amp_remote_write_grant
+                # seam, now wired in the combined-deploy path).
+                self.observability.amp_remote_write_statement(),
+            ],
+        )
+        policy.attach_to_role(pod_role)
+        return policy
 
     def _build_athena_workgroup(self, data_lake: DataLakeConstruct) -> athena.CfnWorkGroup:
         """Create the operator-facing Athena workgroup for the routing-decisions lake.

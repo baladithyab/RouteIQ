@@ -1,0 +1,93 @@
+{{- if .Values.fluentBit.routingPromotion.enabled }}
+{{- $fb := .Values.fluentBit.routingPromotion }}
+{{- $cluster := $fb.clusterName }}
+{{- $logGroup := $fb.logGroup | default (printf "/aws/containerinsights/%s/routeiq-routing" $cluster) }}
+{{- $region := $fb.region | default .Values.aws.region }}
+# =============================================================================
+# Fluent Bit routing-JSON promotion config (P2: RouteIQ-27b6 + RouteIQ-547d)
+# =============================================================================
+# WHY THIS EXISTS: the P2 CloudWatch metric filters + the Glue/Athena data lake
+# scan TOP-LEVEL JSON keys ($.event, $.latency_ms, $.["gen_ai.response.model"],
+# $.level). The EKS Container Insights add-on's Fluent Bit WRAPS each container
+# stdout line as a stringified `log` field, so those top-level keys resolve to
+# NULL and the filters/lake stay INERT. This config JSON-parses the `log` field
+# and MERGES the inner router JSON to the record top level (skill
+# eks-container-insights-fluentbit-wraps-stdout, Fix A) so the $.field paths
+# resolve.
+#
+# DEPLOY CONTRACT (load-bearing): the add-on's `application-log.conf` REPLACES
+# (does NOT append to) the default pipeline. So this content carries the FULL
+# pipeline (a routing [INPUT] + the [FILTER] chain + the routing [OUTPUT]); the
+# operator MUST merge the `routeiq-routing.conf` + `parsers.conf` keys below into
+# the `amazon-cloudwatch-observability` add-on configurationValues
+# (containerLogs.fluentBit.config: customParsers + extraFiles[application-log.conf])
+# at deploy time. Shipping this as a stand-alone ConfigMap will NOT wire it into
+# the add-on by itself. See the chart README.
+#
+# FIELD POPULATION IS LIVE-VALIDATION-ONLY: helm template / lint assert the SHAPE
+# (the [INPUT], the JSON parser, the Merge_Log, the routing log group); they
+# cannot prove the top-level keys appear. Verify on a live cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}-fluent-bit-routing
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+    routeiq.io/fluent-bit-routing-promotion: "true"
+data:
+  # The JSON parser that decodes the inner router stdout line.
+  parsers.conf: |
+    [PARSER]
+        Name         routeiq_router_json
+        Format       json
+        Time_Key     timestamp
+        Time_Format  %Y-%m-%dT%H:%M:%SZ
+        Time_Keep    On
+  # The FULL routing pipeline. Merge this into the add-on's application-log.conf
+  # (it REPLACES the default pipeline, so the [INPUT]/[OUTPUT] must be present).
+  routeiq-routing.conf: |
+    [INPUT]
+        Name              tail
+        Tag               {{ $fb.tag }}
+        Path              {{ $fb.inputPath }}
+        Parser            docker
+        DB                /var/fluent-bit/state/routeiq-routing.db
+        Mem_Buf_Limit     5MB
+        Skip_Long_Lines   On
+        Refresh_Interval  10
+
+    # Attach pod/namespace/container metadata (the standard Container Insights
+    # enrichment); kept so the routing stream is still identifiable per-pod.
+    [FILTER]
+        Name                kubernetes
+        Match               {{ $fb.tag }}
+        Kube_Tag_Prefix     {{ $fb.tag }}.var.log.containers.
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+
+    # The load-bearing promotion: JSON-parse the wrapped `log` field and MERGE
+    # its keys to the record top level so $.event / $.latency_ms /
+    # $.["gen_ai.response.model"] / $.level resolve for the CW metric filters +
+    # the data lake. Without Merge_Log the router JSON stays a string under `log`.
+    [FILTER]
+        Name      parser
+        Match     {{ $fb.tag }}
+        Key_Name  log
+        Parser    routeiq_router_json
+        Reserve_Data On
+        Preserve_Key Off
+
+    # Deliver the promoted routing lines to the DEDICATED P0-owned routing log
+    # group (NOT the shared /application group), so the P2 metric filters +
+    # subscription scan exactly this stream.
+    [OUTPUT]
+        Name              cloudwatch_logs
+        Match             {{ $fb.tag }}
+        region            {{ $region | default "us-west-2" }}
+        log_group_name    {{ $logGroup }}
+        log_stream_prefix routeiq-routing-
+        auto_create_group true
+{{- end }}

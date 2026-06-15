@@ -124,6 +124,50 @@ def state_template_for(**flags: Any) -> Template:
     return Template.from_stack(state)
 
 
+def make_obs_stack(
+    *,
+    env_name: str = "dev",
+    enable_amg: bool = False,
+    enable_data_lake: bool = False,
+    notify_emails: list[str] | None = None,
+    construct_id: str | None = None,
+    foundation_id: str | None = None,
+):
+    """Build a P0 ``RouteIqStack`` + the P2 ``RouteIqObservabilityStack`` wired to it.
+
+    The combined-deploy shape ``app.py`` uses: both stacks share ONE ``cdk.App``
+    with the dummy env, and the P2 stack takes ``foundation=`` (the P0 stack, by
+    reference). CDK resolves the cross-stack references (the pod-role ARN, the
+    routing log-group name) at synth into ``Export`` / ``Fn::ImportValue`` --
+    cred-free, no ``from_lookup``, no AWS API call. Returns
+    ``(app, foundation, obs_stack)``.
+
+    Mirrors ``make_state_stack``. Imported here (not at module top) so this harness
+    imports cleanly while the stacks are still being authored.
+    """
+    from lib.routeiq_observability_stack import RouteIqObservabilityStack
+    from lib.routeiq_stack import RouteIqStack
+
+    app = cdk.App()
+    foundation = RouteIqStack(
+        app,
+        foundation_id or f"RouteIqStack-{env_name}",
+        env=dummy_env(),
+        env_name=env_name,
+    )
+    obs = RouteIqObservabilityStack(
+        app,
+        construct_id or f"RouteIqObservabilityStack-{env_name}",
+        env=dummy_env(),
+        env_name=env_name,
+        foundation=foundation,
+        enable_amg=enable_amg,
+        enable_data_lake=enable_data_lake,
+        notify_emails=notify_emails,
+    )
+    return app, foundation, obs
+
+
 @pytest.fixture
 def stack_template() -> Template:
     """Default flag-surface ``Template`` for assertion-style unit tests."""

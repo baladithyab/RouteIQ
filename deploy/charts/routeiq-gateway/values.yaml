@@ -592,6 +592,57 @@ extraEnvFrom: []
   #     name: extra-secrets
 
 # -----------------------------------------------------------------------------
+# AWS substrate seam (P2: AMP / AppConfig CfnOutput consume + AWS_REGION)
+# -----------------------------------------------------------------------------
+# RouteIQ-on-AWS P2 (RouteIQ-bf9f): the chart consumes the RouteIqObservabilityStack
+# CfnOutputs as `helm upgrade --set` flags - the same "CfnOutput string -> --set
+# value" seam P1 uses for DbClusterEndpoint / CacheEndpoint, never a CDK-side
+# HelmChart resource. Every value defaults EMPTY so a non-AWS / no-observability
+# deploy renders byte-identically (the env vars are emitted only when set).
+#
+#   STACK=RouteIqObservabilityStack-<env>
+#   q() { aws cloudformation describe-stacks --stack-name "$STACK" \
+#           --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+#   helm upgrade routeiq deploy/charts/routeiq-gateway \
+#     --set aws.region="$AWS_REGION" \
+#     --set aws.appConfig.enabled=true \
+#     --set aws.appConfig.application="$(q AppConfigApplicationId)" \
+#     --set aws.appConfig.environment=<env> \
+#     --set aws.appConfig.profile=<profile> \
+#     --set aws.amp.remoteWriteUrl="$(q AmpRemoteWriteUrl)"
+aws:
+  # AWS region. LOAD-BEARING on the AWS substrate: ANY boto3 client (Bedrock
+  # invoke, AppConfig poll, AMP remote_write, S3 config sync, rds-db:connect /
+  # elasticache:Connect token minting) needs a region or fails. Emitted as both
+  # AWS_REGION and AWS_DEFAULT_REGION. Default empty so the chart stays
+  # cloud-agnostic and byte-stable for a non-AWS deploy.
+  region: ""
+
+  # AppConfig runtime config retrieval (ADR-0026 / RouteIQ-4333). Wires the
+  # gateway's config_sync AppConfig poll adapter from the P2 CfnOutputs. The
+  # pod-role grant (appconfigdata:StartConfigurationSession +
+  # GetLatestConfiguration scoped to the profile ARN) is RouteIQ-569f, applied
+  # CDK-side. Default disabled; env vars are emitted only when enabled.
+  appConfig:
+    enabled: false
+    # = CfnOutput AppConfigApplicationId (the AppConfig application id/name).
+    application: ""
+    # The AppConfig environment id/name (typically the deploy env, e.g. "dev").
+    environment: ""
+    # The AppConfig configuration profile id/name the gateway polls.
+    profile: ""
+    # Requested poll interval (the data plane enforces a 15s minimum).
+    pollIntervalSeconds: 60
+
+  # Amazon Managed Prometheus remote-write target (P2). Consumes the
+  # CfnOutput AmpRemoteWriteUrl. The pod-role aps:RemoteWrite grant is
+  # RouteIQ-74c0/717b, applied CDK-side. Emitted as AMP_REMOTE_WRITE_URL for an
+  # ADOT collector sidecar to read (the sidecar itself is a follow-up; this is
+  # the env seam). Default empty -> not emitted.
+  amp:
+    remoteWriteUrl: ""
+
+# -----------------------------------------------------------------------------
 # Volumes and volume mounts
 # -----------------------------------------------------------------------------
 extraVolumes: []
@@ -756,3 +807,51 @@ metrics:
     enabled: false
     # Annotations for the dashboard ConfigMap
     annotations: {}
+
+# -----------------------------------------------------------------------------
+# Fluent Bit routing-JSON promotion (P2: RouteIQ-27b6 + RouteIQ-547d)
+# -----------------------------------------------------------------------------
+# THE INERTNESS THIS FIXES: the P2 CloudWatch metric filters
+# (observability_construct.py) and the Glue/Athena data lake (data_lake_construct.py)
+# scan TOP-LEVEL JSON keys ($.event, $.latency_ms, $.["gen_ai.response.model"],
+# $.level). But the EKS Container Insights add-on's Fluent Bit WRAPS every
+# container stdout line as a stringified `log` field
+# ({"log":"<your JSON line>","kubernetes":{...},"stream":...,"time":...}), so those
+# top-level keys resolve to NULL on a real cluster and the filters/lake see
+# nothing. The fix (skill: eks-container-insights-fluentbit-wraps-stdout, Fix A) is
+# a Fluent Bit JSON-parse-and-MERGE that lifts the inner router JSON to the record
+# top level so the filters' $.field paths resolve.
+#
+# CRITICAL DEPLOY CONTRACT (read before enabling):
+#   The rendered `routeiq-routing.conf` content here is NOT a free-standing
+#   ConfigMap that the add-on consumes automatically. The add-on's
+#   `extraFiles["application-log.conf"]` REPLACES (does NOT append to) the default
+#   application-log pipeline; shipping ONLY a [FILTER] would wipe the default
+#   [INPUT]/[OUTPUT] and break ALL log delivery. So this content carries the FULL
+#   default pipeline + the merge [FILTER], and the operator must merge it into the
+#   add-on's `amazon-cloudwatch-observability` configurationValues
+#   (containerLogs.fluentBit.config) at deploy time. See the chart README.
+#
+#   FIELD POPULATION CAN ONLY BE VERIFIED ON A LIVE CLUSTER (the skill): synth /
+#   helm template / lint assert the config SHAPE (the [INPUT], the JSON parser, the
+#   Merge_Log, the routing log group); they CANNOT prove the top-level keys appear.
+#
+# Default disabled so the chart renders byte-identically for a non-AWS deploy.
+fluentBit:
+  routingPromotion:
+    enabled: false
+    # The cluster name segment of the routing log group
+    # (= EksClusterConstruct.cluster_name = "routeiq-<env>"). Set to your env.
+    clusterName: "routeiq-dev"
+    # The dedicated routing log group the promoted lines land on (P0-owned). The
+    # default derives from clusterName via the chart template; override only if
+    # your P0 stack uses a non-default group name.
+    logGroup: ""
+    # The container stdout tail glob for the gateway pod. The default matches the
+    # gateway container's Container Insights log path.
+    inputPath: "/var/log/containers/*routeiq*gateway*.log"
+    # The Fluent Bit tag for the routing stream.
+    tag: "routeiq.routing"
+    # The AWS region the cloudwatch_logs output writes to. Falls back to the
+    # render-time aws.region when empty.
+    region: ""

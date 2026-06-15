@@ -83,6 +83,13 @@
           "Arn"
         ]
       }
+    },
+    "RoutingLogGroupName": {
+      "Description": "Dedicated routing-decision CloudWatch log group name. P2 observability + the data lake attach metric/subscription filters to this group (P0 owns it).",
+      "Export": {
+        "Name": "RouteIqStack-dev-RoutingLogGroupName"
+      },
+      "Value": "/aws/containerinsights/routeiq-dev/routeiq-routing"
     }
   },
   "Parameters": {

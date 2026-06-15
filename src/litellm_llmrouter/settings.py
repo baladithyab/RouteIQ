@@ -265,6 +265,20 @@ class OTelSettings(BaseModel):
             "source). Kept off the root logger so it is independently routable."
         ),
     )
+    error_log_enabled: bool = Field(
+        True,
+        description=(
+            "Emit a structured error JSON line (top-level lowercased "
+            '``"level": "error"`` + ``"event": "error"``) on the dedicated '
+            "routing logger from the error path (ADR-0027 P2 hardening, "
+            "RouteIQ-731c). This is the field the CloudWatch ``RouterErrorFilter`` "
+            'selects on (``$.level = "error"``); without it the router-error-count '
+            "alarm can never fire because no emitter produces a top-level ``level`` "
+            "key. PII-safe: carries the error type + a scrubbed error message only. "
+            "Disable to suppress the line "
+            "(env: ROUTEIQ_OTEL__ERROR_LOG_ENABLED)."
+        ),
+    )
 
     @field_validator("endpoint")
     @classmethod
@@ -685,6 +699,53 @@ class ConfigSyncSettings(BaseModel):
         None, description="GCS bucket for remote config sync."
     )
     gcs_key: Optional[str] = Field(None, description="GCS key for the config file.")
+
+    # --- AWS AppConfig runtime retrieval (ADR-0026, RouteIQ-4333) -------------
+    # Poll a deployed AppConfig configuration profile via the AppConfigData
+    # data-plane API. Off by default so the chart/app stays cloud-agnostic. The
+    # pod-role grant for this is RouteIQ-569f (appconfigdata:StartConfigurationSession
+    # + appconfigdata:GetLatestConfiguration scoped to the profile ARN). Env vars
+    # are nested under the ``config_sync`` prefix
+    # (e.g. ROUTEIQ_CONFIG_SYNC__APPCONFIG_ENABLED).
+    appconfig_enabled: bool = Field(
+        False,
+        description=(
+            "Enable runtime AWS AppConfig retrieval (ADR-0026). Polls a deployed "
+            "AppConfig configuration profile via the AppConfigData data-plane API "
+            "(StartConfigurationSession + GetLatestConfiguration) and writes a "
+            "changed body to the local config path. Default off."
+        ),
+    )
+    appconfig_application: Optional[str] = Field(
+        None,
+        description=(
+            "AppConfig application id or name to poll (CfnOutput "
+            "AppConfigApplicationId). Required when appconfig_enabled is true."
+        ),
+    )
+    appconfig_environment: Optional[str] = Field(
+        None,
+        description=(
+            "AppConfig environment id or name to poll (e.g. the deploy env). "
+            "Required when appconfig_enabled is true."
+        ),
+    )
+    appconfig_profile: Optional[str] = Field(
+        None,
+        description=(
+            "AppConfig configuration profile id or name to poll. Required when "
+            "appconfig_enabled is true."
+        ),
+    )
+    appconfig_poll_interval_seconds: int = Field(
+        60,
+        ge=15,
+        description=(
+            "Requested AppConfig poll interval in seconds (the data-plane API "
+            "enforces a minimum of 15s; the loop honors the server's "
+            "NextPollIntervalInSeconds when shorter)."
+        ),
+    )
 
 
 class HTTPClientSettings(BaseModel):

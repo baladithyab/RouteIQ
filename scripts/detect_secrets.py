@@ -91,6 +91,11 @@ ALLOWLISTED_SECRETS = {
     "AKIAIOSFODNN7EXAMPLE",  # AWS example key
     "test-fake-key-12345",
     "proj-fake-key-for-testing",
+    # Scrubber-test fixtures (test_observability.py) — fake bearer-shaped strings fed
+    # INTO scrub_error_message/emit_error_log to PROVE they get [REDACTED]. The test
+    # asserting a scrubber works necessarily contains a token-shaped input.
+    "Bearer secrettokenvalue0123456789",
+    "Bearer abcdef0123456789ABCDEF",
 }
 
 # File patterns to ignore

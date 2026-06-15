@@ -119,8 +119,13 @@ _ROUTING_LATENCY_FIELD = "$.latency_ms"
 _ROUTING_MODEL_DIM_KEY = '$.["gen_ai.response.model"]'
 
 # Severity-level selector for the aggregate router-error-count filter. The
-# gateway's general error log lines in the same group carry a top-level
-# ``level`` == ``error`` key (Python logging level name, lowercased).
+# gateway's error path emits a dedicated structured JSON line (RouteIQ-731c,
+# observability.py ``emit_error_log``) on the SAME routing log group carrying a
+# TOP-LEVEL LOWERCASED ``level == "error"`` literal. NOTE: this is NOT Python's
+# default ``levelname`` (which is UPPERCASE ``ERROR``) - the emitter writes the
+# lowercased literal precisely so this filter pattern matches. Before that
+# emitter shipped, no line carried a ``level`` key and this filter (and its
+# alarm) was inert.
 _ERROR_LEVEL_FIELD = "$.level"
 _ERROR_LEVEL_VALUE = "error"
 
@@ -491,25 +496,33 @@ class ObservabilityConstruct(Construct):
         )
         return dashboard
 
+    def amp_remote_write_statement(self) -> iam.PolicyStatement:
+        """Return the ``aps:RemoteWrite`` PolicyStatement for this AMP workspace.
+
+        RouteIQ-74c0/717b. ARN-scoped to ``self.amp_workspace_arn`` (NEVER ``*``).
+        Returned as a STATEMENT (not added to a role) so the composition root can
+        own the ``iam.Policy`` cross-stack without closing a DependencyCycle (the
+        ``add_to_principal_policy`` form mutates the imported role's default policy
+        in its OWN stack -- see RouteIqObservabilityStack._grant_pod_role). ASCII sid.
+        """
+        return iam.PolicyStatement(
+            sid="AmpRemoteWrite",
+            effect=iam.Effect.ALLOW,
+            actions=["aps:RemoteWrite"],
+            resources=[self.amp_workspace_arn],
+        )
+
     def amp_remote_write_grant(self, pod_role: iam.IRole) -> None:
         """Grant a pod role ``aps:RemoteWrite`` on this AMP workspace.
 
-        The pod-role ``aps:RemoteWrite`` grant is reserved in the P0 stack
-        (``routeiq_stack.py`` _add_pod_role_statements, forward-compatible) but
-        the P0 PodRole lives in a SEPARATE stack. This helper is the documented
-        LATE-BINDING seam: when both stacks deploy together, a combined ``app.py``
-        (or operator step) calls ``observability.amp_remote_write_grant(stack.pod_role)``
-        after both constructs exist, mirroring the VSR
-        ``security.task_role.add_to_policy(... amp_workspace_arn)`` composition. It
-        is NOT called from this construct (no cross-construct coupling) and NOT a
-        P2-in-isolation deliverable (it would require referencing the P0 stack,
-        breaking the cred-free / props-only boundary).
+        The documented LATE-BINDING seam: when both stacks deploy together, a
+        combined ``app.py`` (or operator step) wires the pod-role ``aps:RemoteWrite``
+        grant. NOTE: do NOT call this cross-stack -- ``add_to_principal_policy``
+        mutates the imported role's default policy in its OWN stack, which closes a
+        DependencyCycle when the AMP workspace ARN is owned by another stack. The
+        combined-deploy path (RouteIQ-74c0/717b) instead feeds
+        :meth:`amp_remote_write_statement` into a composition-root-owned
+        ``iam.Policy`` (RouteIqObservabilityStack._grant_pod_role). This helper is
+        the single-stack / same-stack convenience wrapper.
         """
-        pod_role.add_to_principal_policy(
-            iam.PolicyStatement(
-                sid="AmpRemoteWrite",
-                effect=iam.Effect.ALLOW,
-                actions=["aps:RemoteWrite"],
-                resources=[self.amp_workspace_arn],
-            )
-        )
+        pod_role.add_to_principal_policy(self.amp_remote_write_statement())

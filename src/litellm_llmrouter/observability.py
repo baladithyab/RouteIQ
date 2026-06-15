@@ -314,6 +314,66 @@ def set_genai_attributes(
 # data_lake_construct: the top-level ``$.event`` selector value).
 ROUTING_DECISION_EVENT = "routing_decision"
 
+# ==============================================================================
+# P2-hardening (RouteIQ-731c): structured ERROR JSON log line
+# ==============================================================================
+# The CloudWatch ``RouterErrorFilter`` (observability_construct.py) selects on a
+# TOP-LEVEL ``$.level == "error"`` key. Before this hardening NO emitter produced
+# that key: ``log_error_with_trace`` emitted a plain text ``logger.error(...)``
+# with an ``event="error"`` ``extra`` (not a JSON line, no ``level`` field), and
+# the only structured JSON line (``routing_decision``) carries no ``level``. So
+# the filter matched zero events and the router-error-count alarm could never
+# fire. ``emit_error_log`` below emits ONE compact JSON object on the SAME
+# dedicated routing logger (so it lands on the same CloudWatch group the filter
+# scans) carrying a top-level LOWERCASED ``"level": "error"`` (Python's default
+# ``levelname`` is UPPERCASE ``ERROR`` - we emit the lowercased literal the filter
+# pattern matches) plus ``"event": "error"`` so an alternate ``$.event`` re-key
+# also works. PII-safe: the error type + a scrubbed error message only.
+ERROR_EVENT = "error"
+ERROR_LEVEL_VALUE = "error"
+
+# The maximum number of characters retained from an error message in the
+# structured line. Bounds the line size and limits incidental leakage of any
+# value interpolated into an exception string.
+_ERROR_MESSAGE_MAX_LEN = 512
+
+# Token-shaped substrings are scrubbed from the structured error message so a
+# token that leaked into an exception string never reaches the log line. Matches
+# common credential prefixes plus long base64/hex runs.
+import re as _re  # noqa: E402  (local-use only, keep next to the pattern)
+
+_TOKEN_SCRUB_PATTERNS: tuple[Any, ...] = (
+    # bearer / authorization headers
+    _re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),
+    # common API-key prefixes (sk-, pk-, AKIA..., ASIA..., ghp_, xoxb-, etc.)
+    _re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9._\-]{8,}"),
+    _re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{8,}"),
+    _re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}"),
+    _re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}"),
+    # long opaque base64/JWT-ish runs (>=24 chars of base64url, incl dots)
+    _re.compile(r"\b[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{8,}"),
+)
+
+
+def scrub_error_message(message: str) -> str:
+    """Return a length-bounded, token-scrubbed copy of an error message.
+
+    Defence-in-depth so the structured error line never carries a credential that
+    happened to be interpolated into an exception string (the ``NEVER log tokens``
+    rule). Replaces token-shaped substrings with ``[REDACTED]`` and truncates.
+    Never raises.
+    """
+    try:
+        scrubbed = message
+        for pattern in _TOKEN_SCRUB_PATTERNS:
+            scrubbed = pattern.sub("[REDACTED]", scrubbed)
+        if len(scrubbed) > _ERROR_MESSAGE_MAX_LEN:
+            scrubbed = scrubbed[:_ERROR_MESSAGE_MAX_LEN] + "...[truncated]"
+        return scrubbed
+    except Exception:  # pragma: no cover - scrubbing must never break logging
+        return "[unscrubbable error message]"
+
+
 # The 14 flat column keys the data lake's Glue table extracts by identity name
 # (data_lake_construct._COLUMNS). Authored here so the app emitter and the CDK
 # schema share one frozen contract; a drift breaks the lake's column extraction.
@@ -497,6 +557,98 @@ def emit_routing_decision_log(
         return record
     except Exception:  # pragma: no cover - telemetry must never break routing
         logger.debug("Failed to emit routing_decision structured log", exc_info=True)
+        return None
+
+
+def build_error_log_record(
+    *,
+    error_type: str,
+    error_message: str,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the flat error JSON record (no I/O) the RouterErrorFilter selects on.
+
+    Carries a TOP-LEVEL LOWERCASED ``"level": "error"`` (the field the CloudWatch
+    ``RouterErrorFilter`` keys on - ``$.level = "error"``) plus ``"event":
+    "error"`` (so an alternate ``$.event`` re-key also works) plus the error type
+    and a scrubbed error message. Split out so the shape is unit-testable without
+    a logging handler.
+
+    PII-safe: the error type + a length-bounded, token-scrubbed message only -
+    never request prompt/completion text.
+    """
+    return {
+        # The load-bearing key: top-level LOWERCASED level the filter matches.
+        "level": ERROR_LEVEL_VALUE,
+        "event": ERROR_EVENT,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+        "request_id": request_id or "",
+        "trace_id": trace_id if trace_id is not None else _current_trace_id_hex(),
+        "error_type": error_type,
+        "error_message": scrub_error_message(error_message),
+    }
+
+
+def emit_error_log(
+    *,
+    error_type: str,
+    error_message: str,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Emit the structured error JSON line (P2 hardening, RouteIQ-731c).
+
+    Writes ONE compact JSON object as the log message on the SAME dedicated
+    ``routeiq.routing_decision`` logger the routing-decision line uses, so it
+    lands on the SAME CloudWatch routing log group the ``RouterErrorFilter`` scans.
+    The line carries a top-level lowercased ``"level": "error"`` - the field the
+    filter pattern (``$.level = "error"``) selects on. Without this line the
+    router-error-count alarm can never fire (no emitter produced a ``level`` key).
+
+    Gated by ``settings.otel.error_log_enabled`` (default on), read via
+    ``get_settings`` per ADR-0013 - NOT ``os.environ`` - with a fail-open default
+    so a settings failure does not silence the error signal.
+
+    Returns the emitted record (for testing/inspection), or ``None`` when the
+    feature is disabled. Never raises: a telemetry failure must not break the
+    error path itself.
+    """
+    try:
+        enabled = True
+        logger_name = "routeiq.routing_decision"
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otel_s = get_settings().otel
+            enabled = otel_s.error_log_enabled
+            logger_name = otel_s.routing_decision_logger_name
+        except Exception:
+            # Fail-open: emit on the default logger if settings are unavailable.
+            pass
+
+        if not enabled:
+            return None
+
+        record = build_error_log_record(
+            error_type=error_type,
+            error_message=error_message,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+
+        target_logger = (
+            _routing_decision_logger
+            if logger_name == "routeiq.routing_decision"
+            else logging.getLogger(logger_name)
+        )
+        # The message IS the JSON object (one compact line) so Fluent Bit's JSON
+        # parser promotes the keys (incl. the top-level ``level``) to the
+        # CloudWatch record top level. Sorted keys keep the line deterministic.
+        target_logger.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        return record
+    except Exception:  # pragma: no cover - telemetry must never break the error path
+        logger.debug("Failed to emit error structured log", exc_info=True)
         return None
 
 
@@ -1078,6 +1230,22 @@ class ObservabilityManager:
             f"Error occurred: {error}",
             extra=log_data,
             exc_info=True,
+        )
+
+        # P2-hardening (RouteIQ-731c): ALSO emit the structured error JSON line
+        # the CloudWatch RouterErrorFilter selects on (top-level lowercased
+        # ``level == "error"``) on the dedicated routing log group. The
+        # ``logger.error`` above is a plain TEXT line with no top-level ``level``
+        # key, so without this the router-error-count alarm can never fire.
+        # request_id is plucked from context when supplied; the message is scrubbed
+        # by the emitter. Never raises (telemetry must not break the error path).
+        request_id = None
+        if context:
+            request_id = context.get("request_id") or context.get("requestId")
+        emit_error_log(
+            error_type=type(error).__name__,
+            error_message=str(error),
+            request_id=request_id,
         )
 
     @property

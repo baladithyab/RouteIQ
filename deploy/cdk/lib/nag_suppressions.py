@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 
 from cdk_nag import NagPackSuppression, NagSuppressions
 
+from .naming import routing_log_group_name
+
 if TYPE_CHECKING:  # pragma: no cover - forward ref only
     from .routeiq_stack import RouteIqStack
 
@@ -328,8 +330,7 @@ def _suppress_pod_role(stack: RouteIqStack) -> None:
             ),
             applies_to=[
                 "Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:"
-                "log-group:/aws/containerinsights/routeiq-"
-                f"{stack.env_name}/routeiq-routing:*",
+                f"log-group:{routing_log_group_name(stack.env_name)}:*",
             ],
         ),
     ]

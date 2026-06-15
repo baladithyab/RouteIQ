@@ -79,6 +79,12 @@ def get_config_sync_status() -> ConfigSyncStatus:
         source = f"s3://{manager.s3_bucket}/{manager.s3_key}"
     elif manager.gcs_sync_enabled:
         source = f"gs://{manager.gcs_bucket}/{manager.gcs_key}"
+    elif getattr(manager, "appconfig_sync_enabled", False):
+        # NEVER include the session token in the source label.
+        source = (
+            f"appconfig://{manager.appconfig_application}"
+            f"/{manager.appconfig_environment}/{manager.appconfig_profile}"
+        )
 
     config_hash = None
     if manager._last_config_hash:
@@ -119,6 +125,10 @@ class ConfigSyncManager:
         self._last_config_hash: str | None = None
         self._last_s3_etag: str | None = None
         self._last_gcs_etag: str | None = None
+        # AppConfig data-plane session token (ADR-0026, RouteIQ-4333). NEVER
+        # logged: it is an opaque next-poll token, not a credential, but logging
+        # it would leak a usable handle, so it stays out of every log statement.
+        self._appconfig_token: str | None = None
         self._stop_event = threading.Event()
         self._sync_thread: threading.Thread | None = None
         self._reload_count = 0
@@ -134,6 +144,14 @@ class ConfigSyncManager:
         env_hot = os.getenv("CONFIG_HOT_RELOAD")
         env_sync = os.getenv("CONFIG_SYNC_ENABLED")
 
+        # AppConfig fields are settings-only (ADR-0013; no bespoke CONFIG_* env).
+        # Default off; populated from get_settings().config_sync below.
+        self.appconfig_enabled = False
+        self.appconfig_application: str | None = None
+        self.appconfig_environment: str | None = None
+        self.appconfig_profile: str | None = None
+        self.appconfig_poll_interval_seconds = 60
+
         if any(
             v is not None
             for v in (env_s3b, env_s3k, env_gcsb, env_gcsk, env_hot, env_sync)
@@ -144,6 +162,9 @@ class ConfigSyncManager:
             self.gcs_key = env_gcsk
             self.hot_reload_enabled = (env_hot or "false").lower() == "true"
             self.sync_enabled = (env_sync or "true").lower() == "true"
+            # AppConfig is still resolved from settings even when the legacy
+            # CONFIG_* env vars are present (the two seams are independent).
+            self._load_appconfig_settings()
         else:
             try:
                 from litellm_llmrouter.settings import get_settings
@@ -155,6 +176,7 @@ class ConfigSyncManager:
                 self.gcs_key = cs.gcs_key
                 self.hot_reload_enabled = cs.hot_reload
                 self.sync_enabled = cs.sync_enabled
+                self._apply_appconfig_settings(cs)
             except Exception:
                 self.s3_bucket = None
                 self.s3_key = None
@@ -165,6 +187,13 @@ class ConfigSyncManager:
 
         self.s3_sync_enabled = bool(self.s3_bucket and self.s3_key)
         self.gcs_sync_enabled = bool(self.gcs_bucket and self.gcs_key)
+        # AppConfig requires all three identifiers to be configured AND the flag on.
+        self.appconfig_sync_enabled = bool(
+            self.appconfig_enabled
+            and self.appconfig_application
+            and self.appconfig_environment
+            and self.appconfig_profile
+        )
 
         # Incremental reload tracking
         self._current_model_configs: list[dict[str, Any]] = []
@@ -290,6 +319,106 @@ class ConfigSyncManager:
             verbose_proxy_logger.error(f"Failed to sync config from S3: {e}")
             return False
 
+    def _apply_appconfig_settings(self, cs: Any) -> None:
+        """Populate the AppConfig attributes from a ConfigSyncSettings instance."""
+        self.appconfig_enabled = bool(getattr(cs, "appconfig_enabled", False))
+        self.appconfig_application = getattr(cs, "appconfig_application", None)
+        self.appconfig_environment = getattr(cs, "appconfig_environment", None)
+        self.appconfig_profile = getattr(cs, "appconfig_profile", None)
+        self.appconfig_poll_interval_seconds = int(
+            getattr(cs, "appconfig_poll_interval_seconds", 60)
+        )
+
+    def _load_appconfig_settings(self) -> None:
+        """Resolve AppConfig settings via get_settings (used on the env-present path)."""
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            self._apply_appconfig_settings(get_settings().config_sync)
+        except Exception:
+            # Leave the safe defaults set in __init__ (AppConfig disabled).
+            pass
+
+    def _poll_appconfig_if_changed(self) -> bool:
+        """Poll AWS AppConfig and write the body only when it changed (ADR-0026).
+
+        Uses the AppConfigData data-plane API: ``start_configuration_session``
+        once to obtain an initial token, then ``get_latest_configuration`` per
+        poll. The data plane returns an EMPTY ``Configuration`` body when the
+        config is UNCHANGED (the same "no diff" semantics as the S3 ETag path) and
+        a ``NextPollConfigurationToken`` that MUST be carried into the next call.
+
+        Returns True when a changed body was written to ``local_config_path``.
+
+        NEVER logs the session token (the ``NEVER log tokens`` rule): only the
+        changed/unchanged boolean and the version label are logged.
+        """
+        if not self.appconfig_sync_enabled:
+            return False
+
+        try:
+            import boto3
+
+            client = boto3.client("appconfigdata")
+
+            # Open a session once; persist the rolling next-poll token thereafter.
+            if self._appconfig_token is None:
+                session = client.start_configuration_session(
+                    ApplicationIdentifier=self.appconfig_application,
+                    EnvironmentIdentifier=self.appconfig_environment,
+                    ConfigurationProfileIdentifier=self.appconfig_profile,
+                    RequiredMinimumPollIntervalInSeconds=(
+                        self.appconfig_poll_interval_seconds
+                    ),
+                )
+                self._appconfig_token = session.get("InitialConfigurationToken")
+                if not self._appconfig_token:
+                    verbose_proxy_logger.warning(
+                        "AppConfig: start_configuration_session returned no token"
+                    )
+                    return False
+
+            response = client.get_latest_configuration(
+                ConfigurationToken=self._appconfig_token
+            )
+
+            # ALWAYS roll the token forward (re-using a token fails the next call).
+            next_token = response.get("NextPollConfigurationToken")
+            if next_token:
+                self._appconfig_token = next_token
+
+            # An empty body means "unchanged" - the data plane only returns content
+            # when it differs from what this token last saw (like the S3 ETag).
+            body = response.get("Configuration")
+            raw = body.read() if hasattr(body, "read") else body
+            version = response.get("VersionLabel") or "unknown"
+            if not raw:
+                verbose_proxy_logger.debug(
+                    f"AppConfig config unchanged (version={version})"
+                )
+                return False
+
+            self.local_config_path.parent.mkdir(parents=True, exist_ok=True)
+            old_hash = self._compute_file_hash(self.local_config_path)
+            data = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode()
+            with open(self.local_config_path, "wb") as f:
+                f.write(data)
+            new_hash = self._compute_file_hash(self.local_config_path)
+
+            if old_hash != new_hash:
+                verbose_proxy_logger.info(
+                    f"Config synced from AppConfig "
+                    f"app={self.appconfig_application} "
+                    f"env={self.appconfig_environment} "
+                    f"profile={self.appconfig_profile} (version={version})"
+                )
+                return True
+            return False
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to sync config from AppConfig: {e}")
+            return False
+
     def _sync_loop(self):
         """Background sync loop with ETag-based change detection."""
         import time
@@ -323,6 +452,18 @@ class ConfigSyncManager:
                         ):
                             verbose_proxy_logger.info(
                                 "Config changed, triggering reload..."
+                            )
+                            self._trigger_reload()
+                            self._reload_count += 1
+
+                    # Check AppConfig for updates (ADR-0026, RouteIQ-4333).
+                    if self.appconfig_sync_enabled:
+                        if (
+                            self._poll_appconfig_if_changed()
+                            and self.hot_reload_enabled
+                        ):
+                            verbose_proxy_logger.info(
+                                "Config changed (AppConfig), triggering reload..."
                             )
                             self._trigger_reload()
                             self._reload_count += 1
@@ -376,7 +517,9 @@ class ConfigSyncManager:
             )
 
         if not self.sync_enabled or (
-            not self.s3_sync_enabled and not self.gcs_sync_enabled
+            not self.s3_sync_enabled
+            and not self.gcs_sync_enabled
+            and not self.appconfig_sync_enabled
         ):
             verbose_proxy_logger.info(
                 "Config sync disabled or no remote config configured"
@@ -433,6 +576,19 @@ class ConfigSyncManager:
                     "key": self.gcs_key,
                 }
                 if self.gcs_sync_enabled
+                else None
+            ),
+            "appconfig": (
+                {
+                    # NEVER expose the session token here (NEVER log tokens rule);
+                    # only the non-secret identifiers + whether a session is open.
+                    "enabled": self.appconfig_sync_enabled,
+                    "application": self.appconfig_application,
+                    "environment": self.appconfig_environment,
+                    "profile": self.appconfig_profile,
+                    "session_open": self._appconfig_token is not None,
+                }
+                if self.appconfig_sync_enabled
                 else None
             ),
             "local_config_path": str(self.local_config_path),

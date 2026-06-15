@@ -355,6 +355,35 @@ def test_aggregate_filters_keep_default_value_zero() -> None:
         assert transform.get("DefaultValue") == 0, (metric_name, transform)
 
 
+def test_router_error_filter_selects_on_level_error_the_emitted_field() -> None:
+    """The RouterErrorFilter pattern selects on ``$.level = "error"`` (RouteIQ-731c).
+
+    The load-bearing P2-hardening assertion: the gateway error path now emits a
+    structured JSON line carrying a top-level LOWERCASED ``level == "error"``
+    (observability.py ``emit_error_log``), so the alarm can finally fire. This
+    test pins the CDK filter pattern to the field that emitter produces. The two
+    halves (emitter emits ``level``, filter scans ``level``) together close the
+    seed: before, the filter scanned a field no emitter wrote and the alarm was
+    inert.
+    """
+    template = _template()
+    filters = template.find_resources("AWS::Logs::MetricFilter")
+    error_filters = [
+        f
+        for f in filters.values()
+        if f["Properties"]["MetricTransformations"][0].get("MetricName") == "router_error_log_count"
+    ]
+    assert len(error_filters) == 1, "expected exactly one router-error filter"
+    pattern = error_filters[0]["Properties"]["FilterPattern"]
+    # The CloudWatch JSON metric-filter pattern for a string match is
+    # ``{ $.level = "error" }``; assert it keys on the lowercased ``level`` field.
+    assert "$.level" in pattern, pattern
+    assert '"error"' in pattern, pattern
+    # Negative: the lowercased literal the emitter writes, NOT the Python uppercase
+    # ``levelname`` (the false-comment trap the construct doc fixed).
+    assert '"ERROR"' not in pattern, pattern
+
+
 # ------------------------------------------------ alarms -> the single SNS topic
 
 

@@ -57,6 +57,8 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from constructs import Construct
 
+from .naming import cluster_name, routing_log_group_name
+
 if TYPE_CHECKING:  # pragma: no cover - forward refs only
     from aws_cdk import aws_ec2 as ec2
 
@@ -68,22 +70,6 @@ _EKS_VERSION = "1.33"
 # "system" runs cluster-critical add-ons. Both are AWS-managed - RouteIQ does
 # NOT author NodePool/EC2NodeClass CRs for them (that is the point of Auto Mode).
 _AUTO_MODE_NODE_POOLS = ["general-purpose", "system"]
-
-# PREP-ONLY at P0 (proposal section 7.5). The dimensioned per-model routing
-# latency MetricFilter is data-source-blocked until P2: its source, the
-# structured routing_decision CloudWatch JSON log line, is a P2 BUILD-NEW item
-# (today the gateway emits an OTel/logger.info event, not the CW JSON line), so
-# the filter would match zero events at P0. Flip to True only once the P2
-# structured log line ships AND its log group is wired to this group.
-_ENABLE_ROUTING_LATENCY_BY_MODEL = False
-
-# The MetricFilter JSON dimension key for the per-model latency filter.
-# CRITICAL (ADR-0027:64-67): RouteIQ does NOT emit ``selected_model`` as a
-# structured field - the telemetry contract emits ``gen_ai.response.model``
-# (telemetry_contracts.py:673). A filter keyed on ``$.selected_model`` matches
-# ZERO RouteIQ events. The VSR source uses ``$.selected_model``; the RouteIQ
-# port MUST use the telemetry-contract key below.
-_ROUTING_MODEL_DIM_KEY = '$.["gen_ai.response.model"]'
 
 
 class EksClusterConstruct(Construct):
@@ -116,7 +102,7 @@ class EksClusterConstruct(Construct):
         super().__init__(scope, construct_id, **kwargs)
 
         self.env_name = env_name
-        self.cluster_name = f"routeiq-{env_name}"
+        self.cluster_name = cluster_name(env_name)
         self._admin_principal_arns = list(admin_principal_arns or [])
 
         # -- 1. Cluster IAM role (the EKS control plane assumes this) ----------
@@ -349,14 +335,15 @@ class EksClusterConstruct(Construct):
         ``pods.eks.amazonaws.com`` with ``CloudWatchAgentServerPolicy``,
         associated to the add-on's ServiceAccount).
 
-        NO alarms, NO dashboard, NO SNS topic - those are deferred to P2
-        (ADR-0027). This is the major trim from the VSR
+        NO alarms, NO dashboard, NO SNS topic, and NO routing MetricFilter -
+        those are deferred to P2 (ADR-0027). This is the major trim from the VSR
         ``enable_container_insights`` (which builds 7 alarms, a dashboard, an SNS
-        topic, and the custom Fluent Bit pipeline). The dimensioned
-        ``RoutingLatencyByModel`` MetricFilter ships PREP-ONLY / flag-gated off
-        (``_ENABLE_ROUTING_LATENCY_BY_MODEL``) because it is data-source-blocked
-        until P2; when enabled it dimensions on ``$.["gen_ai.response.model"]``
-        (NOT ``$.selected_model``, which RouteIQ never emits - ADR-0027:64-67).
+        topic, and the custom Fluent Bit pipeline). The dimensioned per-model
+        routing-latency MetricFilter is OWNED BY P2 now (``ObservabilityConstruct``,
+        keyed on ``$.["gen_ai.response.model"]`` over the live ``$.event`` /
+        ``$.latency_ms`` contract); P0 only CDK-creates the routing log group the P2
+        filters attach to (RouteIQ-8f08 removed the stale P0-side prep filter, which
+        keyed on the dead VSR contract no emitter produces).
         """
         # Role the CloudWatch agent assumes (Pod Identity). The trust principal
         # is the EKS Pod Identity service principal, with the sts:TagSession +
@@ -409,7 +396,7 @@ class EksClusterConstruct(Construct):
         # time so the metric filters attach, and Fluent Bit's auto_create_group
         # becomes a harmless no-op. RETAIN in non-dev so the captured routing
         # corpus survives a stack teardown; DESTROY in dev for clean re-creates.
-        self.routing_log_group_name = f"/aws/containerinsights/{self.cluster_name}/routeiq-routing"
+        self.routing_log_group_name = routing_log_group_name(self.env_name)
         self.routing_log_group = logs.LogGroup(
             self,
             f"{construct_id}RoutingLogGroup",
@@ -420,22 +407,10 @@ class EksClusterConstruct(Construct):
             ),
         )
 
-        # PREP-ONLY / deferred (proposal section 7.5). The dimensioned per-model
-        # routing-latency MetricFilter is data-source-blocked until P2: its
-        # source (the structured routing_decision CW JSON log line) is a P2
-        # BUILD-NEW item, so the filter matches ZERO events at P0. It is
-        # flag-gated OFF and authored here so the P2 wave only flips the flag.
-        # When enabled it MUST dimension on $.["gen_ai.response.model"] (the
-        # telemetry-contract key), NOT $.selected_model (ADR-0027:64-67). AWS
-        # forbids default_value on a dimensioned filter, so it is omitted.
-        if _ENABLE_ROUTING_LATENCY_BY_MODEL:
-            logs.MetricFilter(
-                self,
-                f"{construct_id}RoutingLatencyByModelFilter",
-                log_group=self.routing_log_group,
-                filter_pattern=logs.FilterPattern.string_value("$.msg", "=", "routing_decision"),
-                metric_namespace=f"routeiq/{self.env_name}/router",
-                metric_name="routing_latency_ms_by_model",
-                metric_value="$.routing_latency_ms",
-                dimensions={"model": _ROUTING_MODEL_DIM_KEY},
-            )
+        # RouteIQ-8f08: the dimensioned per-model routing-latency MetricFilter is
+        # OWNED BY P2 (ObservabilityConstruct), keyed on the live $.event /
+        # $.latency_ms contract + $.["gen_ai.response.model"] dimension. The old
+        # P0-side prep-only filter keyed on the STALE VSR field contract (which no
+        # emitter produces), so even flipped on it matched ZERO events. It is DELETED
+        # here (single owner = P2); P0 only owns the log group the P2 filters attach
+        # to. P0's default surface emits 0 MetricFilters.

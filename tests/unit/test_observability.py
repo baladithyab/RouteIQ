@@ -46,6 +46,13 @@ get_tracer = observability.get_tracer
 get_meter = observability.get_meter
 _is_sdk_tracer_provider = observability._is_sdk_tracer_provider
 
+# P2-hardening (RouteIQ-731c) structured-error emitter symbols. Bound off the
+# importlib-loaded module object (consistent with this file's no-heavy-import
+# style) so the gate's ``-k observability`` selector covers the emitter contract.
+build_error_log_record = observability.build_error_log_record
+emit_error_log = observability.emit_error_log
+scrub_error_message = observability.scrub_error_message
+
 
 class TestIsSdkTracerProvider:
     """Test suite for _is_sdk_tracer_provider helper function."""
@@ -805,3 +812,100 @@ def test_default_metrics_namespace(monkeypatch):
     assert attrs["service.name"] == "routeiq"
     assert attrs["deployment.environment"] == "default"
     assert attrs["routeiq.metrics.namespace"] == "RouteIQ"
+
+
+class TestErrorLogEmitter731c:
+    """The P2-hardening structured-error emitter, the gateway half of RouteIQ-731c.
+
+    The CloudWatch ``RouterErrorFilter`` (observability_construct.py) selects on a
+    TOP-LEVEL ``$.level == "error"`` key. Before this hardening NO emitter produced
+    that key (the only structured line, ``routing_decision``, carries no ``level``;
+    ``log_error_with_trace`` wrote a plain TEXT line), so the filter matched zero
+    events and the router-error-count alarm could NEVER fire. ``emit_error_log``
+    emits one JSON line carrying the lowercased ``level`` literal the filter scans.
+
+    These assertions live HERE (not only in the dedicated ``test_error_log.py``) so
+    the gate's ``-k observability`` selector covers the emitter side of the seed:
+    the two halves -- emitter writes ``level``, the CDK filter scans ``$.level`` --
+    must both hold for the alarm to be live.
+    """
+
+    def test_record_carries_top_level_lowercased_level_error(self):
+        """The single most load-bearing assertion: top-level lowercased level=error.
+
+        Python's default ``levelname`` is UPPERCASE ``ERROR``; the emitter must
+        write the LOWERCASED literal the CloudWatch filter pattern matches.
+        """
+        record = build_error_log_record(error_type="ValueError", error_message="boom")
+        assert record["level"] == "error"
+        assert record["level"] != "ERROR", "must be lowercased, not Python levelname"
+        # The alternate re-key the construct doc allows (``$.event = "error"``).
+        assert record["event"] == "error"
+
+    def test_record_is_pii_safe_no_freetext_keys(self):
+        """No request prompt/completion text keys leak into the error line."""
+        record = build_error_log_record(error_type="E", error_message="m")
+        for forbidden in ("query", "prompt", "completion", "messages", "content"):
+            assert forbidden not in record, f"PII leak: {forbidden!r} present"
+
+    def test_emitted_message_is_token_scrubbed(self):
+        """A token interpolated into the message is redacted (NEVER log tokens)."""
+        record = emit_error_log(
+            error_type="AuthError",
+            error_message="rejected Bearer secrettokenvalue0123456789",
+        )
+        assert record is not None
+        assert "secrettokenvalue0123456789" not in record["error_message"]
+        assert "[REDACTED]" in scrub_error_message("Bearer abcdef0123456789ABCDEF")
+
+    def test_emit_writes_one_json_line_on_the_routing_logger(self, caplog):
+        """emit_error_log writes ONE JSON object on the dedicated routing logger.
+
+        The line must land on the SAME ``routeiq.routing_decision`` logger the
+        routing-decision line uses, so it reaches the routing log group the
+        ``RouterErrorFilter`` scans.
+        """
+        import json
+        import logging
+
+        caplog.set_level(logging.INFO, logger="routeiq.routing_decision")
+        returned = emit_error_log(error_type="ValueError", error_message="boom")
+        assert returned is not None
+        records = [r for r in caplog.records if r.name == "routeiq.routing_decision"]
+        assert len(records) == 1, "expected exactly one structured error line"
+        parsed = json.loads(records[0].getMessage())
+        assert parsed["level"] == "error"
+        assert parsed["event"] == "error"
+        assert parsed["error_type"] == "ValueError"
+
+    def test_log_error_with_trace_also_emits_structured_line(self, caplog):
+        """The existing error call site now ALSO emits the structured filter line.
+
+        ``ObservabilityManager.log_error_with_trace`` keeps its human TEXT log AND
+        emits the flat JSON line (request_id plucked from context), so every error
+        call site feeds the filter without per-site wiring.
+        """
+        import json
+        import logging
+
+        caplog.set_level(logging.INFO, logger="routeiq.routing_decision")
+        manager = ObservabilityManager()
+        manager.log_error_with_trace(
+            ValueError("routing backend unavailable"),
+            context={"request_id": "req-abc-123"},
+        )
+        records = [r for r in caplog.records if r.name == "routeiq.routing_decision"]
+        assert len(records) == 1
+        parsed = json.loads(records[0].getMessage())
+        assert parsed["level"] == "error"
+        assert parsed["request_id"] == "req-abc-123"
+
+    def test_emit_never_raises_on_bad_settings(self, monkeypatch):
+        """A settings failure fails OPEN (still emits) and never raises."""
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("settings unavailable")
+
+        monkeypatch.setattr("litellm_llmrouter.settings.get_settings", _boom)
+        returned = emit_error_log(error_type="E", error_message="m")
+        assert returned is not None

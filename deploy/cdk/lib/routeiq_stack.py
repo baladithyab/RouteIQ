@@ -45,6 +45,7 @@ from constructs import Construct
 from .ecr_construct import EcrConstruct
 from .eks_cluster_construct import EksClusterConstruct
 from .nag_suppressions import apply_nag_suppressions
+from .naming import routing_log_group_export_name
 from .network_construct import NetworkConstruct
 
 
@@ -331,6 +332,28 @@ class RouteIqStack(Stack):
                 "(append /baladithyab/routeiq at helm upgrade time)"
             ),
         )
+        # RouteIQ-81c4: a STABLE cross-stack EXPORT of the routing log group name so
+        # the P2 RouteIqObservabilityStack can Fn::ImportValue it (instead of relying
+        # on a hand-copied NAME-only convention). The export name is deterministic
+        # (RouteIqStack-<env>-RoutingLogGroupName); once P2 imports it, it cannot be
+        # renamed/removed without first removing the P2 consumer
+        # (cfn-cross-stack-export-revisioned-ref-deadlock). The combined-deploy P2
+        # path actually references the ILogGroup directly (CDK auto-generates its own
+        # import), so this named export is the operator-visible + separate-pipeline
+        # handoff contract.
+        log_group_name = getattr(self.eks_cluster, "routing_log_group_name", None)
+        if log_group_name is not None:
+            CfnOutput(
+                self,
+                "RoutingLogGroupName",
+                value=log_group_name,
+                export_name=routing_log_group_export_name(self.env_name),
+                description=(
+                    "Dedicated routing-decision CloudWatch log group name. P2 "
+                    "observability + the data lake attach metric/subscription "
+                    "filters to this group (P0 owns it)."
+                ),
+            )
 
     def _suppress_nag(self) -> None:
         """Apply the evidenced cdk-nag suppressions for this stack (LAST)."""

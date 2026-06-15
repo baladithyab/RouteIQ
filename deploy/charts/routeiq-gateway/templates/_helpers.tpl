@@ -354,6 +354,46 @@ Environment variables for gateway configuration
   value: {{ .Values.externalOtel.protocol | default "grpc" | quote }}
 {{- end }}
 
+# AWS substrate seam (P2: AMP / AppConfig CfnOutput consume + AWS_REGION)
+# RouteIQ-bf9f. Every block is gated on a non-empty value so the default render
+# stays byte-stable / cloud-agnostic.
+{{- if .Values.aws.region }}
+# LOAD-BEARING on AWS: every boto3 client (Bedrock, AppConfig poll, AMP, S3
+# config sync, IAM-token minting) needs a region. Emitted as BOTH names because
+# boto3 reads AWS_REGION first, AWS_DEFAULT_REGION as a fallback.
+- name: AWS_REGION
+  value: {{ .Values.aws.region | quote }}
+- name: AWS_DEFAULT_REGION
+  value: {{ .Values.aws.region | quote }}
+{{- end }}
+{{- if .Values.aws.appConfig.enabled }}
+# AppConfig runtime config retrieval (ADR-0026 / RouteIQ-4333). Wires the
+# config_sync AppConfig poll adapter via its ROUTEIQ_CONFIG_SYNC__APPCONFIG_*
+# settings (ADR-0013 nested env prefix).
+- name: ROUTEIQ_CONFIG_SYNC__APPCONFIG_ENABLED
+  value: "true"
+{{- if .Values.aws.appConfig.application }}
+- name: ROUTEIQ_CONFIG_SYNC__APPCONFIG_APPLICATION
+  value: {{ .Values.aws.appConfig.application | quote }}
+{{- end }}
+{{- if .Values.aws.appConfig.environment }}
+- name: ROUTEIQ_CONFIG_SYNC__APPCONFIG_ENVIRONMENT
+  value: {{ .Values.aws.appConfig.environment | quote }}
+{{- end }}
+{{- if .Values.aws.appConfig.profile }}
+- name: ROUTEIQ_CONFIG_SYNC__APPCONFIG_PROFILE
+  value: {{ .Values.aws.appConfig.profile | quote }}
+{{- end }}
+- name: ROUTEIQ_CONFIG_SYNC__APPCONFIG_POLL_INTERVAL_SECONDS
+  value: {{ .Values.aws.appConfig.pollIntervalSeconds | quote }}
+{{- end }}
+{{- if .Values.aws.amp.remoteWriteUrl }}
+# Amazon Managed Prometheus remote-write target (P2). Consumed by an ADOT
+# collector sidecar (follow-up); this is the env seam.
+- name: AMP_REMOTE_WRITE_URL
+  value: {{ .Values.aws.amp.remoteWriteUrl | quote }}
+{{- end }}
+
 # OIDC / SSO
 {{- if .Values.oidc.enabled }}
 - name: ROUTEIQ_OIDC_ENABLED

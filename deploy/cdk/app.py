@@ -140,16 +140,24 @@ def main() -> None:
     # P2 (ADR-0026/0027): the SEPARATE config-state + observability + data-lake
     # stack. Flag-gated off by default so the default synth carries only the P0
     # stack (the ~30-minute-rollback rule keeps P2 independently deployable). When
-    # routeiq:enable_observability_stack=true it synths alongside P0. AMG and the
-    # data lake are each their own nested flag (both default off). The routing log
-    # group is referenced by NAME (the P0 output, or the P0 naming convention) -
-    # props-only, never from_lookup, to keep synth credential-free.
+    # routeiq:enable_observability_stack=true it synths alongside P0.
+    #
+    # COMBINED-DEPLOY WIRING (RouteIQ-569f / 81c4 / 74c0 / 717b): the P0 foundation
+    # is threaded by REFERENCE (foundation=foundation), exactly as the P1 state
+    # stack is. CDK resolves the cross-stack references (the pod-role ARN, the
+    # routing log-group name) at synth into Export / Fn::ImportValue -- cred-free,
+    # never from_lookup. With the foundation present the P2 stack: references the
+    # real P0 routing ILogGroup + add_dependency(P0) so CFN deploys the group before
+    # the filters (81c4); and owns a P2-stack iam.Policy attached to the P0 pod role
+    # granting the AppConfig runtime poll (569f) + aps:RemoteWrite (74c0/717b). AMG
+    # and the data lake are each their own nested flag (both default off).
     if _bool_ctx(app, "routeiq:enable_observability_stack", False):
         RouteIqObservabilityStack(
             app,
             f"RouteIqObservabilityStack-{env_name}",
             env=env,
             env_name=env_name,
+            foundation=foundation,
             routing_log_group_name=(_ctx(app, "routeiq:routing_log_group_name", None) or None),
             enable_amg=_bool_ctx(app, "routeiq:enable_amg", False),
             enable_data_lake=_bool_ctx(app, "routeiq:enable_data_lake", False),

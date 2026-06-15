@@ -1,0 +1,728 @@
+{
+  "Outputs": {
+    "AlarmTopicArn": {
+      "Description": "TLS-enforced on-call SNS topic every routing alarm pages",
+      "Value": {
+        "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+      }
+    },
+    "AmpRemoteWriteUrl": {
+      "Description": "AMP remote_write endpoint URL for the pod ADOT exporter",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "https://aps-workspaces.",
+            {
+              "Ref": "AWS::Region"
+            },
+            ".amazonaws.com/workspaces/",
+            {
+              "Fn::GetAtt": [
+                "ObservabilityConstructAmpWorkspaceF5D84804",
+                "WorkspaceId"
+              ]
+            },
+            "/api/v1/remote_write"
+          ]
+        ]
+      }
+    },
+    "AmpWorkspaceId": {
+      "Description": "Amazon Managed Prometheus workspace id (ADOT remote-write target)",
+      "Value": {
+        "Fn::GetAtt": [
+          "ObservabilityConstructAmpWorkspaceF5D84804",
+          "WorkspaceId"
+        ]
+      }
+    },
+    "AppConfigApplicationId": {
+      "Description": "AppConfig application id (routeiq) for the config poll path",
+      "Value": {
+        "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+      }
+    },
+    "AppConfigArn": {
+      "Description": "AppConfig configuration ARN (alias of AppConfigProfileArn)",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "arn:",
+            {
+              "Ref": "AWS::Partition"
+            },
+            ":appconfig:us-west-2:123456789012:application/",
+            {
+              "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+            },
+            "/environment/",
+            {
+              "Ref": "ConfigStateConstructAppConfigEnvironmentFC0E08E9"
+            },
+            "/configuration/",
+            {
+              "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+            }
+          ]
+        ]
+      }
+    },
+    "AppConfigProfileArn": {
+      "Description": "AppConfig env-scoped configuration ARN the gateway polls via StartConfigurationSession + GetLatestConfiguration",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "arn:",
+            {
+              "Ref": "AWS::Partition"
+            },
+            ":appconfig:us-west-2:123456789012:application/",
+            {
+              "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+            },
+            "/environment/",
+            {
+              "Ref": "ConfigStateConstructAppConfigEnvironmentFC0E08E9"
+            },
+            "/configuration/",
+            {
+              "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+            }
+          ]
+        ]
+      }
+    }
+  },
+  "Parameters": {
+    "BootstrapVersion": {
+      "Default": "/cdk-bootstrap/hnb659fds/version",
+      "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]",
+      "Type": "AWS::SSM::Parameter::Value<String>"
+    }
+  },
+  "Resources": {
+    "ConfigStateConstructAppConfigApplication23BDC382": {
+      "Properties": {
+        "Description": "RouteIQ AppConfig application",
+        "Name": "routeiq",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::AppConfig::Application"
+    },
+    "ConfigStateConstructAppConfigEnvironmentFC0E08E9": {
+      "Properties": {
+        "ApplicationId": {
+          "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+        },
+        "Description": "RouteIQ AppConfig environment for dev",
+        "Name": "dev",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::AppConfig::Environment"
+    },
+    "ConfigStateConstructAppConfigInitialDeploymentF8ACBBBB": {
+      "DependsOn": [
+        "ConfigStateConstructAppConfigValidatorPermission6C8A4322"
+      ],
+      "Properties": {
+        "ApplicationId": {
+          "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+        },
+        "ConfigurationProfileId": {
+          "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+        },
+        "ConfigurationVersion": {
+          "Ref": "ConfigStateConstructAppConfigInitialVersion70B339D9"
+        },
+        "DeploymentStrategyId": {
+          "Ref": "ConfigStateConstructAppConfigStrategy2A79B687"
+        },
+        "Description": "Initial AppConfig deployment of placeholder config",
+        "EnvironmentId": {
+          "Ref": "ConfigStateConstructAppConfigEnvironmentFC0E08E9"
+        },
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::AppConfig::Deployment"
+    },
+    "ConfigStateConstructAppConfigInitialVersion70B339D9": {
+      "Properties": {
+        "ApplicationId": {
+          "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+        },
+        "ConfigurationProfileId": {
+          "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+        },
+        "Content": "# RouteIQ AppConfig placeholder configuration (config.yaml).\n# Replaced by the operator via a subsequent CreateHostedConfigurationVersion.\nmodel_list:\n  - model_name: claude-haiku\n    litellm_params:\n      model: bedrock/anthropic.claude-3-haiku-20240307-v1:0\n      aws_region_name: os.environ/AWS_REGION\nlitellm_settings:\n  drop_params: true\n  num_retries: 2\ngeneral:\n  config_source: file\n",
+        "ContentType": "application/x-yaml",
+        "Description": "Placeholder config for first deploy; operator replaces via CreateHostedConfigurationVersion"
+      },
+      "Type": "AWS::AppConfig::HostedConfigurationVersion"
+    },
+    "ConfigStateConstructAppConfigProfile40E0B43F": {
+      "Properties": {
+        "ApplicationId": {
+          "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+        },
+        "Description": "RouteIQ config profile (free-form YAML)",
+        "LocationUri": "hosted",
+        "Name": "router-yaml",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "Type": "AWS.Freeform",
+        "Validators": [
+          {
+            "Content": {
+              "Fn::GetAtt": [
+                "ConfigStateConstructAppConfigValidatorLambdaA611FC27",
+                "Arn"
+              ]
+            },
+            "Type": "LAMBDA"
+          }
+        ]
+      },
+      "Type": "AWS::AppConfig::ConfigurationProfile"
+    },
+    "ConfigStateConstructAppConfigStrategy2A79B687": {
+      "Properties": {
+        "DeploymentDurationInMinutes": 12,
+        "Description": "Linear 20% per 3 minutes (60% over 12min) + 5min final bake",
+        "FinalBakeTimeInMinutes": 5,
+        "GrowthFactor": 20,
+        "GrowthType": "LINEAR",
+        "Name": "Linear20Pct3Min",
+        "ReplicateTo": "NONE",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::AppConfig::DeploymentStrategy"
+    },
+    "ConfigStateConstructAppConfigValidatorLambdaA611FC27": {
+      "DependsOn": [
+        "ConfigStateConstructAppConfigValidatorLambdaServiceRole084F78D3"
+      ],
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-L1",
+              "reason": "Runtime is pinned to Python 3.13 to match the bundled lambda/appconfig-validator/handler.py and the inline placeholder fallback. Bumping to a newer runtime happens in lockstep with the next aws-cdk-lib upgrade per mulch mx-1d874a. Owner: RouteIQ P2 ConfigStateConstruct."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "Code": {
+          "ZipFile": "def lambda_handler(event, context):\n    # Placeholder validator: accept every configuration (return None).\n    # Replaced by lambda/appconfig-validator/handler.py once bundled.\n    return None\n"
+        },
+        "Description": "AppConfig validator for the RouteIQ config: runs RouteIQ's config validation rules (YAML parse + RouteIQ-shape + inline-secret deny). Wired into the AppConfig profile's Validators array.",
+        "Environment": {
+          "Variables": {
+            "ENV_NAME": "dev",
+            "LOG_LEVEL": "INFO"
+          }
+        },
+        "FunctionName": "routeiq-dev-appconfig-validator",
+        "Handler": "index.lambda_handler",
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "ConfigStateConstructAppConfigValidatorLambdaServiceRole084F78D3",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.13",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "Timeout": 15
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ConfigStateConstructAppConfigValidatorLambdaServiceRole084F78D3": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "AWSLambdaBasicExecutionRole is the AWS-canonical execution role auto-attached by CDK to every lambda.Function. The RouteIQ config validator needs no additional permissions beyond CloudWatch Logs. Owner: RouteIQ P2 ConfigStateConstruct."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ConfigStateConstructAppConfigValidatorLogGroupFD562211": {
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/aws/lambda/",
+              {
+                "Ref": "ConfigStateConstructAppConfigValidatorLambdaA611FC27"
+              }
+            ]
+          ]
+        },
+        "RetentionInDays": 30,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::LogGroup",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ConfigStateConstructAppConfigValidatorPermission6C8A4322": {
+      "DependsOn": [
+        "ConfigStateConstructAppConfigProfile40E0B43F"
+      ],
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "ConfigStateConstructAppConfigValidatorLambdaA611FC27",
+            "Arn"
+          ]
+        },
+        "Principal": "appconfig.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":appconfig:us-west-2:123456789012:application/",
+              {
+                "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+              },
+              "/configurationprofile/",
+              {
+                "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+              }
+            ]
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
+    "ObservabilityConstructAlarmTopic6B087DCD": {
+      "Properties": {
+        "DisplayName": "routeiq dev oncall",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "TopicName": "routeiq-dev-oncall"
+      },
+      "Type": "AWS::SNS::Topic"
+    },
+    "ObservabilityConstructAlarmTopicPolicy6775703B": {
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "sns:Publish",
+                "sns:Subscribe"
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              },
+              "Effect": "Deny",
+              "Principal": {
+                "AWS": "*"
+              },
+              "Resource": {
+                "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+              },
+              "Sid": "DenyInsecureTransport"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Topics": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ]
+      },
+      "Type": "AWS::SNS::TopicPolicy"
+    },
+    "ObservabilityConstructAmpWorkspaceF5D84804": {
+      "Properties": {
+        "Alias": "routeiq-dev",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::APS::Workspace"
+    },
+    "ObservabilityConstructRouterErrorAlarm2BC5C5D4": {
+      "Properties": {
+        "AlarmActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "AlarmDescription": "RouteIQ dev router error-log count exceeded 10 events over 5 minutes (top-level level=error lines on the routing log group). Reads the router_error_log_count CW Logs metric filter.",
+        "AlarmName": "routeiq-dev-router-error-log-count",
+        "ComparisonOperator": "GreaterThanThreshold",
+        "DatapointsToAlarm": 1,
+        "EvaluationPeriods": 1,
+        "MetricName": "router_error_log_count",
+        "Namespace": "routeiq/dev/router",
+        "OKActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "Period": 300,
+        "Statistic": "Sum",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "Threshold": 10,
+        "TreatMissingData": "notBreaching"
+      },
+      "Type": "AWS::CloudWatch::Alarm"
+    },
+    "ObservabilityConstructRouterErrorFilter2946D708": {
+      "Properties": {
+        "FilterPattern": "{ $.level = \"error\" }",
+        "LogGroupName": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefEksClusterConstructContainerInsightsRoutingLogGroup20E76F71923D0298"
+        },
+        "MetricTransformations": [
+          {
+            "DefaultValue": 0,
+            "MetricName": "router_error_log_count",
+            "MetricNamespace": "routeiq/dev/router",
+            "MetricValue": "1"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::MetricFilter"
+    },
+    "ObservabilityConstructRoutingDashboardF64F7DF8": {
+      "Properties": {
+        "DashboardBody": {
+          "Fn::Join": [
+            "",
+            [
+              "{\"widgets\":[{\"type\":\"metric\",\"width\":24,\"height\":6,\"x\":0,\"y\":0,\"properties\":{\"view\":\"timeSeries\",\"title\":\"Per-model routing latency (Average, SEARCH expansion)\",\"region\":\"",
+              {
+                "Ref": "AWS::Region"
+              },
+              "\",\"metrics\":[[{\"expression\":\"SEARCH('{\\\"routeiq/dev/router\\\",model} MetricName=\\\"routing_latency_ms_by_model\\\"', 'Average', 60)\",\"period\":60}]],\"yAxis\":{}}},{\"type\":\"metric\",\"width\":24,\"height\":6,\"x\":0,\"y\":6,\"properties\":{\"view\":\"timeSeries\",\"title\":\"Per-model request volume (SampleCount of latency metric)\",\"region\":\"",
+              {
+                "Ref": "AWS::Region"
+              },
+              "\",\"metrics\":[[{\"expression\":\"SEARCH('{\\\"routeiq/dev/router\\\",model} MetricName=\\\"routing_latency_ms_by_model\\\"', 'SampleCount', 60)\",\"period\":60}]],\"yAxis\":{}}}]}"
+            ]
+          ]
+        },
+        "DashboardName": "routeiq-dev-routing",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::CloudWatch::Dashboard"
+    },
+    "ObservabilityConstructRoutingLatencyAlarm28D0B59A": {
+      "Properties": {
+        "AlarmActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "AlarmDescription": "RouteIQ dev routing latency exceeded 30000 ms (30s absolute ceiling) for 3 consecutive minutes - a wedged routing path, a large-prompt timeout, or a backend stall. Reads the aggregate routing_latency_ms CW Logs metric filter.",
+        "AlarmName": "routeiq-dev-routing-latency-high",
+        "ComparisonOperator": "GreaterThanThreshold",
+        "DatapointsToAlarm": 3,
+        "EvaluationPeriods": 3,
+        "MetricName": "routing_latency_ms",
+        "Namespace": "routeiq/dev/router",
+        "OKActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "Period": 60,
+        "Statistic": "Maximum",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "Threshold": 30000,
+        "TreatMissingData": "notBreaching"
+      },
+      "Type": "AWS::CloudWatch::Alarm"
+    },
+    "ObservabilityConstructRoutingLatencyAnomalyAlarm8BEAF313": {
+      "Properties": {
+        "AlarmActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "AlarmDescription": "RouteIQ dev routing latency is abnormally HIGH vs its self-trained 3-sigma band (anomaly detection on average routing_latency_ms over 5min). Reads INSUFFICIENT_DATA until the band trains on ~2 weeks of traffic.",
+        "AlarmName": "routeiq-dev-routing-latency-anomaly",
+        "ComparisonOperator": "GreaterThanUpperThreshold",
+        "EvaluationPeriods": 3,
+        "Metrics": [
+          {
+            "Expression": "ANOMALY_DETECTION_BAND(m0, 3)",
+            "Id": "expr_1",
+            "Label": "Anomaly Detection Band",
+            "ReturnData": true
+          },
+          {
+            "Id": "m0",
+            "MetricStat": {
+              "Metric": {
+                "MetricName": "routing_latency_ms",
+                "Namespace": "routeiq/dev/router"
+              },
+              "Period": 300,
+              "Stat": "Average"
+            },
+            "ReturnData": true
+          }
+        ],
+        "OKActions": [
+          {
+            "Ref": "ObservabilityConstructAlarmTopic6B087DCD"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "ThresholdMetricId": "expr_1",
+        "TreatMissingData": "notBreaching"
+      },
+      "Type": "AWS::CloudWatch::Alarm"
+    },
+    "ObservabilityConstructRoutingLatencyByModelFilterBFC80DA1": {
+      "Properties": {
+        "FilterPattern": "{ $.event = \"routing_decision\" }",
+        "LogGroupName": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefEksClusterConstructContainerInsightsRoutingLogGroup20E76F71923D0298"
+        },
+        "MetricTransformations": [
+          {
+            "Dimensions": [
+              {
+                "Key": "model",
+                "Value": "$.[\"gen_ai.response.model\"]"
+              }
+            ],
+            "MetricName": "routing_latency_ms_by_model",
+            "MetricNamespace": "routeiq/dev/router",
+            "MetricValue": "$.latency_ms",
+            "Unit": "Milliseconds"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::MetricFilter"
+    },
+    "ObservabilityConstructRoutingLatencyFilter7D7CEF36": {
+      "Properties": {
+        "FilterPattern": "{ $.event = \"routing_decision\" }",
+        "LogGroupName": {
+          "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefEksClusterConstructContainerInsightsRoutingLogGroup20E76F71923D0298"
+        },
+        "MetricTransformations": [
+          {
+            "DefaultValue": 0,
+            "MetricName": "routing_latency_ms",
+            "MetricNamespace": "routeiq/dev/router",
+            "MetricValue": "$.latency_ms",
+            "Unit": "Milliseconds"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::MetricFilter"
+    },
+    "PodObsGrantsB7EA3559": {
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "appconfigdata:StartConfigurationSession",
+                "appconfigdata:GetLatestConfiguration",
+                "appconfig:GetLatestConfiguration"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":appconfig:us-west-2:123456789012:application/",
+                    {
+                      "Ref": "ConfigStateConstructAppConfigApplication23BDC382"
+                    },
+                    "/environment/",
+                    {
+                      "Ref": "ConfigStateConstructAppConfigEnvironmentFC0E08E9"
+                    },
+                    "/configuration/",
+                    {
+                      "Ref": "ConfigStateConstructAppConfigProfile40E0B43F"
+                    }
+                  ]
+                ]
+              },
+              "Sid": "AppConfigPoll"
+            },
+            {
+              "Action": "aps:RemoteWrite",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ObservabilityConstructAmpWorkspaceF5D84804",
+                  "Arn"
+                ]
+              },
+              "Sid": "AmpRemoteWrite"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "PodObsGrantsB7EA3559",
+        "Roles": [
+          {
+            "Fn::ImportValue": "RouteIqStack-dev:ExportsOutputRefPodRole29A926005A8989EC"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    }
+  },
+  "Rules": {
+    "CheckBootstrapVersion": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Contains": [
+                  [
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5"
+                  ],
+                  {
+                    "Ref": "BootstrapVersion"
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+        }
+      ]
+    }
+  }
+}

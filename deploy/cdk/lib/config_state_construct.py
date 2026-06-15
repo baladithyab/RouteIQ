@@ -37,10 +37,15 @@ Mulch-recorded VSR lessons carried verbatim:
   * ``cdk-aws-custom-resource-update-stale-attribute``: use the L1
     ``CfnHostedConfigurationVersion`` rather than ``AwsCustomResource`` with
     only ``onCreate`` to avoid stale attribute reads on stack update.
-  * ``mx-86079a`` (lambda-asset-fallback-inline-placeholder): when
-    ``lambda/appconfig-validator/`` is absent at synth (CI, isolated unit tests)
-    OR Docker is unavailable, fall back to ``Code.from_inline`` with an
-    accept-all placeholder so synth + snapshot tests proceed.
+  * ``mx-86079a`` (lambda-asset-fallback-inline-placeholder) + RouteIQ-4772
+    (deterministic synth): the inline accept-all placeholder is the DEFAULT synth
+    path -- selected by an EXPLICIT ``bundle_validator_asset`` toggle (kwarg or the
+    ``routeiq:bundle_validator_asset`` context flag), NOT an implicit
+    ``shutil.which("docker")`` probe. So the synthesised template is identical on a
+    Docker-equipped host and a Docker-less one (CI, isolated unit tests, the
+    cred-free gate, the snapshot). The REAL PyYAML-bundled ``handler.py`` ships ONLY
+    under the explicit opt-in (the operator-controlled "real validator" deploy),
+    with Docker + the asset present; otherwise the inline placeholder is used.
   * ``mx-1d874a`` (lambda runtime tracks aws-cdk-lib latest): validator pins
     ``Runtime.PYTHON_3_13``.
   * bug #10 (handler-string trap): ``from_inline`` ALWAYS writes the body to
@@ -52,11 +57,11 @@ Mulch-recorded VSR lessons carried verbatim:
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 from aws_cdk import Aws, BundlingOptions, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_appconfig as appconfig
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from cdk_nag import NagPackSuppression, NagSuppressions
@@ -126,12 +131,38 @@ class ConfigStateConstruct(Construct):
         construct_id: str,
         *,
         env_name: str,
+        # RouteIQ-4772: make the validator Lambda synth DETERMINISTIC. The default
+        # (False) ALWAYS takes the inline placeholder path -- the byte-stable,
+        # host-Docker-INDEPENDENT path the cred-free gate + the snapshot exercise.
+        # The real PyYAML-bundled validator (lambda/appconfig-validator/handler.py)
+        # ships ONLY under an EXPLICIT opt-in (this kwarg True, or the
+        # ``routeiq:bundle_validator_asset`` context flag) AND with Docker + the
+        # asset present -- the operator-controlled "real validator" deploy. This
+        # removes the old silent ``shutil.which("docker")`` dual-resolution where a
+        # cred-free gate validated an accept-all no-op while a docker-equipped
+        # ``cdk deploy`` shipped a DIFFERENT template (a different Code property +
+        # Handler string + runtime behaviour). The deploy path is documented; the
+        # gate-tested path is the synth default.
+        bundle_validator_asset: bool | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         self.env_name = env_name
         stack = Stack.of(self)
+
+        # Resolve the validator-bundling toggle: explicit kwarg wins; else the
+        # ``routeiq:bundle_validator_asset`` context flag (CLI string or cdk.json
+        # bool); else the deterministic default of False (inline path).
+        if bundle_validator_asset is None:
+            ctx = self.node.try_get_context("routeiq:bundle_validator_asset")
+            if isinstance(ctx, bool):
+                bundle_validator_asset = ctx
+            elif ctx is None:
+                bundle_validator_asset = False
+            else:
+                bundle_validator_asset = str(ctx).strip().lower() in ("true", "1", "yes")
+        self.bundle_validator_asset = bundle_validator_asset
 
         (
             self.appconfig_application,
@@ -161,6 +192,50 @@ class ConfigStateConstruct(Construct):
                 f"{self.appconfig_profile_id}"
             ),
         )
+
+    def appconfig_poll_statement(self) -> iam.PolicyStatement:
+        """Return the AppConfig runtime-poll PolicyStatement for the pod role.
+
+        RouteIQ-569f. The single statement a RouteIQ replica needs to poll AppConfig
+        for new config versions at runtime (ADR-0026): StartConfigurationSession +
+        GetLatestConfiguration, scoped to THIS construct's env-scoped profile ARN
+        (``self.appconfig_profile_arn``), NEVER ``*``.
+
+        PREFIX CORRECTNESS (incidental, folded into 569f): the runtime poll is the
+        ``appconfigdata`` DATA-PLANE prefix -- the boto3 ``appconfigdata`` client
+        (RouteIQ-4333's poll adapter) calls ``appconfigdata:StartConfigurationSession``
+        + ``appconfigdata:GetLatestConfiguration``. Granting ONLY the control-plane
+        ``appconfig:GetLatestConfiguration`` would AccessDeny on the poll. The
+        control-plane GET is also kept for SDK-path tolerance.
+
+        Returned as a STATEMENT (not added to a role) so the composition root can
+        own the ``iam.Policy`` cross-stack without closing a DependencyCycle (see
+        RouteIqObservabilityStack._grant_pod_role). ASCII-only sid.
+        """
+        return iam.PolicyStatement(
+            sid="AppConfigPoll",
+            effect=iam.Effect.ALLOW,
+            actions=[
+                "appconfigdata:StartConfigurationSession",
+                "appconfigdata:GetLatestConfiguration",
+                "appconfig:GetLatestConfiguration",
+            ],
+            resources=[self.appconfig_profile_arn],
+        )
+
+    def appconfig_poll_grant(self, pod_role: iam.IRole) -> None:
+        """Grant a pod role the AppConfig runtime-poll actions on this profile.
+
+        The documented LATE-BINDING seam (mirrors
+        ObservabilityConstruct.amp_remote_write_grant). Adds the
+        :meth:`appconfig_poll_statement` to the role's principal policy directly.
+        NOTE: do NOT call this cross-stack (it mutates the imported role's default
+        policy in its OWN stack, closing a DependencyCycle when the resources are
+        owned by another stack). The combined-deploy path instead uses
+        :meth:`appconfig_poll_statement` inside a composition-root-owned
+        ``iam.Policy`` (RouteIqObservabilityStack._grant_pod_role).
+        """
+        pod_role.add_to_principal_policy(self.appconfig_poll_statement())
 
     def _build_appconfig(
         self, env_name: str
@@ -304,33 +379,32 @@ class ConfigStateConstruct(Construct):
     def _build_validator_lambda(self, env_name: str) -> lambda_.Function:
         """Construct the AppConfig RouteIQ-config validator Lambda.
 
-        Resolution order for the function code (dual-resolution):
+        DETERMINISTIC code resolution (RouteIQ-4772). The synth path is selected by
+        an EXPLICIT toggle (``self.bundle_validator_asset``), NOT by an implicit
+        ``shutil.which("docker")`` probe, so the synthesised template never depends
+        on whether Docker is on the host:
 
-            1. ``lambda/appconfig-validator/handler.py`` is present on disk AND
-               Docker is available -> ``Code.from_asset`` with PyYAML bundling.
-               The asset stages the real ``handler.py``, so the entry point is
-               ``handler.lambda_handler``.
-            2. Otherwise -> ``Code.from_inline`` with an accept-all placeholder
-               (mulch mx-86079a). ``from_inline`` ALWAYS writes the body to
-               ``index.py``, so the entry point is ``index.lambda_handler`` -
-               using ``handler.lambda_handler`` here is bug #10 ("No module
-               named handler" at AppConfig validation time). The resource shape
-               is still synthesised so snapshot tests + cred-free CI proceed.
+            * DEFAULT (toggle False) -> ``Code.from_inline`` with the accept-all
+              placeholder. ``from_inline`` ALWAYS writes the body to ``index.py``,
+              so the entry point is ``index.lambda_handler``. This is the
+              byte-stable, host-independent path the cred-free gate + the snapshot
+              exercise.
+            * OPT-IN (toggle True) AND the asset present -> ``Code.from_asset`` with
+              PyYAML bundling (Docker required), staging the REAL
+              ``lambda/appconfig-validator/handler.py`` (entry point
+              ``handler.lambda_handler``). The operator-controlled "real validator"
+              deploy. If the toggle is on but the asset is missing, fall back to the
+              inline placeholder so synth still proceeds (rather than raising).
 
-        The handler string is therefore selected to match whichever code path
-        was taken - the two are NOT interchangeable.
+        bug #10 (handler-string trap): ``index.lambda_handler`` (inline) and
+        ``handler.lambda_handler`` (asset) are NOT interchangeable; the handler is
+        selected to match the chosen code path.
         """
         code: lambda_.Code
-        # Bundling requires Docker on the synth host. In CI / cred-free synth
-        # contexts where Docker is unavailable the BundlingOptions path raises
-        # ``spawnSync docker ENOENT`` - fall back to the inline placeholder so
-        # synth + snapshot tests proceed (mx-86079a).
-        bundling_available = shutil.which("docker") is not None
-        if (
-            bundling_available
-            and os.path.isdir(_VALIDATOR_ASSET_PATH)
-            and os.path.isfile(os.path.join(_VALIDATOR_ASSET_PATH, "handler.py"))
-        ):
+        asset_present = os.path.isdir(_VALIDATOR_ASSET_PATH) and os.path.isfile(
+            os.path.join(_VALIDATOR_ASSET_PATH, "handler.py")
+        )
+        if self.bundle_validator_asset and asset_present:
             code = lambda_.Code.from_asset(
                 _VALIDATOR_ASSET_PATH,
                 bundling=BundlingOptions(
