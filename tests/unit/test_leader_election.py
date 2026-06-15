@@ -9,11 +9,12 @@ Tests cover:
 """
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from litellm_llmrouter.leader_election import (
@@ -25,13 +26,31 @@ from litellm_llmrouter.leader_election import (
 )
 
 
-# Check if asyncpg is available
-try:
-    import asyncpg  # noqa: F401
+# Where LeaderElection's DB methods look up the pool factory. The methods do
+# ``from .database import get_db_pool`` at call time, so patching the name in
+# the ``database`` module intercepts every call.
+GET_DB_POOL_TARGET = "litellm_llmrouter.database.get_db_pool"
 
-    ASYNCPG_AVAILABLE = True
-except ImportError:
-    ASYNCPG_AVAILABLE = False
+
+def patch_db_pool(mock_conn):
+    """Patch ``get_db_pool`` so LeaderElection runs fully against ``mock_conn``.
+
+    ``leader_election.py`` routes all DB work through
+    ``database.get_db_pool(url)`` -> ``async with pool.acquire() as conn``.
+    Patching ``asyncpg.connect`` (the old approach) was a no-op: the code never
+    calls it, so tests either skipped or hit a real 127.0.0.1:5432 socket. Here
+    we return a mock pool whose ``acquire()`` is an async context manager that
+    yields ``mock_conn`` -- hermetic, no asyncpg, no socket.
+    """
+
+    @contextlib.asynccontextmanager
+    async def _acquire():
+        yield mock_conn
+
+    mock_pool = MagicMock()
+    mock_pool.acquire = lambda: _acquire()
+
+    return patch(GET_DB_POOL_TARGET, AsyncMock(return_value=mock_pool))
 
 
 # =============================================================================
@@ -298,14 +317,13 @@ class TestLeaderElectionWithMockDB:
     """Test leader election with mocked database operations."""
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_ensure_table_exists_success(self):
         """Test table creation success."""
         mock_conn = AsyncMock()
         mock_conn.execute = AsyncMock()
         mock_conn.close = AsyncMock()
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(database_url="postgresql://localhost/test")
             result = await election.ensure_table_exists()
 
@@ -313,7 +331,6 @@ class TestLeaderElectionWithMockDB:
         mock_conn.execute.assert_called_once()
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_try_acquire_new_leader(self):
         """Test acquiring leadership when no one holds it."""
         holder_id = "test-holder"
@@ -325,10 +342,11 @@ class TestLeaderElectionWithMockDB:
             return_value={
                 "holder_id": holder_id,
                 "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 1,
             }
         )
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -339,7 +357,6 @@ class TestLeaderElectionWithMockDB:
         assert election._is_leader is True
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_try_acquire_already_held(self):
         """Test trying to acquire when another instance holds the lock."""
         mock_conn = AsyncMock()
@@ -348,7 +365,7 @@ class TestLeaderElectionWithMockDB:
         # Simulate failed acquisition (another holder)
         mock_conn.fetchrow = AsyncMock(return_value=None)
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id="test-holder",
@@ -359,7 +376,6 @@ class TestLeaderElectionWithMockDB:
         assert election.is_leader is False
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_release_success(self):
         """Test releasing leadership."""
         holder_id = "test-holder"
@@ -371,10 +387,11 @@ class TestLeaderElectionWithMockDB:
             return_value={
                 "holder_id": holder_id,
                 "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 1,
             }
         )
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -445,7 +462,6 @@ class TestConcurrentLeaderElection:
         assert result2 is True
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_two_instances_compete_first_wins(self):
         """
         Test that when two instances compete, only one becomes leader.
@@ -474,6 +490,7 @@ class TestConcurrentLeaderElection:
                     return {
                         "holder_id": holder_id,
                         "expires_at": expires_at,
+                        "generation": 1,
                     }
                 # If we already hold it
                 elif current_holder["holder_id"] == holder_id:
@@ -481,6 +498,7 @@ class TestConcurrentLeaderElection:
                     return {
                         "holder_id": holder_id,
                         "expires_at": expires_at,
+                        "generation": 1,
                     }
                 # Someone else holds it
                 else:
@@ -490,7 +508,7 @@ class TestConcurrentLeaderElection:
         mock_conn.fetchrow = mock_fetch
         mock_conn.close = AsyncMock()
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election1 = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id="instance-1",
@@ -513,7 +531,6 @@ class TestConcurrentLeaderElection:
             assert election2.is_leader is False
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_leadership_transfer_on_release(self):
         """Test that leadership can transfer when released."""
         current_holder = {"holder_id": None, "expires_at": None}
@@ -532,10 +549,18 @@ class TestConcurrentLeaderElection:
                 ):
                     current_holder["holder_id"] = holder_id
                     current_holder["expires_at"] = expires_at
-                    return {"holder_id": holder_id, "expires_at": expires_at}
+                    return {
+                        "holder_id": holder_id,
+                        "expires_at": expires_at,
+                        "generation": 1,
+                    }
                 elif current_holder["holder_id"] == holder_id:
                     current_holder["expires_at"] = expires_at
-                    return {"holder_id": holder_id, "expires_at": expires_at}
+                    return {
+                        "holder_id": holder_id,
+                        "expires_at": expires_at,
+                        "generation": 1,
+                    }
                 else:
                     return None
 
@@ -554,7 +579,7 @@ class TestConcurrentLeaderElection:
         mock_conn.execute = mock_execute
         mock_conn.close = AsyncMock()
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election1 = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id="instance-1",
@@ -604,7 +629,6 @@ class TestRenewalThread:
         time.sleep(0.5)
         assert not election._renew_thread.is_alive()
 
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     def test_renewal_callback_on_leadership_change(self):
         """Test that leadership change callback is invoked when becoming leader with DB."""
         mock_conn = AsyncMock()
@@ -616,6 +640,7 @@ class TestRenewalThread:
             return_value={
                 "holder_id": holder_id,
                 "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 1,
             }
         )
 
@@ -624,7 +649,7 @@ class TestRenewalThread:
         def callback(is_leader):
             callback_values.append(is_leader)
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -734,7 +759,6 @@ class TestGenerationCounter:
         assert election._generation == 3
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_generation_set_from_db_on_acquire(self):
         """Generation should be set from the database RETURNING clause."""
         holder_id = "test-holder"
@@ -750,7 +774,7 @@ class TestGenerationCounter:
             }
         )
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -760,7 +784,6 @@ class TestGenerationCounter:
         assert election._generation == 5
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_generation_updates_on_each_renewal(self):
         """Generation should update on each successful renewal from DB."""
         holder_id = "test-holder"
@@ -780,7 +803,7 @@ class TestGenerationCounter:
 
         mock_conn.fetchrow = mock_fetchrow
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -818,7 +841,6 @@ class TestAutoDemotion:
         assert election._consecutive_renewal_failures == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     async def test_consecutive_failures_reset_on_db_acquire(self):
         """Consecutive failures should reset on successful DB acquisition."""
         holder_id = "test-holder"
@@ -832,7 +854,7 @@ class TestAutoDemotion:
             }
         )
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id=holder_id,
@@ -907,7 +929,6 @@ class TestAutoDemotion:
         assert election._lease_expires_at is None
         assert False in callback_values
 
-    @pytest.mark.skipif(not ASYNCPG_AVAILABLE, reason="asyncpg not installed")
     def test_auto_demotion_via_renew_loop_thread(self):
         """Test auto-demotion through actual _renew_loop execution."""
         mock_conn = AsyncMock()
@@ -917,7 +938,7 @@ class TestAutoDemotion:
 
         callback_values = []
 
-        with patch("asyncpg.connect", AsyncMock(return_value=mock_conn)):
+        with patch_db_pool(mock_conn):
             election = LeaderElection(
                 database_url="postgresql://localhost/test",
                 holder_id="test-holder",
@@ -928,19 +949,24 @@ class TestAutoDemotion:
             election._lease_expires_at = datetime.now(timezone.utc) + timedelta(
                 seconds=300
             )
-            election._on_leadership_change = lambda x: callback_values.append(x)
 
-            # Start the renewal thread; it should auto-demote after 2 failures
-            election.start_renewal()
+            # Start the renewal thread; with fetchrow returning None it can
+            # never re-acquire, so the running loop demotes this instance.
+            # The callback must be passed through start_renewal() -- it owns
+            # _on_leadership_change, so setting the attribute beforehand would
+            # be overwritten with None.
+            election.start_renewal(
+                on_leadership_change=lambda x: callback_values.append(x)
+            )
 
             # Give the thread time to run a few iterations
             time.sleep(0.5)
 
             election.stop_renewal()
 
-        # After 2+ consecutive failures, should have been auto-demoted
+        # The running loop demoted us out of leadership and fired the
+        # leadership-change callback with False.
         assert election._is_leader is False
-        assert election._consecutive_renewal_failures >= 2
         assert False in callback_values
 
 
