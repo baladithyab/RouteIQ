@@ -1,0 +1,1781 @@
+{
+  "Outputs": {
+    "ClusterEndpoint": {
+      "Description": "EKS API server endpoint",
+      "Value": {
+        "Fn::GetAtt": [
+          "EksClusterConstructClusterFBE5CB5C",
+          "Endpoint"
+        ]
+      }
+    },
+    "ClusterName": {
+      "Description": "EKS cluster name for aws eks update-kubeconfig + helm upgrade",
+      "Value": "routeiq-dev"
+    },
+    "EcrGhcrPrefix": {
+      "Description": "chart image.repository override base (append /baladithyab/routeiq at helm upgrade time)",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            {
+              "Ref": "AWS::AccountId"
+            },
+            ".dkr.ecr.",
+            {
+              "Ref": "AWS::Region"
+            },
+            ".amazonaws.com/ghcr"
+          ]
+        ]
+      }
+    },
+    "EksClusterConstructClusterEndpoint09EDC352": {
+      "Value": {
+        "Fn::GetAtt": [
+          "EksClusterConstructClusterFBE5CB5C",
+          "Endpoint"
+        ]
+      }
+    },
+    "EksClusterConstructClusterName09597C3D": {
+      "Value": "routeiq-dev"
+    },
+    "EksClusterConstructKubectlConfigCommand65C32D9D": {
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "aws eks update-kubeconfig --name routeiq-dev --region ",
+            {
+              "Ref": "AWS::Region"
+            }
+          ]
+        ]
+      }
+    },
+    "EksClusterConstructNodeRoleName8D8A89F7": {
+      "Value": {
+        "Ref": "EksClusterConstructNodeRole276B0BF4"
+      }
+    },
+    "NodeRoleName": {
+      "Description": "EKS Auto Mode node role NAME",
+      "Value": {
+        "Ref": "EksClusterConstructNodeRole276B0BF4"
+      }
+    },
+    "PodAssociationId": {
+      "Description": "Pod Identity association id (binds routeiq/routeiq-gateway to PodRoleArn)",
+      "Value": {
+        "Fn::GetAtt": [
+          "EksClusterConstructPodIdentityAssociationAC7410C6",
+          "AssociationId"
+        ]
+      }
+    },
+    "PodRoleArn": {
+      "Description": "The single gateway pod role bound via EKS Pod Identity",
+      "Value": {
+        "Fn::GetAtt": [
+          "PodRole29A92600",
+          "Arn"
+        ]
+      }
+    }
+  },
+  "Parameters": {
+    "BootstrapVersion": {
+      "Default": "/cdk-bootstrap/hnb659fds/version",
+      "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]",
+      "Type": "AWS::SSM::Parameter::Value<String>"
+    },
+    "GhcrCredentialSecretArn": {
+      "Default": "",
+      "Description": "ARN of the operator-provisioned ecr-pullthroughcache/ Secrets Manager secret holding the GHCR PAT. NOT created by CDK.",
+      "NoEcho": true,
+      "Type": "String"
+    }
+  },
+  "Resources": {
+    "EcrConstructGhcrPullThroughCache52FB9C2F": {
+      "Properties": {
+        "CredentialArn": {
+          "Ref": "GhcrCredentialSecretArn"
+        },
+        "EcrRepositoryPrefix": "ghcr",
+        "UpstreamRegistry": "github-container-registry",
+        "UpstreamRegistryUrl": "ghcr.io"
+      },
+      "Type": "AWS::ECR::PullThroughCacheRule"
+    },
+    "EcrConstructGhcrRepositoryCreationTemplate2223DECB": {
+      "DependsOn": [
+        "EcrConstructGhcrPullThroughCache52FB9C2F"
+      ],
+      "Properties": {
+        "AppliedFor": [
+          "PULL_THROUGH_CACHE"
+        ],
+        "Description": "Apply IMMUTABLE tag mutability to repos auto-created by the ghcr.io pull-through-cache rule. Scan-on-push for these repos is governed by the registry-level scanning configuration.",
+        "ImageTagMutability": "IMMUTABLE",
+        "Prefix": "ghcr"
+      },
+      "Type": "AWS::ECR::RepositoryCreationTemplate"
+    },
+    "EcrConstructRegistryScanningConfiguration26122F12": {
+      "Properties": {
+        "Rules": [
+          {
+            "RepositoryFilters": [
+              {
+                "Filter": "ghcr/*",
+                "FilterType": "WILDCARD"
+              }
+            ],
+            "ScanFrequency": "SCAN_ON_PUSH"
+          }
+        ],
+        "ScanType": "BASIC"
+      },
+      "Type": "AWS::ECR::RegistryScanningConfiguration"
+    },
+    "EksClusterConstructClusterFBE5CB5C": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-EKS2",
+              "reason": "EKS control-plane log export is a deferred P2 observability item (ADR-0027), not a P0 deliverable. P0 ships pod/container observability via the amazon-cloudwatch-observability add-on plus the CDK-created RoutingLogGroup; the control-plane audit logs add per-stream CloudWatch ingestion cost best sized by the operator once the deployment is live, and the EKS API endpoint is PRIVATE-only at P0 so the attack surface is in-VPC only. Owner: EksClusterConstruct (Cluster, control-plane logging deferred to P2)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AccessConfig": {
+          "AuthenticationMode": "API",
+          "BootstrapClusterCreatorAdminPermissions": true
+        },
+        "BootstrapSelfManagedAddons": false,
+        "ComputeConfig": {
+          "Enabled": true,
+          "NodePools": [
+            "general-purpose",
+            "system"
+          ],
+          "NodeRoleArn": {
+            "Fn::GetAtt": [
+              "EksClusterConstructNodeRole276B0BF4",
+              "Arn"
+            ]
+          }
+        },
+        "KubernetesNetworkConfig": {
+          "ElasticLoadBalancing": {
+            "Enabled": true
+          }
+        },
+        "Name": "routeiq-dev",
+        "ResourcesVpcConfig": {
+          "EndpointPrivateAccess": true,
+          "EndpointPublicAccess": false,
+          "SubnetIds": [
+            {
+              "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+            },
+            {
+              "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+            }
+          ]
+        },
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "EksClusterConstructClusterRoleE43AE3FA",
+            "Arn"
+          ]
+        },
+        "StorageConfig": {
+          "BlockStorage": {
+            "Enabled": true
+          }
+        },
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          },
+          {
+            "Key": "routeiq:substrate",
+            "Value": "eks-automode"
+          }
+        ],
+        "Version": "1.33"
+      },
+      "Type": "AWS::EKS::Cluster"
+    },
+    "EksClusterConstructClusterRoleE43AE3FA": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSClusterPolicy",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSComputePolicy",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSBlockStoragePolicy",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSLoadBalancingPolicy",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSNetworkingPolicy"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "EKS Auto Mode REQUIRES these exact AWS-published control-plane policies so the AWS-managed data plane can provision nodes, EBS, and ELBs. They are AWS-managed, scoped to EKS service actions, and not replaceable with a narrower custom policy without breaking Auto Mode. Owner: EksClusterConstruct (ClusterRole)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "eks.amazonaws.com"
+              }
+            },
+            {
+              "Action": "sts:TagSession",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "eks.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Description": "RouteIQ dev EKS Auto Mode cluster role",
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSClusterPolicy"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSComputePolicy"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSBlockStoragePolicy"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSLoadBalancingPolicy"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSNetworkingPolicy"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "EksClusterConstructContainerInsights34402E66": {
+      "DependsOn": [
+        "EksClusterConstructContainerInsightsAgentPodIdentity8FDDA1A7"
+      ],
+      "Properties": {
+        "AddonName": "amazon-cloudwatch-observability",
+        "ClusterName": "routeiq-dev",
+        "ResolveConflicts": "OVERWRITE",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EKS::Addon"
+    },
+    "EksClusterConstructContainerInsightsAgentPodIdentity8FDDA1A7": {
+      "DependsOn": [
+        "EksClusterConstructPodIdentityAddon54133305"
+      ],
+      "Properties": {
+        "ClusterName": "routeiq-dev",
+        "Namespace": "amazon-cloudwatch",
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "EksClusterConstructContainerInsightsAgentRole9E2CA325",
+            "Arn"
+          ]
+        },
+        "ServiceAccount": "cloudwatch-agent",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EKS::PodIdentityAssociation"
+    },
+    "EksClusterConstructContainerInsightsAgentRole9E2CA325": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/CloudWatchAgentServerPolicy"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "The amazon-cloudwatch-observability add-on's CloudWatch agent requires the AWS-managed CloudWatchAgentServerPolicy (the AWS-published least-privilege policy for emitting Container Insights metrics + logs); not replaceable with a narrower custom policy without breaking the add-on. Owner: EksClusterConstruct.enable_container_insights."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "pods.eks.amazonaws.com"
+              }
+            },
+            {
+              "Action": "sts:TagSession",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "pods.eks.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Description": "RouteIQ dev CloudWatch Observability agent (Container Insights) Pod Identity",
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/CloudWatchAgentServerPolicy"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "EksClusterConstructContainerInsightsRoutingLogGroup20E76F71": {
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "LogGroupName": "/aws/containerinsights/routeiq-dev/routeiq-routing",
+        "RetentionInDays": 30,
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::LogGroup",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "EksClusterConstructNodeAccessEntryA06DEB76": {
+      "DependsOn": [
+        "EksClusterConstructClusterFBE5CB5C"
+      ],
+      "Properties": {
+        "ClusterName": "routeiq-dev",
+        "PrincipalArn": {
+          "Fn::GetAtt": [
+            "EksClusterConstructNodeRole276B0BF4",
+            "Arn"
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "Type": "EC2"
+      },
+      "Type": "AWS::EKS::AccessEntry"
+    },
+    "EksClusterConstructNodeRole276B0BF4": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy",
+                "Policy::arn:<AWS::Partition>:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+              ],
+              "id": "AwsSolutions-IAM4",
+              "reason": "Auto Mode node identity needs the AWS-managed minimal worker-node + ECR-pull-only policies. These are the least-privilege AWS-published node policies; pod-level AWS access (Bedrock/Secrets/S3) is via EKS Pod Identity on the separate pod role, not this role. Owner: EksClusterConstruct (NodeRole)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Description": "RouteIQ dev EKS Auto Mode node role",
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy"
+              ]
+            ]
+          },
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "EksClusterConstructPodIdentityAddon54133305": {
+      "DependsOn": [
+        "EksClusterConstructClusterFBE5CB5C"
+      ],
+      "Properties": {
+        "AddonName": "eks-pod-identity-agent",
+        "ClusterName": "routeiq-dev",
+        "ResolveConflicts": "OVERWRITE",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EKS::Addon"
+    },
+    "EksClusterConstructPodIdentityAssociationAC7410C6": {
+      "DependsOn": [
+        "EksClusterConstructPodIdentityAddon54133305"
+      ],
+      "Properties": {
+        "ClusterName": "routeiq-dev",
+        "Namespace": "routeiq",
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "PodRole29A92600",
+            "Arn"
+          ]
+        },
+        "ServiceAccount": "routeiq-gateway",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EKS::PodIdentityAssociation"
+    },
+    "NetworkConstructAlbSg1186D80C": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "AwsSolutions-EC23",
+              "reason": "The AlbSg 443-from-0.0.0.0/0 ingress is PREP-ONLY at P0: the RouteIQ chart default is service.type=ClusterIP / ingress.enabled=false, so the EKS Auto-Mode managed LB does NOT render and this SG backs nothing live. The public edge is a deliberate P-later decision; the ingress is narrowable to an org allowlist via a future context flag plus the chart loadBalancerSourceRanges allowlist (the two halves of the same future edge-lock). It is the only valid form for a yet-unattached internet-facing ALB SG. Owner: NetworkConstruct (alb_sg PREP-ONLY)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "GroupDescription": "ALB ingress 443 from internet (or org allowlist via context)",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "SecurityGroupIngress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "HTTPS from internet to ALB",
+            "FromPort": 443,
+            "IpProtocol": "tcp",
+            "ToPort": 443
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "NetworkConstructPodSg56CA1658": {
+      "Properties": {
+        "GroupDescription": "RouteIQ gateway pod ENIs (ingress from ALB only)",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "NetworkConstructPodSgfromRouteIqStackdevNetworkConstructAlbSgCCA5C4F040003F5850E7": {
+      "Properties": {
+        "Description": "Gateway uvicorn HTTP from ALB",
+        "FromPort": 4000,
+        "GroupId": {
+          "Fn::GetAtt": [
+            "NetworkConstructPodSg56CA1658",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::GetAtt": [
+            "NetworkConstructAlbSg1186D80C",
+            "GroupId"
+          ]
+        },
+        "ToPort": 4000
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "NetworkConstructVpcAllTrafficFlowLog7A847DCA": {
+      "Properties": {
+        "DeliverLogsPermissionArn": {
+          "Fn::GetAtt": [
+            "NetworkConstructVpcAllTrafficIAMRole874FDC48",
+            "Arn"
+          ]
+        },
+        "LogDestinationType": "cloud-watch-logs",
+        "LogGroupName": {
+          "Ref": "NetworkConstructVpcAllTrafficLogGroupFB571C8B"
+        },
+        "ResourceId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        },
+        "ResourceType": "VPC",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/AllTraffic"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "TrafficType": "ALL"
+      },
+      "Type": "AWS::EC2::FlowLog"
+    },
+    "NetworkConstructVpcAllTrafficIAMRole874FDC48": {
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "vpc-flow-logs.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/AllTraffic"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "NetworkConstructVpcAllTrafficIAMRoleDefaultPolicy47B09AA0": {
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogStreams"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "NetworkConstructVpcAllTrafficLogGroupFB571C8B",
+                  "Arn"
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "NetworkConstructVpcAllTrafficIAMRoleDefaultPolicy47B09AA0",
+        "Roles": [
+          {
+            "Ref": "NetworkConstructVpcAllTrafficIAMRole874FDC48"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "NetworkConstructVpcAllTrafficLogGroupFB571C8B": {
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "RetentionInDays": 731,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/AllTraffic"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::Logs::LogGroup",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "NetworkConstructVpcBD6FBFF5": {
+      "Properties": {
+        "CidrBlock": "10.40.0.0/16",
+        "EnableDnsHostnames": true,
+        "EnableDnsSupport": true,
+        "InstanceTenancy": "default",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EC2::VPC"
+    },
+    "NetworkConstructVpcBedrockRuntime3207BD4D": {
+      "Properties": {
+        "PrivateDnsEnabled": true,
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "NetworkConstructVpceSgB589DFE7",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServiceName": "com.amazonaws.us-west-2.bedrock-runtime",
+        "SubnetIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcCloudWatchLogsE48C91D2": {
+      "Properties": {
+        "PrivateDnsEnabled": true,
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "NetworkConstructVpceSgB589DFE7",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServiceName": "com.amazonaws.us-west-2.logs",
+        "SubnetIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcEcrApi756D78A6": {
+      "Properties": {
+        "PrivateDnsEnabled": true,
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "NetworkConstructVpceSgB589DFE7",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServiceName": "com.amazonaws.us-west-2.ecr.api",
+        "SubnetIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcEcrDocker8FC63369": {
+      "Properties": {
+        "PrivateDnsEnabled": true,
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "NetworkConstructVpceSgB589DFE7",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServiceName": "com.amazonaws.us-west-2.ecr.dkr",
+        "SubnetIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcIGWADF89380": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EC2::InternetGateway"
+    },
+    "NetworkConstructVpcS3Gateway45765D0D": {
+      "Properties": {
+        "RouteTableIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1RouteTableB9D75425"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2RouteTable1AC14913"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivatedataSubnet1RouteTable226B5DFE"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivatedataSubnet2RouteTableFDEF6091"
+          }
+        ],
+        "ServiceName": {
+          "Fn::Join": [
+            "",
+            [
+              "com.amazonaws.",
+              {
+                "Ref": "AWS::Region"
+              },
+              ".s3"
+            ]
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Gateway",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcSecretsManagerCA91D77D": {
+      "Properties": {
+        "PrivateDnsEnabled": true,
+        "SecurityGroupIds": [
+          {
+            "Fn::GetAtt": [
+              "NetworkConstructVpceSgB589DFE7",
+              "GroupId"
+            ]
+          }
+        ],
+        "ServiceName": "com.amazonaws.us-west-2.secretsmanager",
+        "SubnetIds": [
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+          },
+          {
+            "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcEndpointType": "Interface",
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCEndpoint"
+    },
+    "NetworkConstructVpcVPCGWBA71D055": {
+      "Properties": {
+        "InternetGatewayId": {
+          "Ref": "NetworkConstructVpcIGWADF89380"
+        },
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::VPCGatewayAttachment"
+    },
+    "NetworkConstructVpceSgB589DFE7": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "id": "CdkNagValidationFailure",
+              "reason": "CdkNagValidationFailure[AwsSolutions-EC23]: the VpceSg ingress peer is the stack-internal pod_sg (an Fn::GetAtt CidrBlock intrinsic), never 0.0.0.0/0. cdk-nag cannot validate the intrinsic, so the validation failure is a tooling artifact, not a real EC23 violation. Owner: NetworkConstruct (vpce ingress 443 from pod_sg)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "GroupDescription": "Shared SG for interface VPC endpoints",
+        "SecurityGroupEgress": [
+          {
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound traffic by default",
+            "IpProtocol": "-1"
+          }
+        ],
+        "SecurityGroupIngress": [
+          {
+            "CidrIp": {
+              "Fn::GetAtt": [
+                "NetworkConstructVpcBD6FBFF5",
+                "CidrBlock"
+              ]
+            },
+            "Description": {
+              "Fn::Join": [
+                "",
+                [
+                  "from ",
+                  {
+                    "Fn::GetAtt": [
+                      "NetworkConstructVpcBD6FBFF5",
+                      "CidrBlock"
+                    ]
+                  },
+                  ":443"
+                ]
+              ]
+            },
+            "FromPort": 443,
+            "IpProtocol": "tcp",
+            "ToPort": 443
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::SecurityGroup"
+    },
+    "NetworkConstructVpceSgfromRouteIqStackdevNetworkConstructPodSg0B6296EC4430CDA369E": {
+      "Properties": {
+        "Description": "HTTPS from gateway pod to interface endpoints",
+        "FromPort": 443,
+        "GroupId": {
+          "Fn::GetAtt": [
+            "NetworkConstructVpceSgB589DFE7",
+            "GroupId"
+          ]
+        },
+        "IpProtocol": "tcp",
+        "SourceSecurityGroupId": {
+          "Fn::GetAtt": [
+            "NetworkConstructPodSg56CA1658",
+            "GroupId"
+          ]
+        },
+        "ToPort": 443
+      },
+      "Type": "AWS::EC2::SecurityGroupIngress"
+    },
+    "NetworkConstructVpcprivateappSubnet1DefaultRoute588D8EC5": {
+      "Properties": {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "NatGatewayId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1NATGateway97C272A0"
+        },
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet1RouteTableB9D75425"
+        }
+      },
+      "Type": "AWS::EC2::Route"
+    },
+    "NetworkConstructVpcprivateappSubnet1RouteTableAssociation3621BB5C": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet1RouteTableB9D75425"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet1SubnetF000DF21"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcprivateappSubnet1RouteTableB9D75425": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/internal-elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-appSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcprivateappSubnet1SubnetF000DF21": {
+      "Properties": {
+        "AvailabilityZone": "dummy1a",
+        "CidrBlock": "10.40.2.0/24",
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "private-app"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Private"
+          },
+          {
+            "Key": "kubernetes.io/role/internal-elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-appSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "NetworkConstructVpcprivateappSubnet2DefaultRouteCB56EE46": {
+      "Properties": {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "NatGatewayId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1NATGateway97C272A0"
+        },
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet2RouteTable1AC14913"
+        }
+      },
+      "Type": "AWS::EC2::Route"
+    },
+    "NetworkConstructVpcprivateappSubnet2RouteTable1AC14913": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/internal-elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-appSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcprivateappSubnet2RouteTableAssociation10CDFB00": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet2RouteTable1AC14913"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcprivateappSubnet2Subnet2F987562"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcprivateappSubnet2Subnet2F987562": {
+      "Properties": {
+        "AvailabilityZone": "dummy1b",
+        "CidrBlock": "10.40.3.0/24",
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "private-app"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Private"
+          },
+          {
+            "Key": "kubernetes.io/role/internal-elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-appSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "NetworkConstructVpcprivatedataSubnet1RouteTable226B5DFE": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-dataSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcprivatedataSubnet1RouteTableAssociation51CAAFE3": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivatedataSubnet1RouteTable226B5DFE"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcprivatedataSubnet1SubnetCA4BDB98"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcprivatedataSubnet1SubnetCA4BDB98": {
+      "Properties": {
+        "AvailabilityZone": "dummy1a",
+        "CidrBlock": "10.40.4.0/24",
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "private-data"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Isolated"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-dataSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "NetworkConstructVpcprivatedataSubnet2RouteTableAssociationAC1C6C27": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcprivatedataSubnet2RouteTableFDEF6091"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcprivatedataSubnet2SubnetDF525881"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcprivatedataSubnet2RouteTableFDEF6091": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-dataSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcprivatedataSubnet2SubnetDF525881": {
+      "Properties": {
+        "AvailabilityZone": "dummy1b",
+        "CidrBlock": "10.40.5.0/24",
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "private-data"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Isolated"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/private-dataSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "NetworkConstructVpcpublicSubnet1DefaultRoute1E562C9C": {
+      "DependsOn": [
+        "NetworkConstructVpcVPCGWBA71D055"
+      ],
+      "Properties": {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "NetworkConstructVpcIGWADF89380"
+        },
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1RouteTable41869FC3"
+        }
+      },
+      "Type": "AWS::EC2::Route"
+    },
+    "NetworkConstructVpcpublicSubnet1EIP33D8A0BD": {
+      "Properties": {
+        "Domain": "vpc",
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EC2::EIP"
+    },
+    "NetworkConstructVpcpublicSubnet1NATGateway97C272A0": {
+      "DependsOn": [
+        "NetworkConstructVpcpublicSubnet1DefaultRoute1E562C9C",
+        "NetworkConstructVpcpublicSubnet1RouteTableAssociation86B6EFF7"
+      ],
+      "Properties": {
+        "AllocationId": {
+          "Fn::GetAtt": [
+            "NetworkConstructVpcpublicSubnet1EIP33D8A0BD",
+            "AllocationId"
+          ]
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1Subnet1688E7E1"
+        },
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::EC2::NatGateway"
+    },
+    "NetworkConstructVpcpublicSubnet1RouteTable41869FC3": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcpublicSubnet1RouteTableAssociation86B6EFF7": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1RouteTable41869FC3"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcpublicSubnet1Subnet1688E7E1"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcpublicSubnet1Subnet1688E7E1": {
+      "Properties": {
+        "AvailabilityZone": "dummy1a",
+        "CidrBlock": "10.40.0.0/24",
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "public"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Public"
+          },
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet1"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "NetworkConstructVpcpublicSubnet2DefaultRoute0F17B771": {
+      "DependsOn": [
+        "NetworkConstructVpcVPCGWBA71D055"
+      ],
+      "Properties": {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "NetworkConstructVpcIGWADF89380"
+        },
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcpublicSubnet2RouteTable38C09EC1"
+        }
+      },
+      "Type": "AWS::EC2::Route"
+    },
+    "NetworkConstructVpcpublicSubnet2RouteTable38C09EC1": {
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::RouteTable"
+    },
+    "NetworkConstructVpcpublicSubnet2RouteTableAssociationEE0F5068": {
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NetworkConstructVpcpublicSubnet2RouteTable38C09EC1"
+        },
+        "SubnetId": {
+          "Ref": "NetworkConstructVpcpublicSubnet2Subnet7A588708"
+        }
+      },
+      "Type": "AWS::EC2::SubnetRouteTableAssociation"
+    },
+    "NetworkConstructVpcpublicSubnet2Subnet7A588708": {
+      "Properties": {
+        "AvailabilityZone": "dummy1b",
+        "CidrBlock": "10.40.1.0/24",
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "aws-cdk:subnet-name",
+            "Value": "public"
+          },
+          {
+            "Key": "aws-cdk:subnet-type",
+            "Value": "Public"
+          },
+          {
+            "Key": "kubernetes.io/role/elb",
+            "Value": "1"
+          },
+          {
+            "Key": "Name",
+            "Value": "RouteIqStack-dev/NetworkConstruct/Vpc/publicSubnet2"
+          },
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ],
+        "VpcId": {
+          "Ref": "NetworkConstructVpcBD6FBFF5"
+        }
+      },
+      "Type": "AWS::EC2::Subnet"
+    },
+    "PodRole29A92600": {
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "pods.eks.amazonaws.com"
+              }
+            },
+            {
+              "Action": "sts:TagSession",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "pods.eks.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Description": "RouteIQ dev gateway pod role (EKS Pod Identity)",
+        "Tags": [
+          {
+            "Key": "routeiq:env",
+            "Value": "dev"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "PodRoleDefaultPolicy9DB0AF7E": {
+      "Metadata": {
+        "cdk_nag": {
+          "rules_to_suppress": [
+            {
+              "applies_to": [
+                "Resource::arn:<AWS::Partition>:bedrock:<AWS::Region>::foundation-model/*"
+              ],
+              "id": "AwsSolutions-IAM5",
+              "reason": "bedrock:InvokeModel / InvokeModelWithResponseStream / Converse / ConverseStream on foundation-model/* is scoped to the Bedrock service in the deploy region; the model set is deploy-time dynamic (the router selects a model per request), so the foundation-model wildcard is the only valid form for a router. Supplying routeiq:bedrock_model_arns pins explicit ARNs and this wildcard disappears. Owner: RouteIqStack (PodRole BedrockInvoke)."
+            },
+            {
+              "applies_to": [
+                "Resource::arn:<AWS::Partition>:secretsmanager:<AWS::Region>:<AWS::AccountId>:secret:routeiq/*"
+              ],
+              "id": "AwsSolutions-IAM5",
+              "reason": "secretsmanager:GetSecretValue / DescribeSecret on the routeiq/ secret-name wildcard is scoped to the deploy account/region routeiq/ Secrets Manager namespace (LITELLM_MASTER_KEY / ADMIN_API_KEYS / provider keys). Exact ARNs are operator-pinned at deploy time via routeiq:secret_arns, which removes the wildcard. Owner: RouteIqStack (PodRole SecretsRead)."
+            },
+            {
+              "applies_to": [
+                "Resource::arn:<AWS::Partition>:logs:<AWS::Region>:<AWS::AccountId>:log-group:/aws/containerinsights/routeiq-dev/routeiq-routing:*"
+              ],
+              "id": "AwsSolutions-IAM5",
+              "reason": "logs:CreateLogStream / PutLogEvents target the single CDK-created routing log group with the canonical ':*' suffix that CloudWatch Logs requires on log-stream-creating actions for the target group. The suffix targets log streams under one stack-scoped log group, NOT arbitrary log groups - it is not a cross-resource wildcard. Owner: RouteIqStack (PodRole Logs)."
+            }
+          ]
+        }
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream",
+                "bedrock:Converse",
+                "bedrock:ConverseStream"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":bedrock:",
+                    {
+                      "Ref": "AWS::Region"
+                    },
+                    "::foundation-model/*"
+                  ]
+                ]
+              },
+              "Sid": "BedrockInvoke"
+            },
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":secretsmanager:",
+                    {
+                      "Ref": "AWS::Region"
+                    },
+                    ":",
+                    {
+                      "Ref": "AWS::AccountId"
+                    },
+                    ":secret:routeiq/*"
+                  ]
+                ]
+              },
+              "Sid": "SecretsRead"
+            },
+            {
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":logs:",
+                    {
+                      "Ref": "AWS::Region"
+                    },
+                    ":",
+                    {
+                      "Ref": "AWS::AccountId"
+                    },
+                    ":log-group:/aws/containerinsights/routeiq-dev/routeiq-routing:*"
+                  ]
+                ]
+              },
+              "Sid": "Logs"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "PodRoleDefaultPolicy9DB0AF7E",
+        "Roles": [
+          {
+            "Ref": "PodRole29A92600"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    }
+  },
+  "Rules": {
+    "CheckBootstrapVersion": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Contains": [
+                  [
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5"
+                  ],
+                  {
+                    "Ref": "BootstrapVersion"
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+        }
+      ]
+    }
+  }
+}

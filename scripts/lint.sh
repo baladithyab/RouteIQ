@@ -52,8 +52,20 @@ case "${1:-help}" in
     yaml)
         shift
         files=$(get_files "$@")
-        if [[ -n "$files" ]]; then
-            run_tool yamllint -c "$REPO_ROOT/.yamllint.yaml" $files
+        # Drop Helm chart TEMPLATES: they are Go-templates ({{- ... }}), not standalone
+        # YAML, so yamllint reports false "syntax error: ... found '-'" lines and exits 1.
+        # They are validated by `helm lint` instead. Plain chart YAML (values.yaml,
+        # Chart.yaml) and all other YAML is still linted.
+        filtered=""
+        for f in $files; do
+            case "$f" in
+                deploy/charts/*/templates/*) ;;  # skip Helm templates
+                */templates/*.yaml|*/templates/*.yml) ;;  # skip any chart templates dir
+                *) filtered="$filtered $f" ;;
+            esac
+        done
+        if [[ -n "${filtered// /}" ]]; then
+            run_tool yamllint -c "$REPO_ROOT/.yamllint.yaml" $filtered
         fi
         ;;
     help|*)

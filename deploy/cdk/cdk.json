@@ -1,0 +1,17 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "routeiq:env": "dev",
+    "routeiq:vpc_cidr": "10.40.0.0/16",
+    "routeiq:nat_gateways": 1,
+    "routeiq:k8s_version": "1.33",
+    "routeiq:enable_ghcr_ptc": true,
+    "routeiq:sa_namespace": "routeiq",
+    "routeiq:sa_name": "routeiq-gateway",
+    "routeiq:image_tag": "1.0.0-rc1",
+    "routeiq:admin_principal_arns": [],
+    "routeiq:bedrock_model_arns": [],
+    "routeiq:config_s3_bucket": null,
+    "routeiq:secret_arns": []
+  }
+}

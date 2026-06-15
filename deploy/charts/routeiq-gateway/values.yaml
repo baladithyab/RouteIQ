@@ -66,11 +66,23 @@ podDisruptionBudget:
 # Service configuration
 # -----------------------------------------------------------------------------
 service:
+  # P0 (AWS re-architecture) defers the public edge: keep ClusterIP. The
+  # EKS Auto Mode managed LoadBalancer only renders when type is flipped to
+  # LoadBalancer by an operator; until then loadBalancerSourceRanges (below)
+  # emits nothing. See docs/architecture/aws-rearchitecture/31-... §11.1a.
   type: ClusterIP
   port: 80
   targetPort: 4000
   # NodePort (only used if type is NodePort)
   # nodePort: 30000
+  # Source-IP CIDR allowlist for the LoadBalancer NLB. Under EKS Auto Mode
+  # managed load balancing the NLB allowlist is honored via
+  # spec.loadBalancerSourceRanges, NOT the legacy
+  # service.beta.kubernetes.io/aws-load-balancer-internal annotation.
+  # PREP-ONLY: inert until service.type is LoadBalancer (empty == 0.0.0.0/0
+  # once a LoadBalancer Service exists, so set an explicit allowlist then).
+  loadBalancerSourceRanges: []
+  # - 203.0.113.0/24
   annotations: {}
   # For internal load balancers:
   # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
@@ -197,18 +209,34 @@ containerSecurityContext:
 # Service account
 # -----------------------------------------------------------------------------
 serviceAccount:
-  # Create a dedicated service account
+  # Create a dedicated service account with a STABLE (namespace, name).
+  # On the AWS substrate (P0 re-architecture) the pod->IAM-role binding is an
+  # EKS Pod Identity association created CDK-side
+  # (eks.CfnPodIdentityAssociation), NOT an IRSA annotation. The CDK pins the
+  # association to this ServiceAccount's (namespace, name); that pair MUST be
+  # passed to the CDK as routeiq:sa_namespace / routeiq:sa_name context keys.
+  #   Binding contract:
+  #     (sa_namespace = release namespace,
+  #      sa_name      = serviceAccount.name OR the rendered fullname from
+  #                     _helpers.tpl "routeiq-gateway.serviceAccountName")
+  #     --> routeiq:sa_namespace / routeiq:sa_name in deploy/cdk/cdk.json
+  # Keep create: true and a stable name so the association never dangles.
   create: true
-  # Name of the service account (defaults to fullname)
+  # Name of the service account. Empty == the rendered fullname
+  # (<release>-routeiq-gateway) from _helpers.tpl. Set an explicit name if you
+  # want a fullname-override-independent SA name to pin the CDK association.
   name: ""
-  # Annotations for the service account
+  # Annotations for the service account.
+  # NOTE: do NOT add an eks.amazonaws.com/role-arn annotation here. Under EKS
+  # Pod Identity the pod->role binding is CDK-side (see the binding contract
+  # above); that annotation is IRSA-only and is not used on this substrate.
   annotations: {}
-    # For AWS IRSA:
-    # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/routeiq-gateway
-    # For GKE Workload Identity:
+    # For GKE Workload Identity (non-AWS path only):
     # iam.gke.io/gcp-service-account: routeiq@project.iam.gserviceaccount.com
-  # Disable automounting service account token for security
-  # Enable only if your application requires Kubernetes API access
+  # Disable automounting service account token for security.
+  # NOTE: Pod Identity does NOT require an automounted SA token (credentials
+  # are injected by the pod-identity webhook). Enable this only if the app
+  # needs Kubernetes API access (e.g. K8s-backed leader election).
   automountServiceAccountToken: false
 
 # -----------------------------------------------------------------------------
@@ -439,7 +467,14 @@ config:
 # Additional environment variables
 # -----------------------------------------------------------------------------
 # Extra environment variables from values
+# The chart emits no AWS_REGION / AWS_DEFAULT_REGION env, so a Bedrock or AMP
+# client with no region fails. On the AWS substrate (P0 re-architecture) set
+# AWS_REGION here at deploy time, e.g. --set extraEnv[0].name=AWS_REGION
+# --set extraEnv[0].value=us-west-2. Left empty by default so the chart stays
+# cloud-agnostic. See docs/architecture/aws-rearchitecture/31-... §11.3.
 extraEnv: []
+  # - name: AWS_REGION
+  #   value: "us-west-2"
   # - name: MY_VAR
   #   value: "my-value"
 

@@ -122,3 +122,18 @@ ui/dist/
 
 # Hyperresearch local vault (workflow-generated research DB + exports)
 .hyperresearch/
+
+# CDK build caches / local venv / synth output (deploy/cdk/)
+deploy/cdk/.venv/
+deploy/cdk/.mypy_cache/
+deploy/cdk/.ruff_cache/
+deploy/cdk/.pytest_cache/
+deploy/cdk/cdk.out/
+deploy/cdk/**/__pycache__/
+
+# Un-ignore the CDK source lib/ — the generic `lib/` rule above (Python packaging
+# build output) otherwise swallows the deploy/cdk/lib/ CONSTRUCTS source tree.
+# Negate the dir + the .py sources only (NOT __pycache__, which stays ignored).
+!deploy/cdk/lib/
+!deploy/cdk/lib/*.py
+deploy/cdk/lib/__pycache__/

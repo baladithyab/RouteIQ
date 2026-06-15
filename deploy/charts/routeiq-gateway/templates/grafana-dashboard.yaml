@@ -55,7 +55,7 @@ data:
           "targets": [
             {
               "expr": "sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m])) by (model)",
-              "legendFormat": "{{ model }}",
+              "legendFormat": "{{ "{{ model }}" }}",
               "refId": "A"
             }
           ]
@@ -174,7 +174,7 @@ data:
           "targets": [
             {
               "expr": "sum(increase(routeiq_routing_decisions_total{namespace=\"$namespace\"}[1h])) by (strategy)",
-              "legendFormat": "{{ strategy }}",
+              "legendFormat": "{{ "{{ strategy }}" }}",
               "refId": "A"
             }
           ]
@@ -231,7 +231,7 @@ data:
           "targets": [
             {
               "expr": "sum(increase(routeiq_tokens_total{namespace=\"$namespace\"}[5m])) by (model)",
-              "legendFormat": "{{ model }}",
+              "legendFormat": "{{ "{{ model }}" }}",
               "refId": "A"
             }
           ]

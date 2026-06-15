@@ -87,6 +87,14 @@ docs = [
     "mkdocs-autorefs>=0.5",
     "pymdown-extensions>=10.0",
 ]
+# AWS CDK foundation (deploy/cdk/) — the cred-free `uv run pytest deploy/cdk/tests/`
+# synth + cdk-nag gate. Mirrors deploy/cdk/requirements.txt (proposal §5.1).
+cdk = [
+    "aws-cdk-lib>=2.150.0,<3.0.0",
+    "cdk-nag>=2.27.0,<3.0.0",
+    "constructs>=10.0.0,<11.0.0",
+    "pytest>=7.4.0,<9.0.0",
+]
 
 [project.scripts]
 routeiq = "litellm_llmrouter.cli:main"

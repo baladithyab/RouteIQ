@@ -1,0 +1,17 @@
+# Ruff/mypy config for the RouteIQ CDK subtree only (proposal §5 layout).
+#
+# The CDK code uses line-length 100 (CDK construct call sites with many kwargs
+# read better wider) — distinct from the root project's 88. This file scopes
+# that override to deploy/cdk/ without disturbing the root pyproject. Dependency
+# pins live in deploy/cdk/requirements.txt and the root pyproject `cdk` extra.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

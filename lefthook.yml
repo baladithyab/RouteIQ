@@ -35,7 +35,11 @@ pre-commit:
     # ---------------------------------------------------------------------
     yamllint:
       glob: "*.{yaml,yml}"
-      exclude: "(^reference/|^.github/)"
+      # Helm chart TEMPLATES are Go-templates ({{- ... }}), not standalone YAML —
+      # yamllint cannot parse them and reports false "syntax error" lines. They are
+      # validated by `helm lint` instead. Plain YAML (values.yaml, Chart.yaml) is
+      # still linted. Also skip reference/ (submodule) and .github/.
+      exclude: "(^reference/|^.github/|deploy/charts/.+/templates/)"
       run: ./scripts/lint.sh yaml {staged_files}
 
     # ---------------------------------------------------------------------

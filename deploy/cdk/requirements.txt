@@ -1,0 +1,15 @@
+# RouteIQ CDK foundation pins (proposal §5.1). Mirrors the vllm-sr-on-aws CDK
+# pins MINUS the VSR-only blue/green construct.
+#
+# These same four pins are also carried by the root pyproject's `cdk` optional
+# group, so `uv sync --extra cdk` is the uv-native path (one lockfile, one
+# `uv run pytest deploy/cdk/tests/`). This file is the standalone alternative
+# (`uv pip install -r deploy/cdk/requirements.txt`).
+aws-cdk-lib>=2.150.0,<3.0.0     # floor for the BEDROCK_RUNTIME interface-endpoint
+                                #   enum + Auto Mode L1 props
+cdk-nag>=2.27.0,<3.0.0          # add_*_by_path RAISES on an absent path at >=2.27
+                                #   (drives the flag-gated getattr guards)
+constructs>=10.0.0,<11.0.0
+pytest>=7.4.0,<9.0.0
+# DROPPED relative to VSR: cdklabs.ecs-codedeploy==0.0.441 (ECS blue/green only;
+#   RouteIQ is EKS + Helm). cdk-monitoring-constructs is OPTIONAL for P0 and omitted.
