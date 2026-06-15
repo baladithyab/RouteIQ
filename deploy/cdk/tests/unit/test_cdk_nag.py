@@ -36,6 +36,11 @@ _MAXIMAL_FLAGS = {
     "bedrock_model_arns": [
         "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-sonnet-v1:0",
     ],
+    # RouteIQ-6150 (C1): two cross-account capacity ids so the home pod-role
+    # sts:AssumeRole grant on the computed RouteIqBedrockCapacity-<env> member ARNs
+    # is exercised by the default+maximal nag gate. The grant targets EXPLICIT ARNs
+    # (not a wildcard), so it must draw NO unsuppressed AwsSolutions-IAM5.
+    "capacity_account_ids": ["111122223333", "444455556666"],
     "config_s3_bucket": "routeiq-config-dev",
     "secret_arns": [
         "arn:aws:secretsmanager:us-west-2:123456789012:secret:routeiq/master-AbCdEf",

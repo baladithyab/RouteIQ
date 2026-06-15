@@ -631,6 +631,41 @@ externalSecrets:
 config:
   # Gateway configuration YAML (mounted at gateway.configPath)
   # See config/config.yaml for full options
+  #
+  # C0 CAPACITY POOLS (RouteIQ-e677) -- multi-key + cross-region capacity pools
+  # are NATIVE LiteLLM: stack N model_list rows that SHARE one model_name and
+  # vary exactly ONE litellm_param. Each row hashes to a distinct LiteLLM
+  # model_info.id (sha256 over model_group + every litellm_param,
+  # reference/litellm/litellm/router.py:5592-5621), so it is an independently
+  # cool-downable ARM. RouteIQ's CustomRoutingStrategyBase groups candidates by
+  # model_name and the Kumaraswamy-Thompson bandit picks the best surviving arm.
+  # This needs NO new routing code -- it is pure config. See
+  # docs/architecture/aws-rearchitecture/50-litellm-universal-surface.md §2
+  # and research/cdk/discover-c0.md.
+  #
+  # Drop-in pool example (operator override; the default below is single-arm):
+  #
+  #   config:
+  #     gateway: |
+  #       model_list:
+  #         # gpt-4o: two-KEY pool (§2a) -- vary api_key only -> 2x rpm + 429 failover
+  #         - model_name: gpt-4o
+  #           litellm_params: {model: openai/gpt-4o, api_key: os.environ/OPENAI_KEY_A, rpm: 10000}
+  #         - model_name: gpt-4o
+  #           litellm_params: {model: openai/gpt-4o, api_key: os.environ/OPENAI_KEY_B, rpm: 10000}
+  #         # claude-sonnet: CROSS-REGION Bedrock pool (§2b) -- vary aws_region_name only
+  #         - model_name: claude-sonnet
+  #           litellm_params: {model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0, aws_region_name: us-east-1}
+  #         - model_name: claude-sonnet
+  #           litellm_params: {model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0, aws_region_name: us-west-2}
+  #       general_settings:
+  #         master_key: env/LITELLM_MASTER_KEY
+  #
+  #   NOTE: the extra api_keys are wired via secrets/externalSecrets (OPENAI_KEY_A,
+  #   OPENAI_KEY_B as os.environ/ refs). Cross-region Bedrock needs NO key (Pod
+  #   Identity + bedrock:InvokeModel on the PodRole) but DOES need AWS_REGION set
+  #   per the `aws.region` value (the gateway emits AWS_REGION). Cross-ACCOUNT
+  #   Bedrock (aws_role_name) is C1 (RouteIQ-6150), a separate CDK construct.
   gateway: |
     model_list:
       - model_name: gpt-4o

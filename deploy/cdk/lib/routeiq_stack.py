@@ -47,6 +47,7 @@ from .eks_cluster_construct import EksClusterConstruct
 from .nag_suppressions import apply_nag_suppressions
 from .naming import routing_log_group_export_name
 from .network_construct import NetworkConstruct
+from .waf_construct import WafConstruct
 
 
 class RouteIqStack(Stack):
@@ -67,8 +68,14 @@ class RouteIqStack(Stack):
         image_tag: str = "1.0.0-rc1",
         admin_principal_arns: list[str] | None = None,
         bedrock_model_arns: list[str] | None = None,
+        capacity_account_ids: list[str] | None = None,
         config_s3_bucket: str | None = None,
         secret_arns: list[str] | None = None,
+        enable_waf: bool = False,
+        waf_alb_arn: str | None = None,
+        waf_rate_limit: int | None = None,
+        waf_crs_block: bool = False,
+        waf_rate_block: bool = False,
         cost_center: str | None = None,
         team: str | None = None,
         tenant: str | None = None,
@@ -82,8 +89,14 @@ class RouteIqStack(Stack):
         self.image_tag = image_tag
         self._admin_principal_arns = list(admin_principal_arns or [])
         self._bedrock_model_arns = list(bedrock_model_arns or [])
+        self._capacity_account_ids = list(capacity_account_ids or [])
         self._config_s3_bucket = config_s3_bucket
         self._secret_arns = list(secret_arns or [])
+        self._enable_waf = bool(enable_waf)
+        self._waf_alb_arn = waf_alb_arn
+        self._waf_rate_limit = waf_rate_limit
+        self._waf_crs_block = bool(waf_crs_block)
+        self._waf_rate_block = bool(waf_rate_block)
 
         # Stack tag on every taggable resource (Tags.of propagates). Cost tags
         # are emitted ONLY when supplied so the default synth stays byte-stable
@@ -178,6 +191,7 @@ class RouteIqStack(Stack):
         )
 
         self._add_pod_role_statements()
+        self._add_capacity_assume_grant()
 
         # The pod->role binding. Keyed on (namespace, serviceAccount) matching the
         # chart's rendered ServiceAccount; NO eks.amazonaws.com/role-arn annotation
@@ -193,6 +207,30 @@ class RouteIqStack(Stack):
 
         # -- 5. CfnOutputs the chart / CI consume -----------------------------
         self._add_outputs()
+
+        # -- 5b. WAFv2 edge layer (RouteIQ-4f59; flag-gated, DEFAULT OFF) ------
+        # Instantiated ONLY when routeiq:enable_waf is True AND an operator
+        # supplies a waf_alb_arn. The `and self._waf_alb_arn` guard is
+        # load-bearing: at P0 the chart default is service.type=ClusterIP /
+        # ingress.enabled=false, so EKS Auto Mode renders NO ALB - there is no
+        # in-stack ALB ARN to associate to. The construct + its synth test (the
+        # association to a SUPPLIED ARN) are the cred-free deliverables; the LIVE
+        # attach is operator-gated (flip ingress.enabled=true -> Auto Mode renders
+        # an ALB -> pass its ARN as routeiq:waf_alb_arn). With the flag OFF (the
+        # default surface) NO WafConstruct is built, so the stack emits ZERO
+        # AWS::WAFv2::* resources and test_p4_edge_no_cdk_alb + the snapshot stay
+        # byte-stable. RouteIQ-4f59 closes PARTIAL (live attach deploy-gated).
+        self.waf: WafConstruct | None = None
+        if self._enable_waf and self._waf_alb_arn:
+            self.waf = WafConstruct(
+                self,
+                "WafConstruct",
+                env_name=env_name,
+                alb_arn=self._waf_alb_arn,
+                rate_limit=self._waf_rate_limit,
+                crs_block=self._waf_crs_block,
+                rate_block=self._waf_rate_block,
+            )
 
         # -- 6. cdk-nag suppressions (LAST, by path) --------------------------
         self._suppress_nag()
@@ -282,6 +320,58 @@ class RouteIqStack(Stack):
         #   P2 (ADR-0027): aps:RemoteWrite (AMP workspace ARN)
         #   P1 (ADR-0028): rds-db:connect (Aurora dbuser ARN)
         #   P1 (ADR-0029): elasticache:Connect (cache + IAM-user ARN)
+
+    def _add_capacity_assume_grant(self) -> None:
+        """RouteIQ-6150 (C1): grant the pod role sts:AssumeRole on cross-account
+        Bedrock capacity member roles (flag-gated; empty list => byte-stable).
+
+        For each account id in ``routeiq:capacity_account_ids`` this computes the
+        PREDICTABLE member-role ARN
+        ``arn:<part>:iam::<acct>:role/RouteIqBedrockCapacity-<env>`` (the stable
+        name BedrockCapacityMemberStack mints in that account) and grants the home
+        gateway pod role plain ``sts:AssumeRole`` on EXACTLY those ARNs - never a
+        wildcard, so AwsSolutions-IAM5 does NOT fire and no new suppression is
+        needed.
+
+        This is the RouteIQ DIVERGENCE from VSR: VSR put the home grant on a
+        separate bearer-minter role (its native path used web-identity and needed
+        no home assume); RouteIQ has no minter and no web-identity, so the grant
+        lands on the single Pod-Identity pod role directly.
+
+        Each member ARN becomes one LiteLLM ``model_list`` row's
+        ``litellm_params.aws_role_name`` (doc 50 section 2c): LiteLLM's BaseAWSLLM
+        STS-assumes it (the assume this statement authorizes) to borrow that
+        account's Bedrock quota. The per-account CfnOutput surfaces the ARN the
+        operator pastes into that row.
+
+        Empty ``capacity_account_ids`` (the default) => zero statements, zero
+        outputs => the default synth is byte-identical (the snapshot stays green).
+        """
+        if not self._capacity_account_ids:
+            return
+
+        member_role_arns = [
+            f"arn:{Aws.PARTITION}:iam::{acct}:role/RouteIqBedrockCapacity-{self.env_name}"
+            for acct in self._capacity_account_ids
+        ]
+        self.pod_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="AssumeCapacityRoles",
+                actions=["sts:AssumeRole"],
+                resources=member_role_arns,  # explicit ARNs, NOT a wildcard
+            )
+        )
+        for acct, arn in zip(self._capacity_account_ids, member_role_arns, strict=True):
+            CfnOutput(
+                self,
+                f"CapacityRoleArn{acct}",
+                value=arn,
+                description=(
+                    f"Bedrock capacity role ARN in account {acct} (deploy "
+                    "BedrockCapacityMemberStack there). Set as "
+                    "litellm_params.aws_role_name for that account model_list row."
+                ),
+            )
 
     def _add_outputs(self) -> None:
         """Emit the operator-visible CfnOutputs (proposal section 7.6 / 10).

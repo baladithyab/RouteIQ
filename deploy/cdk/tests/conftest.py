@@ -41,8 +41,14 @@ DEFAULT_STACK_FLAGS: dict[str, Any] = {
     "image_tag": "1.0.0-rc1",
     "admin_principal_arns": [],
     "bedrock_model_arns": [],
+    "capacity_account_ids": [],
     "config_s3_bucket": None,
     "secret_arns": [],
+    "enable_waf": False,
+    "waf_alb_arn": None,
+    "waf_rate_limit": None,
+    "waf_crs_block": False,
+    "waf_rate_block": False,
 }
 
 

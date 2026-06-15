@@ -45,6 +45,7 @@ def apply_nag_suppressions(stack: RouteIqStack) -> None:
     _suppress_eks_cluster(stack)
     _suppress_ecr(stack)
     _suppress_pod_role(stack)
+    _suppress_waf(stack)
 
 
 # --------------------------------------------------------------------- network
@@ -368,3 +369,34 @@ def _suppress_pod_role(stack: RouteIqStack) -> None:
         f"/{stack_id}/PodRole/DefaultPolicy/Resource",
         suppressions,
     )
+
+
+# ------------------------------------------------------------------------- waf
+
+
+def _suppress_waf(stack: RouteIqStack) -> None:
+    """No WAF suppressions (RouteIQ-4f59); guarded no-op when the flag is OFF.
+
+    The WafConstruct (``routeiq:enable_waf``, default OFF) emits only WAFv2 +
+    LogGroup L1 resources and NO IAM role, so there are no IAM4/IAM5 findings to
+    suppress. The two cdk-nag rules that COULD fire on a WAF are both satisfied
+    outright: attaching the web ACL via CfnWebACLAssociation CLOSES
+    ``AwsSolutions-ALB2`` ("ALB not associated with a WAFv2 web ACL"), and the
+    CfnLoggingConfiguration the construct wires satisfies
+    ``AwsSolutions-WAFv2LoggingEnabled``. The construct-isolation cdk-nag test
+    (``test_waf.py::test_waf_construct_isolation_cdk_nag_clean``) proves ZERO
+    ``AwsSolutions-*`` survive, so no suppression body is needed.
+
+    This is an explicit no-op fan-out target (mirroring ``_suppress_ecr``): with
+    ``enable_waf`` OFF (the default surface) ``stack.waf`` is ``None``, so the
+    ``getattr`` guard returns BEFORE any ``add_resource_suppressions_by_path``
+    call -- which is mandatory, because that API RAISES on an absent path under
+    cdk-nag >= 2.27 and the WAF path does not exist on the OFF synth. If a future
+    residual WAF finding ever appears, the suppression body goes here (guarded),
+    so the OFF synth never references a non-existent path. Owner: WafConstruct.
+    """
+    if getattr(stack, "waf", None) is None:
+        return
+    # No residual findings to suppress (see docstring). Intentionally empty body
+    # past the guard.
+    return

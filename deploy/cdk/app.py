@@ -84,6 +84,23 @@ def main() -> None:
     bedrock_model_arns = _split_csv_or_list(_ctx(app, "routeiq:bedrock_model_arns", []))
     config_s3_bucket = _ctx(app, "routeiq:config_s3_bucket", None) or None
     secret_arns = _split_csv_or_list(_ctx(app, "routeiq:secret_arns", []))
+    # RouteIQ-6150 (C1): cross-account Bedrock capacity account ids. For each id the
+    # home pod role is granted sts:AssumeRole on the computed
+    # RouteIqBedrockCapacity-<env> member role ARN (which BedrockCapacityMemberStack
+    # mints in that account). Empty default keeps the synth byte-stable (no grant,
+    # no output).
+    capacity_account_ids = _split_csv_or_list(_ctx(app, "routeiq:capacity_account_ids", []))
+    # RouteIQ-4f59 (WAF): the WAFv2 edge layer. DEFAULT OFF; the construct is built
+    # only when routeiq:enable_waf is true AND an operator supplies a non-empty
+    # routeiq:waf_alb_arn (no ALB renders at P0 / ClusterIP, so the live attach is
+    # deploy-gated). Empty/false defaults keep the default synth byte-stable (zero
+    # AWS::WAFv2::* resources). The waf_rate_limit honors a CLI string or null.
+    enable_waf = _bool_ctx(app, "routeiq:enable_waf", False)
+    waf_alb_arn = _ctx(app, "routeiq:waf_alb_arn", None) or None
+    _waf_rate_limit_raw = _ctx(app, "routeiq:waf_rate_limit", None)
+    waf_rate_limit = int(_waf_rate_limit_raw) if _waf_rate_limit_raw not in (None, "") else None
+    waf_crs_block = _bool_ctx(app, "routeiq:waf_crs_block", False)
+    waf_rate_block = _bool_ctx(app, "routeiq:waf_rate_block", False)
 
     # P1 state-plane context keys (ADR-0028 Aurora + ADR-0029 ElastiCache). The
     # state stack is a SEPARATE stack/CI-stage per the ~30-min-rollback rule, so
@@ -118,8 +135,14 @@ def main() -> None:
         image_tag=image_tag,
         admin_principal_arns=admin_principal_arns,
         bedrock_model_arns=bedrock_model_arns,
+        capacity_account_ids=capacity_account_ids,
         config_s3_bucket=config_s3_bucket,
         secret_arns=secret_arns,
+        enable_waf=enable_waf,
+        waf_alb_arn=waf_alb_arn,
+        waf_rate_limit=waf_rate_limit,
+        waf_crs_block=waf_crs_block,
+        waf_rate_block=waf_rate_block,
     )
 
     # P1 state stack (Aurora + ElastiCache), wired cross-stack to the P0
