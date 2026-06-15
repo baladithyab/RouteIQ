@@ -729,3 +729,300 @@ LEGACY_TO_GENAI_ATTR_MAP: Dict[str, str] = {
     "mcp.server.name": GenAIAttributes.TOOL_MCP_SERVER,
     "a2a.agent.name": GenAIAttributes.AGENT_NAME,
 }
+
+
+# =============================================================================
+# Canonical Metric Catalog (metrics-1, RouteIQ-2d35)
+# =============================================================================
+#
+# Single source of truth that reconciles the "metric-name split-brain": the
+# CODE creates OTel instruments under dot-style names (e.g.
+# ``gateway.request.total``), while the Helm dashboards / alert rules query
+# the PROMETHEUS-exposition names produced after the OTel Collector's
+# OTel->Prometheus translation (e.g. ``gateway_request_total``).
+#
+# Each ``MetricSpec`` records BOTH names plus the type/unit/labels so dashboards
+# and code can be reconciled by the contract test in
+# ``tests/unit/test_metrics_catalog.py``.
+#
+# IMPORTANT: this catalog records the EXISTING instrument names verbatim. It
+# does NOT rename any live instrument (metrics.py runtime behavior is byte
+# stable). Instrumenting currently-dark subsystems is a SEPARATE seed
+# (metrics-2) and is out of scope here.
+
+
+class MetricType(str, Enum):
+    """OTel instrument kind. Drives the Prometheus ``_total`` suffix rule.
+
+    Only monotonic sums (``COUNTER``) receive the ``_total`` suffix in the
+    Prometheus exposition format. ``UP_DOWN_COUNTER`` is a non-monotonic sum
+    and ``HISTOGRAM``/``GAUGE`` never get ``_total``.
+    """
+
+    COUNTER = "counter"
+    UP_DOWN_COUNTER = "up_down_counter"
+    HISTOGRAM = "histogram"
+    GAUGE = "gauge"
+
+
+# UCUM unit -> Prometheus base-unit suffix. Mirrors the OTel Collector
+# ``prometheus`` exporter unit map. Annotation-only units (``{token}`` etc.)
+# and the dimensionless ``1`` carry NO suffix. Units absent from this map are
+# appended verbatim (sanitized + lowercased) -- this is how ``USD`` becomes the
+# ``usd`` suffix in the exposition name.
+_PROM_UNIT_SUFFIX: Dict[str, str] = {
+    "s": "seconds",
+    "ms": "milliseconds",
+    "By": "bytes",
+    "USD": "usd",
+}
+
+# Units that produce NO Prometheus suffix at all.
+_PROM_UNITLESS = {"", "1", "{token}/s"}
+
+
+def otel_metric_name_to_prometheus(
+    otel_name: str,
+    metric_type: "MetricType",
+    unit: str = "",
+) -> str:
+    """Translate an OTel instrument name into its Prometheus-exposition name.
+
+    Implements the documented OTel->Prometheus normalization that the OTel
+    Collector ``prometheus``/``prometheusremotewrite`` exporters apply (RouteIQ
+    exports via OTLP, so the translation happens downstream, not in-process):
+
+    1. Sanitize: every char outside ``[A-Za-z0-9_:]`` becomes ``_`` (so dots,
+       slashes and dashes collapse to underscores).
+    2. Unit suffix: append the UCUM->Prometheus base-unit suffix
+       (``s`` -> ``seconds``); annotation-only units (``{...}``) and the
+       dimensionless unit are dropped; unknown units (e.g. ``USD``) are
+       appended verbatim (sanitized + lowercased). Skipped if the name already
+       ends with that suffix.
+    3. ``_total`` suffix: appended ONLY for monotonic counters, and only when
+       the name does not already end in ``_total``.
+
+    This is the function the contract test uses to prove every catalog
+    ``prometheus_name`` is the faithful normalization of its ``otel_name``.
+    """
+    # (1) sanitize every invalid character to underscore
+    sanitized = "".join(c if (c.isalnum() or c in "_:") else "_" for c in otel_name)
+
+    # (2) unit suffix
+    if unit not in _PROM_UNITLESS and not unit.startswith("{"):
+        suffix = _PROM_UNIT_SUFFIX.get(unit)
+        if suffix is None:
+            # Unknown unit -> sanitized + lowercased verbatim suffix.
+            suffix = "".join(c if c.isalnum() else "_" for c in unit).strip("_").lower()
+        if suffix and not sanitized.endswith(f"_{suffix}"):
+            sanitized = f"{sanitized}_{suffix}"
+
+    # (3) _total for monotonic counters only
+    if metric_type is MetricType.COUNTER and not sanitized.endswith("_total"):
+        sanitized = f"{sanitized}_total"
+
+    return sanitized
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    """One canonical metric: maps a CODE (OTel) name to its PROMETHEUS name.
+
+    Attributes:
+        otel_name: The exact name passed to ``meter.create_*`` in code.
+        metric_type: OTel instrument kind (drives the ``_total`` rule).
+        unit: The OTel ``unit`` argument (drives the Prometheus unit suffix).
+        prometheus_name: The resulting Prometheus-exposition name after the
+            OTel Collector translation. MUST equal
+            ``otel_metric_name_to_prometheus(otel_name, metric_type, unit)`` --
+            asserted by the contract test.
+        label_keys: Attribute/label keys recorded on the instrument (the
+            Prometheus label set, excluding infra labels like ``namespace``
+            injected by the scrape config).
+        source: Module the instrument is created in (provenance).
+        description: Human-readable description (mirrors the instrument's).
+    """
+
+    otel_name: str
+    metric_type: MetricType
+    unit: str
+    prometheus_name: str
+    label_keys: tuple[str, ...] = ()
+    source: str = "metrics.py"
+    description: str = ""
+
+
+def _spec(
+    otel_name: str,
+    metric_type: MetricType,
+    unit: str,
+    label_keys: tuple[str, ...] = (),
+    source: str = "metrics.py",
+    description: str = "",
+) -> MetricSpec:
+    """Build a MetricSpec, deriving prometheus_name from the normalization.
+
+    Keeping derivation in one place guarantees the catalog's ``prometheus_name``
+    is internally consistent; the contract test independently re-derives it as a
+    cross-check against accidental edits to this module.
+    """
+    return MetricSpec(
+        otel_name=otel_name,
+        metric_type=metric_type,
+        unit=unit,
+        prometheus_name=otel_metric_name_to_prometheus(otel_name, metric_type, unit),
+        label_keys=label_keys,
+        source=source,
+        description=description,
+    )
+
+
+# The catalog. Order mirrors GatewayMetrics.__init__ (metrics.py) followed by
+# the lazily-created cost-aware-routing histogram in strategies.py.
+METRIC_CATALOG: tuple[MetricSpec, ...] = (
+    # --- GenAI Semantic Convention instruments (gen_ai.*) ---
+    _spec(
+        "gen_ai.client.operation.duration",
+        MetricType.HISTOGRAM,
+        "s",
+        ("gen_ai.request.model", "gen_ai.system"),
+        description="Duration of GenAI client operations",
+    ),
+    _spec(
+        "gen_ai.client.token.usage",
+        MetricType.HISTOGRAM,
+        "{token}",
+        ("gen_ai.request.model", "gen_ai.system"),
+        description="Token usage per GenAI request",
+    ),
+    _spec(
+        "gen_ai.server.time_to_first_token",
+        MetricType.HISTOGRAM,
+        "s",
+        ("gen_ai.request.model", "gen_ai.system"),
+        description="Time to first token for streaming responses",
+    ),
+    _spec(
+        "gen_ai.client.tokens_per_second",
+        MetricType.HISTOGRAM,
+        "{token}/s",
+        ("gen_ai.request.model", "gen_ai.system"),
+        description="Token generation throughput",
+    ),
+    # --- Gateway operational instruments (gateway.*) ---
+    _spec(
+        "gateway.request.total",
+        MetricType.COUNTER,
+        "{request}",
+        ("model", "status"),
+        description="Total gateway requests",
+    ),
+    _spec(
+        "gateway.request.error",
+        MetricType.COUNTER,
+        "{request}",
+        ("model", "error_type"),
+        description="Total gateway request errors",
+    ),
+    _spec(
+        "gateway.request.active",
+        MetricType.UP_DOWN_COUNTER,
+        "{request}",
+        ("model",),
+        description="Number of currently active requests",
+    ),
+    # --- Routing instruments ---
+    _spec(
+        "gateway.routing.decision.duration",
+        MetricType.HISTOGRAM,
+        "s",
+        ("strategy", "model"),
+        description="Duration of routing decisions",
+    ),
+    _spec(
+        "gateway.routing.strategy.usage",
+        MetricType.COUNTER,
+        "{decision}",
+        ("strategy", "outcome"),
+        description="Routing strategy usage count",
+    ),
+    # --- Cost tracking ---
+    _spec(
+        "gateway.cost.total",
+        MetricType.COUNTER,
+        "USD",
+        ("model", "team", "user"),
+        description="Total estimated cost in USD",
+    ),
+    _spec(
+        "gateway.cost.per_request",
+        MetricType.HISTOGRAM,
+        "USD",
+        ("model",),
+        description="Cost per LLM request in USD",
+    ),
+    _spec(
+        "gateway.tokens.total",
+        MetricType.COUNTER,
+        "{token}",
+        ("model", "team", "direction"),
+        description="Total tokens consumed across all requests",
+    ),
+    _spec(
+        "gateway.cost.errors",
+        MetricType.COUNTER,
+        "{error}",
+        ("model",),
+        description="Errors during cost calculation",
+    ),
+    # --- Cost reconciliation (quota.*) ---
+    _spec(
+        "quota.reconciliation.savings",
+        MetricType.HISTOGRAM,
+        "USD",
+        ("subject",),
+        description="Amount credited back by post-call cost reconciliation",
+    ),
+    _spec(
+        "quota.reconciliation.count",
+        MetricType.COUNTER,
+        "{reconciliation}",
+        ("subject",),
+        description="Number of post-call cost reconciliations performed",
+    ),
+    # --- Resilience ---
+    _spec(
+        "gateway.circuit_breaker.transitions",
+        MetricType.COUNTER,
+        "{transition}",
+        ("breaker", "from_state", "to_state"),
+        description="Circuit breaker state transitions",
+    ),
+    # --- Cost-aware routing histogram (strategies.py, lazily created) ---
+    _spec(
+        "routeiq.routing.cost_per_1k_tokens",
+        MetricType.HISTOGRAM,
+        "USD",
+        ("model",),
+        source="strategies.py",
+        description="Cost per 1K tokens for the selected model",
+    ),
+)
+
+# Fast lookups keyed by each name space.
+METRIC_CATALOG_BY_OTEL_NAME: Dict[str, MetricSpec] = {
+    s.otel_name: s for s in METRIC_CATALOG
+}
+METRIC_CATALOG_BY_PROM_NAME: Dict[str, MetricSpec] = {
+    s.prometheus_name: s for s in METRIC_CATALOG
+}
+
+# Frozen set of every Prometheus-exposition name a dashboard / alert rule may
+# legitimately reference. Mirrors how ``ROUTING_DECISION_COLUMNS`` is the
+# contract for the data-lake column set.
+METRIC_CATALOG_PROM_NAMES: frozenset[str] = frozenset(
+    s.prometheus_name for s in METRIC_CATALOG
+)
+METRIC_CATALOG_OTEL_NAMES: frozenset[str] = frozenset(
+    s.otel_name for s in METRIC_CATALOG
+)

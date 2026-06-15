@@ -54,7 +54,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m])) by (model)",
+              "expr": "sum(rate(gateway_request_total{namespace=\"$namespace\"}[5m])) by (model)",
               "legendFormat": "{{ "{{ model }}" }}",
               "refId": "A"
             }
@@ -89,7 +89,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(rate(routeiq_requests_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m]))",
+              "expr": "sum(rate(gateway_request_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(gateway_request_total{namespace=\"$namespace\"}[5m]))",
               "legendFormat": "Error Rate",
               "refId": "A"
             }
@@ -117,7 +117,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(rate(routeiq_requests_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(routeiq_requests_total{namespace=\"$namespace\"}[5m]))",
+              "expr": "sum(rate(gateway_request_total{status=\"error\", namespace=\"$namespace\"}[5m])) / sum(rate(gateway_request_total{namespace=\"$namespace\"}[5m]))",
               "refId": "A"
             }
           ]
@@ -140,17 +140,17 @@ data:
           },
           "targets": [
             {
-              "expr": "histogram_quantile(0.50, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "expr": "histogram_quantile(0.50, sum(rate(gen_ai_client_operation_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
               "legendFormat": "p50",
               "refId": "A"
             },
             {
-              "expr": "histogram_quantile(0.95, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(gen_ai_client_operation_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
               "legendFormat": "p95",
               "refId": "B"
             },
             {
-              "expr": "histogram_quantile(0.99, sum(rate(routeiq_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
+              "expr": "histogram_quantile(0.99, sum(rate(gen_ai_client_operation_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le))",
               "legendFormat": "p99",
               "refId": "C"
             }
@@ -173,14 +173,14 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(increase(routeiq_routing_decisions_total{namespace=\"$namespace\"}[1h])) by (strategy)",
+              "expr": "sum(increase(gateway_routing_strategy_usage_total{namespace=\"$namespace\"}[1h])) by (strategy)",
               "legendFormat": "{{ "{{ strategy }}" }}",
               "refId": "A"
             }
           ]
         },
         {
-          "title": "Active Circuit Breakers",
+          "title": "Circuit Breaker Opens (1h)",
           "type": "stat",
           "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -206,7 +206,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(routeiq_circuit_breaker_state{state=\"open\", namespace=\"$namespace\"})",
+              "expr": "sum(increase(gateway_circuit_breaker_transitions_total{to_state=\"open\", namespace=\"$namespace\"}[1h]))",
               "refId": "A"
             }
           ]
@@ -230,7 +230,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(increase(routeiq_tokens_total{namespace=\"$namespace\"}[5m])) by (model)",
+              "expr": "sum(increase(gateway_tokens_total{namespace=\"$namespace\"}[5m])) by (model)",
               "legendFormat": "{{ "{{ model }}" }}",
               "refId": "A"
             }
@@ -254,7 +254,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum(increase(routeiq_cost_usd_total{namespace=\"$namespace\"}[1h]))",
+              "expr": "sum(increase(gateway_cost_total_usd_total{namespace=\"$namespace\"}[1h]))",
               "legendFormat": "Cost/hr",
               "refId": "A"
             }
@@ -286,7 +286,7 @@ data:
           },
           "targets": [
             {
-              "expr": "1 - (sum(rate(routeiq_tokens_total{namespace=\"$namespace\", type=\"output\"}[1h])) / sum(rate(routeiq_tokens_total{namespace=\"$namespace\", type=\"input\"}[1h])))",
+              "expr": "1 - (sum(rate(gateway_tokens_total{namespace=\"$namespace\", direction=\"output\"}[1h])) / sum(rate(gateway_tokens_total{namespace=\"$namespace\", direction=\"input\"}[1h])))",
               "refId": "A"
             }
           ]
@@ -310,13 +310,13 @@ data:
           {
             "current": { "selected": false, "text": "", "value": "" },
             "datasource": { "type": "prometheus", "uid": "${datasource}" },
-            "definition": "label_values(routeiq_requests_total, namespace)",
+            "definition": "label_values(gateway_request_total, namespace)",
             "hide": 0,
             "includeAll": false,
             "label": "Namespace",
             "multi": false,
             "name": "namespace",
-            "query": { "query": "label_values(routeiq_requests_total, namespace)", "refId": "StandardVariableQuery" },
+            "query": { "query": "label_values(gateway_request_total, namespace)", "refId": "StandardVariableQuery" },
             "type": "query"
           }
         ]
