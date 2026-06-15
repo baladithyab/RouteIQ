@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
@@ -186,7 +187,9 @@ class GovernanceContext:
 # -- Canonical scope derivation (single source of truth for WRITE == READ) ---
 
 
-def derive_spend_scope_from_ctx(ctx: GovernanceContext) -> tuple[str, str]:
+def derive_spend_scope_from_ctx(
+    ctx: "GovernanceContext | Mapping[str, Any]",
+) -> tuple[str, str]:
     """Derive the canonical ``(scope, scope_type)`` for a governance context.
 
     This is the SINGLE source of truth for the spend/RPM scope token used by
@@ -198,6 +201,11 @@ def derive_spend_scope_from_ctx(ctx: GovernanceContext) -> tuple[str, str]:
     so workspace (RouteIQ-ed7a) and key (RouteIQ-08dd) budgets are actually
     enforced instead of silently fail-open.
 
+    Accepts EITHER a :class:`GovernanceContext` (the READ path) OR the dict
+    stamp written into ``metadata["_governance_ctx"]`` (the WRITE path), so both
+    sides call this ONE code path instead of hand-copying the precedence inline
+    (RouteIQ-9738 — eliminates the drift class by construction).
+
     Precedence (most-specific-wins, identical on both sides):
     ``workspace_id`` -> ``key_id`` -> ``"global"``.  ``scope_type`` is
     ``"workspace"`` when a workspace is resolved, else ``"key"`` when a key is
@@ -205,10 +213,16 @@ def derive_spend_scope_from_ctx(ctx: GovernanceContext) -> tuple[str, str]:
     path resolves (NOT a hash / user-id), so the write must reuse the same raw
     token for the read to see it.
     """
-    if ctx.workspace_id:
-        return str(ctx.workspace_id), "workspace"
-    if ctx.key_id:
-        return str(ctx.key_id), "key"
+    if isinstance(ctx, Mapping):
+        workspace_id = ctx.get("workspace_id")
+        key_id = ctx.get("key_id")
+    else:
+        workspace_id = ctx.workspace_id
+        key_id = ctx.key_id
+    if workspace_id:
+        return str(workspace_id), "workspace"
+    if key_id:
+        return str(key_id), "key"
     return "global", "global"
 
 

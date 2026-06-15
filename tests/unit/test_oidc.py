@@ -14,7 +14,6 @@ Tests cover:
 
 from __future__ import annotations
 
-import base64
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +25,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from starlette.requests import Request
 
+from litellm_llmrouter import oidc as _oidc_mod
 from litellm_llmrouter.oidc import (
     JWTValidator,
     OIDCAuthError,
@@ -48,6 +48,22 @@ from litellm_llmrouter.oidc import (
     reset_oidc,
     resolve_identity,
     setup_oidc,
+)
+
+# RouteIQ-0480: the real OIDC endpoint + token-validation paths require the
+# optional [oidc] extra (authlib). When authlib is absent, create_oidc_router()
+# returns a 501 placeholder router and _jwt_validator stays None, so tests that
+# assert the REAL behaviour (400/401/403/200/302, or a non-None validator) must
+# skip cleanly rather than fail. Key on the module's own probe
+# (oidc.authlib_available) -- exactly what the production code branches on -- so
+# the gate matches prod and never imports authlib as a side effect. Skip (not
+# xfail): when authlib IS present these are real passing tests with their
+# assertions UNCHANGED. The 501-placeholder contract is covered separately by
+# TestAuthLibNotAvailable, which must keep running in BOTH environments -- so a
+# module-level importorskip("authlib") would be WRONG here.
+_requires_authlib = pytest.mark.skipif(
+    not _oidc_mod.authlib_available,
+    reason="OIDC endpoint/validator paths require the optional [oidc] extra (authlib)",
 )
 
 
@@ -577,6 +593,7 @@ class TestRoleMapping:
         assert roles == ["internal_user"]
 
 
+@_requires_authlib
 class TestJWTValidatorValidateToken:
     """Tests for JWTValidator.validate_token() — mocking authlib."""
 
@@ -743,6 +760,7 @@ class TestJWTValidatorValidateToken:
 # =============================================================================
 
 
+@_requires_authlib
 class TestOIDCRouterEndpoints:
     """Tests for the FastAPI router endpoints created by create_oidc_router()."""
 
@@ -1123,6 +1141,7 @@ class TestSingletonLifecycle:
         assert oidc_mod._oidc_config is not None
         assert oidc_mod._jwt_validator is None
 
+    @_requires_authlib
     def test_setup_oidc_enabled(self):
         """setup_oidc() with enabled config creates validator."""
         import litellm_llmrouter.oidc as oidc_mod

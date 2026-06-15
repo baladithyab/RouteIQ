@@ -3112,6 +3112,7 @@ db = [
     { name = "prisma" },
 ]
 dev = [
+    { name = "authlib" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -3180,6 +3181,7 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=23.0.0" },
     { name = "apscheduler", specifier = ">=3.10.0" },
     { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.29.0" },
+    { name = "authlib", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "authlib", marker = "extra == 'oidc'", specifier = ">=1.5.0" },
     { name = "aws-cdk-lib", marker = "extra == 'cdk'", specifier = ">=2.150.0,<3.0.0" },
     { name = "azure-identity", marker = "extra == 'cloud'", specifier = ">=1.15.0" },

@@ -1383,7 +1383,13 @@ class RoutingPipeline:
 # Singleton instances
 _registry_instance: Optional[RoutingStrategyRegistry] = None
 _pipeline_instance: Optional[RoutingPipeline] = None
-_instance_lock = threading.Lock()
+# RouteIQ-1af0: must be RLock, not Lock. get_routing_pipeline() acquires this
+# lock then calls get_routing_registry() which re-acquires the SAME lock. On a
+# truly cold process (both singletons None) a non-reentrant threading.Lock
+# self-deadlocks there. RLock lets the same thread re-acquire; reset_* and the
+# warm paths are unaffected (RLock is a strict superset of Lock for the
+# single-acquire case).
+_instance_lock = threading.RLock()
 
 
 def get_routing_registry() -> RoutingStrategyRegistry:
@@ -1402,6 +1408,8 @@ def get_routing_pipeline() -> RoutingPipeline:
 
     with _instance_lock:
         if _pipeline_instance is None:
+            # Re-acquires _instance_lock via get_routing_registry(); safe only
+            # because _instance_lock is an RLock (RouteIQ-1af0).
             registry = get_routing_registry()
             _pipeline_instance = RoutingPipeline(registry)
         return _pipeline_instance

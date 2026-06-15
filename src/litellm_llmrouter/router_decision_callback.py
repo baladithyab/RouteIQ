@@ -734,17 +734,14 @@ def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:
     Legacy/back-compat fallthrough (raw ``metadata`` keys) is preserved for
     non-enforce callers that never produced a ``_governance_ctx`` stamp.
     """
+    from litellm_llmrouter.governance import derive_spend_scope_from_ctx
+
     gctx = metadata.get("_governance_ctx")
     if isinstance(gctx, dict):
-        # Same precedence as the read path -- workspace_id wins, then raw key_id.
-        ws = gctx.get("workspace_id")
-        if ws:
-            return str(ws), "workspace"
-        key = gctx.get("key_id")
-        if key:
-            return str(key), "key"
-        # An explicit stamp with neither workspace nor key -> global scope.
-        return "global", "global"
+        # Delegate to the SINGLE source of truth the read path uses so WRITE ==
+        # READ by construction -- no inline precedence to drift (RouteIQ-9738).
+        # derive_spend_scope_from_ctx accepts the dict stamp directly.
+        return derive_spend_scope_from_ctx(gctx)
 
     # Legacy fallback: requests that bypassed the enforce stamp.
     workspace_id = metadata.get("workspace_id") or metadata.get("_workspace")

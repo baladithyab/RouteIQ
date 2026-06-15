@@ -38,8 +38,9 @@ import asyncio
 import logging
 import os
 import re
+import time
 import warnings
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from litellm_llmrouter.settings import get_settings
 
@@ -53,6 +54,46 @@ _async_client_lock: Optional[asyncio.Lock] = None
 _sync_client: Optional[Any] = None  # redis.Redis | None
 _last_health_check: float = 0.0
 _HEALTH_CHECK_INTERVAL = 30.0  # seconds
+
+# RouteIQ-f5c4: the ElastiCache IAM SigV4 token (_mint_elasticache_token,
+# expires=900) is baked into the long-lived singleton client at build time. A
+# healthy long-lived connection never re-pings-to-failure, so without an
+# age-gated refresh the baked token silently outlives its ~15-min validity and
+# new pool connections AUTH with an expired token. We stamp the monotonic mint
+# time and proactively rebuild (-> re-mint) once the token ages past
+# ``_IAM_TOKEN_TTL - _IAM_REFRESH_BEFORE``. The clock is an injectable seam so
+# tests drive staleness deterministically (no real time/sleep on this path).
+_iam_token_minted_at: float = 0.0  # monotonic seconds at last successful IAM mint
+_IAM_TOKEN_TTL = 900.0  # matches _mint_elasticache_token expires=900
+_IAM_REFRESH_BEFORE = 120.0  # re-mint >=120s before expiry -> ~780s usable budget
+_clock: Callable[[], float] = time.monotonic  # test-injectable monotonic seam
+
+
+def _set_clock(fn: Callable[[], float]) -> None:
+    """Inject a deterministic monotonic clock. TEST-ONLY seam.
+
+    Production/runtime code never calls this; the default ``time.monotonic`` is
+    restored by :func:`reset_redis_clients`.
+    """
+    global _clock
+    _clock = fn
+
+
+def _iam_token_is_stale() -> bool:
+    """True only when IAM auth is ON, a token has been minted, and it has aged
+    past the refresh threshold (``TTL - REFRESH_BEFORE``).
+
+    Fail-soft: any settings error, IAM-off, or un-minted state returns False so
+    the static / freshly-built path is left completely unchanged.
+    """
+    try:
+        if not get_settings().redis.iam_auth:
+            return False
+    except Exception:
+        return False
+    if _iam_token_minted_at == 0.0:
+        return False
+    return (_clock() - _iam_token_minted_at) > (_IAM_TOKEN_TTL - _IAM_REFRESH_BEFORE)
 
 
 def _get_async_client_lock() -> asyncio.Lock:
@@ -211,16 +252,20 @@ async def get_async_redis_client() -> Optional[Any]:
         A ``redis.asyncio.Redis`` instance, or ``None`` if Redis is not
         configured (``REDIS_HOST`` is not set).
     """
-    global _async_client, _last_health_check
+    global _async_client, _last_health_check, _iam_token_minted_at
 
     # Fast path: reuse existing healthy client with time-gated health check
     if _async_client is not None:
-        import time
-
-        if time.monotonic() - _last_health_check > _HEALTH_CHECK_INTERVAL:
+        # RouteIQ-f5c4: a stale IAM token forces a rebuild FIRST, even if PING is
+        # still within its 30s gate -- otherwise an aged-out token survives until
+        # a PING happens to fail. The rebuild below re-mints a fresh token.
+        if _iam_token_is_stale():
+            logger.debug("Redis IAM token aged out; rebuilding async client to re-mint")
+            _async_client = None
+        elif _clock() - _last_health_check > _HEALTH_CHECK_INTERVAL:
             try:
                 await _async_client.ping()
-                _last_health_check = time.monotonic()
+                _last_health_check = _clock()
             except Exception:
                 logger.debug("Async Redis client health-check failed, reconnecting")
                 _async_client = None
@@ -268,6 +313,10 @@ async def get_async_redis_client() -> Optional[Any]:
                 username = rsettings.username or username  # CacheIamUserName
                 cache_name = host.split(".")[0]
                 password = _mint_elasticache_token(username, cache_name, region)
+                # RouteIQ-f5c4: stamp the mint time so _iam_token_is_stale() can
+                # age-gate the next rebuild. Only on the IAM branch -> the static
+                # path leaves _iam_token_minted_at at 0.0 (never "stale").
+                _iam_token_minted_at = _clock()
                 logger.info("Redis IAM auth enabled (user=%s)", username)  # no token
         except Exception as e:
             logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
@@ -321,7 +370,14 @@ def get_sync_redis_client() -> Optional[Any]:
         A ``redis.Redis`` instance, or ``None`` if Redis is not
         configured (``REDIS_HOST`` is not set).
     """
-    global _sync_client
+    global _sync_client, _iam_token_minted_at
+
+    # RouteIQ-f5c4: the sync singleton has NO health-check, so on the IAM path its
+    # baked token would otherwise never refresh until process restart. Drop the
+    # cached client when its token has aged out so we rebuild + re-mint below.
+    if _sync_client is not None and _iam_token_is_stale():
+        logger.debug("Redis IAM token aged out; rebuilding sync client to re-mint")
+        _sync_client = None
 
     if _sync_client is not None:
         return _sync_client
@@ -358,6 +414,8 @@ def get_sync_redis_client() -> Optional[Any]:
             username = rsettings.username or username  # CacheIamUserName
             cache_name = host.split(".")[0]
             password = _mint_elasticache_token(username, cache_name, region)
+            # RouteIQ-f5c4: stamp the mint time for the sync staleness gate above.
+            _iam_token_minted_at = _clock()
             logger.info("Redis IAM auth enabled (user=%s)", username)  # no token
     except Exception as e:
         logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
@@ -389,10 +447,14 @@ def reset_redis_clients() -> None:
     :func:`close_async_redis_client` for graceful shutdown.
     """
     global _async_client, _sync_client, _async_client_lock, _last_health_check
+    global _iam_token_minted_at, _clock
     _async_client = None
     _sync_client = None
     _async_client_lock = None
     _last_health_check = 0.0
+    # RouteIQ-f5c4: start cold and restore the REAL clock after any test injection.
+    _iam_token_minted_at = 0.0
+    _clock = time.monotonic
 
 
 # ---------------------------------------------------------------------------

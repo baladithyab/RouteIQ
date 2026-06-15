@@ -264,6 +264,29 @@ def test_writer_prefers_governance_ctx_stamp():
     )
 
 
+@pytest.mark.parametrize(
+    "ws,key,expect",
+    [
+        ("ws-1", "sk-raw", ("ws-1", "workspace")),  # both -> workspace wins
+        ("ws-1", None, ("ws-1", "workspace")),  # workspace only
+        (None, "sk-raw", ("sk-raw", "key")),  # key only (RAW api_key)
+        (None, None, ("global", "global")),  # neither -> global
+    ],
+)
+def test_write_scope_equals_read_scope(ws, key, expect):
+    """RouteIQ-9738: WRITE (_derive_spend_scope) == READ
+    (derive_spend_scope_from_ctx) via the shared helper, byte-identical across
+    all 4 scope variants. Pins that the write stamp branch and the read path can
+    never drift -- they call the SAME code (derive_spend_scope_from_ctx)."""
+    from litellm_llmrouter.router_decision_callback import _derive_spend_scope
+
+    read = derive_spend_scope_from_ctx(GovernanceContext(workspace_id=ws, key_id=key))
+    write = _derive_spend_scope(
+        {"_governance_ctx": {"workspace_id": ws, "key_id": key}}
+    )
+    assert read == write == expect
+
+
 @pytest.mark.asyncio
 async def test_workspace_budget_write_seen_by_read_and_enforced(monkeypatch):
     """RouteIQ-ed7a: spend written via the success-callback path lands on the

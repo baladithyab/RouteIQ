@@ -13,7 +13,7 @@ Run tests:
     uv run pytest tests/unit/test_redis_pool.py -v
 """
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -540,3 +540,139 @@ class TestRedisIamAuthSplice:
                 rp._warn_no_password()
         warnings_emitted = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert not warnings_emitted, [r.getMessage() for r in warnings_emitted]
+
+
+# =============================================================================
+# RouteIQ-f5c4 -- IAM token refresh-before-expiry (age-gated re-mint)
+# =============================================================================
+#
+# The ElastiCache IAM SigV4 token (expires=900) is baked into the long-lived
+# singleton at build time. Without an age-gate a healthy connection ages the
+# token past 15 min and new pool connections AUTH with an expired token. These
+# tests mock the signer (count mints, NEVER a real token) and inject a fake
+# monotonic clock so staleness is fully deterministic -- no real time/sleep.
+
+_IAM_ENV = {
+    "REDIS_HOST": _SERVERLESS_HOST,
+    "REDIS_SSL": "true",
+    "REDIS_USERNAME": _FAKE_CACHE_USER,
+    "ROUTEIQ_REDIS_IAM_AUTH": "true",
+    "AWS_REGION": "us-east-1",
+}
+
+
+class TestRedisIamTokenRefresh:
+    """RouteIQ-f5c4: an aged (>~15min) IAM token forces a rebuild + re-mint."""
+
+    async def test_async_iam_token_remint_after_expiry(self):
+        """A clock advance past (TTL - REFRESH_BEFORE) re-mints on the async path."""
+        import litellm_llmrouter.redis_pool as rp
+
+        clock = {"t": 1000.0}
+        mints: list[float] = []
+
+        def _fake_mint(user, cache_name, region):
+            mints.append(clock["t"])
+            return f"{_FAKE_SIGNED_TOKEN}-{len(mints)}"  # never a real token
+
+        with patch.dict("os.environ", _IAM_ENV, clear=True):
+            reset_settings()
+            rp.reset_redis_clients()  # cold; restores real clock, then re-inject
+            rp._set_clock(lambda: clock["t"])
+            with patch.object(rp, "_mint_elasticache_token", _fake_mint):
+                with patch("redis.asyncio.Redis") as mock_cls:
+                    # ping() must SUCCEED so the ONLY rebuild trigger is token age.
+                    inst = MagicMock()
+                    inst.ping = AsyncMock(return_value=True)
+                    mock_cls.return_value = inst
+
+                    await rp.get_async_redis_client()  # mint #1
+                    assert len(mints) == 1
+
+                    clock["t"] += (rp._IAM_TOKEN_TTL - rp._IAM_REFRESH_BEFORE) + 1.0
+                    await rp.get_async_redis_client()  # stale -> rebuild -> re-mint #2
+                    assert len(mints) == 2, "aged IAM token must trigger a re-mint"
+
+    async def test_async_iam_token_not_reminted_within_ttl(self):
+        """A small advance (< threshold) does NOT re-mint (no over-eager rebuild)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        clock = {"t": 5000.0}
+        mints: list[float] = []
+
+        def _fake_mint(user, cache_name, region):
+            mints.append(clock["t"])
+            return f"{_FAKE_SIGNED_TOKEN}-{len(mints)}"
+
+        with patch.dict("os.environ", _IAM_ENV, clear=True):
+            reset_settings()
+            rp.reset_redis_clients()
+            rp._set_clock(lambda: clock["t"])
+            with patch.object(rp, "_mint_elasticache_token", _fake_mint):
+                with patch("redis.asyncio.Redis") as mock_cls:
+                    inst = MagicMock()
+                    inst.ping = AsyncMock(return_value=True)
+                    mock_cls.return_value = inst
+
+                    await rp.get_async_redis_client()  # mint #1
+                    assert len(mints) == 1
+
+                    # Within the health-check gate AND well under the refresh
+                    # threshold -> cached client returned, no new mint.
+                    clock["t"] += 10.0
+                    await rp.get_async_redis_client()
+                    assert len(mints) == 1, "fresh IAM token must NOT be re-minted"
+
+    def test_sync_iam_token_remint_after_expiry(self):
+        """A clock advance past threshold re-mints on the sync path (no health-check)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        clock = {"t": 2000.0}
+        mints: list[float] = []
+
+        def _fake_mint(user, cache_name, region):
+            mints.append(clock["t"])
+            return f"{_FAKE_SIGNED_TOKEN}-{len(mints)}"
+
+        with patch.dict("os.environ", _IAM_ENV, clear=True):
+            reset_settings()
+            rp.reset_redis_clients()
+            rp._set_clock(lambda: clock["t"])
+            with patch.object(rp, "_mint_elasticache_token", _fake_mint):
+                with patch("redis.Redis") as mock_cls:
+                    mock_cls.return_value = MagicMock()
+
+                    rp.get_sync_redis_client()  # mint #1
+                    assert len(mints) == 1
+
+                    clock["t"] += (rp._IAM_TOKEN_TTL - rp._IAM_REFRESH_BEFORE) + 1.0
+                    rp.get_sync_redis_client()  # stale -> rebuild -> re-mint #2
+                    assert len(mints) == 2, "aged sync IAM token must trigger a re-mint"
+
+    async def test_token_value_never_logged_on_remint(self, caplog):
+        """The token VALUE is never logged across mint + re-mint (only user=...)."""
+        import logging
+
+        import litellm_llmrouter.redis_pool as rp
+
+        clock = {"t": 3000.0}
+        secret_token = f"{_FAKE_SIGNED_TOKEN}-MUST-NOT-LEAK"
+
+        with patch.dict("os.environ", _IAM_ENV, clear=True):
+            reset_settings()
+            rp.reset_redis_clients()
+            rp._set_clock(lambda: clock["t"])
+            with patch.object(
+                rp, "_mint_elasticache_token", lambda u, c, r: secret_token
+            ):
+                with patch("redis.asyncio.Redis") as mock_cls:
+                    inst = MagicMock()
+                    inst.ping = AsyncMock(return_value=True)
+                    mock_cls.return_value = inst
+                    with caplog.at_level(logging.DEBUG, logger=rp.logger.name):
+                        await rp.get_async_redis_client()
+                        clock["t"] += (rp._IAM_TOKEN_TTL - rp._IAM_REFRESH_BEFORE) + 1.0
+                        await rp.get_async_redis_client()
+
+        for record in caplog.records:
+            assert secret_token not in record.getMessage(), "IAM token leaked to logs"

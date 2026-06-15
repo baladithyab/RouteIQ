@@ -1182,3 +1182,59 @@ class TestSingletonAccess:
         registry2 = get_routing_registry()
 
         assert registry1 is not registry2
+
+
+class TestColdProcessPipelineNoDeadlock:
+    """RouteIQ-1af0: get_routing_pipeline() on a cold process must not deadlock."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        reset_routing_singletons()
+        yield
+        reset_routing_singletons()
+
+    def test_get_routing_pipeline_cold_process_no_deadlock(self):
+        """RouteIQ-1af0: cold process (both singletons None) ->
+        get_routing_pipeline() must NOT self-deadlock on the shared instance
+        lock.
+
+        get_routing_pipeline() acquires _instance_lock then calls
+        get_routing_registry() which re-acquires the SAME lock. With a
+        non-reentrant threading.Lock this self-deadlocks when both singletons
+        start None (cold). Run on a daemon worker with join(timeout=...) so a
+        regression FAILS the assertion instead of hanging the test runner.
+        """
+        from litellm_llmrouter.strategy_registry import (
+            get_routing_pipeline,
+            get_routing_registry,
+            reset_routing_singletons,
+        )
+
+        # Cold: both _registry_instance AND _pipeline_instance are None, and
+        # the FIRST call is get_routing_pipeline() (pipeline-before-registry
+        # ordering is what triggers the nested re-acquire).
+        reset_routing_singletons()
+
+        box: dict = {}
+        error: dict = {}
+
+        def _worker():
+            try:
+                box["pipeline"] = get_routing_pipeline()
+            except Exception as exc:  # pragma: no cover - surfaced via assert
+                error["exc"] = exc
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+
+        assert not t.is_alive(), (
+            "get_routing_pipeline() deadlocked on a cold process (RouteIQ-1af0)"
+        )
+        assert "exc" not in error, f"get_routing_pipeline() raised: {error.get('exc')}"
+        assert box.get("pipeline") is not None
+
+        # The pipeline must wrap the singleton registry, and a subsequent
+        # get_routing_pipeline() returns the same instance (warm path intact).
+        assert get_routing_pipeline() is box["pipeline"]
+        assert box["pipeline"]._registry is get_routing_registry()
