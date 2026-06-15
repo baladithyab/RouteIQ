@@ -1,0 +1,138 @@
+[
+  {
+    "title": "Combined cred-free gate VERIFIED GREEN: 180 passed, no AWS creds (P0 36 + P2 81 + P1 63)",
+    "severity": "info",
+    "detail": "Ran `uv sync --extra cdk && uv run python -m pytest deploy/cdk/tests/ -q` from repo root with AWS_* env unset. Result: 180 passed in 15.39s (deploy/cdk/tests). Matches the commit-7c57eba claim exactly. Three nag suites (test_cdk_nag.py 4, test_obs_cdk_nag.py 4, test_state_cdk_nag.py 3) all green. Snapshot suite = 2 tests only (P0 dev.json + P1 state-dev.json). Working tree deploy/ is byte-identical to snapshot 7c57eba (git diff 7c57eba HEAD -- deploy/ is empty; the only HEAD-vs-7c57eba delta is .seeds/issues.jsonl).",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": false
+  },
+  {
+    "title": "Cross-stack wiring P0->P1 is SOUND: all 14 Fn::ImportValue refs resolve to the 7 P0 exports; pod-role rds-db:connect + elasticache:Connect ARE applied",
+    "severity": "info",
+    "detail": "Built the combined app (RouteIqStack + RouteIqStateStack with foundation=) and rendered both templates offline (docker masked via shutil.which monkeypatch). RouteIqStateStack emits 14 Fn::ImportValue against exactly the 7 P0 CfnOutput exports (Vpc, PodSg.GroupId, 2x private-data subnets, 2x private-app subnets, PodRole) -- UNRESOLVED imports: NONE. The PodStateGrants iam.Policy (routeiq_state_stack.py:216-248) carries BOTH rds-db:connect AND elasticache:Connect and attach_to_role(pod_role) (verified in synthesised template Statement actions). The DependencyCycle-avoidance pattern (own iam.Policy in State stack, not role.add_to_principal_policy on the imported P0 role; routeiq_state_stack.py:204-248) is correct. This is the GOOD half of the grant-accumulation story and contrasts with the P2 amp/appconfig gaps below.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": false
+  },
+  {
+    "title": "Pod role NEVER receives appconfig:GetLatestConfiguration / appconfigdata:StartConfigurationSession from ANY stack -- no grant seam exists at all",
+    "severity": "high",
+    "detail": "P0 forward-comment promises this grant (routeiq_stack.py:279-280: 'P2 (ADR-0026): appconfig:GetLatestConfiguration + appconfigdata:StartConfigurationSession (AppConfig ARN)') but never emits it. Unlike P2's aps:RemoteWrite which at least has a late-binding seam (observability_construct.py:494 amp_remote_write_grant), the AppConfig grant has NO method anywhere: `grep -n 'def grant|add_to_principal|appconfig_grant' lib/config_state_construct.py` returns nothing, and RouteIqObservabilityStack takes no foundation/pod_role arg (routeiq_observability_stack.py:78-92). So even after all three stacks deploy and the operator manually wires the AMP grant, the pod that polls AppConfig (the ADR-0026 config path) will get AccessDenied -- there is no IAM path to GetLatestConfiguration. This is the SECOND missing P2 pod-role grant and is strictly worse than the filed AMP one (which has a seam). The filed RouteIQ-4333 is about app-side AppConfig RETRIEVAL CODE being unimplemented, NOT the missing IAM grant seam in CDK.",
+    "isSeedWorthy": true,
+    "seedPriority": "P2",
+    "alreadyFiled": false
+  },
+  {
+    "title": "P2->P0 routing-log-group coupling is NAME-only (no Export/ImportValue, no add_dependency) -> unenforced deploy ordering; P2 MetricFilter CREATE fails if P0 group absent",
+    "severity": "high",
+    "detail": "RouteIqObservabilityStack references the P0 routing log group by NAME via logs.LogGroup.from_log_group_name (routeiq_observability_stack.py:116-121), NOT by foundation reference, so there is NO Fn::ImportValue and NO add_dependency between P2 and P0 (`grep add_dependency lib/routeiq_observability_stack.py app.py` = empty). The construct docstrings themselves state 'A CFN AWS::Logs::MetricFilter requires its target log group to ALREADY EXIST at deploy time' (observability_construct.py:57, routeiq_observability_stack.py:23-24). Because the coupling is a bare string, CloudFormation cannot enforce P0-before-P2: deploying P2 first (or against an account where P0's RoutingLogGroup is the dev DESTROY/teardown-recreated group) fails the MetricFilter + SubscriptionFilter CREATE with no protective dependency. Contrast P1, whose Export/ImportValue DOES enforce P0-first. This P0->P2 ordering hazard is invisible to per-wave reviews (each saw only its own stack) and is not in any of the ~17 filed seeds. Mitigation would be an operator runbook ordering note or a CfnOutput-name import to force the dependency.",
+    "isSeedWorthy": true,
+    "seedPriority": "P2",
+    "alreadyFiled": false
+  },
+  {
+    "title": "AppConfig validator Lambda dual-resolution => template + behavior DRIFT between cred-free gate (docker absent: no-op accept-all validator) and real deploy (docker present: real validator)",
+    "severity": "high",
+    "detail": "config_state_construct.py:328 guards on `bundling_available = shutil.which('docker') is not None` (binary present, NOT a healthy daemon). When docker is absent the code falls back to Code.from_inline(_VALIDATOR_INLINE_PLACEHOLDER) which is `def lambda_handler(event, context): return None` -- an ACCEPT-ALL no-op (config_state_construct.py:87-92, 351). The real validator (lambda/appconfig-validator/handler.py: YAML parse + RouteIQ-shape + inline-secret deny) only ships on the docker path (config_state_construct.py:334-347). Consequences: (1) ALL tests + the cred-free CI gate exercise ONLY the inline no-op path (tests/unit/test_observability_stack.py:34-48 forces _VALIDATOR_ASSET_PATH to a missing dir; the snapshot suite has no P2 baseline at all), so the gate is green on a validator that does nothing; (2) a deploy from a docker-equipped host produces a DIFFERENT CFN template (different asset hash, different handler index.lambda_handler vs handler.lambda_handler) than the gate validates -- gate/deploy template divergence; (3) on a docker-binary-present-but-daemon-down host (e.g. this audit host, OrbStack stopped) the synth CRASHES with 'docker exited with status 1' (reproduced: `Template.from_stack(RouteIqObservabilityStack)` raised FailedToBundleAsset). The security-relevant config gate (inline-secret deny) is silently absent whenever the deploy host lacks a working docker daemon. Not in the ~17 filed seeds.",
+    "isSeedWorthy": true,
+    "seedPriority": "P2",
+    "alreadyFiled": false
+  },
+  {
+    "title": "RouteIqObservabilityStack (the full P2 composition root) has NO snapshot test -> P2 template never pinned against drift",
+    "severity": "medium",
+    "detail": "tests/snapshot/ collects exactly 2 tests: test_dev_template_snapshot (P0) and test_state_dev_template_snapshot (P1). There is no observability snapshot baseline (__snapshots__/ holds only dev.json + state-dev.json). The P2 stack is unit-tested (test_observability_stack.py) but only via the forced inline-placeholder path, and a snapshot would be non-deterministic anyway because of the docker dual-resolution (prior finding). Net effect: the P2 template (AppConfig + AMP/AMG/CW + Firehose lake + Athena workgroup) has zero byte-stability guard -- a future construct edit can silently change the P2 CFN output with no failing test. The per-wave P2 review could not see this as a gap relative to P0/P1's snapshot discipline. Not in the ~17 filed seeds.",
+    "isSeedWorthy": true,
+    "seedPriority": "P3",
+    "alreadyFiled": false
+  },
+  {
+    "title": "Routing-log-group naming convention is TRIPLICATED as independent string literals across three files (drift risk beyond the filed _COLUMNS duplication)",
+    "severity": "medium",
+    "detail": "The dedicated routing log group name is hand-built in THREE places that rely on the unstated invariant cluster_name == 'routeiq-<env>' to stay in sync: (1) eks_cluster_construct.py:412 (authoritative producer) `/aws/containerinsights/{self.cluster_name}/routeiq-routing` where cluster_name = f'routeiq-{env_name}' (eks_cluster_construct.py:119); (2) nag_suppressions.py:331-332 hardcodes `/aws/containerinsights/routeiq-{env_name}/routeiq-routing:*` for the P0 Logs-grant IAM5 suppression; (3) routeiq_observability_stack.py:117 derives `/aws/containerinsights/routeiq-{env_name}/routeiq-routing` when no name is passed (the default cred-free path). They MATCH today, but there is no shared constant -- a change to the cluster-naming scheme drifts the P0 IAM grant scope, the P0 nag suppression, and the P2 filter target apart silently. This is DISTINCT from the filed RouteIQ-199e (which is about the routing_decision _COLUMNS / ROUTING_DECISION_COLUMNS schema duplication, not the log-group name).",
+    "isSeedWorthy": true,
+    "seedPriority": "P3",
+    "alreadyFiled": false
+  },
+  {
+    "title": "IRSA-vs-Pod-Identity doc drift is NOT confined to ADR-0030 -- it propagates into ADR-0026/0027/0028/0029 body text and cross-links",
+    "severity": "low",
+    "detail": "The P0 substrate uses EKS Pod Identity (no OIDC provider, no WebIdentityPrincipal; routeiq_stack.py:163-177, network_construct.py:16-18 drops the STS endpoint 'on the Pod Identity path'). But the ADRs still say IRSA: ADR-0027:43 ('The workload IRSA role (ADR-0030) needs aps:RemoteWrite'), ADR-0028:56 ('the workload IRSA role (ADR-0030) is granted') and ADR-0028:104 ('IAM auth + IRSA'), plus every ADR (0026:162, 0027:165, 0028:161, 0029:151) cross-links '0030-eks-auto-mode-irsa-substrate.md / EKS Auto Mode + IRSA Deployment Substrate'. The filed seed RouteIQ-1f1b is scoped narrowly to ADR-0030 (title rename + L1/L2 rationale). The cross-ADR propagation of stale IRSA terminology into 0026-0029 bodies + the shared filename/link is broader than that seed and contradicts the shipped Pod Identity code.",
+    "isSeedWorthy": true,
+    "seedPriority": "P4",
+    "alreadyFiled": false
+  },
+  {
+    "title": "Chart has NO seam to consume the P2 AMP/AppConfig CfnOutputs, and emits no AWS_REGION -- a single shared gap across all three planes (Bedrock P0, RDS/cache token P1, AMP P2)",
+    "severity": "medium",
+    "detail": "RouteIqObservabilityStack emits AmpRemoteWriteUrl, AmpWorkspaceId, AppConfigArn, AppConfigProfileArn (routeiq_observability_stack.py:201-241), but the chart has no documented --set seam for any of them: `grep -i 'amp|appconfig|remotewrite|adot|prometheus.*write' deploy/charts/routeiq-gateway/README.md` returns nothing, and there is no ADOT/collector sidecar in templates/. So the P2 remote-write + AppConfig outputs are emitted-but-unconsumable from the chart side (corroborates filed RouteIQ-27b6 / RouteIQ-4333 but extends them to the chart wiring). Separately, the chart emits NO AWS_REGION/AWS_DEFAULT_REGION env in any template (`grep AWS_REGION deploy/charts/routeiq-gateway/templates/` = empty); values.yaml:566-573 documents this only as an operator-must-set extraEnv hint and frames it as Bedrock/AMP. But AWS_REGION is in fact a SHARED prerequisite of P0 (Bedrock), P1 (the rds-db:connect / elasticache:Connect SigV4 token signer in database.py/redis_pool.py), and P2 (AMP remote-write) -- a regionless client on any of the three planes fails. The cross-plane breadth of this single env gap is only visible synthesising all three waves.",
+    "isSeedWorthy": true,
+    "seedPriority": "P3",
+    "alreadyFiled": false
+  },
+  {
+    "title": "Combined-app cdk-nag is CLEAN: zero unsuppressed AwsSolutions errors on FOUNDATION + OBS synthesised together with state+obs+amg+lake all on",
+    "severity": "info",
+    "detail": "Built one cdk.App holding all three stacks (enable_state_stack + enable_observability_stack + enable_amg + enable_data_lake all true), added AwsSolutionsChecks aspect, rendered templates with docker masked. FOUNDATION: AwsSolutions=0 ValidationFailures=0. OBS: AwsSolutions=0 ValidationFailures=0. STATE template synthesises and its cross-stack imports all resolve; its Annotations.find_error query hit a jsii proxy KeyError ('aws-cdk-lib.cloud_assembly_schema.MetadataEntry') that is a jsii-version deserialization quirk on the second cross-stack-coupled stack, NOT a nag finding -- the dedicated test_state_cdk_nag.py (which builds the state stack in its own app) passes 0-finding for default/prod/scale-to-zero. No surviving AwsSolutions errors for the combined app.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": false
+  },
+  {
+    "title": "P2 router_error_log_count metric filter keys on $.level='error' but the emitter produces NO top-level level key -> alarm can never fire (CONFIRMED, already filed)",
+    "severity": "medium",
+    "detail": "Cross-checked the full field contract end-to-end. observability_construct.py:124 _ERROR_LEVEL_FIELD = '$.level' drives router_error_filter (observability_construct.py:314-321). The actual emitter build_routing_decision_record (src/litellm_llmrouter/observability.py:391-422) produces top-level keys: event, timestamp, request_id, trace_id, selected_model, model, decision, reason_code, category, reasoning_enabled, latency_ms, prompt_tokens, completion_tokens, cache_hit, gen_ai.response.model, (optional) strategy, query_length -- there is NO 'level' key. So router_error_log_count stays flat at 0 and router_error_alarm never fires. Confirms filed RouteIQ-731c.",
+    "isSeedWorthy": false,
+    "seedPriority": "P3",
+    "alreadyFiled": true
+  },
+  {
+    "title": "P0 prep-only RoutingLatencyByModel filter uses STALE $.msg/$.routing_latency_ms contract vs the shipped $.event/$.latency_ms (CONFIRMED, already filed)",
+    "severity": "low",
+    "detail": "eks_cluster_construct.py:436-439 (flag-gated-off prep filter) uses filter_pattern string_value('$.msg','=','routing_decision') + metric_value '$.routing_latency_ms' -- the VSR-legacy contract. The shipped P2 filters (observability_construct.py:103-119) + the emitter (src observability.py:393,403) use $.event + $.latency_ms. The stale P0 prep filter, if ever flag-enabled, matches zero events. Confirms filed RouteIQ-8f08.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": true
+  },
+  {
+    "title": "amp_remote_write_grant defined but never invoked -> pod role never gets aps:RemoteWrite (CONFIRMED, already filed)",
+    "severity": "low",
+    "detail": "observability_construct.py:494 defines amp_remote_write_grant(pod_role) but `grep -rn amp_remote_write_grant lib/ tests/ src/` finds it only in its own def + docstrings/comments -- never called. RouteIqObservabilityStack takes no pod_role/foundation arg so it cannot call it. ADOT remote-write is therefore IAM-blocked at runtime. Confirms filed RouteIQ-74c0 / RouteIQ-717b.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": true
+  },
+  {
+    "title": "P1 schema-bootstrap Lambda SG cannot reach the P0 SecretsManager interface endpoint (CONFIRMED, already filed)",
+    "severity": "high",
+    "detail": "The bootstrap Lambda runs in security_groups=[self.replay_store_sg] (replay_store_construct.py:460), but the P0 vpce_sg admits 443 ONLY from pod_sg (network_construct.py:173-175). So the bootstrap Lambda's GetSecretValue (to read the master secret for idempotent DDL) is blocked at the interface endpoint -> the schema-bootstrap custom resource deploy-breaks. Confirms filed RouteIQ-8374.",
+    "isSeedWorthy": false,
+    "seedPriority": "P2",
+    "alreadyFiled": true
+  },
+  {
+    "title": "App-side IAM-token minting runtime half unbuilt; database.py/redis_pool.py still use static creds (CONFIRMED, already filed)",
+    "severity": "high",
+    "detail": "Chart README (deploy/charts/routeiq-gateway/README.md:231-239) truthfully documents 'Runtime code not yet shipped': database.py / redis_pool.py read static PASSWORD/host envs and do NOT mint the 15-min rds-db:connect / elasticache:Connect SigV4 token in-process. The CDK grants (PodStateGrants) and chart host seams ARE correct; only the app-side minting remains. Confirms filed RouteIQ-d3a4. Note: AWS_REGION + the dropped STS endpoint (network_construct.py:16-18) will both bite this runtime half when it lands (cf. filed RouteIQ-df6e).",
+    "isSeedWorthy": false,
+    "seedPriority": "P2",
+    "alreadyFiled": true
+  },
+  {
+    "title": "ADR-0027 claims 9 alarms; only 3 alarm constructs built (CONFIRMED, already filed)",
+    "severity": "low",
+    "detail": "ADR-0027:160 says 'CW dashboard + 9 alarms + 3 metric filters'. observability_construct.py builds exactly 3 alarms: routing_latency_alarm (:362), router_error_alarm (:388), routing_latency_anomaly_alarm (:417). The ECS-set alarms were dropped (EKS substrate). Confirms filed RouteIQ-4b2a.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": true
+  },
+  {
+    "title": "routeiq: context-key naming is consistent across app.py / lib / cdk.json -- no undeclared or unused keys",
+    "severity": "info",
+    "detail": "Diffed all routeiq:<key> referenced in lib/ + app.py against the keys declared in cdk.json. After excluding regex-split false positives (routeiq:config_s3_bucket truncations) and Tag keys (routeiq:cost-center/team/tenant/plane/substrate, which are Tags.of(...).add labels not context keys), there are no context keys used-but-undeclared and none declared-but-unused. Context-key naming coheres across the three waves.",
+    "isSeedWorthy": false,
+    "seedPriority": "P4",
+    "alreadyFiled": false
+  }
+]
