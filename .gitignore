@@ -130,6 +130,8 @@ deploy/cdk/.ruff_cache/
 deploy/cdk/.pytest_cache/
 deploy/cdk/cdk.out/
 deploy/cdk/**/__pycache__/
+# Redundant per-subtree lockfile — the root uv.lock + pyproject `cdk` extra is canonical.
+deploy/cdk/uv.lock
 
 # Un-ignore the CDK source lib/ — the generic `lib/` rule above (Python packaging
 # build output) otherwise swallows the deploy/cdk/lib/ CONSTRUCTS source tree.
