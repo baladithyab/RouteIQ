@@ -555,18 +555,32 @@ def test_moment_fit_beats_shortcut_on_exploit_inversion():
     assert shortcut_wins / 20000 < 0.2
 
 
-def test_moment_fit_cache_refreshes_on_log_threshold():
-    # Within a strength bucket the fit is cached (identical); crossing a
-    # log-spaced bucket boundary (alpha+beta doubling) triggers a refit.
-    p = Posterior(alpha=4.0, beta=4.0)  # s=8 -> bucket floor(log2(8))=3
+def test_moment_fit_cache_hit_when_counts_unchanged():
+    # RouteIQ-f9e9 defect-1 fix: the fit is cached on the EXACT (alpha, beta),
+    # so a repeat call with unchanged counts is a cache hit (identical result),
+    # but ANY evidence change recomputes (no stale within-bucket fit).
+    p = Posterior(alpha=4.0, beta=4.0)
     a1, b1 = p.shape(moment_fit=True)
-    a1b, b1b = p.shape(moment_fit=True)  # same bucket -> cached, identical
+    a1b, b1b = p.shape(moment_fit=True)  # counts unchanged -> cached, identical
     assert (a1, b1) == (a1b, b1b)
-    assert strength_bucket(8.0) == 3
-    p.alpha += 8.0  # s=16 -> bucket floor(log2(16))=4 -> refit
-    assert strength_bucket(16.0) == 4
+
+
+def test_moment_fit_cache_recomputes_on_within_bucket_update():
+    # RouteIQ-f9e9 defect-1: the OLD bucket key served a STALE fit for evidence
+    # changes WITHIN a strength bucket -> a ~0.24-wrong sampled mean. Beta(8,8)
+    # and Beta(23,8) are BOTH in bucket 4 (floor(log2(s)) for s=16 and s=31), so
+    # the bucket key would NOT refresh. The exact-(alpha,beta) key must.
+    assert strength_bucket(16.0) == strength_bucket(31.0) == 4  # same bucket
+    p = Posterior(alpha=8.0, beta=8.0)
+    a1, b1 = p.shape(moment_fit=True)
+    m1, _ = kumaraswamy_mean_var(a1, b1)
+    assert m1 == pytest.approx(0.5, abs=1e-3)  # Beta(8,8) mean
+
+    p.alpha = 23.0  # within-bucket evidence change -> MUST refit
     a2, b2 = p.shape(moment_fit=True)
-    assert (a2, b2) != (a1, b1)
+    m2, _ = kumaraswamy_mean_var(a2, b2)
+    assert (a2, b2) != (a1, b1)  # not the stale cached fit
+    assert m2 == pytest.approx(23.0 / 31.0, abs=1e-3)  # tracks the new mean
 
 
 def test_moment_fit_deterministic():
@@ -587,12 +601,12 @@ def test_moment_fit_deterministic():
     ],
 )
 def test_moment_fit_mean_holds_on_high_evidence_near_symmetric(alpha, beta):
-    # High-evidence near-symmetric posteriors sit below Kumaraswamy's minimum
-    # achievable variance, so Newton chasing the infeasible variance would walk
-    # the mean off the warm start (~0.14 error). Best-iterate tracking keeps the
-    # right mean (the doc's degradation contract: right mean, larger variance,
-    # never the shortcut's wrong mean). Regression guard for the property-test
-    # falsifying example.
+    # High-evidence near-symmetric posteriors can sit below Kumaraswamy's minimum
+    # achievable variance (the floor). The 1-D fit (RouteIQ-f9e9) holds the mean
+    # EXACTLY at every step (b is solved for the mean), so even an infeasible
+    # target variance yields the right mean -- the doc's degradation contract
+    # (right mean, variance slightly above the floor = more exploration, never
+    # the shortcut's wrong mean, never under-exploration).
     a, b = fit_kumaraswamy_moments(alpha, beta)
     fit_mean, _ = kumaraswamy_mean_var(a, b)
     assert abs(fit_mean - alpha / (alpha + beta)) < 1e-2

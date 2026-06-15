@@ -169,12 +169,26 @@ def sample_kumaraswamy(a: float, b: float, rng: random.Random) -> float:
 # Option-2 maps Beta(alpha,beta) -> Kumaraswamy(a,b) by matching the mean
 # ``alpha/(alpha+beta)`` and variance ``alpha*beta/((alpha+beta)^2*(alpha+beta+1))``
 # to the Kumaraswamy moments ``E[X^n] = b*B(1+n/a, b)``. There is no closed
-# form, so this is a 5-iteration damped log-space Newton solve. The log-space
-# coordinates + log-variance residual + damping + a NON-shortcut warm start are
-# each required: a naive raw-coordinate Newton seeded from the shortcut
-# DIVERGES on the symmetric peaked posteriors a bandit produces most (it
-# collapses ``a -> ~1e-3`` into a degenerate corner). Pure stdlib ``math`` only
-# (no numpy), consistent with the module's no-numpy constraint.
+# form.
+#
+# The fit is a 1-D root-find, NOT a 2-D Newton solve (RouteIQ-f9e9 defect 2).
+# The key observation: at a FIXED ``a``, the mean is strictly monotone in ``b``,
+# so ``_solve_b_for_mean`` pins the mean EXACTLY by bisection. That collapses
+# the problem to one free variable ``a``: choose ``a`` so the variance matches.
+# ``var_K(a, b_solve(a, mean))`` is U-shaped in ``a`` at a fixed mean (a minimum
+# achievable "variance floor"), so the fit is:
+#   1. golden-section to the variance floor ``a_min``;
+#   2. if the target variance is FEASIBLE (>= floor), bisect the low-``a`` branch
+#      ``[tiny, a_min]`` where variance decreases monotonically -> exact match;
+#   3. if INFEASIBLE (target below the floor -- high-evidence near-symmetric
+#      posteriors), return ``a_min``: the tightest Kumaraswamy at the correct
+#      mean. Its variance is slightly ABOVE target (more exploration), which is
+#      the doc's degradation contract -- never a wrong mean, never UNDER-
+#      exploration.
+# This holds the mean to ~1e-7 and the variance to ~1.0x across the full
+# evidence grid (the old 2-D Newton inflated variance ~3-7x on peaked
+# posteriors -> over-exploration). Pure stdlib ``math`` only (no numpy).
+_GOLDEN_RATIO = (math.sqrt(5.0) - 1.0) / 2.0
 
 
 def _lbeta(x: float, y: float) -> float:
@@ -198,14 +212,21 @@ def kumaraswamy_mean_var(a: float, b: float) -> Tuple[float, float]:
     return m1, max(m2 - m1 * m1, 1e-15)
 
 
-def _solve_b_for_mean(a: float, target_mean: float, iters: int = 30) -> float:
+def _solve_b_for_mean(a: float, target_mean: float, iters: int = 50) -> float:
     """1-D log-bisection for ``b`` matching ``mean_K(a, b) = target_mean``.
 
     ``mean_K`` is strictly monotone-decreasing in ``b`` at fixed ``a``, so a
-    log-space bisection over ``[1e-6, 1e12]`` converges robustly. Used to build
-    a warm start that lands inside Newton's basin of attraction.
+    log-space bisection over ``[1e-12, 1e18]`` converges robustly. This pins the
+    mean EXACTLY for any ``a`` in the search range, which is what makes the
+    moment fit a 1-D problem (root-find ``a`` for the variance; the mean is held
+    here). The 1e18 ceiling (vs a tighter 1e12) extends the ``a``-range over
+    which the mean stays holdable to ``a ~ 16`` -- the feasible-variance branch
+    for asymmetric mid-evidence posteriors (e.g. Beta(100,200), mean 1/3) needs
+    ``b ~ 4e7`` there. 50 iterations halve the ~69-nat ``ln b`` range to ~6e-14,
+    which holds the mean to ~1e-7 -- ample, and far cheaper than the 120 the
+    nested floor search would otherwise pay per evaluation.
     """
-    lo, hi = 1e-6, 1e12
+    lo, hi = 1e-12, 1e18
     for _ in range(iters):
         mid = math.sqrt(lo * hi)
         m, _ = kumaraswamy_mean_var(a, mid)
@@ -213,33 +234,46 @@ def _solve_b_for_mean(a: float, target_mean: float, iters: int = 30) -> float:
     return math.sqrt(lo * hi)
 
 
+def _mean_holdable(a: float, target_mean: float) -> bool:
+    """True if ``_solve_b_for_mean`` can hold the mean at this ``a``.
+
+    For very large ``a`` the required ``b`` exceeds the bisection ceiling and the
+    mean can no longer be matched; the golden-section search must not wander
+    into that region. Cheap re-check used to cap the search upper bound.
+    """
+    b = _solve_b_for_mean(a, target_mean)
+    m, _ = kumaraswamy_mean_var(a, b)
+    return abs(m - target_mean) < 1e-6
+
+
 def fit_kumaraswamy_moments(alpha: float, beta: float) -> Tuple[float, float]:
     """Map ``Beta(alpha, beta) -> Kumaraswamy(a, b)`` (doc-20 §3.1 option-2).
 
-    Matches the mean ``alpha/(alpha+beta)`` and variance to the Kumaraswamy
-    moments via a 5-iteration damped log-space Newton solve with a 1-D
-    log-bisection warm start. Pure deterministic function of ``(alpha, beta)``
-    (no RNG, no global state). Returns valid params (``a > 0``, ``b > 0``) for
-    all inputs.
+    Matches the mean ``alpha/(alpha+beta)`` exactly and the variance as closely
+    as the Kumaraswamy family allows, via a 1-D root-find on ``a`` (the mean is
+    held by :func:`_solve_b_for_mean` at every step). Pure deterministic
+    function of ``(alpha, beta)`` (no RNG, no global state). Returns valid params
+    (``a > 0``, ``b > 0``) for all inputs.
 
-    Numerical structure (each element is required, validated against a grid):
+    Structure (RouteIQ-f9e9 defect-2 fix -- replaces the old 2-D Newton solve
+    that inflated variance ~3-7x on peaked posteriors):
     - Exact special-case short-circuits (``Kuma(1,b)=Beta(1,b)``,
       ``Kuma(a,1)=Beta(a,1)``) -> byte-stable corners.
-    - Log-space coordinates ``(ln a, ln b)`` -> params positive by construction.
-    - Log-variance residual -> conditions the 2x2 Jacobian (peaked posteriors
-      have tiny variances that otherwise make the system ill-conditioned).
-    - Damped step (``|delta| <= 1.5``) + box-guard -> prevents the single
-      overshoot into the degenerate ``a -> 0`` corner.
-    - Singular-Jacobian guard (``|det| < 1e-14`` -> break, keep best iterate).
-    - Best-iterate tracking on the MEAN (mean-error first, variance-error tie-
-      break). Kumaraswamy has a *minimum achievable variance* for a given mean;
-      on high-evidence near-symmetric posteriors (e.g. Beta(185,190)) the target
-      variance is below that floor, so Newton — chasing an infeasible variance —
-      walks the mean off the warm start (which already nails the mean). Keeping
-      the smallest-mean-error iterate is the doc's stated degradation contract:
-      the right mean with a slightly-too-large variance (more exploration),
-      NEVER the shortcut's wrong mean. Without it the fit returns a mean error of
-      ~0.14 in that regime — the very distortion this fixes.
+    - Cap the ``a`` search at the largest value where the mean is still holdable
+      (large ``a`` needs ``b`` past the bisection ceiling) so the search never
+      wanders into the region where the mean breaks. ``var_at`` is monotone-
+      decreasing across ``[-12, la_hi]`` (the low-``a`` branch up to the cap), so
+      a single bisection both decides feasibility and finds the solution:
+    - FEASIBLE (``var_at(la_hi) <= t_var <= var_at(-12)``): bisect for the exact
+      variance match (the mean is held exactly at every step).
+    - INFEASIBLE (``t_var < var_at(la_hi)``, the tightest reachable variance is
+      still above target -- high-evidence asymmetric posteriors past the
+      ceiling): return the cap point. Its variance is slightly ABOVE target
+      (more exploration), the doc's degradation contract: never a wrong mean,
+      never under-explore.
+    The single-bisection form avoids the prior golden-section floor search:
+    within the bandit's 0.3..200 evidence band the target is always on the low-a
+    branch, so the common path is one ~46-step bisection.
     """
     # Exact special cases (byte-stable corners). alpha==beta==1 falls out here.
     if abs(alpha - 1.0) < 1e-12:
@@ -251,50 +285,48 @@ def fit_kumaraswamy_moments(alpha: float, beta: float) -> Tuple[float, float]:
     t_mean = alpha / s
     t_var = (alpha * beta) / (s * s * (s + 1.0))
 
-    # Warm start: a0 = sqrt(alpha) (NOT the shortcut), b0 from the mean eqn.
-    a = max(0.1, math.sqrt(alpha))
-    b = _solve_b_for_mean(a, t_mean)
-    la, lb = math.log(a), math.log(b)
+    def var_at(la: float) -> float:
+        a = math.exp(la)
+        _, v = kumaraswamy_mean_var(a, _solve_b_for_mean(a, t_mean))
+        return v
 
-    h = 1e-5
-    log_t_var = math.log(t_var)
-    # Track the best iterate by (mean error, variance error) — mean is the
-    # load-bearing quantity, so it dominates the comparison.
-    best_la, best_lb = la, lb
-    best_m, best_v = kumaraswamy_mean_var(a, b)
-    best_key = (abs(best_m - t_mean), abs(math.log(best_v) - log_t_var))
-    for _ in range(5):
-        a, b = math.exp(la), math.exp(lb)
-        m, v = kumaraswamy_mean_var(a, b)
-        key = (abs(m - t_mean), abs(math.log(v) - log_t_var))
-        if key < best_key:
-            best_key = key
-            best_la, best_lb = la, lb
-        r0 = m - t_mean
-        r1 = math.log(v) - log_t_var
-        m_a, v_a = kumaraswamy_mean_var(math.exp(la + h), b)
-        m_b, v_b = kumaraswamy_mean_var(a, math.exp(lb + h))
-        j00 = (m_a - m) / h
-        j01 = (m_b - m) / h
-        j10 = (math.log(v_a) - math.log(v)) / h
-        j11 = (math.log(v_b) - math.log(v)) / h
-        det = j00 * j11 - j01 * j10
-        if abs(det) < 1e-14:
-            break  # singular -> keep best iterate seen
-        d_la = (j11 * r0 - j01 * r1) / det
-        d_lb = (-j10 * r0 + j00 * r1) / det
-        d_la = max(-1.5, min(1.5, d_la))  # damping
-        d_lb = max(-1.5, min(1.5, d_lb))
-        la -= d_la
-        lb -= d_lb
-        la = max(min(la, 20.0), -8.0)  # box-guard
-        lb = max(min(lb, 25.0), -8.0)
-    # Final post-loop iterate may also be the best — check it.
-    a, b = math.exp(la), math.exp(lb)
-    m, v = kumaraswamy_mean_var(a, b)
-    if (abs(m - t_mean), abs(math.log(v) - log_t_var)) < best_key:
-        best_la, best_lb = la, lb
-    return (math.exp(best_la), math.exp(best_lb))
+    # Upper bound on ln a: the largest ln a where the mean is still holdable
+    # (past it the required b exceeds the bisection ceiling and the mean breaks).
+    # Coarse unit-step walk to bracket the boundary, THEN bisect for it -- a
+    # plain unit-step cap lands up to a full e-fold below the true boundary and
+    # can skip the feasible-variance solution (e.g. Beta(100,200): the feasible
+    # a~15 is holdable but a~20 is not, so a unit cap stops at a~7).
+    if not _mean_holdable(math.e, t_mean):  # even a=e unholdable -> tiny range
+        la_hi = 0.0
+    else:
+        lo_h, hi_h = 0.0, 1.0
+        while hi_h < 14.0 and _mean_holdable(math.exp(hi_h), t_mean):
+            lo_h, hi_h = hi_h, hi_h + 1.0
+        # boundary in [lo_h, hi_h): bisect (holdable at lo_h, not at hi_h).
+        for _ in range(24):
+            mid_h = (lo_h + hi_h) / 2.0
+            if _mean_holdable(math.exp(mid_h), t_mean):
+                lo_h = mid_h
+            else:
+                hi_h = mid_h
+        la_hi = lo_h
+
+    # Infeasible: even the tightest holdable a (the cap) has variance above the
+    # target -> return the cap (var slightly high = more exploration, mean exact).
+    if var_at(la_hi) >= t_var:
+        return (math.exp(la_hi), _solve_b_for_mean(math.exp(la_hi), t_mean))
+
+    # Feasible: var_at is monotone-decreasing on [-12, la_hi]; bisect for the
+    # exact variance match. ~46 steps -> ln a to ~(la_hi+12)/2^46 ~ 1e-13.
+    lo2, hi2 = -12.0, la_hi
+    for _ in range(46):
+        mid = (lo2 + hi2) / 2.0
+        if var_at(mid) > t_var:
+            lo2 = mid
+        else:
+            hi2 = mid
+    a = math.exp((lo2 + hi2) / 2.0)
+    return (a, _solve_b_for_mean(a, t_mean))
 
 
 def strength_bucket(s: float, base: float = 2.0) -> int:
@@ -327,12 +359,19 @@ class Posterior:
     alpha: float = 1.0
     beta: float = 1.0
     last_update: float = 0.0
-    # Cached moment-fit (RouteIQ-f9e9). 0.0 a => unset; refreshed when the
-    # strength bucket changes. Per-instance -> reset with the backend, no
-    # module-level singleton.
+    # Cached moment-fit (RouteIQ-f9e9). 0.0 a => unset. The cache key is the
+    # EXACT (alpha, beta) the fit was computed for, NOT a log-spaced bucket: a
+    # bucket key served a stale (a,b) for evidence changes WITHIN a bucket
+    # (e.g. Beta(8,8) -> Beta(23,8), both in bucket 4 -> a ~0.24-wrong sampled
+    # mean). The fit is a pure deterministic function of (alpha, beta), so
+    # keying on (alpha, beta) is exact: a hit only when the counts are unchanged
+    # since the last fit, a miss (recompute) on ANY evidence change. The fit is
+    # ~30 lgamma calls; arms update at most once per request, so this is still
+    # off the hot path. Per-instance -> reset with the backend, no singleton.
     _fit_a: float = 0.0
     _fit_b: float = 0.0
-    _fit_bucket: int = -(2**31)
+    _fit_alpha: float = -1.0
+    _fit_beta: float = -1.0
 
     def mean(self) -> float:
         """Posterior mean reward ``alpha / (alpha + beta)``."""
@@ -344,15 +383,19 @@ class Posterior:
 
         ``moment_fit=False`` (default): the §3.1 option-1 ``a=alpha, b=beta``
         shortcut -- unchanged, byte-stable. ``moment_fit=True``: the §3.1
-        option-2 Newton moment-fit (cached; recomputed only when the strength
-        bucket ``floor(log2(alpha+beta))`` differs from the cached fit).
+        option-2 moment-fit (:func:`fit_kumaraswamy_moments`), cached on the
+        EXACT ``(alpha, beta)`` so any evidence change recomputes (RouteIQ-f9e9
+        defect 1 -- the old bucket key served a stale fit within a bucket).
         """
         if not moment_fit:
             return (self.alpha, self.beta)  # option-1 shortcut (default)
-        bucket = strength_bucket(self.alpha + self.beta)
-        if self._fit_a <= 0.0 or bucket != self._fit_bucket:
+        if (
+            self._fit_a <= 0.0
+            or self._fit_alpha != self.alpha
+            or self._fit_beta != self.beta
+        ):
             self._fit_a, self._fit_b = fit_kumaraswamy_moments(self.alpha, self.beta)
-            self._fit_bucket = bucket
+            self._fit_alpha, self._fit_beta = self.alpha, self.beta
         return (self._fit_a, self._fit_b)
 
     def strength(self) -> float:

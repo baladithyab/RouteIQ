@@ -174,16 +174,43 @@ def test_seeded_selection_deterministic(seed):
     alpha=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
     beta=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
 )
-@settings(max_examples=100)
+@settings(max_examples=200)
 def test_moment_fit_mean_within_tolerance(alpha, beta):
-    # The fitted Kumaraswamy mean approximates the Beta mean across the whole
-    # (alpha, beta) band, and the fit always returns valid Kumaraswamy params.
-    # 5e-2 is a robust band including the ultra-low-variance extremes where the
-    # fit saturates at the box-guard (correct degradation: right mean, slightly
-    # too-large variance, never the shortcut's wrong mean).
+    # The 1-D fit (RouteIQ-f9e9) holds the mean EXACTLY (b is solved for the mean
+    # at every step), so the fitted Kumaraswamy mean tracks the Beta mean tightly
+    # across the whole (alpha, beta) band. 1e-3 is comfortably above the ~1e-6
+    # worst-case observed on a dense grid.
     a, b = fit_kumaraswamy_moments(alpha, beta)
     fit_mean, fit_var = kumaraswamy_mean_var(a, b)
-    assert abs(fit_mean - alpha / (alpha + beta)) < 5e-2
+    assert abs(fit_mean - alpha / (alpha + beta)) < 1e-3
     assert a > 0.0 and b > 0.0
     assert math.isfinite(a) and math.isfinite(b)
     assert math.isfinite(fit_mean) and math.isfinite(fit_var)
+
+
+@given(
+    alpha=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
+    beta=st.floats(min_value=0.3, max_value=200.0, allow_nan=False),
+)
+@settings(max_examples=200)
+def test_moment_fit_variance_tracks_beta(alpha, beta):
+    # RouteIQ-f9e9 defect-2: the fitted variance must TRACK the Beta variance.
+    # The old 2-D Newton inflated it ~3-7x on peaked posteriors (over-
+    # exploration); the 1-D fit (root-find a on the low-variance branch, mean
+    # held exactly) matches it across the whole (alpha, beta) band -- the worst
+    # observed deviation on a 3000-sample sweep is ~1e-4. When a target variance
+    # is genuinely below Kumaraswamy's achievable floor the fit returns the
+    # floor (variance ABOVE target = more exploration, never UNDER), but within
+    # the 0.3..200 evidence band that floor is always reachable, so the band is
+    # tight on both sides.
+    s = alpha + beta
+    beta_var = (alpha * beta) / (s * s * (s + 1.0))
+    a, b = fit_kumaraswamy_moments(alpha, beta)
+    _, fit_var = kumaraswamy_mean_var(a, b)
+    ratio = fit_var / beta_var if beta_var > 0 else 1.0
+    # Never materially UNDER-explore (the dangerous direction: under-variance
+    # over-exploits a not-yet-proven arm).
+    assert ratio > 0.99
+    # Bounded over-exploration: tracks ~1.0x (old solver hit 3-7x). 1.05x leaves
+    # headroom for the rare sub-floor straddle without admitting the old defect.
+    assert ratio < 1.05

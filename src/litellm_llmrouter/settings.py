@@ -1253,15 +1253,15 @@ class KumaraswamyThompsonSettings(BaseModel):
     moment_fit: bool = Field(
         False,
         description=(
-            "Use the doc-20 §3.1 option-2 cached Newton moment-fit "
-            "Beta(alpha,beta) -> Kumaraswamy(a,b) mapping (matches mean + "
-            "variance) instead of the option-1 ``a=alpha, b=beta`` shortcut. "
+            "Use the doc-20 §3.1 option-2 moment-fit Beta(alpha,beta) -> "
+            "Kumaraswamy(a,b) mapping (matches mean + variance via a 1-D "
+            "root-find) instead of the option-1 ``a=alpha, b=beta`` shortcut. "
             "The shortcut distorts the posterior mean (Beta(51,51) mean 0.5 -> "
             "Kumaraswamy 0.9155) and can invert the exploit decision; the "
-            "moment-fit restores the correct mean. Cached per-posterior and "
-            "refreshed only when ``alpha+beta`` crosses a log-spaced threshold, "
-            "keeping the hot path at ~1 uniform draw + the quantile. Default "
-            "off for byte-stable backward-compat. "
+            "moment-fit restores the mean (~1e-8) and tracks the variance "
+            "(~1.0x, vs the shortcut's distortion). Cached per-posterior on the "
+            "exact (alpha,beta) so any evidence change refits (RouteIQ-f9e9). "
+            "Default off for byte-stable backward-compat. "
             "Env: ``ROUTEIQ_KUMARASWAMY_THOMPSON__MOMENT_FIT``."
         ),
     )
