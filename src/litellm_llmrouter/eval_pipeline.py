@@ -295,6 +295,28 @@ class EvalPipeline:
         """Access the model quality tracker."""
         return self._tracker
 
+    def add_feedback_callback(self, callback: Callable) -> bool:
+        """Subscribe an additional feedback callback after construction.
+
+        Each registered callback is invoked with ``(model_qualities: dict)``
+        on every ``push_feedback()``. This is the extension hook the
+        strategy-agnostic MLOps coordinator uses to receive aggregate quality
+        scores (the FEEDBACK arm of COLLECT/EVALUATE/AGGREGATE/FEEDBACK) without
+        the eval pipeline knowing which adapters consume them.
+
+        Idempotent: a callback already subscribed is not added twice.
+
+        Args:
+            callback: A callable taking ``Dict[str, float]`` (sync or async).
+
+        Returns:
+            True if newly added, False if it was already present.
+        """
+        if callback in self._feedback_callbacks:
+            return False
+        self._feedback_callbacks.append(callback)
+        return True
+
     def should_sample(self) -> bool:
         """Probabilistically decide whether to sample this request.
 
@@ -564,7 +586,7 @@ def _is_eval_pipeline_enabled() -> bool:
         settings = get_settings()
         eval_settings = getattr(settings, "eval_pipeline", None)
         if eval_settings is not None:
-            return eval_settings.enabled
+            return bool(eval_settings.enabled)
     except Exception:
         pass
     import os

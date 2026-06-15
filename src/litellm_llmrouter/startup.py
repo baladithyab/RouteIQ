@@ -123,6 +123,33 @@ def register_strategies():
         from litellm_llmrouter.strategies import register_llmrouter_strategies
 
         strategies = register_llmrouter_strategies()
+
+        # Register the net-new Kumaraswamy-Thompson bandit (gated by settings;
+        # rides the existing pipeline, no LiteLLM-mount edit).
+        try:
+            from litellm_llmrouter.kumaraswamy_thompson import (
+                register_kumaraswamy_thompson_strategy,
+            )
+
+            if register_kumaraswamy_thompson_strategy():
+                print("\u2705 Kumaraswamy-Thompson bandit strategy registered")
+        except Exception as e:  # pragma: no cover - defensive at startup
+            print(f"\u26a0\ufe0f Could not register Kumaraswamy-Thompson strategy: {e}")
+
+        # Wire the strategy-agnostic MLOps FEEDBACK arm: discover continuous
+        # learning adapters from the registry and subscribe the coordinator to
+        # the eval pipeline's feedback callbacks. Gated by
+        # adapter_framework.mlops_feedback_loop (default off); never raises.
+        try:
+            from litellm_llmrouter.adapters.mlops import wire_mlops_feedback_loop
+
+            if wire_mlops_feedback_loop():
+                print(
+                    "\u2705 MLOps feedback loop wired (eval \u2192 learning adapters)"
+                )
+        except Exception as e:  # pragma: no cover - defensive at startup
+            print(f"\u26a0\ufe0f Could not wire MLOps feedback loop: {e}")
+
         print(
             f"\u2705 {len(strategies)} LLMRouter strategies available "
             f"(activated via plugin strategy \u2014 RouteIQRoutingStrategy)"

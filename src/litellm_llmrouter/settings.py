@@ -1078,6 +1078,96 @@ class EvalPipelineSettings(BaseModel):
     )
 
 
+class KumaraswamyThompsonSettings(BaseModel):
+    """Kumaraswamy-Thompson online-bandit routing strategy configuration.
+
+    The core bandit runs with the in-memory backend and NO external deps;
+    Redis (hot) / Aurora (durable) backends are wired behind ``backend`` /
+    ``durable`` flags for the live substrate (P1/P2), default off.
+
+    Env vars: ``ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED``,
+    ``ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND``, etc. (``__`` nested delimiter).
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Register the Kumaraswamy-Thompson strategy at startup.",
+    )
+    backend: str = Field(
+        "memory",
+        description="Hot posterior backend: memory | redis.",
+    )
+    durable: str = Field(
+        "none",
+        description="Durable posterior store: none | aurora.",
+    )
+    w_quality: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="Reward weight on response quality.",
+    )
+    w_cost: float = Field(
+        0.4,
+        ge=0.0,
+        le=1.0,
+        description="Reward weight on cost (cheaper => higher).",
+    )
+    w_latency: float = Field(
+        0.1,
+        ge=0.0,
+        le=1.0,
+        description="Reward weight on latency (faster => higher).",
+    )
+    cost_reward_alpha: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="Mixing rate of the cost term into the reward signal.",
+    )
+    decay_gamma: float = Field(
+        0.99,
+        ge=0.5,
+        le=1.0,
+        description="Per-day decay toward the prior (re-opens exploration).",
+    )
+    cold_start_kappa: float = Field(
+        5.0,
+        ge=0.0,
+        le=50.0,
+        description="Warm-start pseudo-count from the static quality table.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="RNG seed for deterministic sampling in tests/replay.",
+    )
+
+
+class AdapterFrameworkSettings(BaseModel):
+    """Strategy-agnostic routing-adapter framework configuration.
+
+    Env vars: ``ROUTEIQ_ADAPTER_FRAMEWORK__ENTRYPOINT_DISCOVERY``, etc.
+    """
+
+    entrypoint_discovery: bool = Field(
+        False,
+        description="Discover out-of-tree adapters via entry-points at startup.",
+    )
+    capability_negotiation: bool = Field(
+        False,
+        description="Enable the pre-selection required-signals filter.",
+    )
+    mlops_feedback_loop: bool = Field(
+        False,
+        description=(
+            "Wire the eval-pipeline FEEDBACK arm into the strategy-agnostic "
+            "MLOps coordinator: discover continuous-train learning adapters "
+            "from the registry and subscribe the coordinator to "
+            "EvalPipeline.feedback_callbacks. Default off."
+        ),
+    )
+
+
 class HASettings(BaseModel):
     """High-availability and leader election configuration.
 
@@ -1343,6 +1433,14 @@ class GatewaySettings(BaseSettings):
     skills_discovery: SkillsDiscoverySettings = Field(
         default_factory=SkillsDiscoverySettings,  # type: ignore[arg-type]
         description="Skills discovery plugin settings.",
+    )
+    kumaraswamy_thompson: KumaraswamyThompsonSettings = Field(
+        default_factory=KumaraswamyThompsonSettings,  # type: ignore[arg-type]
+        description="Kumaraswamy-Thompson bandit routing strategy settings.",
+    )
+    adapter_framework: AdapterFrameworkSettings = Field(
+        default_factory=AdapterFrameworkSettings,  # type: ignore[arg-type]
+        description="Strategy-agnostic routing-adapter framework settings.",
     )
 
     # ------------------------------------------------------------------

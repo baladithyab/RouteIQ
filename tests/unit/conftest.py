@@ -146,6 +146,14 @@ def _reset_all_singletons():
 
     reset_redis_clients()
 
+    # KumaraswamyThompsonStrategy keeps no module-level singleton (it is
+    # constructed fresh per register_*() and lives in the routing registry,
+    # which reset_routing_singletons() above already clears). The MLOps
+    # coordinator IS a module-level singleton and MUST be reset here.
+    from litellm_llmrouter.adapters.mlops import reset_mlops_coordinator
+
+    reset_mlops_coordinator()
+
     # NOTE: reset_http_client_pool() is async and cannot be called from
     # this sync fixture. The http_client_pool module has a fallback for
     # when the pool is not initialized, so skipping it is safe.
