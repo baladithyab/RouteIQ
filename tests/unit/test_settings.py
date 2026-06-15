@@ -14,13 +14,13 @@ import pytest
 from pydantic import ValidationError
 
 from litellm_llmrouter.settings import (
-    A2ASettings,
     AuditFailMode,
-    AuditSettings,
     CacheSettings,
     ConfigSyncSettings,
     ConversationAffinitySettings,
     GatewaySettings,
+    GovernanceFailMode,
+    GovernanceSettings,
     HASettings,
     HTTPClientSettings,
     MCPSettings,
@@ -29,10 +29,8 @@ from litellm_llmrouter.settings import (
     OTelSettings,
     PluginSettings,
     PolicyFailMode,
-    PolicySettings,
     PostgresSettings,
     QuotaFailMode,
-    QuotaSettings,
     RedisSettings,
     ResilienceSettings,
     RoutingProfile,
@@ -223,6 +221,19 @@ class TestDefaults:
         s = GatewaySettings()
         assert s.quota.enabled is False
         assert s.quota.fail_mode == QuotaFailMode.OPEN
+
+    def test_nested_governance_defaults(self):
+        # RouteIQ-24fc: governance fail_mode defaults OPEN (back-compat).
+        s = GatewaySettings()
+        assert isinstance(s.governance, GovernanceSettings)
+        assert s.governance.fail_mode == GovernanceFailMode.OPEN
+
+    def test_nested_governance_fail_mode_closed_via_nested_env(self, monkeypatch):
+        # The nested ROUTEIQ_GOVERNANCE__FAIL_MODE env (env_nested_delimiter)
+        # selects fail-closed.
+        monkeypatch.setenv("ROUTEIQ_GOVERNANCE__FAIL_MODE", "closed")
+        s = GatewaySettings()
+        assert s.governance.fail_mode == GovernanceFailMode.CLOSED
 
     def test_nested_cache_defaults(self):
         s = GatewaySettings()

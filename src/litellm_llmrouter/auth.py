@@ -485,6 +485,25 @@ def sanitize_error_response(
         exc_info=True,
     )
 
+    # Also emit the structured error JSON line the CloudWatch RouterErrorFilter
+    # selects on (top-level lowercased level=="error") on the dedicated
+    # ``routeiq.routing_decision`` logger. ``sanitize_error_response`` is the live
+    # 5xx funnel every route try/except flows through, so this is the single
+    # chokepoint that feeds the filter (RouteIQ-40b2) with zero per-site wiring.
+    # Telemetry must NEVER break the error path -> fully guarded, never raises.
+    # Local import avoids an auth<->observability module-scope import cycle and
+    # mirrors the lazy ``get_settings`` pattern emit_error_log itself uses.
+    try:
+        from .observability import emit_error_log
+
+        emit_error_log(
+            error_type=type(error).__name__,
+            error_message=error_msg,  # already secret-scrubbed above; emitter re-scrubs
+            request_id=req_id,
+        )
+    except Exception:  # pragma: no cover - telemetry must not break the error path
+        pass
+
     return {
         "error": "internal_error",
         "message": public_message,

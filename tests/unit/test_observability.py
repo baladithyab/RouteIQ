@@ -909,3 +909,69 @@ class TestErrorLogEmitter731c:
         monkeypatch.setattr("litellm_llmrouter.settings.get_settings", _boom)
         returned = emit_error_log(error_type="E", error_message="m")
         assert returned is not None
+
+    def test_sanitize_error_response_emits_structured_error_line(self, caplog):
+        """The LIVE 5xx seam feeds the RouterErrorFilter (RouteIQ-40b2 acceptance).
+
+        ``sanitize_error_response`` is the helper every route try/except calls to
+        build a 5xx body; it is the single live error chokepoint in the gateway.
+        Before the fix it only wrote a plain-TEXT ``logger.error`` line (no
+        top-level ``level`` key), so a real gateway error never reached
+        ``emit_error_log`` and the ``level=="error"`` JSON line never landed on
+        ``routeiq.routing_decision`` -- the filter could not fire. This drives the
+        REAL gateway error helper (not the unwired ``log_error_with_trace``) and
+        asserts the structured JSON line with ``level=="error"`` lands on the
+        ``routeiq.routing_decision`` logger -- the exact acceptance criterion.
+        """
+        import json
+        import logging
+
+        # Imported inside the test: this file deliberately loads ``observability``
+        # via importlib to avoid the heavy package import at module scope. The
+        # caplog assertion keys off the logger NAME (process-global), so it
+        # captures the line regardless of which module instance emits it.
+        from litellm_llmrouter.auth import sanitize_error_response
+
+        caplog.set_level(logging.INFO, logger="routeiq.routing_decision")
+
+        response = sanitize_error_response(
+            ValueError("backend unavailable"),
+            request_id="req-xyz-1",
+            public_message="An internal error occurred",
+        )
+
+        # The public body stays sanitized (no internal detail leak).
+        assert response["error"] == "internal_error"
+        assert response["request_id"] == "req-xyz-1"
+
+        records = [r for r in caplog.records if r.name == "routeiq.routing_decision"]
+        assert len(records) == 1, "expected exactly one structured error line"
+        parsed = json.loads(records[0].getMessage())
+        assert parsed["level"] == "error"  # the field the CloudWatch filter scans
+        assert parsed["event"] == "error"
+        assert parsed["error_type"] == "ValueError"
+        assert parsed["request_id"] == "req-xyz-1"
+
+    def test_sanitize_error_response_error_line_is_token_scrubbed(self, caplog):
+        """The structured error line from the live seam NEVER leaks a token.
+
+        ``sanitize_error_response`` scrubs secrets before logging and
+        ``emit_error_log`` re-scrubs (defence in depth). A bearer token in the
+        raised exception must not survive into the structured ``error_message``.
+        """
+        import json
+        import logging
+
+        from litellm_llmrouter.auth import sanitize_error_response
+
+        caplog.set_level(logging.INFO, logger="routeiq.routing_decision")
+
+        sanitize_error_response(
+            RuntimeError("upstream rejected Bearer secrettokenvalue0123456789"),
+            request_id="req-scrub-1",
+        )
+
+        records = [r for r in caplog.records if r.name == "routeiq.routing_decision"]
+        assert len(records) == 1
+        parsed = json.loads(records[0].getMessage())
+        assert "secrettokenvalue0123456789" not in parsed["error_message"]

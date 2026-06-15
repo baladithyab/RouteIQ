@@ -183,6 +183,60 @@ class GovernanceContext:
     budget_used_pct: float = 0.0
 
 
+# -- Canonical scope derivation (single source of truth for WRITE == READ) ---
+
+
+def derive_spend_scope_from_ctx(ctx: GovernanceContext) -> tuple[str, str]:
+    """Derive the canonical ``(scope, scope_type)`` for a governance context.
+
+    This is the SINGLE source of truth for the spend/RPM scope token used by
+    BOTH the READ path (:meth:`GovernanceEngine._get_current_spend` /
+    :meth:`_get_current_rpm`) AND the WRITE path
+    (``router_decision_callback._derive_spend_scope`` ->
+    ``record_governance_spend``).  Keeping one helper guarantees the write key
+    (``governance:spend:{scope}:{bucket}``) is byte-identical to the read key,
+    so workspace (RouteIQ-ed7a) and key (RouteIQ-08dd) budgets are actually
+    enforced instead of silently fail-open.
+
+    Precedence (most-specific-wins, identical on both sides):
+    ``workspace_id`` -> ``key_id`` -> ``"global"``.  ``scope_type`` is
+    ``"workspace"`` when a workspace is resolved, else ``"key"`` when a key is
+    resolved, else ``"global"``.  ``ctx.key_id`` is the RAW api_key the enforce
+    path resolves (NOT a hash / user-id), so the write must reuse the same raw
+    token for the read to see it.
+    """
+    if ctx.workspace_id:
+        return str(ctx.workspace_id), "workspace"
+    if ctx.key_id:
+        return str(ctx.key_id), "key"
+    return "global", "global"
+
+
+def _governance_fail_mode_closed() -> bool:
+    """Return True when governance enforcement should fail CLOSED (deny on store down).
+
+    Honours TWO equivalent operator controls (either selects fail-closed):
+      * the canonical nested setting ``settings.governance.fail_mode`` (ADR-0013,
+        env ``ROUTEIQ_GOVERNANCE__FAIL_MODE``), read via ``get_settings``, and
+      * the legacy flat ``ROUTEIQ_GOVERNANCE_FAIL_MODE`` env var the seed names,
+        read via ``os.getenv`` (mirrors ``QuotaConfig.from_env``'s flat fallback;
+        pydantic-settings does NOT map the flat form onto the nested field).
+
+    Default is OPEN (back-compat): returns True only when an operator has
+    explicitly selected ``closed`` through either control.  A settings failure
+    fails OPEN -- it must NOT silently start denying traffic.
+    """
+    # Legacy flat env: explicit operator opt-in to fail-closed.
+    if os.getenv("ROUTEIQ_GOVERNANCE_FAIL_MODE", "open").lower() == "closed":
+        return True
+    try:
+        from litellm_llmrouter.settings import GovernanceFailMode, get_settings
+
+        return get_settings().governance.fail_mode == GovernanceFailMode.CLOSED
+    except Exception:
+        return False
+
+
 # -- Governance Engine ------------------------------------------------------
 
 
@@ -426,8 +480,14 @@ class GovernanceEngine:
         """Check if the request is within budget limits.
 
         Uses Redis for real-time spend tracking when available.
-        If Redis is unavailable or no budget is configured, returns True
-        (fail-open).
+
+        Fail behaviour when the spend store cannot confirm current spend (Redis
+        down / not configured) is governed by ``settings.governance.fail_mode``
+        (RouteIQ-24fc).  When a budget IS configured but the store is
+        unavailable: ``open`` (default, back-compat) allows; ``closed`` denies so
+        a store outage cannot leak spend past the budget.  When NO budget is
+        configured (``effective_max_budget_usd is None``) the request is always
+        allowed -- fail-closed must NOT deny when there is no limit to enforce.
         """
         if ctx.effective_max_budget_usd is None:
             return True
@@ -435,7 +495,16 @@ class GovernanceEngine:
         try:
             current_spend = await self._get_current_spend(ctx)
             if current_spend is None:
-                # No spend data available (Redis down or not configured)
+                # Store unavailable (Redis down / not configured) and a budget
+                # IS set -> fail-closed denies, fail-open (default) allows.
+                if _governance_fail_mode_closed():
+                    logger.warning(
+                        "Governance: budget store unavailable, denying "
+                        "(fail-closed) workspace=%s key=%s",
+                        ctx.workspace_id,
+                        ctx.key_id,
+                    )
+                    return False
                 return True
 
             ctx.budget_remaining_usd = max(
@@ -449,6 +518,14 @@ class GovernanceEngine:
 
             return current_spend < ctx.effective_max_budget_usd
         except Exception as e:
+            # A budget IS configured (early-returned above otherwise) and the
+            # store raised -> honour fail_mode (deny when closed).
+            if _governance_fail_mode_closed():
+                logger.warning(
+                    "Governance: budget check errored, denying (fail-closed): %s",
+                    e,
+                )
+                return False
             logger.warning("Budget check failed (fail-open): %s", e)
             return True
 
@@ -456,7 +533,12 @@ class GovernanceEngine:
         """Check if the request is within rate limits.
 
         Uses Redis sliding window counters when available.
-        If Redis is unavailable or no limits are configured, returns True.
+
+        Fail behaviour when the store cannot confirm current RPM mirrors
+        :meth:`check_budget` (RouteIQ-24fc): when an RPM limit IS configured but
+        the store is unavailable, ``settings.governance.fail_mode == closed``
+        denies while ``open`` (default) allows.  When NO RPM limit is configured
+        the request is always allowed (fail-closed must not deny without a limit).
         """
         if ctx.effective_max_rpm is None:
             return True
@@ -464,9 +546,24 @@ class GovernanceEngine:
         try:
             current_rpm = await self._get_current_rpm(ctx)
             if current_rpm is None:
+                # Store unavailable and an RPM limit IS set -> honour fail_mode.
+                if _governance_fail_mode_closed():
+                    logger.warning(
+                        "Governance: rate-limit store unavailable, denying "
+                        "(fail-closed) workspace=%s key=%s",
+                        ctx.workspace_id,
+                        ctx.key_id,
+                    )
+                    return False
                 return True
             return current_rpm < ctx.effective_max_rpm
         except Exception as e:
+            if _governance_fail_mode_closed():
+                logger.warning(
+                    "Governance: rate-limit check errored, denying (fail-closed): %s",
+                    e,
+                )
+                return False
             logger.warning("Rate limit check failed (fail-open): %s", e)
             return True
 
@@ -641,7 +738,7 @@ class GovernanceEngine:
             # each month.  This is intentional for simplicity and consistency
             # across timezones.
             bucket = int(time.time() // 2_592_000)  # ~30 day buckets
-            scope = ctx.workspace_id or ctx.key_id or "global"
+            scope, _scope_type = derive_spend_scope_from_ctx(ctx)
             key = f"governance:spend:{scope}:{bucket}"
 
             value = await redis.get(key)
@@ -693,7 +790,7 @@ class GovernanceEngine:
                 return None
 
             bucket = int(time.time() // 60)
-            scope = ctx.workspace_id or ctx.key_id or "global"
+            scope, _scope_type = derive_spend_scope_from_ctx(ctx)
             key = f"governance:rpm:{scope}:{bucket}"
 
             value = await redis.get(key)
@@ -865,6 +962,8 @@ __all__ = [
     "reset_governance_engine",
     # Spend write path
     "record_governance_spend",
+    # Canonical scope derivation (shared by WRITE + READ paths)
+    "derive_spend_scope_from_ctx",
     # Persistence
     "save_governance_state",
     "load_governance_state",

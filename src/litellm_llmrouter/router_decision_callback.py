@@ -721,11 +721,32 @@ def _compute_duration(start_time: Any, end_time: Any) -> float:
 def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:
     """Derive the governance spend scope + scope_type from request metadata.
 
-    Precedence matches ``GovernanceEngine._get_current_spend``
-    (workspace_id -> key/user -> "global").  LiteLLM stamps user/key identifiers
-    under ``metadata`` (``_user``/``user_api_key_user_id`` etc.); we read the
-    workspace first, then a key/user identifier, else fall back to global.
+    The WRITE scope MUST be byte-identical to the READ scope the enforce path
+    checks, or the budget counter the read consults is always 0.0 (fail-open).
+    The enforce path (``custom_routing_strategy._enforce_governance``) stamps the
+    RESOLVED governance scope into ``metadata["_governance_ctx"]``
+    (``workspace_id`` + the RAW ``key_id``).  We prefer that stamp and apply the
+    SAME precedence the read path uses (``workspace_id`` -> ``key_id`` ->
+    ``"global"``, via ``derive_spend_scope_from_ctx``), so:
+      * workspace budgets are enforced (RouteIQ-ed7a), and
+      * key budgets use the raw api_key, not LiteLLM's hashed token (RouteIQ-08dd).
+
+    Legacy/back-compat fallthrough (raw ``metadata`` keys) is preserved for
+    non-enforce callers that never produced a ``_governance_ctx`` stamp.
     """
+    gctx = metadata.get("_governance_ctx")
+    if isinstance(gctx, dict):
+        # Same precedence as the read path -- workspace_id wins, then raw key_id.
+        ws = gctx.get("workspace_id")
+        if ws:
+            return str(ws), "workspace"
+        key = gctx.get("key_id")
+        if key:
+            return str(key), "key"
+        # An explicit stamp with neither workspace nor key -> global scope.
+        return "global", "global"
+
+    # Legacy fallback: requests that bypassed the enforce stamp.
     workspace_id = metadata.get("workspace_id") or metadata.get("_workspace")
     if workspace_id:
         return str(workspace_id), "workspace"

@@ -368,8 +368,15 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 metadata = {}
                 request_kwargs["metadata"] = metadata
 
+            # Stamp the RESOLVED governance scope so the post-response spend
+            # WRITER (router_decision_callback._derive_spend_scope) reuses the
+            # EXACT scope the READ/enforce path uses -- workspace_id (ed7a) and
+            # the RAW key_id (08dd).  Without key_id here the writer fell back to
+            # LiteLLM's hashed user_api_key / user-id, which never matched the
+            # read scope, leaving workspace + key budgets silently fail-open.
             metadata["_governance_ctx"] = {
                 "workspace_id": ctx.workspace_id,
+                "key_id": ctx.key_id,
                 "effective_profile": ctx.effective_routing_profile,
             }
 

@@ -76,6 +76,20 @@ class QuotaFailMode(str, Enum):
     CLOSED = "closed"
 
 
+class GovernanceFailMode(str, Enum):
+    """Governance budget/rate enforcement behaviour when the spend store fails.
+
+    ``OPEN`` (default, back-compat) allows the request when the store
+    (ElastiCache/Aurora) cannot confirm spend or RPM -- the historical
+    fail-open behaviour.  ``CLOSED`` denies the request when a limit IS
+    configured but the store is unavailable, so a store outage cannot leak
+    spend/rate past the configured budget/RPM (RouteIQ-24fc).
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 # ============================================================================
 # Nested Settings Models
 # ============================================================================
@@ -575,6 +589,26 @@ class QuotaSettings(BaseModel):
     cost_reconciliation_enabled: bool = Field(
         True,
         description="Enable post-response cost reconciliation.",
+    )
+
+
+class GovernanceSettings(BaseModel):
+    """Workspace/key governance budget + rate-limit enforcement behaviour.
+
+    Env vars: nested ``ROUTEIQ_GOVERNANCE__FAIL_MODE`` (the ``__`` nested
+    delimiter on :class:`GatewaySettings`).  The consumer in ``governance.py``
+    ALSO honours the legacy flat ``ROUTEIQ_GOVERNANCE_FAIL_MODE`` via an
+    ``os.getenv`` fallback (mirrors the ``QuotaConfig.from_env`` pattern), so
+    operators can use either form.
+    """
+
+    fail_mode: GovernanceFailMode = Field(
+        GovernanceFailMode.OPEN,
+        description=(
+            "Behaviour when the governance spend store (ElastiCache/Aurora) is "
+            "unavailable.  OPEN (default) allows; CLOSED denies when a budget/RPM "
+            "limit is configured but the store cannot confirm current usage."
+        ),
     )
 
 
@@ -1422,6 +1456,10 @@ class GatewaySettings(BaseSettings):
     quota: QuotaSettings = Field(
         default_factory=QuotaSettings,  # type: ignore[arg-type]
         description="Quota enforcement settings.",
+    )
+    governance: GovernanceSettings = Field(
+        default_factory=GovernanceSettings,  # type: ignore[arg-type]
+        description="Workspace/key governance budget + rate-limit settings.",
     )
     mcp: MCPSettings = Field(
         default_factory=MCPSettings,  # type: ignore[arg-type]
