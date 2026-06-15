@@ -12,6 +12,11 @@
     "routeiq:admin_principal_arns": [],
     "routeiq:bedrock_model_arns": [],
     "routeiq:config_s3_bucket": null,
-    "routeiq:secret_arns": []
+    "routeiq:secret_arns": [],
+    "routeiq:enable_observability_stack": false,
+    "routeiq:enable_amg": false,
+    "routeiq:enable_data_lake": false,
+    "routeiq:routing_log_group_name": null,
+    "routeiq:notify_emails": []
   }
 }

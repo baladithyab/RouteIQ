@@ -21,6 +21,7 @@ import os
 import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks
 
+from lib.routeiq_observability_stack import RouteIqObservabilityStack
 from lib.routeiq_stack import RouteIqStack
 
 
@@ -105,6 +106,25 @@ def main() -> None:
         config_s3_bucket=config_s3_bucket,
         secret_arns=secret_arns,
     )
+
+    # P2 (ADR-0026/0027): the SEPARATE config-state + observability + data-lake
+    # stack. Flag-gated off by default so the default synth carries only the P0
+    # stack (the ~30-minute-rollback rule keeps P2 independently deployable). When
+    # routeiq:enable_observability_stack=true it synths alongside P0. AMG and the
+    # data lake are each their own nested flag (both default off). The routing log
+    # group is referenced by NAME (the P0 output, or the P0 naming convention) -
+    # props-only, never from_lookup, to keep synth credential-free.
+    if _bool_ctx(app, "routeiq:enable_observability_stack", False):
+        RouteIqObservabilityStack(
+            app,
+            f"RouteIqObservabilityStack-{env_name}",
+            env=env,
+            env_name=env_name,
+            routing_log_group_name=(_ctx(app, "routeiq:routing_log_group_name", None) or None),
+            enable_amg=_bool_ctx(app, "routeiq:enable_amg", False),
+            enable_data_lake=_bool_ctx(app, "routeiq:enable_data_lake", False),
+            notify_emails=_split_csv_or_list(_ctx(app, "routeiq:notify_emails", [])),
+        )
 
     cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
 

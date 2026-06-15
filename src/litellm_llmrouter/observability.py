@@ -16,8 +16,10 @@ This prevents "provider mismatch" issues where custom spans are exported to
 a different provider than the one used by auto-instrumentation.
 """
 
+import json
 import logging
 import os
+import time
 from typing import Any, Dict, Optional, cast
 
 from opentelemetry import trace, metrics
@@ -276,6 +278,226 @@ def set_genai_attributes(
 
     if top_p is not None:
         span.set_attribute(GA.REQUEST_TOP_P, top_p)
+
+
+# ==============================================================================
+# P2 (ADR-0027): Structured ``routing_decision`` JSON log line
+# ==============================================================================
+# The gateway already emits an OTel span + a ``log_routing_decision`` event for
+# every routing decision (above). P2 adds a SEPARATE, machine-parseable flat JSON
+# log line on a dedicated logger that the AWS observability stack consumes:
+#
+#   - the CloudWatch Logs metric filters (aggregate + PER-MODEL dimensioned
+#     latency) read it (observability_construct.py); and
+#   - the Firehose subscription filter promotes it to the Glue/Athena data lake
+#     (data_lake_construct.py).
+#
+# THE DUAL-KEY CONTRACT (the load-bearing P2 detail):
+#   * The per-model CloudWatch MetricFilter dimensions on the OTel
+#     ``gen_ai.response.model`` field (telemetry_contracts.py RESPONSE_MODEL) -
+#     RouteIQ does NOT emit ``selected_model`` as the OTel key.
+#   * The Glue/Athena lake's identity-SerDe column is named ``selected_model``
+#     (and a sibling ``model`` column).
+#   So this line carries the SAME model value under THREE top-level keys:
+#   ``selected_model``, ``model``, and ``gen_ai.response.model`` - one line
+#   satisfies both the CW dimension contract and the lake schema simultaneously.
+#
+# THE EVENT MARKER: top-level ``event`` == ``"routing_decision"`` (underscore),
+# which both the metric filters (``$.event = "routing_decision"``) and the
+# Firehose subscription (``{ $.event = "routing_decision" }``) select on.
+#
+# PII POSTURE: this line carries model names, numeric scores/tokens, latency,
+# booleans, and a ``query_length`` (int) ONLY - NEVER prompt or completion text
+# (per telemetry_contracts). No redaction is needed downstream.
+
+# The structured-line event marker (matches observability_construct +
+# data_lake_construct: the top-level ``$.event`` selector value).
+ROUTING_DECISION_EVENT = "routing_decision"
+
+# The 14 flat column keys the data lake's Glue table extracts by identity name
+# (data_lake_construct._COLUMNS). Authored here so the app emitter and the CDK
+# schema share one frozen contract; a drift breaks the lake's column extraction.
+ROUTING_DECISION_COLUMNS: tuple[str, ...] = (
+    "event",
+    "timestamp",
+    "request_id",
+    "trace_id",
+    "selected_model",
+    "model",
+    "decision",
+    "reason_code",
+    "category",
+    "reasoning_enabled",
+    "latency_ms",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_hit",
+)
+
+# The OTel telemetry-contract key the per-model CloudWatch MetricFilter
+# dimensions on (NOT ``selected_model``). Carried as a sibling top-level key with
+# the SAME value as ``selected_model``/``model``.
+_GEN_AI_RESPONSE_MODEL_KEY = "gen_ai.response.model"
+
+# Dedicated logger for the structured routing_decision line. Kept OFF the root
+# logger (propagate=False is set by the caller via settings) so it is
+# independently routable to the dedicated CloudWatch routing log group. Module
+# level so the line is emitted with no ObservabilityManager dependency.
+_routing_decision_logger = logging.getLogger("routeiq.routing_decision")
+
+
+def _current_trace_id_hex() -> str:
+    """Return the active span's 32-hex trace id, or "" when no span is recording.
+
+    Used to correlate the flat routing_decision line with its OTel span/trace
+    in the lake (the ``trace_id`` column) without coupling to the SDK provider.
+    """
+    span = trace.get_current_span()
+    ctx = span.get_span_context() if span is not None else None
+    if ctx is None or not ctx.is_valid:
+        return ""
+    return format(ctx.trace_id, "032x")
+
+
+def build_routing_decision_record(
+    *,
+    selected_model: str,
+    decision: str = "route",
+    strategy: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    category: Optional[str] = None,
+    reasoning_enabled: bool = False,
+    latency_ms: Optional[float] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    cache_hit: bool = False,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    query_length: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build the flat, PII-safe ``routing_decision`` record (no I/O).
+
+    Returns the dict that ``emit_routing_decision_log`` serialises to one JSON
+    line. Split out so the shape is unit-testable without a logging handler.
+
+    The model value is written under THREE top-level keys so ONE line satisfies
+    both the CloudWatch per-model dimension contract (``gen_ai.response.model``,
+    the OTel telemetry-contract key) and the Glue/Athena lake's identity columns
+    (``selected_model`` + ``model``). All three hold the SAME value.
+
+    PII-safe: ``query_length`` (an int) is the ONLY query-derived field; prompt
+    and completion TEXT are never included.
+    """
+    record: Dict[str, Any] = {
+        # --- the 14 flat lake columns (identity-SerDe extraction) ---
+        "event": ROUTING_DECISION_EVENT,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+        "request_id": request_id or "",
+        "trace_id": trace_id if trace_id is not None else _current_trace_id_hex(),
+        "selected_model": selected_model,
+        "model": selected_model,
+        "decision": decision,
+        "reason_code": reason_code or "",
+        "category": category or "",
+        "reasoning_enabled": bool(reasoning_enabled),
+        "latency_ms": int(latency_ms) if latency_ms is not None else 0,
+        "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else 0,
+        "completion_tokens": (
+            int(completion_tokens) if completion_tokens is not None else 0
+        ),
+        "cache_hit": bool(cache_hit),
+        # --- the OTel telemetry-contract dimension key (CW MetricFilter reads
+        # this; the lake drops it harmlessly via dot-folding) ---
+        _GEN_AI_RESPONSE_MODEL_KEY: selected_model,
+    }
+    # ``strategy`` lives on the span (gen_ai.routeiq.strategy), not a lake column,
+    # but is carried as a sibling key for the operator/dashboard convenience (the
+    # OpenXJsonSerDe drops any key not in the table schema). Only when provided.
+    if strategy is not None:
+        record["strategy"] = strategy
+    # query_length is the ONLY query-derived field (an int length, never text),
+    # carried sibling for PII-safe prompt-size analytics. Only when provided.
+    if query_length is not None:
+        record["query_length"] = int(query_length)
+    return record
+
+
+def emit_routing_decision_log(
+    *,
+    selected_model: str,
+    decision: str = "route",
+    strategy: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    category: Optional[str] = None,
+    reasoning_enabled: bool = False,
+    latency_ms: Optional[float] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    cache_hit: bool = False,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    query_length: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Emit the structured ``routing_decision`` JSON line (P2, ADR-0027).
+
+    Writes ONE compact JSON object as the log message on the dedicated
+    ``routeiq.routing_decision`` logger. The AWS observability stack consumes it:
+    the CloudWatch metric filters (aggregate + per-model dimensioned latency) and
+    the Firehose->Glue/Athena data lake both select on ``$.event ==
+    "routing_decision"``.
+
+    Gated by ``settings.otel.routing_decision_log_enabled`` (default on). The
+    toggle is read via ``get_settings`` per ADR-0013 - NOT ``os.environ`` - with a
+    fail-open default so a settings failure does not silence telemetry.
+
+    Returns the emitted record (for testing/inspection), or ``None`` when the
+    feature is disabled. Never raises: a telemetry failure must not break routing.
+    """
+    try:
+        enabled = True
+        logger_name = "routeiq.routing_decision"
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            otel_s = get_settings().otel
+            enabled = otel_s.routing_decision_log_enabled
+            logger_name = otel_s.routing_decision_logger_name
+        except Exception:
+            # Fail-open: emit on the default logger if settings are unavailable.
+            pass
+
+        if not enabled:
+            return None
+
+        record = build_routing_decision_record(
+            selected_model=selected_model,
+            decision=decision,
+            strategy=strategy,
+            reason_code=reason_code,
+            category=category,
+            reasoning_enabled=reasoning_enabled,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_hit=cache_hit,
+            request_id=request_id,
+            trace_id=trace_id,
+            query_length=query_length,
+        )
+
+        target_logger = (
+            _routing_decision_logger
+            if logger_name == "routeiq.routing_decision"
+            else logging.getLogger(logger_name)
+        )
+        # The message IS the JSON object (one compact line) so Fluent Bit's JSON
+        # parser promotes the keys to the CloudWatch record top level. Sorted
+        # keys keep the line deterministic for tests + diffs.
+        target_logger.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        return record
+    except Exception:  # pragma: no cover - telemetry must never break routing
+        logger.debug("Failed to emit routing_decision structured log", exc_info=True)
+        return None
 
 
 def _is_sdk_tracer_provider(provider: Any) -> bool:
@@ -812,10 +1034,24 @@ class ObservabilityManager:
             log_data.update(extra)
 
         # Don't log query content by default for privacy
+        query_length: Optional[int] = None
         if query and os.getenv("LOG_QUERIES", "false").lower() == "true":
-            log_data["query_length"] = len(query)
+            query_length = len(query)
+            log_data["query_length"] = query_length
 
         logger.info("Routing decision made", extra=log_data)
+
+        # P2 (ADR-0027): also emit the structured, machine-parseable
+        # routing_decision JSON line the AWS observability stack consumes (the
+        # CloudWatch per-model metric filter + the Firehose data lake). Distinct
+        # from the human ``logger.info`` event above: this is a flat JSON object
+        # on a dedicated logger carrying the dual-key model field. PII-safe.
+        emit_routing_decision_log(
+            selected_model=selected_model,
+            strategy=strategy,
+            latency_ms=latency_ms,
+            query_length=query_length,
+        )
 
     def log_error_with_trace(
         self,

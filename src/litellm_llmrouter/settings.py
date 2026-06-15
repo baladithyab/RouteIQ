@@ -203,6 +203,25 @@ class OTelSettings(BaseModel):
         "RouteIQ",
         description="Namespace prefix for RouteIQ metrics.",
     )
+    routing_decision_log_enabled: bool = Field(
+        True,
+        description=(
+            "Emit the structured ``routing_decision`` JSON log line per request "
+            "(ADR-0027 P2 data-lake / CloudWatch metric-filter source). PII-safe: "
+            "carries model names, token counts, latency, and a query_length only - "
+            "never prompt or completion text. Disable to suppress the line "
+            "entirely (env: ROUTEIQ_OTEL__ROUTING_DECISION_LOG_ENABLED)."
+        ),
+    )
+    routing_decision_logger_name: str = Field(
+        "routeiq.routing_decision",
+        description=(
+            "Dedicated logger name the structured routing_decision JSON line is "
+            "emitted on. Routed to the dedicated CloudWatch routing log group by "
+            "the Fluent Bit pipeline (the data-lake + dimensioned metric filter "
+            "source). Kept off the root logger so it is independently routable."
+        ),
+    )
 
     @field_validator("endpoint")
     @classmethod

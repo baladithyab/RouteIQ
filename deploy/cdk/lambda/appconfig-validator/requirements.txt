@@ -1,0 +1,8 @@
+# Runtime deps for the RouteIQ AppConfig validator Lambda (handler.py).
+#
+# PyYAML ONLY. The handler is deliberately self-contained: it re-implements the
+# RULES of RouteIQ's config validation (YAML parse + RouteIQ-shape + inline-secret
+# deny) inline rather than importing the litellm_llmrouter package, which is NOT
+# bundled into the validator zip. Keeping the dependency surface to PyYAML keeps
+# the Docker-bundled asset small and the cold-start fast.
+PyYAML>=6.0,<7.0
