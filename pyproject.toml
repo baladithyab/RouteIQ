@@ -16,9 +16,13 @@ dependencies = [
     "pydantic-settings>=2.2.0",
     "httpx>=0.26.0",
     # LiteLLM core (provides Router, logging, etc.)
-    # Note: Using litellm without [proxy] extra due to strict pinned dependencies in proxy extra
-    # that conflict with project requirements. Adding needed proxy deps individually below.
-    "litellm==1.82.3",
+    # Note: Using litellm without the [proxy] extra. The modern [proxy] extra uses `>=` version
+    # RANGES (not the `==` pins the historical conflict-avoidance rationale assumed), so that
+    # premise is stale. RouteIQ still avoids [proxy] because it runs the proxy IN-PROCESS under
+    # its own FastAPI app (ADR-0012) and needs none of [proxy]'s server runners
+    # (gunicorn/granian/uvicorn/rq/polars/soundfile/litellm-enterprise/litellm-proxy-extras).
+    # We hand-vendor only the proxy transitive deps actually imported at initialize() below.
+    "litellm==1.89.0",
     # APScheduler - required by litellm proxy for background scheduling
     "apscheduler>=3.10.0",
     # email-validator - required by pydantic.EmailStr (used by LiteLLM proxy SCIM)
@@ -31,6 +35,11 @@ dependencies = [
     "backoff>=2.0.0",
     # redis - required by LiteLLM for Redis caching
     "redis>=5.0.0",
+    # orjson - eager top-level import in litellm.proxy.proxy_server; ABSENT from the prod
+    #          closure (masked in dev by mypy[faster-cache]) — closes that latent gap
+    "orjson>=3.11.6",
+    # mcp - conditional litellm.proxy import; required if any config declares MCP servers/tools
+    "mcp>=1.26.0",
     # Configuration and utilities
     "pyyaml>=6.0",
     "aiofiles>=23.0.0",

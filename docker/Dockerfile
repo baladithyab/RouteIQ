@@ -23,7 +23,7 @@
 # Build args:
 #   PYTHON_VERSION    - Python version (default: 3.14)
 #   UV_VERSION        - uv package manager version (default: 0.9)
-#   LITELLM_VERSION   - LiteLLM version (default: 1.81.3)
+#   LITELLM_VERSION   - LiteLLM version (default: 1.89.0)
 #   LLMROUTER_COMMIT  - LLMRouter git commit hash
 #   ROUTEIQ_EXTRAS    - Comma-separated pip extras (default: "prod")
 #   BUILD_UI          - Build and include admin UI (default: "true")
@@ -45,7 +45,7 @@
 
 ARG PYTHON_VERSION=3.14
 ARG UV_VERSION=0.9
-ARG LITELLM_VERSION=1.81.3
+ARG LITELLM_VERSION=1.89.0
 # LLMRouter pinned to specific commit for reproducibility
 ARG LLMROUTER_COMMIT=7890cd9d36951a3c73fec83619321f3704a7aaa8
 
