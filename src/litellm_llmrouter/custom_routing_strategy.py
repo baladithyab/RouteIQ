@@ -195,8 +195,31 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         specific_deployment: Optional[bool] = False,
         request_kwargs: Optional[Dict] = None,
     ) -> Optional[Dict]:
+        """Async entry point called by LiteLLM's Router.
+
+        Thin wrapper: delegates selection to :meth:`_async_select` and routes
+        the result through :meth:`_guard_selected` -- the single gov-ban
+        chokepoint (RouteIQ-a073) every path returns through.
         """
-        Async routing method called by LiteLLM's Router.
+        selected = await self._async_select(
+            model=model,
+            messages=messages,
+            input=input,
+            specific_deployment=specific_deployment,
+            request_kwargs=request_kwargs,
+        )
+        return self._guard_selected(selected, model)
+
+    async def _async_select(
+        self,
+        model: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        input: Optional[Union[str, List]] = None,
+        specific_deployment: Optional[bool] = False,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """
+        Async deployment selection (guarded by the caller).
 
         Order of operations:
         0. Governance enforcement (budget, rate limit, model access)
@@ -264,8 +287,31 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         specific_deployment: Optional[bool] = False,
         request_kwargs: Optional[Dict] = None,
     ) -> Optional[Dict]:
+        """Sync entry point called by LiteLLM's Router.
+
+        Thin wrapper: delegates to :meth:`_sync_select` and routes the result
+        through :meth:`_guard_selected` -- the single gov-ban chokepoint
+        (RouteIQ-a073) every path returns through.
         """
-        Sync routing method called by LiteLLM's Router.
+        selected = self._sync_select(
+            model=model,
+            messages=messages,
+            input=input,
+            specific_deployment=specific_deployment,
+            request_kwargs=request_kwargs,
+        )
+        return self._guard_selected(selected, model)
+
+    def _sync_select(
+        self,
+        model: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        input: Optional[Union[str, List]] = None,
+        specific_deployment: Optional[bool] = False,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """
+        Sync deployment selection (guarded by the caller).
 
         Same logic as the async version but uses synchronous calls.
         Note: Personalized routing is skipped in sync path because the
@@ -310,6 +356,48 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # 5. Fallback to first available deployment
         return self._fallback_deployment(model)
+
+    # ------------------------------------------------------------------
+    # Internal: Gov-ban chokepoint (RouteIQ-a073)
+    # ------------------------------------------------------------------
+
+    def _guard_selected(self, selected: Optional[Dict], model: str) -> Optional[Dict]:
+        """Post-selection backstop: never return a gov-banned deployment.
+
+        This is the SINGLE chokepoint mandated by RouteIQ-a073. Every routing
+        path -- pipeline, ML, personalized, centroid, fallback, and any FUTURE
+        strategy added later -- returns through here, so a gov-banned arm
+        (Fable 5 family always-on, plus operator ``banned_models``) can never
+        be selected even if a strategy's own candidate source forgot to filter.
+
+        Defense-in-depth: each candidate source ALSO pre-filters (so banned arms
+        are never scored), but this guard guarantees the invariant holds
+        regardless. Fail-CLOSED: a banned selection is refused; we then attempt
+        the (already-filtered) fallback, and if that is also banned/empty return
+        ``None`` (a banned-only group must yield no deployment).
+        """
+        if selected is None:
+            return None
+
+        from litellm_llmrouter.candidate_filter import is_gov_banned
+
+        if not is_gov_banned(selected):
+            return selected
+
+        arm = (selected.get("litellm_params") or {}).get("model", "unknown")
+        logger.error(
+            "Gov-ban chokepoint REFUSED a selected deployment (arm=%s, model=%s); "
+            "a routing strategy bypassed its pre-filter. Falling back to the "
+            "filtered candidate set.",
+            arm,
+            model,
+        )
+        # _fallback_deployment is already gov-ban filtered; re-guard it so a
+        # double-banned group resolves to None rather than a banned arm.
+        fallback = self._fallback_deployment(model)
+        if fallback is not None and not is_gov_banned(fallback):
+            return fallback
+        return None
 
     # ------------------------------------------------------------------
     # Internal: Governance enforcement

@@ -1676,7 +1676,11 @@ class CentroidRoutingStrategy:
             context: Routing context with router instance.
 
         Returns:
-            List of deployment dicts matching the requested model.
+            List of deployment dicts matching the requested model, with
+            cooled-down / gov-banned arms removed (RouteIQ-a073). The centroid
+            path also bypasses LiteLLM's healthy-deployment pipeline, so the
+            pre-scoring filter must be applied here too -- this seam was the
+            gap RouteIQ-a073 closes.
         """
         router = context.router
         if router is None:
@@ -1686,7 +1690,13 @@ class CentroidRoutingStrategy:
         if healthy is None:
             healthy = getattr(router, "model_list", [])
 
-        return [dep for dep in healthy if dep.get("model_name") == context.model]
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
 
     @staticmethod
     def _fallback_deployment(context: Any) -> Optional[Dict]:
@@ -1708,7 +1718,15 @@ class CentroidRoutingStrategy:
         if healthy is None:
             healthy = getattr(router, "model_list", [])
 
-        candidates = [dep for dep in healthy if dep.get("model_name") == context.model]
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        # RouteIQ-a073: even the centroid fallback must never return a banned /
+        # cooled-down arm (this path also bypasses LiteLLM's pipeline).
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        candidates = filter_routable_candidates(router, group_matched)
         if candidates:
             return random.choice(candidates)
         return None

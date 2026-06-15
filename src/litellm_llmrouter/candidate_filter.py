@@ -47,6 +47,32 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Always-on compliance ban (RouteIQ-513e)
+# ---------------------------------------------------------------------------
+# The standing constraint "Fable 5 is GOV-BANNED as a routable arm — never add
+# it to live routing config" must hold with ZERO operator config. Relying on
+# ``GovernanceSettings.banned_models`` alone left it unenforced out-of-the-box
+# (the default is empty), so a bare deployment that happened to list a Fable 5
+# arm could route it. These substrings are matched (normalized, see
+# ``_normalize``) against BOTH the arm key (``litellm_params.model``) and the
+# group name (``model_name``) IN ADDITION TO the config-driven bans, so the
+# control survives an empty / cleared / glitched ``banned_models``.
+#
+# Substrings (not exact strings) so every provider-prefixed and region-prefixed
+# variant is caught: ``bedrock/global.anthropic.claude-fable-5``,
+# ``anthropic/claude-fable-5``, the bare ``claude-fable-5``, and the model-id
+# ``claude-fable-5`` all contain ``claude-fable-5``.
+_ALWAYS_BANNED_SUBSTRINGS: tuple[str, ...] = (
+    "claude-fable-5",
+    "claude-fable5",
+)
+
+
+def _normalize(s: str) -> str:
+    """Lowercase + strip whitespace for case/format-insensitive ban matching."""
+    return str(s or "").strip().lower()
+
 
 def cooled_down_ids(router: Any) -> set[str]:
     """Return LiteLLM's live cooldown set as ``model_info.id`` strings.
@@ -99,8 +125,11 @@ def drop_cooled_down(
 def banned_model_keys() -> set[str]:
     """Config-driven gov-ban set from ``get_settings().governance.banned_models``.
 
-    Default empty -> a byte-stable no-op for :func:`drop_gov_banned`. Fails to
-    the empty set on any error (no spurious bans from a settings glitch).
+    NOTE: this is the OPERATOR-CONFIGURED set only; it does NOT include the
+    always-on Fable 5 family ban (:data:`_ALWAYS_BANNED_SUBSTRINGS`). Use
+    :func:`is_gov_banned` / :func:`drop_gov_banned` for the full ban check.
+    Default empty. Fails to the empty set on any error (no spurious bans from a
+    settings glitch).
     """
     try:
         from litellm_llmrouter.settings import get_settings
@@ -111,28 +140,46 @@ def banned_model_keys() -> set[str]:
         return set()
 
 
-def drop_gov_banned(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """RouteIQ-badb: remove gov-banned arms BEFORE scoring.
+def is_gov_banned(deployment: Dict[str, Any]) -> bool:
+    """True if ``deployment`` is gov-banned — the single ban predicate.
 
-    Matches a banned key against BOTH ``litellm_params.model`` (the bandit arm
-    key / ``_arm_key``) AND ``model_name`` (the group name), so a config of
-    ``["bedrock/global.anthropic.claude-fable-5"]`` removes that arm.
+    Banned when EITHER the arm key (``litellm_params.model``) OR the group name
+    (``model_name``) is banned, by EITHER:
 
-    Default-empty config -> returns the input list object unchanged (byte
-    stable). NO fail-open re-add: a banned arm must NEVER be selected even if it
-    is the only candidate (compliance fail-closed-to-removal).
+    - the always-on Fable 5 family ban (:data:`_ALWAYS_BANNED_SUBSTRINGS`,
+      normalized substring match — RouteIQ-513e, holds with zero config), OR
+    - the operator config (:func:`banned_model_keys`, exact normalized match —
+      RouteIQ-badb).
+
+    This is the chokepoint primitive: every candidate source AND the post-
+    selection backstop call it, so no strategy can route a banned arm.
     """
-    banned = banned_model_keys()
-    if not banned:
+    arm = _normalize((deployment.get("litellm_params") or {}).get("model", ""))
+    name = _normalize(deployment.get("model_name", ""))
+
+    # Always-on family ban (substring, zero-config).
+    for sub in _ALWAYS_BANNED_SUBSTRINGS:
+        if sub in arm or sub in name:
+            return True
+
+    # Operator-configured ban (exact, normalized).
+    configured = {_normalize(m) for m in banned_model_keys()}
+    return arm in configured or name in configured
+
+
+def drop_gov_banned(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """RouteIQ-badb + RouteIQ-513e: remove gov-banned arms BEFORE scoring.
+
+    Removes any deployment for which :func:`is_gov_banned` is True (the always-on
+    Fable 5 family ban OR the operator-configured ``banned_models``).
+
+    Byte-stable no-op when NO candidate is banned -> returns the input list
+    object unchanged. NO fail-open re-add: a banned arm must NEVER be selected
+    even if it is the only candidate (compliance fail-closed-to-removal).
+    """
+    if not any(is_gov_banned(d) for d in candidates):
         return candidates
-    out: List[Dict[str, Any]] = []
-    for d in candidates:
-        arm = str((d.get("litellm_params") or {}).get("model", ""))
-        name = str(d.get("model_name", ""))
-        if arm in banned or name in banned:
-            continue
-        out.append(d)
-    return out
+    return [d for d in candidates if not is_gov_banned(d)]
 
 
 def filter_routable_candidates(

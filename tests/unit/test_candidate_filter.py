@@ -21,6 +21,7 @@ from litellm_llmrouter.candidate_filter import (
     drop_cooled_down,
     drop_gov_banned,
     filter_routable_candidates,
+    is_gov_banned,
 )
 from litellm_llmrouter.settings import get_settings, reset_settings
 
@@ -172,3 +173,63 @@ def test_filter_composition_ban_then_cooldown(monkeypatch):
     out_arms = [d["litellm_params"]["model"] for d in out]
     assert FABLE5 not in out_arms
     assert out == [legal]  # fail-open re-add from the ban-filtered set only
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-513e — Fable 5 banned with ZERO operator config (always-on family ban)
+# ---------------------------------------------------------------------------
+
+
+def test_fable5_banned_with_zero_config():
+    """513e acceptance: Fable 5 is removed even when banned_models is EMPTY.
+
+    The standing constraint must hold out-of-the-box; relying on operator
+    config alone left it unenforced.
+    """
+    reset_settings()
+    get_settings()  # default GovernanceSettings -> banned_models == []
+    assert banned_model_keys() == set()  # operator config is empty
+    legal = _dep("claude", "bedrock/anthropic.claude-3-sonnet", "d1")
+    banned = _dep("fable5", FABLE5, "d2")
+    out = drop_gov_banned([legal, banned])
+    assert out == [legal]  # banned by the always-on family ban, not config
+
+
+def test_fable5_family_ban_catches_all_prefix_variants():
+    """Every provider/region-prefixed + bare Fable 5 variant is caught."""
+    reset_settings()
+    get_settings()
+    variants = [
+        "bedrock/global.anthropic.claude-fable-5",
+        "anthropic/claude-fable-5",
+        "claude-fable-5",
+        "Bedrock/Global.Anthropic.Claude-Fable-5",  # case-insensitive
+        "  claude-fable-5  ",  # whitespace-insensitive
+    ]
+    for arm in variants:
+        assert is_gov_banned(_dep("grp", arm, "d")), arm
+    # And by model_name too (group named for fable5).
+    assert is_gov_banned(_dep("claude-fable-5-group", "bedrock/safe-arm", "d"))
+
+
+def test_is_gov_banned_legal_model_is_false():
+    """A legal model is not banned (no false positives) with default config."""
+    reset_settings()
+    get_settings()
+    assert not is_gov_banned(_dep("claude", "bedrock/anthropic.claude-3-sonnet", "d1"))
+    assert not is_gov_banned(_dep("gpt", "openai/gpt-4o", "d2"))
+
+
+def test_fable5_banned_even_as_sole_candidate_zero_config():
+    """A Fable-5-only group yields NO deployment, even with empty config."""
+    reset_settings()
+    get_settings()
+    assert drop_gov_banned([_dep("fable5", FABLE5, "d1")]) == []
+
+
+def test_drop_gov_banned_byte_stable_when_nothing_banned():
+    """No banned candidate (and empty config) -> same list object (byte-stable)."""
+    reset_settings()
+    get_settings()
+    cands = [_dep("claude", "bedrock/anthropic.claude-3-sonnet", "d1")]
+    assert drop_gov_banned(cands) is cands

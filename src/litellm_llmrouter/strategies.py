@@ -2876,11 +2876,22 @@ class CostAwareRoutingStrategy(RoutingStrategy):
             context: Routing context with router and model info
 
         Returns:
-            List of deployment dicts matching the requested model
+            List of deployment dicts matching the requested model, with
+            cooled-down / gov-banned arms removed (RouteIQ-a073). This strategy
+            is registered live as ``"cost-aware"`` and bypasses LiteLLM's
+            healthy-deployment pipeline like every RouteIQ strategy, so the
+            pre-scoring filter must run here -- this seam was a gov-ban gap
+            RouteIQ-a073's audit found beyond the centroid path.
         """
         router = context.router
         healthy = getattr(router, "healthy_deployments", router.model_list)
-        return [dep for dep in healthy if dep.get("model_name") == context.model]
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
 
     def _get_available_candidates(self, candidates: List[Dict]) -> List[Dict]:
         """Filter out candidates whose provider circuit breaker is open.
