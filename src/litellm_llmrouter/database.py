@@ -44,6 +44,11 @@ def is_database_configured() -> bool:
     return get_database_url() is not None
 
 
+class IamRegionUnresolvedError(RuntimeError):
+    """Raised when RDS/Aurora IAM auth is enabled but no AWS region can be
+    resolved. RouteIQ-6829: fail loud instead of signing ``Region=None``."""
+
+
 def _region_from_rds_host(host: str | None) -> str | None:
     """Parse the AWS region out of an RDS/Aurora endpoint hostname.
 
@@ -59,11 +64,34 @@ def _region_from_rds_host(host: str | None) -> str | None:
         return None
 
 
-def _mint_db_token(*, host: str, port: int, user: str, region: str | None) -> str:
+def _resolve_db_iam_region(host: str | None, iam_region: str | None) -> str:
+    """Resolve the AWS region for the rds-db:connect IAM mint, or FAIL LOUD.
+
+    Resolution order: ``settings.postgres.iam_region`` -> region parsed from the
+    RDS/Aurora endpoint host -> ``AWS_REGION``. Serverless Aurora endpoints do
+    not always carry a parseable region label, so config or the environment must
+    supply it.
+
+    RouteIQ-89a6 / RouteIQ-6829: when none of the sources yield a region we used
+    to call ``generate_db_auth_token(Region=None)`` -- an invalid SigV4 token that
+    fails AUTH at connect time. Instead raise a clear, actionable error naming the
+    missing env so the misconfiguration surfaces at pool-build time.
+    """
+    region = iam_region or _region_from_rds_host(host) or os.getenv("AWS_REGION")
+    if not region:
+        raise IamRegionUnresolvedError(
+            "cannot resolve AWS region for RDS/Aurora IAM auth: set "
+            "ROUTEIQ_POSTGRES__IAM_REGION or the AWS_REGION environment variable"
+        )
+    return region
+
+
+def _mint_db_token(*, host: str, port: int, user: str, region: str) -> str:
     """Mint a 15-min ``rds-db:connect`` IAM auth token (SigV4, local, no network call).
 
     Constructed inline (no module-level boto3 cache, so no new reset obligation).
-    NEVER log the returned token.
+    NEVER log the returned token. ``region`` is resolved + validated by
+    :func:`_resolve_db_iam_region` before this is called (never None).
     """
     import boto3
 
@@ -140,37 +168,41 @@ async def get_db_pool(db_url: Optional[str] = None):
             # On any setup failure we log (NEVER the token) and fall through to the
             # static URL so a misconfig degrades softly instead of crashing boot.
             connect_kwargs: dict[str, Any] = {}
+            # RouteIQ-6829: confirming IAM-on is fail-soft (a settings-read error
+            # degrades to the static URL), but an UNRESOLVED region once IAM IS on
+            # must fail loud rather than silently sign Region=None. So the region
+            # is resolved OUTSIDE this fail-soft try.
+            _iam_on = False
+            _iam_region = None
             try:
                 from litellm_llmrouter.settings import get_settings as _gs
 
                 _pg = _gs().postgres
-                if _pg.iam_auth:
-                    from urllib.parse import urlsplit
-
-                    parts = urlsplit(url)
-                    host = parts.hostname
-                    port = parts.port or 5432
-                    user = parts.username  # "routeiq" / DbRuntimeUser
-                    region = (
-                        _pg.iam_region
-                        or _region_from_rds_host(host)
-                        or os.getenv("AWS_REGION")
-                    )
-
-                    def _password() -> str:
-                        # asyncpg calls this per new/replacement connection -> 15-min refresh.
-                        return _mint_db_token(
-                            host=host, port=port, user=user, region=region
-                        )
-
-                    connect_kwargs["password"] = _password
-                    verbose_proxy_logger.info(
-                        "DB IAM auth enabled: minting rds-db:connect token per connection"
-                    )  # no token value logged
+                _iam_on = _pg.iam_auth
+                _iam_region = _pg.iam_region
             except Exception as e:
                 verbose_proxy_logger.error(
                     f"DB IAM token setup failed; using static URL: {e}"
                 )
+            if _iam_on:
+                from urllib.parse import urlsplit
+
+                parts = urlsplit(url)
+                host = parts.hostname
+                port = parts.port or 5432
+                user = parts.username  # "routeiq" / DbRuntimeUser
+                region = _resolve_db_iam_region(host, _iam_region)  # fail-loud
+
+                def _password() -> str:
+                    # asyncpg calls this per new/replacement connection -> 15-min refresh.
+                    return _mint_db_token(
+                        host=host, port=port, user=user, region=region
+                    )
+
+                connect_kwargs["password"] = _password
+                verbose_proxy_logger.info(
+                    "DB IAM auth enabled: minting rds-db:connect token per connection"
+                )  # no token value logged
 
             _pool = await asyncpg.create_pool(
                 url,
@@ -190,6 +222,12 @@ async def get_db_pool(db_url: Optional[str] = None):
                 "asyncpg not installed, database pool not available"
             )
             return None
+        except IamRegionUnresolvedError:
+            # RouteIQ-6829: an unresolved region on the IAM path is a FAIL-LOUD
+            # misconfiguration, NOT a soft degradation. Re-raise it past the
+            # broad handler below so it is never swallowed into a static-URL
+            # fallback that would then sign with no/invalid region.
+            raise
         except Exception as e:
             verbose_proxy_logger.error(f"Failed to create database pool: {e}")
             return None

@@ -46,6 +46,17 @@ from litellm_llmrouter.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+
+class IamRegionUnresolvedError(RuntimeError):
+    """Raised when ElastiCache IAM auth is enabled but no AWS region can be
+    resolved. RouteIQ-6829: fail loud instead of signing ``region=None``.
+
+    Subclasses ``RuntimeError`` so existing ``except (Exception | RuntimeError)``
+    fail-soft boundaries keep their behaviour; the region resolution that raises
+    this is deliberately performed OUTSIDE those boundaries so it propagates.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Module-level singletons
 # ---------------------------------------------------------------------------
@@ -64,7 +75,12 @@ _HEALTH_CHECK_INTERVAL = 30.0  # seconds
 # ``_IAM_TOKEN_TTL - _IAM_REFRESH_BEFORE``. The clock is an injectable seam so
 # tests drive staleness deterministically (no real time/sleep on this path).
 _iam_token_minted_at: float = 0.0  # monotonic seconds at last successful IAM mint
-_IAM_TOKEN_TTL = 900.0  # matches _mint_elasticache_token expires=900
+# RouteIQ-d3fb: single source-of-truth for the ElastiCache IAM token lifetime.
+# Both the SigV4 presign (``_mint_elasticache_token(expires=...)``) and the
+# age-gated refresh stamp (``_iam_token_is_stale``) reference this one constant,
+# so the 900s validity cannot drift between the mint and the refresh logic.
+_IAM_TOKEN_TTL_SECONDS = 900
+_IAM_TOKEN_TTL = float(_IAM_TOKEN_TTL_SECONDS)  # float alias for clock arithmetic
 _IAM_REFRESH_BEFORE = 120.0  # re-mint >=120s before expiry -> ~780s usable budget
 _clock: Callable[[], float] = time.monotonic  # test-injectable monotonic seam
 
@@ -212,12 +228,41 @@ def _region_from_cache_host(host: str | None) -> str | None:
     return None
 
 
+def _resolve_iam_region(host: str) -> str:
+    """Resolve the AWS region for the ElastiCache IAM SigV4 mint, or FAIL LOUD.
+
+    Resolution order: ``settings.redis.iam_region`` -> region parsed from the
+    cache endpoint host -> ``AWS_REGION``. Serverless ElastiCache endpoints carry
+    only a SHORTENED region token (``use1``) that ``_region_from_cache_host``
+    deliberately refuses, so on serverless the host contributes nothing and the
+    region MUST come from config or the environment.
+
+    RouteIQ-89a6 / RouteIQ-6829: when none of the sources yield a region we used
+    to sign the token with ``region=None`` -- an invalid SigV4 token that fails
+    AUTH at connect time with an opaque error. Instead raise a clear, actionable
+    error naming the missing env so the misconfiguration surfaces at mint time.
+    """
+    region = (
+        get_settings().redis.iam_region
+        or _region_from_cache_host(host)
+        or os.getenv("AWS_REGION")
+    )
+    if not region:
+        raise IamRegionUnresolvedError(
+            "cannot resolve AWS region for ElastiCache IAM auth: set "
+            "ROUTEIQ_REDIS__IAM_REGION or the AWS_REGION environment variable "
+            "(serverless ElastiCache endpoints do not carry a usable region)"
+        )
+    return region
+
+
 def _mint_elasticache_token(user: str, cache_name: str, region: str) -> str:
     """Mint an ``elasticache:Connect`` SigV4-presigned AUTH token (local, no network).
 
     Token = the SigV4-signed ``GET https://<cache-name>/?Action=connect&User=<user>``
-    URL with the ``https://`` scheme stripped. Valid 900s. Constructed inline (no
-    module-level cache -> no new reset obligation). NEVER log the returned token.
+    URL with the ``https://`` scheme stripped. Valid for ``_IAM_TOKEN_TTL_SECONDS``.
+    Constructed inline (no module-level cache -> no new reset obligation). NEVER log
+    the returned token.
     """
     import boto3
     from botocore.auth import SigV4QueryAuth
@@ -226,7 +271,9 @@ def _mint_elasticache_token(user: str, cache_name: str, region: str) -> str:
     creds = boto3.session.Session().get_credentials()
     if creds is None:
         raise RuntimeError("no AWS credentials for elasticache:Connect token mint")
-    signer = SigV4QueryAuth(creds, "elasticache", region, expires=900)
+    signer = SigV4QueryAuth(
+        creds, "elasticache", region, expires=_IAM_TOKEN_TTL_SECONDS
+    )
     req = AWSRequest(
         method="GET",
         url=f"https://{cache_name}/",
@@ -302,14 +349,21 @@ async def get_async_redis_client() -> Optional[Any]:
         # 30s health-check + reconnect rebuilds -> re-mints). Default OFF -> the
         # static path is unchanged. On mint failure we log (NEVER the token) and
         # fall through to the static AUTH (fail-soft, matches the Redis pattern).
+        # RouteIQ-6829: an UNRESOLVED region must fail loud (not silently sign a
+        # region=None / invalid SigV4 token), so the region is resolved OUTSIDE
+        # the mint-failure fallback below -- only transient mint failures (e.g.
+        # missing creds) degrade to the static AUTH.
+        iam_on = False
+        region = None
         try:
             rsettings = get_settings().redis
-            if rsettings.iam_auth:
-                region = (
-                    rsettings.iam_region
-                    or _region_from_cache_host(host)
-                    or os.getenv("AWS_REGION")
-                )
+            iam_on = rsettings.iam_auth
+        except Exception:
+            rsettings = None
+        if iam_on:
+            region = _resolve_iam_region(host)  # raises (fail-loud) if unresolved
+        try:
+            if iam_on:
                 username = rsettings.username or username  # CacheIamUserName
                 cache_name = host.split(".")[0]
                 password = _mint_elasticache_token(username, cache_name, region)
@@ -403,14 +457,19 @@ def get_sync_redis_client() -> Optional[Any]:
     # IAM auth (ADR-0029): mirror the async splice. _mint_elasticache_token is
     # sync (local SigV4 presign), fine for the sync client. Default OFF -> static
     # path unchanged; mint failure falls through to the static AUTH (fail-soft).
+    # RouteIQ-6829: resolve the region OUTSIDE the mint-failure fallback so an
+    # unresolved region fails loud (mirrors the async path above).
+    iam_on = False
+    region = None
     try:
         rsettings = get_settings().redis
-        if rsettings.iam_auth:
-            region = (
-                rsettings.iam_region
-                or _region_from_cache_host(host)
-                or os.getenv("AWS_REGION")
-            )
+        iam_on = rsettings.iam_auth
+    except Exception:
+        rsettings = None
+    if iam_on:
+        region = _resolve_iam_region(host)  # raises (fail-loud) if unresolved
+    try:
+        if iam_on:
             username = rsettings.username or username  # CacheIamUserName
             cache_name = host.split(".")[0]
             password = _mint_elasticache_token(username, cache_name, region)

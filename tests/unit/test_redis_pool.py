@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from litellm_llmrouter.redis_pool import (
+    IamRegionUnresolvedError,
     _redis_settings,
     build_redis_url,
     create_async_redis_client,
@@ -676,3 +677,219 @@ class TestRedisIamTokenRefresh:
 
         for record in caplog.records:
             assert secret_token not in record.getMessage(), "IAM token leaked to logs"
+
+
+# =============================================================================
+# RouteIQ-89a6 / RouteIQ-6829 -- region resolution + fail-loud on unresolved
+# =============================================================================
+#
+# A serverless ElastiCache endpoint carries only the SHORTENED region token
+# (use1), which _region_from_cache_host deliberately refuses. When neither
+# ROUTEIQ_REDIS__IAM_REGION nor AWS_REGION is set the region cannot be resolved,
+# and signing the SigV4 token with region=None yields an invalid token that
+# fails AUTH with an opaque error. The mint paths must FAIL LOUD instead.
+
+# Serverless host with NO usable region label (only the use1 short token).
+_NO_REGION_ENV = {
+    "REDIS_HOST": _SERVERLESS_HOST,
+    "REDIS_SSL": "true",
+    "REDIS_USERNAME": _FAKE_CACHE_USER,
+    "ROUTEIQ_REDIS_IAM_AUTH": "true",
+    # NEITHER ROUTEIQ_REDIS__IAM_REGION NOR AWS_REGION -> unresolvable.
+}
+
+
+class TestResolveIamRegion:
+    """RouteIQ-89a6/6829: region resolution order + fail-loud on unresolved."""
+
+    def test_unresolved_region_raises_fail_loud(self):
+        """No iam_region, no parseable host region, no AWS_REGION -> raise."""
+        import litellm_llmrouter.redis_pool as rp
+
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            with pytest.raises(IamRegionUnresolvedError) as exc_info:
+                rp._resolve_iam_region(_SERVERLESS_HOST)
+        # The error names the missing env so the misconfig is actionable.
+        msg = str(exc_info.value)
+        assert "ROUTEIQ_REDIS__IAM_REGION" in msg
+        assert "AWS_REGION" in msg
+
+    def test_resolves_from_aws_region_env(self):
+        """AWS_REGION supplies the region when host/settings cannot."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {**_NO_REGION_ENV, "AWS_REGION": "ap-southeast-2"}
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            assert rp._resolve_iam_region(_SERVERLESS_HOST) == "ap-southeast-2"
+
+    def test_resolves_from_settings_iam_region(self):
+        """ROUTEIQ_REDIS__IAM_REGION takes precedence over host + AWS_REGION."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {
+            **_NO_REGION_ENV,
+            "ROUTEIQ_REDIS__IAM_REGION": "eu-west-1",
+            "AWS_REGION": "us-east-1",  # lower precedence
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            assert rp._resolve_iam_region(_SERVERLESS_HOST) == "eu-west-1"
+
+    def test_resolves_from_provisioned_host_label(self):
+        """A provisioned cluster host carrying a long-form region label resolves
+        even without iam_region / AWS_REGION (RouteIQ-d3a4 strict regex)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        provisioned = "routeiq-cache.abc123.ng.0001.use1.cache.amazonaws.com"
+        host_with_region = "routeiq-cache.abc.us-east-1.cache.amazonaws.com"
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            # The serverless-style host has no long-form label -> not resolvable.
+            assert rp._region_from_cache_host(provisioned) is None
+            # A host carrying the canonical region label IS resolved from the host.
+            assert rp._resolve_iam_region(host_with_region) == "us-east-1"
+
+
+class TestRedisIamFailLoudOnUnresolvedRegion:
+    """The async + sync mint paths fail loud (do NOT sign region=None)."""
+
+    async def test_async_unresolved_region_fails_loud(self, monkeypatch):
+        """get_async_redis_client raises rather than minting with region=None."""
+        import litellm_llmrouter.redis_pool as rp
+
+        # The mint must NEVER be reached (no region=None sign attempt).
+        def _should_not_mint(*a, **kw):
+            raise AssertionError("mint reached despite unresolved region")
+
+        monkeypatch.setattr(rp, "_mint_elasticache_token", _should_not_mint)
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            with patch("redis.asyncio.Redis"):
+                with pytest.raises(IamRegionUnresolvedError):
+                    await rp.get_async_redis_client()
+
+    def test_sync_unresolved_region_fails_loud(self, monkeypatch):
+        """get_sync_redis_client raises rather than minting with region=None."""
+        import litellm_llmrouter.redis_pool as rp
+
+        def _should_not_mint(*a, **kw):
+            raise AssertionError("mint reached despite unresolved region")
+
+        monkeypatch.setattr(rp, "_mint_elasticache_token", _should_not_mint)
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            with patch("redis.Redis"):
+                with pytest.raises(IamRegionUnresolvedError):
+                    rp.get_sync_redis_client()
+
+    async def test_resolved_region_mints_ok(self, monkeypatch):
+        """With a resolvable region, the mint runs and the token is presented."""
+        import litellm_llmrouter.redis_pool as rp
+
+        seen = {}
+
+        def _fake_mint(user, cache_name, region):
+            seen["region"] = region
+            return _FAKE_SIGNED_TOKEN
+
+        monkeypatch.setattr(rp, "_mint_elasticache_token", _fake_mint)
+        env = {**_NO_REGION_ENV, "AWS_REGION": "us-east-1"}
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            with patch("redis.asyncio.Redis") as mock_cls:
+                mock_cls.return_value = MagicMock()
+                await rp.get_async_redis_client()
+                kwargs = mock_cls.call_args.kwargs
+                assert kwargs["password"] == _FAKE_SIGNED_TOKEN
+        assert seen["region"] == "us-east-1"
+
+
+class TestIamTokenTtlSingleSource:
+    """RouteIQ-d3fb: the 900s TTL is a single source-of-truth constant referenced
+    by BOTH the SigV4 presign (_mint_elasticache_token expires=...) and the
+    age-gated refresh stamp (_iam_token_is_stale)."""
+
+    def test_ttl_constant_value(self):
+        """The single-source constant is 900 seconds; the float alias matches."""
+        import litellm_llmrouter.redis_pool as rp
+
+        assert rp._IAM_TOKEN_TTL_SECONDS == 900
+        assert rp._IAM_TOKEN_TTL == float(rp._IAM_TOKEN_TTL_SECONDS)
+
+    def test_mint_signs_with_ttl_constant(self, monkeypatch):
+        """_mint_elasticache_token passes _IAM_TOKEN_TTL_SECONDS as expires=..,
+        proving the presign reads the single-source constant (not a literal)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        captured = {}
+
+        class _FakeSigner:
+            def __init__(self, creds, service, region, expires):
+                captured["service"] = service
+                captured["region"] = region
+                captured["expires"] = expires
+
+            def add_auth(self, req):
+                return None
+
+        class _FakeCreds:
+            pass
+
+        class _FakeSession:
+            def get_credentials(self):
+                return _FakeCreds()
+
+        fake_boto3 = MagicMock()
+        fake_boto3.session.Session.return_value = _FakeSession()
+        fake_auth = MagicMock()
+        fake_auth.SigV4QueryAuth = _FakeSigner
+
+        class _FakePrepared:
+            url = "https://cache.example/signed"
+
+        class _FakeReq:
+            def prepare(self):
+                return _FakePrepared()
+
+        fake_awsrequest = MagicMock()
+        fake_awsrequest.AWSRequest.return_value = _FakeReq()
+
+        import sys
+
+        with patch.dict(
+            sys.modules,
+            {
+                "boto3": fake_boto3,
+                "botocore.auth": fake_auth,
+                "botocore.awsrequest": fake_awsrequest,
+            },
+        ):
+            token = rp._mint_elasticache_token("u", "cache.example", "us-east-1")
+
+        assert token == "cache.example/signed"  # https:// stripped
+        # The presign TTL is the single-source constant, not a hard-coded 900.
+        assert captured["expires"] == rp._IAM_TOKEN_TTL_SECONDS
+        assert captured["expires"] == 900
+        assert captured["service"] == "elasticache"
+
+    def test_stale_gate_uses_ttl_constant(self):
+        """_iam_token_is_stale's threshold derives from the same TTL constant:
+        an advance of exactly (TTL - REFRESH_BEFORE) is NOT yet stale, +1 IS."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {**_NO_REGION_ENV, "AWS_REGION": "us-east-1"}
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            rp.reset_redis_clients()
+            clock = {"t": 1000.0}
+            rp._set_clock(lambda: clock["t"])
+            # Simulate a mint at t=1000.
+            rp._iam_token_minted_at = clock["t"]
+            # Exactly at the threshold boundary -> NOT stale (strict >).
+            clock["t"] = 1000.0 + (rp._IAM_TOKEN_TTL - rp._IAM_REFRESH_BEFORE)
+            assert rp._iam_token_is_stale() is False
+            # One second past the threshold -> stale.
+            clock["t"] += 1.0
+            assert rp._iam_token_is_stale() is True

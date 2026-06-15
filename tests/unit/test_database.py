@@ -748,7 +748,9 @@ import sys  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from litellm_llmrouter.database import (  # noqa: E402
+    IamRegionUnresolvedError,
     _region_from_rds_host,
+    _resolve_db_iam_region,
     get_db_pool,
 )
 from litellm_llmrouter.settings import reset_settings  # noqa: E402
@@ -756,6 +758,10 @@ from litellm_llmrouter.settings import reset_settings  # noqa: E402
 # Placeholder only -- NEVER a real token value (RouteIQ-d3a4 discipline).
 _FAKE_DB_TOKEN = "TOKEN-15MIN"  # noqa: S105 - test placeholder, not a secret
 _RDS_URL = "postgresql://routeiq@db.cluster-xyz.us-east-1.rds.amazonaws.com:5432/litellm?sslmode=require"
+# Serverless Aurora endpoint whose host carries NO parseable region label.
+_SERVERLESS_RDS_URL = (
+    "postgresql://routeiq@my-aurora-sl.cluster-abc.serverless:5432/litellm"
+)
 
 
 def _mock_asyncpg():
@@ -872,3 +878,104 @@ class TestGetDbPoolIamAuth:
         assert pool is not None  # still built (fail-soft)
         kwargs = mock_asyncpg.create_pool.call_args.kwargs
         assert "password" not in kwargs, kwargs
+
+
+# =============================================================================
+# RouteIQ-89a6 / RouteIQ-6829 -- DB region resolution + fail-loud on unresolved
+# =============================================================================
+#
+# When neither settings.postgres.iam_region nor AWS_REGION is set and the RDS
+# host carries no parseable region, generate_db_auth_token(Region=None) would
+# sign an invalid SigV4 token that fails AUTH at connect time. The rds-db mint
+# path must FAIL LOUD instead (raise naming the missing env).
+
+
+class TestResolveDbIamRegion:
+    """RouteIQ-89a6/6829: region resolution order + fail-loud on unresolved."""
+
+    def test_unresolved_region_raises_fail_loud(self):
+        """No iam_region arg, no parseable host region, no AWS_REGION -> raise."""
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(IamRegionUnresolvedError) as exc_info:
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+        msg = str(exc_info.value)
+        assert "ROUTEIQ_POSTGRES__IAM_REGION" in msg
+        assert "AWS_REGION" in msg
+
+    def test_resolves_from_iam_region_arg(self):
+        """The explicit iam_region arg takes precedence over host + AWS_REGION."""
+        with patch.dict(os.environ, {"AWS_REGION": "us-east-1"}, clear=True):
+            assert (
+                _resolve_db_iam_region(
+                    "db.cluster-xyz.eu-west-1.rds.amazonaws.com", "ca-central-1"
+                )
+                == "ca-central-1"
+            )
+
+    def test_resolves_from_rds_host_label(self):
+        """The region parsed from the RDS host is used when no arg/AWS_REGION."""
+        with patch.dict(os.environ, {}, clear=True):
+            assert (
+                _resolve_db_iam_region(
+                    "db.cluster-xyz.us-east-1.rds.amazonaws.com", None
+                )
+                == "us-east-1"
+            )
+
+    def test_resolves_from_aws_region_env(self):
+        """AWS_REGION supplies the region when arg + host cannot."""
+        with patch.dict(os.environ, {"AWS_REGION": "ap-southeast-2"}, clear=True):
+            assert (
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+                == "ap-southeast-2"
+            )
+
+
+class TestGetDbPoolIamFailLoud:
+    """get_db_pool fails loud when IAM is on but the region is unresolvable."""
+
+    async def test_unresolved_region_raises_in_pool_build(self, monkeypatch):
+        """IAM on + serverless host + no region env -> raise (no Region=None mint)."""
+        import litellm_llmrouter.database as db_mod
+
+        def _should_not_mint(**kw):
+            raise AssertionError("mint reached despite unresolved region")
+
+        monkeypatch.setattr(db_mod, "_mint_db_token", _should_not_mint)
+        mock_asyncpg = _mock_asyncpg()
+        # IAM on, serverless URL, and NO AWS_REGION / ROUTEIQ_POSTGRES__IAM_REGION.
+        env = {"DATABASE_URL": _SERVERLESS_RDS_URL, "ROUTEIQ_DB_IAM_AUTH": "true"}
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                with pytest.raises(IamRegionUnresolvedError):
+                    await get_db_pool()
+        # Pool build aborted before create_pool -> never reached.
+        mock_asyncpg.create_pool.assert_not_called()
+
+    async def test_resolved_region_mints_ok(self, monkeypatch):
+        """A serverless host + AWS_REGION resolves -> callable password minted."""
+        import litellm_llmrouter.database as db_mod
+
+        spy = MagicMock(return_value=_FAKE_DB_TOKEN)
+        monkeypatch.setattr(db_mod, "_mint_db_token", spy)
+        mock_asyncpg = _mock_asyncpg()
+        env = {
+            "DATABASE_URL": _SERVERLESS_RDS_URL,
+            "ROUTEIQ_DB_IAM_AUTH": "true",
+            "AWS_REGION": "ap-southeast-2",  # supplies the otherwise-missing region
+        }
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                await get_db_pool()
+
+        pw = mock_asyncpg.create_pool.call_args.kwargs["password"]
+        assert callable(pw)
+        pw()  # trigger the mint
+        spy.assert_called_with(
+            host="my-aurora-sl.cluster-abc.serverless",
+            port=5432,
+            user="routeiq",
+            region="ap-southeast-2",
+        )
