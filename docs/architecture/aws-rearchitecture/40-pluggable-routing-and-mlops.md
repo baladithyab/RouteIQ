@@ -28,6 +28,23 @@ Sibling docs (referenced, not depended on): `20-kumaraswamy-thompson-router.md`
 (a new online-bandit strategy) and the deployment ADRs (Aurora replay store,
 AppConfig config delivery, AMP/managed-Prometheus telemetry).
 
+> **Clarification (2026-06-15) — the two are orthogonal; MLOps is generalized.**
+> Kumaraswamy–Thompson is **one** routing algorithm (a single `RoutingStrategy`,
+> RouteIQ's net-new bandit) that sits *alongside* the imported strategies. The
+> **MLOps loop is strategy-agnostic machinery** that attaches to **any** registered
+> strategy (the UIUC LLMRouter classifiers, centroid, personalized, AND the bandit)
+> — the bandit is a *consumer* of the loop, not its center. Each strategy declares,
+> in its `AdapterManifest`, a **`train_mode`**:
+> - **`one_time`** — train/fit once (offline, against a corpus or the data-lake),
+>   produce a signed artifact, freeze, serve. No ongoing loop. (The natural fit for
+>   the offline-trained UIUC classifiers; also the bandit's seeded-posteriors path.)
+> - **`continuous`** — hook the same strategy to the closed loop (telemetry → lake →
+>   train → eval → sign → hot-reload) so it keeps re-tuning as live traffic drifts.
+>
+> So a user can **train a strategy once** *or* **hook it to MLOps for regular
+> tune+eval** — the same adapter contract serves both, for every strategy. The
+> `train_mode` toggle is per-strategy config; the loop machinery is shared.
+
 ---
 
 ## 1. Current Extension Points — Honest Inventory
