@@ -15,12 +15,26 @@ This plugin:
 
 Configuration via environment variables:
 - ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_ENABLED: Enable this plugin (default: false)
-- ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION: AWS region (default: us-east-1)
-- ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_AGENT_IDS: Comma-separated agent IDs to expose
+- ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION: AWS region (default: resolved from env)
+- ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_AGENT_IDS: Comma-separated AgentCore Runtime
+  identifiers — either bare runtime ids or full ``agentRuntimeArn`` values.
+- ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_QUALIFIER: Runtime endpoint qualifier
+  (default: ``DEFAULT``) — replaces the legacy hardcoded ``TSTALIASID``.
+
+AgentCore retargeting (RouteIQ-e5a4):
+- The legacy connector targeted the DEPRECATED ``bedrock-agent-runtime`` data
+  plane (``/agents/{id}/agentAliases/TSTALIASID/sessions/test/text``) with a
+  hardcoded test alias and NO SigV4 signing, registered (contradictorily) under
+  the ``streamable_http`` transport.
+- It now targets Amazon Bedrock AgentCore Runtime's ``InvokeAgentRuntime`` API
+  on the ``bedrock-agentcore`` data-plane service. Invocation is SigV4-signed
+  by a ``boto3.client("bedrock-agentcore")`` (botocore signs every request), so
+  no manual credential handling is required.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -37,6 +51,73 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
+
+# AgentCore Runtime data-plane service name (boto3/botocore). Distinct from the
+# control-plane ``bedrock-agentcore-control`` service (see the IAM prefix split
+# in agentcore-gotchas). InvokeAgentRuntime lives on the data plane.
+AGENTCORE_RUNTIME_SERVICE = "bedrock-agentcore"
+
+
+def _resolve_region(configured: str | None) -> str | None:
+    """Resolve the AWS region for AgentCore calls.
+
+    Mirrors the region-resolution discipline used elsewhere (bedrock_discovery /
+    database): explicit config first, then ``AWS_REGION`` / ``AWS_DEFAULT_REGION``,
+    then the boto3 session default. Returns None when none can be resolved (the
+    caller then skips registration rather than signing ``Region=None``).
+    """
+    if configured and configured.strip():
+        return configured.strip()
+    for env_key in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        val = os.getenv(env_key)
+        if val and val.strip():
+            return val.strip()
+    try:
+        import boto3
+
+        return boto3.session.Session().region_name or None
+    except Exception:
+        return None
+
+
+def _agentcore_runtime_endpoint(region: str) -> str:
+    """Return the AgentCore Runtime data-plane endpoint for a region.
+
+    Used both as the registered server URL (for discovery) and as the boto3
+    ``endpoint_url``. Shape: ``https://bedrock-agentcore.{region}.amazonaws.com``.
+    """
+    return f"https://{AGENTCORE_RUNTIME_SERVICE}.{region}.amazonaws.com"
+
+
+def _agent_runtime_arn(agent_id: str, region: str) -> str:
+    """Normalize an agent identifier into a full ``agentRuntimeArn``.
+
+    Accepts either a full ARN (passed through) or a bare runtime id (wrapped).
+    The account id is resolved at invoke time by boto3 from the caller's
+    credentials, so registration uses a best-effort ARN with an empty account
+    segment when only a bare id is supplied; invocation always passes the
+    operator-supplied identifier through to boto3 unchanged.
+    """
+    if agent_id.startswith("arn:"):
+        return agent_id
+    return f"arn:aws:{AGENTCORE_RUNTIME_SERVICE}:{region}::runtime/{agent_id}"
+
+
+def _make_agentcore_client(region: str, endpoint_url: str | None = None) -> Any:
+    """Construct a SigV4-signing ``boto3.client('bedrock-agentcore')``.
+
+    boto3/botocore attaches SigV4 to every request automatically from the
+    standard credential chain — no manual signing required. Built inline (no
+    module-level cache => no reset obligation), following the
+    ``bedrock_discovery._bedrock_control_client`` pattern.
+    """
+    import boto3
+
+    return boto3.session.Session().client(
+        AGENTCORE_RUNTIME_SERVICE,
+        region_name=region,
+        endpoint_url=endpoint_url,
+    )
 
 
 class BedrockAgentCoreMCPPlugin(GatewayPlugin):
@@ -60,12 +141,25 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
             description="Connects Bedrock AgentCore agents as MCP tool servers",
         )
 
-    def __init__(self) -> None:
-        self._region = os.getenv("ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION", "us-east-1")
+    def __init__(self, client_factory: Any = None) -> None:
+        # Region resolution discipline: explicit config -> AWS_REGION ->
+        # boto3 session default. May be None until startup (we resolve again
+        # lazily so a late-set AWS_REGION still works).
+        self._region = _resolve_region(
+            os.getenv("ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION")
+        )
+        # Runtime endpoint qualifier replaces the legacy hardcoded TSTALIASID.
+        self._qualifier = os.getenv(
+            "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_QUALIFIER", "DEFAULT"
+        )
         self._agent_ids: list[str] = []
         raw_ids = os.getenv("ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_AGENT_IDS", "")
         if raw_ids.strip():
             self._agent_ids = [a.strip() for a in raw_ids.split(",") if a.strip()]
+
+        # Injectable boto3 client factory: ``region -> client``. Tests pass a
+        # MagicMock factory so no live AWS / real boto3 is needed.
+        self._client_factory = client_factory or _make_agentcore_client
 
         self._registered_server_ids: list[str] = []
         self._context: PluginContext | None = None
@@ -224,7 +318,7 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
     # =========================================================================
 
     async def _register_agents(self, context: PluginContext) -> None:
-        """Register configured AgentCore agents as MCP servers."""
+        """Register configured AgentCore Runtime agents as MCP servers."""
         if not context.mcp:
             logger.debug("MCP accessor not available, skipping agent registration")
             return
@@ -233,18 +327,31 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
             logger.debug("MCP gateway disabled, skipping agent registration")
             return
 
+        # Re-resolve the region lazily so a late-set AWS_REGION is honoured.
+        region = self._region or _resolve_region(None)
+        if not region:
+            logger.warning(
+                "BedrockAgentCoreMCPPlugin: no AWS region resolved; "
+                "set ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION or AWS_REGION. "
+                "Skipping AgentCore registration."
+            )
+            return
+        self._region = region
+
+        # AgentCore Runtime data-plane endpoint (NOT the deprecated
+        # bedrock-agent-runtime alias path). This is the SigV4 target.
+        endpoint = _agentcore_runtime_endpoint(region)
+
         for agent_id in self._agent_ids:
             server_id = f"bedrock-agentcore-{agent_id}"
-            # Build the AgentCore endpoint URL
-            url = (
-                f"https://bedrock-agent-runtime.{self._region}.amazonaws.com"
-                f"/agents/{agent_id}/agentAliases/TSTALIASID/sessions/test/text"
-            )
+            runtime_arn = _agent_runtime_arn(agent_id, region)
 
-            # Validate URL against SSRF if available
+            # Validate the endpoint against SSRF if available (registration-time,
+            # no DNS). The endpoint, not a fabricated alias path, is what gets
+            # called — so that is what we validate.
             if context.validate_outbound_url:
                 try:
-                    context.validate_outbound_url(url)
+                    context.validate_outbound_url(endpoint)
                 except Exception as e:
                     logger.warning(f"SSRF validation failed for AgentCore URL: {e}")
                     continue
@@ -253,12 +360,19 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
                 await context.mcp.register_server(
                     server_id=server_id,
                     name=f"Bedrock AgentCore ({agent_id})",
-                    url=url,
-                    transport="streamable_http",
+                    url=endpoint,
+                    # AgentCore Runtime speaks MCP; register under the SSE/MCP
+                    # transport, not the legacy contradictory streamable_http
+                    # pointed at a REST alias path.
+                    transport="sse",
                     metadata={
                         "provider": "bedrock-agentcore",
-                        "region": self._region,
+                        "region": region,
                         "agent_id": agent_id,
+                        "agent_runtime_arn": runtime_arn,
+                        "qualifier": self._qualifier,
+                        "service": AGENTCORE_RUNTIME_SERVICE,
+                        "signed": "sigv4",
                     },
                 )
                 self._registered_server_ids.append(server_id)
@@ -267,7 +381,7 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
                 if self._tools_registered_counter:
                     self._tools_registered_counter.add(
                         1,
-                        {"agent_id": agent_id, "region": self._region},
+                        {"agent_id": agent_id, "region": region},
                     )
 
                 logger.info(f"Registered AgentCore agent as MCP server: {server_id}")
@@ -276,3 +390,85 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
                 logger.warning(
                     f"Failed to register AgentCore agent {agent_id} as MCP server: {e}"
                 )
+
+    async def invoke_agent(
+        self,
+        agent_id: str,
+        payload: dict[str, Any],
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Invoke an AgentCore Runtime agent via the SigV4-signed data plane.
+
+        Uses ``boto3.client('bedrock-agentcore').invoke_agent_runtime`` — botocore
+        SigV4-signs the request automatically from the standard credential chain.
+        This replaces the legacy unsigned POST to the deprecated
+        ``bedrock-agent-runtime`` alias path.
+
+        Args:
+            agent_id: A configured agent id or full ``agentRuntimeArn``.
+            payload: JSON-serializable request body for the runtime.
+            session_id: Optional runtime session id for multi-turn continuity.
+
+        Returns:
+            The decoded response payload from the runtime.
+
+        Raises:
+            ValueError: when no region can be resolved.
+        """
+        region = self._region or _resolve_region(None)
+        if not region:
+            raise ValueError(
+                "No AWS region resolved for AgentCore invocation; "
+                "set ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION or AWS_REGION."
+            )
+
+        endpoint = _agentcore_runtime_endpoint(region)
+        runtime_arn = _agent_runtime_arn(agent_id, region)
+
+        # Build a fresh SigV4-signing client (no module-level cache).
+        client = self._client_factory(region, endpoint)
+
+        kwargs: dict[str, Any] = {
+            "agentRuntimeArn": runtime_arn,
+            "qualifier": self._qualifier,
+            "payload": json.dumps(payload).encode("utf-8"),
+        }
+        if session_id:
+            kwargs["runtimeSessionId"] = session_id
+
+        response = client.invoke_agent_runtime(**kwargs)
+
+        if self._invocations_counter:
+            self._invocations_counter.add(1, {"agent_id": agent_id, "region": region})
+
+        return self._decode_invoke_response(response)
+
+    @staticmethod
+    def _decode_invoke_response(response: dict[str, Any]) -> dict[str, Any]:
+        """Decode the InvokeAgentRuntime response body into a dict.
+
+        The runtime returns a streaming/bytes ``response`` body carrying JSON.
+        Tolerates botocore StreamingBody (``.read()``), raw bytes, str, or an
+        already-decoded dict.
+        """
+        body = response.get("response") if isinstance(response, dict) else None
+        if body is None:
+            return response if isinstance(response, dict) else {}
+
+        raw: Any = body
+        if hasattr(body, "read"):
+            raw = body.read()
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            try:
+                decoded: Any = json.loads(raw)
+            except json.JSONDecodeError:
+                return {"output": raw}
+            if isinstance(decoded, dict):
+                return decoded
+            return {"output": decoded}
+        if isinstance(raw, dict):
+            return raw
+        return {"output": str(raw)}

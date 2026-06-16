@@ -72,6 +72,23 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """Concatenate the ``text`` of MCP text content blocks for error messages.
+
+    MCP tool results carry a ``content`` list of typed blocks (text/image/...).
+    On a tool-level error we surface the text blocks as the error string.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(parts)
+
+
 def _record_mcp_invocation_metric(result: str) -> None:
     """Emit the MCP tool invocation metric (best-effort).
 
@@ -274,6 +291,164 @@ class MCPGateway:
 
         if self._ha_sync_enabled:
             self._init_redis_client()
+
+        # DB-backed persistence (optional, RouteIQ-635d). When DATABASE_URL is
+        # configured, registrations are persisted to the mcp_servers table via
+        # MCPServerRepository so they survive restarts and are shared across
+        # workers/replicas. Falls back silently to in-memory when no DB.
+        self._db_persistence_enabled = self._resolve_db_persistence_enabled()
+
+    @staticmethod
+    def _resolve_db_persistence_enabled() -> bool:
+        """Whether MCP registrations should be persisted to the database.
+
+        Enabled automatically when a database is configured. A dedicated
+        ``MCP_DB_PERSISTENCE_ENABLED`` env var can force-disable it for rollback.
+        """
+        env_flag = os.getenv("MCP_DB_PERSISTENCE_ENABLED")
+        if env_flag is not None:
+            if env_flag.lower() != "true":
+                return False
+        try:
+            from litellm_llmrouter.database import is_database_configured
+
+            return bool(is_database_configured())
+        except Exception:
+            return False
+
+    def is_db_persistence_enabled(self) -> bool:
+        """Check whether DB-backed registry persistence is active."""
+        return bool(self._db_persistence_enabled)
+
+    @staticmethod
+    def _schedule_db_op(coro: Any) -> None:
+        """Run a best-effort DB coroutine without blocking the caller.
+
+        If an event loop is running (the normal async-route path), the coroutine
+        is scheduled as a fire-and-forget task. If no loop is running (e.g. a
+        sync test or startup script), it is run to completion via asyncio.run.
+        Failures are swallowed by the coroutines themselves.
+        """
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            loop.create_task(coro)
+        else:
+            try:
+                asyncio.run(coro)
+            except Exception:  # pragma: no cover - defensive
+                # Close the un-awaited coroutine to avoid a warning.
+                try:
+                    coro.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _to_db_model(server: "MCPServer") -> Any:
+        """Map an in-memory MCPServer to the MCPServerDB database model."""
+        from litellm_llmrouter.database import MCPServerDB
+
+        return MCPServerDB(
+            server_id=server.server_id,
+            name=server.name,
+            url=server.url,
+            transport=server.transport.value,
+            tools=list(server.tools),
+            resources=list(server.resources),
+            auth_type=server.auth_type,
+            metadata=dict(server.metadata),
+        )
+
+    @staticmethod
+    def _from_db_model(db_server: Any) -> "MCPServer":
+        """Map an MCPServerDB row back to an in-memory MCPServer."""
+        return MCPServer(
+            server_id=db_server.server_id,
+            name=db_server.name,
+            url=db_server.url,
+            transport=MCPTransport(db_server.transport),
+            tools=list(db_server.tools),
+            resources=list(db_server.resources),
+            auth_type=db_server.auth_type,
+            metadata=dict(db_server.metadata),
+        )
+
+    async def _persist_server_to_db(self, server: "MCPServer") -> None:
+        """Best-effort persist a server registration to the database.
+
+        Never raises: a DB outage degrades to in-memory-only behaviour.
+        """
+        if not self._db_persistence_enabled:
+            return
+        try:
+            from litellm_llmrouter.database import get_mcp_repository
+
+            repo = get_mcp_repository()
+            db_model = self._to_db_model(server)
+            existing = await repo.get(server.server_id)
+            if existing is not None:
+                await repo.update(server.server_id, db_model)
+            else:
+                await repo.create(db_model)
+        except Exception as e:  # pragma: no cover - defensive
+            verbose_proxy_logger.warning(
+                f"MCP: Failed to persist server '{server.server_id}' to DB: {e}"
+            )
+
+    async def _delete_server_from_db(self, server_id: str) -> None:
+        """Best-effort delete a server registration from the database."""
+        if not self._db_persistence_enabled:
+            return
+        try:
+            from litellm_llmrouter.database import get_mcp_repository
+
+            repo = get_mcp_repository()
+            await repo.delete(server_id)
+        except Exception as e:  # pragma: no cover - defensive
+            verbose_proxy_logger.warning(
+                f"MCP: Failed to delete server '{server_id}' from DB: {e}"
+            )
+
+    async def load_persisted_servers(self) -> int:
+        """Load DB-persisted MCP servers into the in-memory registry.
+
+        Call this at startup so a fresh gateway/worker rehydrates the registry
+        from the shared database. Returns the number of servers loaded. No-op
+        (returns 0) when DB persistence is disabled.
+        """
+        if not self._db_persistence_enabled:
+            return 0
+        try:
+            from litellm_llmrouter.database import get_mcp_repository
+
+            repo = get_mcp_repository()
+            db_servers = await repo.list_all()
+        except Exception as e:  # pragma: no cover - defensive
+            verbose_proxy_logger.warning(
+                f"MCP: Failed to load persisted servers from DB: {e}"
+            )
+            return 0
+
+        loaded = 0
+        with self._lock:
+            for db_server in db_servers:
+                try:
+                    server = self._from_db_model(db_server)
+                except Exception:
+                    continue
+                self.servers[server.server_id] = server
+                for tool_name in server.tools:
+                    self._tool_to_server[tool_name] = server.server_id
+                loaded += 1
+
+        if loaded:
+            verbose_proxy_logger.info(f"MCP: Loaded {loaded} persisted servers from DB")
+        return loaded
 
     def _init_redis_client(self) -> None:
         """Initialize Redis client for HA sync if available."""
@@ -493,9 +668,15 @@ class MCPGateway:
         if self._ha_sync_enabled:
             self._save_server_to_redis(server)
 
+        # Persist to the database for cross-restart/cross-worker durability
+        # (outside lock; best-effort and non-blocking when a loop is running).
+        if self._db_persistence_enabled:
+            self._schedule_db_op(self._persist_server_to_db(server))
+
         verbose_proxy_logger.info(
             f"MCP: Registered server {server.name} ({server.server_id})"
             f"{' [HA synced]' if self._ha_sync_enabled else ''}"
+            f"{' [DB persisted]' if self._db_persistence_enabled else ''}"
         )
 
         # Notify listeners about tool list change
@@ -525,6 +706,10 @@ class MCPGateway:
             # Remove from Redis for HA sync (outside lock)
             if self._ha_sync_enabled:
                 self._delete_server_from_redis(server_id)
+
+            # Remove from the database (outside lock; best-effort).
+            if self._db_persistence_enabled:
+                self._schedule_db_op(self._delete_server_from_db(server_id))
 
             verbose_proxy_logger.info(f"MCP: Unregistered server {server_id}")
 
@@ -956,127 +1141,40 @@ class MCPGateway:
                     server_id=server.server_id,
                 )
 
-        # Build the tool invocation URL (per MCP stub server protocol)
-        # The server URL base + /mcp/tools/call endpoint
-        base_url = server.url.rstrip("/")
-        if not base_url.endswith("/mcp/tools/call"):
-            # Append standard endpoint if not already present
-            if base_url.endswith("/mcp"):
-                invocation_url = f"{base_url}/tools/call"
-            else:
-                invocation_url = f"{base_url}/mcp/tools/call"
-        else:
-            invocation_url = base_url
-
         verbose_proxy_logger.info(
-            f"MCP: Invoking tool {tool_name} on server {server.server_id} at {invocation_url}"
+            f"MCP: Invoking tool {tool_name} on server {server.server_id} "
+            f"at {server.url} via JSON-RPC 2.0"
         )
 
-        # Prepare request payload (matches MCP stub server format)
-        request_payload = {
-            "tool_name": tool_name,
-            "arguments": arguments,
-        }
+        # Real MCP invocation: speak JSON-RPC 2.0 over HTTP (+SSE) per the MCP
+        # spec, NOT the legacy REST stub. The client negotiates an initialize
+        # handshake (best-effort) then issues tools/call.
+        from .mcp_jsonrpc_client import (
+            MCPJSONRPCClient,
+            MCPProtocolError,
+        )
 
-        # Build headers (include auth if configured)
-        headers = {"Content-Type": "application/json"}
-        if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
-            headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
-        elif server.auth_type == "api_key" and server.metadata.get("api_key"):
-            headers["X-API-Key"] = server.metadata["api_key"]
-
-        # Make HTTP request with strict timeouts
-        # Do NOT hold locks during I/O
-        timeout = httpx.Timeout(
-            connect=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
-            read=self.TOOL_INVOCATION_READ_TIMEOUT,
-            write=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+        client = MCPJSONRPCClient(
+            server.url,
+            auth_type=server.auth_type,
+            metadata=server.metadata,
+            connect_timeout=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+            read_timeout=self.TOOL_INVOCATION_READ_TIMEOUT,
         )
 
         try:
-            async with get_client_for_request(timeout=timeout) as client:
-                response = await client.post(
-                    invocation_url,
-                    json=request_payload,
-                    headers=headers,
-                    timeout=timeout,  # Override timeout for this specific request
-                )
-
-                # Check HTTP status
-                if response.status_code >= 400:
-                    error_detail = (
-                        response.text[:500]
-                        if response.text
-                        else f"HTTP {response.status_code}"
-                    )
-                    verbose_proxy_logger.warning(
-                        f"MCP: Tool invocation failed with HTTP {response.status_code}: {error_detail}"
-                    )
-                    return MCPToolResult(
-                        success=False,
-                        error=f"HTTP {response.status_code}: {error_detail}",
-                        tool_name=tool_name,
-                        server_id=server.server_id,
-                    )
-
-                # Parse response JSON
-                try:
-                    response_data = response.json()
-                except json.JSONDecodeError as e:
-                    verbose_proxy_logger.warning(
-                        f"MCP: Invalid JSON response from server: {e}"
-                    )
-                    return MCPToolResult(
-                        success=False,
-                        error=f"Invalid JSON response from MCP server: {str(e)}",
-                        tool_name=tool_name,
-                        server_id=server.server_id,
-                    )
-
-                # Parse MCP server response format
-                # Expected format: {"status": "success", "tool_name": "...", "result": {...}}
-                # or error: {"detail": "error message"}
-                if isinstance(response_data, dict):
-                    status = response_data.get("status", "")
-                    if status == "success":
-                        return MCPToolResult(
-                            success=True,
-                            result=response_data.get("result"),
-                            tool_name=response_data.get("tool_name", tool_name),
-                            server_id=server.server_id,
-                        )
-                    elif "detail" in response_data:
-                        # Error response format
-                        return MCPToolResult(
-                            success=False,
-                            error=response_data["detail"],
-                            tool_name=tool_name,
-                            server_id=server.server_id,
-                        )
-                    elif "error" in response_data:
-                        return MCPToolResult(
-                            success=False,
-                            error=response_data["error"],
-                            tool_name=tool_name,
-                            server_id=server.server_id,
-                        )
-                    else:
-                        # Unknown format - return as-is with success
-                        return MCPToolResult(
-                            success=True,
-                            result=response_data,
-                            tool_name=tool_name,
-                            server_id=server.server_id,
-                        )
-                else:
-                    # Non-dict response
-                    return MCPToolResult(
-                        success=True,
-                        result=response_data,
-                        tool_name=tool_name,
-                        server_id=server.server_id,
-                    )
-
+            call_result = await client.initialize_and_call_tool(tool_name, arguments)
+        except MCPProtocolError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: JSON-RPC protocol error invoking '{tool_name}' "
+                f"on server '{server.server_id}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"MCP protocol error: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
         except httpx.TimeoutException as e:
             verbose_proxy_logger.warning(
                 f"MCP: Timeout invoking tool '{tool_name}' on server '{server.server_id}': {e}"
@@ -1097,6 +1195,16 @@ class MCPGateway:
                 tool_name=tool_name,
                 server_id=server.server_id,
             )
+        except httpx.HTTPError as e:
+            verbose_proxy_logger.warning(
+                f"MCP: HTTP error invoking tool '{tool_name}': {e}"
+            )
+            return MCPToolResult(
+                success=False,
+                error=f"HTTP error from MCP server: {str(e)}",
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
         except Exception as e:
             verbose_proxy_logger.exception(
                 f"MCP: Unexpected error invoking tool '{tool_name}': {e}"
@@ -1107,6 +1215,25 @@ class MCPGateway:
                 tool_name=tool_name,
                 server_id=server.server_id,
             )
+
+        # tools/call succeeded at the transport level; isError signals a
+        # tool-level failure carried in the content blocks.
+        if call_result.is_error:
+            err_text = _extract_text_from_content(call_result.content)
+            return MCPToolResult(
+                success=False,
+                error=err_text or "MCP tool reported an error",
+                result=call_result.content,
+                tool_name=tool_name,
+                server_id=server.server_id,
+            )
+
+        return MCPToolResult(
+            success=True,
+            result=call_result.content,
+            tool_name=tool_name,
+            server_id=server.server_id,
+        )
 
     def _validate_arguments(
         self,

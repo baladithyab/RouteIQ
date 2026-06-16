@@ -788,6 +788,68 @@ class A2AGateway:
         with self._lock:
             return self.agents.get(agent_id)
 
+    def resolve_agent(self, agent_id: str) -> A2AAgent | None:
+        """Resolve an agent for invocation, unifying the two registries.
+
+        The native A2AGateway registry is the source of truth. On a miss, this
+        falls back to LiteLLM's ``global_agent_registry`` (the DB/config-backed
+        registry that the convenience CRUD endpoints write to) and adopts the
+        agent into the native registry so subsequent lookups + invocation share
+        a single registry. This removes the "two registries" split where CRUD
+        wrote to LiteLLM but invocation read only the native gateway.
+
+        Thread-safe.
+        """
+        agent = self.get_agent(agent_id)
+        if agent is not None:
+            return agent
+
+        adopted = self._adopt_from_litellm_registry(agent_id)
+        if adopted is not None:
+            with self._lock:
+                self.agents[adopted.agent_id] = adopted
+            return adopted
+        return None
+
+    def _adopt_from_litellm_registry(self, agent_id: str) -> A2AAgent | None:
+        """Build a native A2AAgent from LiteLLM's global_agent_registry.
+
+        Returns None when LiteLLM is unavailable or the agent is unknown there.
+        Best-effort: never raises.
+        """
+        try:
+            from litellm.proxy.agent_endpoints.agent_registry import (
+                global_agent_registry,
+            )
+        except Exception:
+            return None
+
+        try:
+            ll_agent = global_agent_registry.get_agent_by_id(agent_id)
+            if ll_agent is None:
+                ll_agent = global_agent_registry.get_agent_by_name(agent_id)
+        except Exception:
+            return None
+
+        if ll_agent is None:
+            return None
+
+        card = getattr(ll_agent, "agent_card_params", None) or {}
+        url = card.get("url", "") if isinstance(card, dict) else ""
+        description = card.get("description", "") if isinstance(card, dict) else ""
+        capabilities: list[str] = []
+        caps = card.get("capabilities") if isinstance(card, dict) else None
+        if isinstance(caps, dict) and caps.get("streaming"):
+            capabilities.append("streaming")
+
+        return A2AAgent(
+            agent_id=getattr(ll_agent, "agent_id", agent_id),
+            name=getattr(ll_agent, "agent_name", agent_id),
+            description=description,
+            url=url,
+            capabilities=capabilities,
+        )
+
     def get_agents_snapshot(self) -> MappingProxyType[str, A2AAgent]:
         """
         Get an immutable snapshot of the agents registry.
@@ -980,9 +1042,8 @@ class A2AGateway:
         if request.method == "tasks/cancel":
             return await self.handle_task_cancel(request)
 
-        # Get agent under lock
-        with self._lock:
-            agent = self.agents.get(agent_id)
+        # Resolve agent via the unified registry (native first, LiteLLM fallback)
+        agent = self.resolve_agent(agent_id)
 
         if not agent:
             return JSONRPCResponse.error_response(
@@ -1276,9 +1337,8 @@ class A2AGateway:
         if not self.enabled:
             raise ValueError("A2A Gateway is not enabled")
 
-        # Get agent under lock
-        with self._lock:
-            agent = self.agents.get(agent_id)
+        # Resolve agent via the unified registry (native first, LiteLLM fallback)
+        agent = self.resolve_agent(agent_id)
 
         if not agent:
             raise ValueError(f"Agent '{agent_id}' not found")
@@ -1380,9 +1440,8 @@ class A2AGateway:
             )
             return
 
-        # Get agent under lock
-        with self._lock:
-            agent = self.agents.get(agent_id)
+        # Resolve agent via the unified registry (native first, LiteLLM fallback)
+        agent = self.resolve_agent(agent_id)
 
         if not agent:
             yield (
@@ -1531,9 +1590,8 @@ class A2AGateway:
             )
             return
 
-        # Get agent under lock
-        with self._lock:
-            agent = self.agents.get(agent_id)
+        # Resolve agent via the unified registry (native first, LiteLLM fallback)
+        agent = self.resolve_agent(agent_id)
 
         if not agent:
             yield (

@@ -10,16 +10,52 @@ The main A2A functionality is provided by LiteLLM's built-in endpoints:
 - POST /a2a/{agent_id}/message/stream - Streaming alias (proxies to canonical)
 """
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from starlette.convertors import Convertor, register_url_convertor
 
-from ..a2a_gateway import A2AError
+from ..a2a_gateway import (
+    A2AAgent,
+    A2AError,
+    JSONRPCRequest,
+    get_a2a_gateway,
+)
 from ..auth import get_request_id, sanitize_error_response
 from ..rbac import requires_permission, PERMISSION_A2A_AGENT_WRITE
 from ..audit import AuditAction, AuditOutcome
-from ..mcp_gateway import MCPTransport
 from ..url_security import validate_outbound_url_async, SSRFBlockedError
 from .models import AgentRegistration
 from . import admin_router, llmrouter_router, handle_audit_write
+
+
+# Reserved collection literals under /a2a that must NOT be captured by the
+# parametric invocation route POST /a2a/{agent_id}. Without this, a request to
+# the admin CRUD literal POST /a2a/agents would be shadowed by the invocation
+# route (Starlette matches in include order; llmrouter_router precedes
+# admin_router). A custom path convertor with a negative-lookahead regex makes
+# the literal win while keeping the documented /a2a/{agent_id} contract.
+_A2A_RESERVED_LITERALS = ("agents",)
+
+
+class _A2AAgentIdConvertor(Convertor):
+    """Path convertor for A2A agent ids that excludes reserved collection
+    literals (e.g. ``agents``) so the admin CRUD endpoints are reachable."""
+
+    regex = r"(?!(?:agents)$)[^/]+"
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+# Idempotent route-setup registration (not a behavioural side effect): registers
+# the ``a2a_agent_id`` convertor used by the invocation routes below.
+try:
+    register_url_convertor("a2a_agent_id", _A2AAgentIdConvertor())
+except Exception:  # pragma: no cover - already registered
+    pass
 
 
 # Read-only endpoint - user auth is sufficient
@@ -28,60 +64,187 @@ async def list_a2a_agents_convenience():
     """
     List all registered A2A agents.
 
-    This is a convenience endpoint that wraps LiteLLM's global_agent_registry.
-    For full functionality, use GET /v1/agents (DB-backed, supports filtering).
+    Lists the unified A2A registry: agents from the native A2AGateway merged
+    with LiteLLM's global_agent_registry (deduplicated by agent_id). The native
+    registry is the source of truth for invocation.
 
-    Returns agents from LiteLLM's in-memory registry (synced from DB+config).
+    For full functionality, use GET /v1/agents (DB-backed, supports filtering).
     """
     request_id = get_request_id() or "unknown"
+    merged: dict[str, dict] = {}
+
+    # Native A2AGateway registry first (source of truth for invocation).
+    try:
+        for a in get_a2a_gateway().list_agents():
+            merged[a.agent_id] = {
+                "agent_id": a.agent_id,
+                "agent_name": a.name,
+                "description": a.description,
+                "url": a.url,
+            }
+    except Exception:
+        pass
+
+    # Merge in LiteLLM's registry (DB/config-backed) without overwriting native.
     try:
         from litellm.proxy.agent_endpoints.agent_registry import global_agent_registry
 
-        agents = global_agent_registry.get_agent_list()
-        return {
-            "agents": [
-                {
-                    "agent_id": a.agent_id,
-                    "agent_name": a.agent_name,
-                    "description": (
-                        a.agent_card_params.get("description", "")
-                        if a.agent_card_params
-                        else ""
-                    ),
-                    "url": (
-                        a.agent_card_params.get("url", "")
-                        if a.agent_card_params
-                        else ""
-                    ),
-                }
-                for a in agents
-            ]
-        }
+        for a in global_agent_registry.get_agent_list():
+            if a.agent_id in merged:
+                continue
+            card = a.agent_card_params or {}
+            merged[a.agent_id] = {
+                "agent_id": a.agent_id,
+                "agent_name": a.agent_name,
+                "description": card.get("description", "") if card else "",
+                "url": card.get("url", "") if card else "",
+            }
     except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "agent_registry_unavailable",
-                "message": "Agent registry not available. Ensure LiteLLM is properly initialized.",
-                "request_id": request_id,
-            },
-        )
+        # LiteLLM not initialized — return whatever the native registry has.
+        if not merged:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "agent_registry_unavailable",
+                    "message": "Agent registry not available. Ensure LiteLLM is properly initialized.",
+                    "request_id": request_id,
+                },
+            )
     except Exception as e:
         err = sanitize_error_response(e, request_id, "Failed to list agents")
         raise HTTPException(status_code=500, detail=err)
 
+    return {"agents": list(merged.values())}
 
-# Helper for A2A router
-def ensure_a2a_server(transport: str):
+
+# =============================================================================
+# A2A Native Invocation (JSON-RPC 2.0 over HTTP + SSE)
+# =============================================================================
+
+
+@llmrouter_router.post("/a2a/{agent_id:a2a_agent_id}")
+async def invoke_a2a_agent(agent_id: str, request: Request):
     """
-    Helper dependency to ensure the A2A server is streamable.
+    Invoke an A2A agent via JSON-RPC 2.0 (the A2A protocol data plane).
+
+    This is the native invocation route backed by the unified A2AGateway
+    registry (native registrations + LiteLLM global_agent_registry fallback).
+    Streaming methods (``message/stream`` / ``tasks/sendSubscribe``) are served
+    as Server-Sent Events when the client sends ``Accept: text/event-stream``.
+
+    Request body is a JSON-RPC 2.0 envelope:
+    ```json
+    {"jsonrpc": "2.0", "id": 1, "method": "message/send",
+     "params": {"message": {...}}}
+    ```
+
+    Security: outbound agent URLs are SSRF-validated by the gateway at
+    invocation time (with DNS).
     """
-    t = MCPTransport(transport)
-    if not t.is_supported():
+    request_id = get_request_id() or "unknown"
+    gateway = get_a2a_gateway()
+
+    if not gateway.is_enabled():
         raise HTTPException(
-            status_code=500, detail=f"Transport '{transport}' is not supported"
+            status_code=404,
+            detail={
+                "error": "a2a_gateway_disabled",
+                "message": "A2A Gateway is not enabled",
+                "request_id": request_id,
+            },
         )
-    return t
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_json",
+                "message": "Request body must be a JSON-RPC 2.0 object",
+                "request_id": request_id,
+            },
+        )
+
+    if not isinstance(body, dict) or "method" not in body:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_request",
+                "message": "Missing required JSON-RPC field: method",
+                "request_id": request_id,
+            },
+        )
+
+    rpc_request = JSONRPCRequest(
+        method=body["method"],
+        params=body.get("params", {}) or {},
+        id=body.get("id"),
+        jsonrpc=body.get("jsonrpc", "2.0"),
+    )
+
+    # Streaming dispatch: SSE when requested or for streaming methods.
+    accept = request.headers.get("accept", "")
+    wants_stream = "text/event-stream" in accept or gateway._is_streaming_method(
+        rpc_request.method
+    )
+
+    if wants_stream:
+        return StreamingResponse(
+            gateway.stream_agent_response_sse(agent_id, rpc_request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    response = await gateway.invoke_agent(agent_id, rpc_request)
+    return response.to_dict()
+
+
+@llmrouter_router.post("/a2a/{agent_id}/message/stream")
+async def stream_a2a_agent(agent_id: str, request: Request):
+    """
+    Streaming alias for A2A agent invocation (always SSE).
+
+    Equivalent to POST /a2a/{agent_id} with ``Accept: text/event-stream``.
+    Backed by the same unified A2AGateway registry.
+    """
+    request_id = get_request_id() or "unknown"
+    gateway = get_a2a_gateway()
+
+    if not gateway.is_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "a2a_gateway_disabled",
+                "message": "A2A Gateway is not enabled",
+                "request_id": request_id,
+            },
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_json",
+                "message": "Request body must be a JSON-RPC 2.0 object",
+                "request_id": request_id,
+            },
+        )
+
+    rpc_request = JSONRPCRequest(
+        method=body.get("method", "message/stream"),
+        params=body.get("params", {}) or {},
+        id=body.get("id"),
+        jsonrpc=body.get("jsonrpc", "2.0"),
+    )
+
+    return StreamingResponse(
+        gateway.stream_agent_response_sse(agent_id, rpc_request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # Write operations - admin auth required + RBAC
@@ -162,8 +325,29 @@ async def register_a2a_agent_convenience(
             litellm_params=agent.litellm_params,
         )
 
-        # Register with in-memory registry
+        # Register with LiteLLM's in-memory registry
         global_agent_registry.register_agent(agent_config=agent_response)
+
+        # Registry unification: mirror into the native A2AGateway so the
+        # invocation route (POST /a2a/{agent_id}) resolves the same agent.
+        # This removes the "two registries" split (CRUD wrote LiteLLM only,
+        # invocation read the native gateway only). Best-effort: a disabled
+        # native gateway is a no-op.
+        gateway = get_a2a_gateway()
+        if gateway.is_enabled():
+            try:
+                gateway.register_agent(
+                    A2AAgent(
+                        agent_id=agent_id,
+                        name=agent.agent_name,
+                        description=agent.description,
+                        url=agent.url,
+                        capabilities=agent.capabilities,
+                    )
+                )
+            except ValueError:
+                # SSRF/validation already enforced above; ignore native dupe errs
+                pass
 
         # Audit log the success
         await handle_audit_write(
@@ -179,7 +363,7 @@ async def register_a2a_agent_convenience(
             "status": "registered",
             "agent_id": agent_id,
             "agent_name": agent.agent_name,
-            "note": "Agent registered in-memory only. For HA persistence, use POST /v1/agents instead.",
+            "note": "Agent registered in the unified A2A registry. For HA persistence, use POST /v1/agents.",
         }
     except HTTPException:
         raise
@@ -215,6 +399,14 @@ async def unregister_a2a_agent_convenience(
     Requires admin API key authentication or user with a2a.agent.write permission.
     """
     request_id = get_request_id() or "unknown"
+
+    # Registry unification: also remove from the native A2AGateway registry so
+    # the invocation route stops resolving a deleted agent. Best-effort.
+    try:
+        get_a2a_gateway().unregister_agent(agent_id)
+    except Exception:
+        pass
+
     try:
         from litellm.proxy.agent_endpoints.agent_registry import global_agent_registry
 
