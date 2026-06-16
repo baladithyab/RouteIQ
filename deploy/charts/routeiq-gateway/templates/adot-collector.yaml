@@ -1,0 +1,203 @@
+{{- if .Values.gateway.otel.collector.enabled }}
+{{- $c := .Values.gateway.otel.collector }}
+{{- $name := include "routeiq-gateway.adotCollectorName" . }}
+{{- $region := $c.region | default .Values.aws.region }}
+{{- $saName := default $name $c.serviceAccount.name }}
+# =============================================================================
+# ADOT (AWS Distro for OpenTelemetry) collector (RouteIQ-85e3, P1)
+# =============================================================================
+# WHY THIS EXISTS: the gateway (observability.py) already emits OTLP, but the
+# chart shipped tracesExporter/metricsExporter/logsExporter: none + endpoint: ""
+# by default, so OUT OF THE BOX nothing reached CloudWatch. This bundles a real
+# OTLP sink: an aws-otel-collector Deployment whose pipeline receives OTLP and
+# exports metrics to CloudWatch EMF (awsemf) + traces to X-Ray / Transaction
+# Search (awsxray). UNBLOCKS RouteIQ-ebf8 (CW GenAI Observability) + RouteIQ-3c0a
+# (X-Ray).
+#
+# CONFIG DELIVERY IS LOAD-BEARING: the stock aws-otel-collector image loads its
+# OWN /etc/ecs/... default config silently if nothing delivers yours -- the
+# pipeline then never scrapes/exports your data (skill
+# adot-ecs-fargate-telemetry-gotchas). So this mounts the ConfigMap below at
+# /etc/otel and passes --config=/etc/otel/collector.yaml EXPLICITLY.
+#
+# LIVE CW DELIVERY IS OPERATOR-GATED: the collector renders + runs with no AWS
+# creds (chart stays installable anywhere), but only PUTs to CloudWatch/X-Ray
+# once its pod has an IAM identity (Pod Identity association on $saName CDK-side,
+# or an IRSA role-arn in collector.serviceAccount.annotations) granting
+# cloudwatch:PutMetricData + logs:* + xray:PutTraceSegments. In a private subnet
+# it also needs a com.amazonaws.<region>.xray Interface VPC Endpoint or X-Ray
+# egress times out silently. See values.yaml otel.collector docs + README.
+{{- if $c.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "routeiq-gateway.adotCollectorLabels" . | nindent 4 }}
+  {{- with $c.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "routeiq-gateway.adotCollectorLabels" . | nindent 4 }}
+data:
+  # Keyed `collector.yaml` (NOT `config.yaml`) so it never collides with the
+  # gateway ConfigMap's LiteLLM `config.yaml` (different schema; some render
+  # tests select the gateway ConfigMap by the presence of a `config.yaml` key).
+  collector.yaml: |
+    {{- if $c.config }}
+    {{- $c.config | nindent 4 }}
+    {{- else }}
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:{{ $c.service.grpcPort }}
+          http:
+            endpoint: 0.0.0.0:{{ $c.service.httpPort }}
+    processors:
+      batch/metrics:
+        timeout: 60s
+      batch/traces:
+        timeout: 5s
+    exporters:
+      # Metrics -> CloudWatch Embedded Metric Format (powers CW GenAI Observability).
+      awsemf:
+        namespace: {{ $c.emf.namespace | quote }}
+        log_group_name: {{ $c.emf.logGroupName | quote }}
+        {{- if $region }}
+        region: {{ $region | quote }}
+        {{- end }}
+        resource_to_telemetry_conversion:
+          enabled: true
+      # Traces -> X-Ray (Transaction Search reads the X-Ray trace store).
+      awsxray:
+        {{- if $region }}
+        region: {{ $region | quote }}
+        {{- end }}
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch/traces]
+          exporters: [awsxray]
+        metrics:
+          receivers: [otlp]
+          processors: [batch/metrics]
+          exporters: [awsemf]
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "routeiq-gateway.adotCollectorLabels" . | nindent 4 }}
+spec:
+  replicas: {{ $c.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "routeiq-gateway.adotCollectorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Force restart when the collector pipeline config changes. Checksums the
+        # collector values (not the rendered file -- a file cannot include itself).
+        checksum/config: {{ toYaml $c | sha256sum }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "routeiq-gateway.adotCollectorLabels" . | nindent 8 }}
+    spec:
+      {{- include "routeiq-gateway.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ $saName }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aws-otel-collector
+          image: "{{ $c.image.repository }}:{{ $c.image.tag }}"
+          imagePullPolicy: {{ $c.image.pullPolicy }}
+          # EXPLICIT --config so the stock image default config is NOT used.
+          command: ["/awscollector"]
+          args: ["--config=/etc/otel/collector.yaml"]
+          {{- if $region }}
+          env:
+            # boto3 reads AWS_REGION first, AWS_DEFAULT_REGION as fallback; the
+            # awsemf/awsxray exporters need it. Falls back to aws.region.
+            - name: AWS_REGION
+              value: {{ $region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ $region | quote }}
+          {{- end }}
+          ports:
+            - name: otlp-grpc
+              containerPort: {{ $c.service.grpcPort }}
+              protocol: TCP
+            - name: otlp-http
+              containerPort: {{ $c.service.httpPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      {{- with $c.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "routeiq-gateway.adotCollectorLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: otlp-grpc
+      port: {{ $c.service.grpcPort }}
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: {{ $c.service.httpPort }}
+      targetPort: otlp-http
+      protocol: TCP
+  selector:
+    {{- include "routeiq-gateway.adotCollectorSelectorLabels" . | nindent 4 }}
+{{- end }}

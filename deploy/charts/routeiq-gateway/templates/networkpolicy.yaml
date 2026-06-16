@@ -37,6 +37,21 @@ spec:
         - protocol: TCP
           port: {{ .Values.gateway.port }}
   egress:
+    {{- if .Values.gateway.otel.collector.enabled }}
+    # Allow OTLP export to the in-cluster ADOT collector (RouteIQ-85e3): when the
+    # bundled collector is on AND OTLP is the default exporter, the gateway dials
+    # the collector Service on its gRPC/HTTP OTLP ports. Without this rule an
+    # enabled NetworkPolicy would silently drop all telemetry to the collector.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "routeiq-gateway.adotCollectorSelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gateway.otel.collector.service.grpcPort }}
+        - protocol: TCP
+          port: {{ .Values.gateway.otel.collector.service.httpPort }}
+    {{- end }}
     {{- if .Values.networkPolicy.egress.allowDns }}
     # Allow DNS resolution
     - to:

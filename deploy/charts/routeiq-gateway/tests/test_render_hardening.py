@@ -89,10 +89,15 @@ def _egress_rules(rendered: str) -> list[dict]:
 
 
 def _deployment(rendered: str) -> dict:
+    # Select the GATEWAY Deployment specifically. RouteIQ-85e3 added a bundled
+    # ADOT collector Deployment (<fullname>-adot-collector) that renders first
+    # (alphabetical template name), so "first Deployment" would pick the collector.
     for d in _docs(rendered):
-        if d.get("kind") == "Deployment":
+        if d.get("kind") == "Deployment" and not str(
+            d.get("metadata", {}).get("name", "")
+        ).endswith("-adot-collector"):
             return d
-    raise AssertionError("no Deployment in render")
+    raise AssertionError("no gateway Deployment in render")
 
 
 def _main_container(rendered: str) -> dict:
