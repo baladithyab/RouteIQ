@@ -195,7 +195,7 @@ def compose_stack():
             if resp.status_code == 200:
                 print("✅ Services healthy")
                 break
-        except httpx.RequestError, httpx.TimeoutException:
+        except (httpx.RequestError, httpx.TimeoutException):
             pass
         time.sleep(2)
     else:

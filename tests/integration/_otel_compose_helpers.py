@@ -300,7 +300,7 @@ class ComposeStackManager:
                 if resp.status_code == 200:
                     print("✅ Jaeger accessible")
                     return
-            except httpx.RequestError, httpx.TimeoutException:
+            except (httpx.RequestError, httpx.TimeoutException):
                 pass
             time.sleep(2)
 

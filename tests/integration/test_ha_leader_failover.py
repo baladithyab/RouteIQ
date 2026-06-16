@@ -119,7 +119,7 @@ def is_docker_available() -> bool:
             timeout=5,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -132,7 +132,7 @@ def is_docker_compose_available() -> bool:
             timeout=5,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -144,7 +144,7 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         result = sock.connect_ex((host, port))
         sock.close()
         return result == 0
-    except OSError, socket.error:
+    except (OSError, socket.error):
         return False
 
 
@@ -294,7 +294,7 @@ def get_container_name_from_holder_id(holder_id: str) -> str | None:
                 hostname = result.stdout.strip()
                 if holder_id.startswith(hostname):
                     return container
-        except subprocess.TimeoutExpired, OSError:
+        except (subprocess.TimeoutExpired, OSError):
             pass
 
     return None
@@ -309,7 +309,7 @@ def stop_container(container_name: str) -> bool:
             timeout=30,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -322,7 +322,7 @@ def kill_container(container_name: str) -> bool:
             timeout=10,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -335,7 +335,7 @@ def start_container(container_name: str) -> bool:
             timeout=30,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -350,7 +350,7 @@ def get_container_status(container_name: str) -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         pass
     return "unknown"
 
@@ -429,7 +429,7 @@ def docker_compose_down() -> bool:
             timeout=60,
         )
         return result.returncode == 0
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -449,7 +449,7 @@ def docker_compose_logs(service: str | None = None, tail: int = 100) -> str:
             text=True,
         )
         return result.stdout + result.stderr
-    except subprocess.TimeoutExpired, OSError:
+    except (subprocess.TimeoutExpired, OSError):
         return ""
 
 

@@ -969,6 +969,88 @@ class TestAutoDemotion:
         assert election._is_leader is False
         assert False in callback_values
 
+    def test_renew_loop_db_exception_path_does_not_drive_counter_demotion(self):
+        """Document why the _renew_loop loop-counter demotion branch is unreachable.
+
+        ``_renew_loop`` (leader_election.py:972-993) has an ``elif self._is_leader``
+        branch that increments ``_consecutive_renewal_failures`` and auto-demotes
+        once the counter reaches 2 -- demotion driven by the LOOP COUNTER rather
+        than by ``try_acquire`` itself.
+
+        That branch is genuinely UNREACHABLE through the real ``renew()`` flow,
+        and this test pins the two reasons so a future refactor that "fixes"
+        ``try_acquire`` is forced to revisit it:
+
+        1. NULL / not-our-row path: ``try_acquire`` self-demotes (sets
+           ``_is_leader = False``) *before* returning ``False`` (lines 822-835).
+           So by the time ``_renew_loop`` evaluates ``elif self._is_leader`` the
+           flag is already ``False`` -- the loop counter never runs. (That self-
+           demotion path is what ``test_auto_demotion_via_renew_loop_thread``
+           exercises -- demotion comes from ``try_acquire``, not the counter.)
+
+        2. EXCEPTION path: when the renew query (``fetchrow``) or
+           ``get_db_pool`` RAISES, ``try_acquire`` swallows the exception and
+           returns ``self._is_leader`` -- which is still ``True`` (lines 837-841,
+           "favour stability"). ``renew()`` therefore returns ``True``, the loop
+           sees ``renewed`` truthy and RESETS ``_consecutive_renewal_failures``
+           to 0. The failure counter is never incremented, so it can never reach
+           2 via a raising DB.
+
+        This test drives the REAL ``_renew_loop`` through multiple iterations
+        where the DB query RAISES every time and asserts the observed behavior:
+        the instance STAYS leader, the counter stays at 0, and no demotion
+        callback fires. (f62a: the loop-counter branch cannot be covered without
+        modifying leader_election.py, which is out of scope for this cluster.)
+        """
+        renew_calls = []
+
+        async def boom_fetchrow(*args, **kwargs):
+            renew_calls.append(args)
+            raise RuntimeError("simulated DB outage during renew")
+
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+        mock_conn.fetchrow = boom_fetchrow
+
+        callback_values = []
+
+        with patch_db_pool(mock_conn):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id="test-holder",
+                renew_interval_seconds=0,  # Minimal interval for fast iterations
+            )
+            # Pre-set as leader so renew() proceeds into try_acquire().
+            election._is_leader = True
+            election._lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=300
+            )
+
+            election.start_renewal(
+                on_leadership_change=lambda x: callback_values.append(x)
+            )
+
+            # Let the loop run several iterations -- each renew RAISES inside
+            # try_acquire, which is swallowed and reported as a successful renew.
+            time.sleep(0.5)
+
+            election.stop_renewal()
+
+        # The raising DB exercised the loop multiple times (proves we actually
+        # reached the renew path, not just skipped it).
+        assert len(renew_calls) >= 2
+
+        # Because try_acquire swallows the exception and returns the prior
+        # leader state, the loop treats every raise as a SUCCESSFUL renew:
+        #   - leadership is retained,
+        #   - the consecutive-failure counter is reset to 0 each pass,
+        #   - the loop-counter demotion branch never runs, so no callback fires.
+        assert election._is_leader is True
+        assert election._consecutive_renewal_failures == 0
+        assert False not in callback_values
+        # last_renewal_error is recorded even though leadership is kept.
+        assert election._last_renewal_error is not None
+
 
 # =============================================================================
 # Fencing Token Validation Tests
