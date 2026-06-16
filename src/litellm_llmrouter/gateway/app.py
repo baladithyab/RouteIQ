@@ -701,20 +701,32 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             up = get_usage_policy_engine()
             for p in await store.load_all_policies():
                 up.add_policy(p)
+            # Guardrail policies + prompts share the same durable-backend pattern
+            # (RouteIQ-4f30 + RouteIQ-c2af): DB-first when the store is enabled so
+            # the 14-check guardrail layer + prompt versioning survive pod churn.
+            gp = get_guardrail_policy_engine()
+            for guard in await store.load_all_guardrails():
+                gp.add_policy(guard)
+            pm = get_prompt_manager()
+            for storage_key, prompt in await store.load_all_prompts():
+                pm._prompts[storage_key] = prompt
             gov_count = len(gov.list_workspaces()) + len(gov.list_orgs())
             up_count = len(up.list_policies())
+            gp_count = len(gp.list_policies())
+            pm_count = len(pm._prompts)
             logger.info(
                 "Hydrated governance state from Aurora: workspaces+orgs=%d, "
-                "usage_policies=%d",
+                "usage_policies=%d, guardrail_policies=%d, prompts=%d",
                 gov_count,
                 up_count,
+                gp_count,
+                pm_count,
             )
         else:
             gov_count = load_governance_state(get_governance_engine())
             up_count = load_usage_policies_state(get_usage_policy_engine())
-
-        gp_count = load_guardrail_policies_state(get_guardrail_policy_engine())
-        pm_count = load_prompts_state(get_prompt_manager())
+            gp_count = load_guardrail_policies_state(get_guardrail_policy_engine())
+            pm_count = load_prompts_state(get_prompt_manager())
         total = gov_count + up_count + gp_count + pm_count
         if total > 0:
             logger.info(

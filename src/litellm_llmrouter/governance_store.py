@@ -16,6 +16,14 @@ Tables (all ``CREATE ... IF NOT EXISTS``, idempotent, additive):
   * ``governance_keys``        -- mirror of ``KeyGovernance``
   * ``usage_policies``         -- mirror of ``UsagePolicy``
   * ``governance_spend``       -- durable budget rollup (the NEW write path)
+  * ``guardrail_policies``     -- mirror of ``GuardrailPolicy`` (14-check engine)
+  * ``prompts``                -- mirror of ``PromptDefinition`` (versioning/A-B)
+
+The ``guardrail_policies`` / ``prompts`` rows store the full Pydantic model as a
+single JSONB ``payload`` column (plus a few indexed scalar columns) so the load
+side is a drift-free ``model_validate`` round-trip -- the policy/prompt schemas
+are nested (enums, version maps, A/B weights) and a column-per-field mirror
+would be brittle.
 
 Soft FKs only (no PG ``REFERENCES``) to preserve the additive contract and
 tolerate hydration ordering on a partial restore.
@@ -36,6 +44,8 @@ from .database import get_database_url, get_db_pool
 
 if TYPE_CHECKING:  # avoid import cycle at runtime; only needed for typing
     from .governance import KeyGovernance, OrgConfig, WorkspaceConfig
+    from .guardrail_policies import GuardrailPolicy
+    from .prompt_management import PromptDefinition
     from .usage_policies import UsagePolicy
 
 
@@ -129,6 +139,29 @@ CREATE TABLE IF NOT EXISTS governance_spend (
 );
 CREATE INDEX IF NOT EXISTS idx_gov_spend_scope ON governance_spend(scope);
 CREATE INDEX IF NOT EXISTS idx_gov_spend_period ON governance_spend(period_start);
+
+-- Guardrail policy definitions (mirror of GuardrailPolicy, the 14-check engine).
+-- The full model is stored as JSONB ``payload`` (nested enums) + indexed scalars.
+CREATE TABLE IF NOT EXISTS guardrail_policies (
+    guardrail_id  VARCHAR(255) PRIMARY KEY,
+    name          VARCHAR(255) NOT NULL,
+    workspace_id  VARCHAR(255),
+    payload       JSONB NOT NULL,
+    updated_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_guardrail_policies_ws
+    ON guardrail_policies(workspace_id);
+
+-- Prompt definitions (mirror of PromptDefinition: versions / A-B / rollback).
+-- ``storage_key`` is the manager's composite key ("workspace::name" or "name").
+CREATE TABLE IF NOT EXISTS prompts (
+    storage_key   VARCHAR(512) PRIMARY KEY,
+    name          VARCHAR(255) NOT NULL,
+    workspace_id  VARCHAR(255),
+    payload       JSONB NOT NULL,
+    updated_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prompts_ws ON prompts(workspace_id);
 """
 
 
@@ -235,6 +268,37 @@ def _policy_columns(p: "UsagePolicy") -> dict:
         "alert_threshold": p.alert_threshold,
         "priority": p.priority,
         "workspace_id": p.workspace_id,
+    }
+
+
+def _guardrail_columns(g: "GuardrailPolicy") -> dict:
+    """Map a ``GuardrailPolicy`` to its ``guardrail_policies`` column dict.
+
+    The whole model is serialized to JSONB ``payload`` (Pydantic ``model_dump``
+    with ``mode="json"`` so the nested enums become their ``.value`` strings).
+    ``guardrail_id`` / ``name`` / ``workspace_id`` are duplicated as indexed
+    scalar columns for the PK + scope filtering.
+    """
+    return {
+        "guardrail_id": g.guardrail_id,
+        "name": g.name,
+        "workspace_id": g.workspace_id,
+        "payload": json.dumps(g.model_dump(mode="json")),
+    }
+
+
+def _prompt_columns(storage_key: str, p: "PromptDefinition") -> dict:
+    """Map a ``PromptDefinition`` to its ``prompts`` column dict.
+
+    ``storage_key`` is the manager's composite key (``workspace::name`` or
+    ``name``) and serves as the PK so workspace-scoped prompts stay distinct.
+    The full model (versions / A-B weights / metadata) is the JSONB ``payload``.
+    """
+    return {
+        "storage_key": storage_key,
+        "name": p.name,
+        "workspace_id": p.workspace_id,
+        "payload": json.dumps(p.model_dump(mode="json")),
     }
 
 
@@ -561,6 +625,96 @@ class GovernanceStore:
                     workspace_id=r["workspace_id"],
                 )
             )
+        return out
+
+    # -- Guardrail policy ops -----------------------------------------------
+
+    async def upsert_guardrail(self, g: "GuardrailPolicy") -> None:
+        if not self.enabled:
+            return
+        c = _guardrail_columns(g)
+        await self._execute(
+            """
+            INSERT INTO guardrail_policies (
+                guardrail_id, name, workspace_id, payload, updated_at
+            ) VALUES ($1,$2,$3,$4, NOW())
+            ON CONFLICT (guardrail_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                workspace_id = EXCLUDED.workspace_id,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            c["guardrail_id"],
+            c["name"],
+            c["workspace_id"],
+            c["payload"],
+        )
+
+    async def delete_guardrail(self, guardrail_id: str) -> None:
+        if not self.enabled:
+            return
+        await self._execute(
+            "DELETE FROM guardrail_policies WHERE guardrail_id = $1", guardrail_id
+        )
+
+    async def load_all_guardrails(self) -> list["GuardrailPolicy"]:
+        if not self.enabled:
+            return []
+        from .guardrail_policies import GuardrailPolicy
+
+        rows = await self._fetch("SELECT payload FROM guardrail_policies")
+        out: list[GuardrailPolicy] = []
+        for r in rows:
+            payload = r["payload"]
+            data = json.loads(payload) if isinstance(payload, str) else payload
+            out.append(GuardrailPolicy.model_validate(data))
+        return out
+
+    # -- Prompt ops ---------------------------------------------------------
+
+    async def upsert_prompt(self, storage_key: str, p: "PromptDefinition") -> None:
+        if not self.enabled:
+            return
+        c = _prompt_columns(storage_key, p)
+        await self._execute(
+            """
+            INSERT INTO prompts (
+                storage_key, name, workspace_id, payload, updated_at
+            ) VALUES ($1,$2,$3,$4, NOW())
+            ON CONFLICT (storage_key) DO UPDATE SET
+                name = EXCLUDED.name,
+                workspace_id = EXCLUDED.workspace_id,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            c["storage_key"],
+            c["name"],
+            c["workspace_id"],
+            c["payload"],
+        )
+
+    async def delete_prompt(self, storage_key: str) -> None:
+        if not self.enabled:
+            return
+        await self._execute("DELETE FROM prompts WHERE storage_key = $1", storage_key)
+
+    async def load_all_prompts(self) -> list[tuple[str, "PromptDefinition"]]:
+        """Load all prompts as ``(storage_key, PromptDefinition)`` pairs.
+
+        The storage key is returned alongside the model so the caller can hydrate
+        ``PromptManager._prompts`` (keyed by the composite ``workspace::name``)
+        without re-deriving the key.
+        """
+        if not self.enabled:
+            return []
+        from .prompt_management import PromptDefinition
+
+        rows = await self._fetch("SELECT storage_key, payload FROM prompts")
+        out: list[tuple[str, PromptDefinition]] = []
+        for r in rows:
+            payload = r["payload"]
+            data = json.loads(payload) if isinstance(payload, str) else payload
+            out.append((r["storage_key"], PromptDefinition.model_validate(data)))
         return out
 
     # -- Spend ops (the durable budget system-of-record) --------------------

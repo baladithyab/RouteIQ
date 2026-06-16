@@ -1185,6 +1185,9 @@ async def create_guardrail_policy(
     existing = engine.get_policy(policy.guardrail_id)
     engine.add_policy(policy)
     save_guardrail_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_guardrail(engine.get_policy(policy.guardrail_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1254,6 +1257,9 @@ async def update_guardrail_policy(
     policy.created_at = existing.created_at
     engine.add_policy(policy)
     save_guardrail_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_guardrail(engine.get_policy(guardrail_id))
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1290,6 +1296,9 @@ async def delete_guardrail_policy(
             },
         )
     save_guardrail_policies_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_guardrail(guardrail_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1334,6 +1343,28 @@ def _require_prompt_management() -> None:
                 ),
             },
         )
+
+
+async def _durable_upsert_prompt(manager, name: str, workspace_id) -> None:
+    """Mirror a single prompt mutation to the durable store (when enabled).
+
+    Reads the current definition out of the manager (so versions / A-B / rollback
+    state are captured) and writes it under the manager's composite storage key.
+    No-op when the store is disabled -- the JSON-file path is the default.
+    """
+    store = get_governance_store()
+    if not store.enabled:
+        return
+    prompt = manager.get_prompt(name, workspace_id=workspace_id)
+    if prompt is not None:
+        await store.upsert_prompt(manager._storage_key(name, workspace_id), prompt)
+
+
+async def _durable_delete_prompt(manager, name: str, workspace_id) -> None:
+    """Mirror a prompt deletion to the durable store (when enabled)."""
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_prompt(manager._storage_key(name, workspace_id))
 
 
 @admin_router.get("/api/v1/routeiq/prompts")
@@ -1397,6 +1428,7 @@ async def create_prompt(
         )
 
     save_prompts_state(manager)
+    await _durable_upsert_prompt(manager, body.name, body.workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1479,6 +1511,7 @@ async def update_prompt(
         )
 
     save_prompts_state(manager)
+    await _durable_upsert_prompt(manager, name, workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1517,6 +1550,7 @@ async def delete_prompt(
             },
         )
     save_prompts_state(manager)
+    await _durable_delete_prompt(manager, name, workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1561,6 +1595,7 @@ async def rollback_prompt(
         )
 
     save_prompts_state(manager)
+    await _durable_upsert_prompt(manager, name, workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1608,6 +1643,7 @@ async def start_ab_test(
         )
 
     save_prompts_state(manager)
+    await _durable_upsert_prompt(manager, name, workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1654,6 +1690,7 @@ async def stop_ab_test(
         )
 
     save_prompts_state(manager)
+    await _durable_upsert_prompt(manager, name, workspace_id)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,
@@ -1711,6 +1748,11 @@ async def import_prompts(
 
     count = manager.import_prompts(body.prompts, workspace_id=body.workspace_id)
     save_prompts_state(manager)
+    store = get_governance_store()
+    if store.enabled:
+        # Mirror every prompt the manager now holds (import overwrites by name).
+        for storage_key, prompt in manager._prompts.items():
+            await store.upsert_prompt(storage_key, prompt)
 
     await handle_audit_write(
         AuditAction.CONFIG_RELOAD,

@@ -325,6 +325,229 @@ async def test_load_all_policies_coerces_enums(enabled_store):
 
 
 # ---------------------------------------------------------------------------
+# Guardrail policy ops (RouteIQ-4f30): durable WRITE + round-trip READ
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_guardrail_writes_durably(enabled_store):
+    from litellm_llmrouter.guardrail_policies import (
+        GuardrailAction,
+        GuardrailPhase,
+        GuardrailPolicy,
+        GuardrailType,
+    )
+
+    conn = _FakeConn()
+    g = GuardrailPolicy(
+        guardrail_id="g-1",
+        name="Deny Secrets",
+        check_type=GuardrailType.REGEX_DENY,
+        action=GuardrailAction.DENY,
+        phase=GuardrailPhase.INPUT,
+        parameters={"patterns": ["(?i)password"]},
+        workspace_id="ws-1",
+    )
+    with _patch_pool(conn):
+        await enabled_store.upsert_guardrail(g)
+    sql, args = conn.executed[0]
+    assert "INSERT INTO guardrail_policies" in sql
+    assert "ON CONFLICT (guardrail_id) DO UPDATE" in sql
+    assert args[0] == "g-1"
+    assert args[1] == "Deny Secrets"
+    assert args[2] == "ws-1"
+    # The full model is serialized to the JSONB payload (enum -> .value string).
+    import json as _json
+
+    payload = _json.loads(args[3])
+    assert payload["check_type"] == "regex_deny"
+    assert payload["action"] == "deny"
+    assert payload["parameters"]["patterns"] == ["(?i)password"]
+
+
+@pytest.mark.asyncio
+async def test_delete_guardrail_issues_delete_sql(enabled_store):
+    conn = _FakeConn()
+    with _patch_pool(conn):
+        await enabled_store.delete_guardrail("g-1")
+    sql, args = conn.executed[0]
+    assert "DELETE FROM guardrail_policies" in sql
+    assert args == ("g-1",)
+
+
+@pytest.mark.asyncio
+async def test_load_all_guardrails_round_trip(enabled_store):
+    from litellm_llmrouter.guardrail_policies import (
+        GuardrailAction,
+        GuardrailPhase,
+        GuardrailPolicy,
+        GuardrailType,
+    )
+
+    rows = [
+        {
+            "payload": (
+                '{"guardrail_id": "g-1", "name": "Deny Secrets", "enabled": true, '
+                '"version": 3, "phase": "output", "check_type": "regex_deny", '
+                '"parameters": {"patterns": ["x"]}, "action": "alert", '
+                '"workspace_id": "ws-1", "org_id": null, "async_execution": false, '
+                '"priority": 50, "created_at": 1.0, "updated_at": 2.0, '
+                '"description": ""}'
+            )
+        }
+    ]
+    conn = _FakeConn(fetch_results=[rows])
+    with _patch_pool(conn):
+        guards = await enabled_store.load_all_guardrails()
+    assert len(guards) == 1
+    g = guards[0]
+    assert isinstance(g, GuardrailPolicy)
+    assert g.guardrail_id == "g-1"
+    # enum coercion on the load side
+    assert g.check_type is GuardrailType.REGEX_DENY
+    assert g.action is GuardrailAction.ALERT
+    assert g.phase is GuardrailPhase.OUTPUT
+    assert g.version == 3
+    assert g.priority == 50
+    assert "SELECT payload FROM guardrail_policies" in conn.fetched[0][0]
+
+
+@pytest.mark.asyncio
+async def test_load_all_guardrails_accepts_dict_payload(enabled_store):
+    """asyncpg may decode JSONB to a dict directly (not a str) -- handle both."""
+    from litellm_llmrouter.guardrail_policies import GuardrailPolicy
+
+    rows = [
+        {
+            "payload": {
+                "guardrail_id": "g-2",
+                "name": "G2",
+                "check_type": "max_tokens",
+                "parameters": {"max_tokens_limit": 100},
+            }
+        }
+    ]
+    conn = _FakeConn(fetch_results=[rows])
+    with _patch_pool(conn):
+        guards = await enabled_store.load_all_guardrails()
+    assert len(guards) == 1
+    assert isinstance(guards[0], GuardrailPolicy)
+    assert guards[0].guardrail_id == "g-2"
+
+
+# ---------------------------------------------------------------------------
+# Prompt ops (RouteIQ-c2af): durable WRITE + round-trip READ (versions / A-B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_prompt_writes_durably(enabled_store):
+    from litellm_llmrouter.prompt_management import PromptDefinition, PromptVersion
+
+    conn = _FakeConn()
+    p = PromptDefinition(
+        name="code-review",
+        workspace_id="ws-1",
+        active_version=2,
+        ab_enabled=True,
+        ab_versions={1: 0.9, 2: 0.1},
+        versions={
+            1: PromptVersion(version=1, template="v1"),
+            2: PromptVersion(version=2, template="v2"),
+        },
+    )
+    with _patch_pool(conn):
+        await enabled_store.upsert_prompt("ws-1::code-review", p)
+    sql, args = conn.executed[0]
+    assert "INSERT INTO prompts" in sql
+    assert "ON CONFLICT (storage_key) DO UPDATE" in sql
+    assert args[0] == "ws-1::code-review"
+    assert args[1] == "code-review"
+    assert args[2] == "ws-1"
+    import json as _json
+
+    payload = _json.loads(args[3])
+    assert payload["active_version"] == 2
+    assert payload["ab_enabled"] is True
+    # JSON serializes int dict keys to strings; Pydantic coerces them back on load.
+    assert set(payload["versions"].keys()) == {"1", "2"}
+
+
+@pytest.mark.asyncio
+async def test_delete_prompt_issues_delete_sql(enabled_store):
+    conn = _FakeConn()
+    with _patch_pool(conn):
+        await enabled_store.delete_prompt("ws-1::code-review")
+    sql, args = conn.executed[0]
+    assert "DELETE FROM prompts" in sql
+    assert args == ("ws-1::code-review",)
+
+
+@pytest.mark.asyncio
+async def test_load_all_prompts_round_trips_versions_and_ab(enabled_store):
+    """The (storage_key, PromptDefinition) pairs round-trip int version keys and
+    A/B weights through JSON -- the rollback/A-B state that pod churn was losing."""
+    from litellm_llmrouter.prompt_management import PromptDefinition, PromptVersion
+
+    src = PromptDefinition(
+        name="code-review",
+        workspace_id="ws-1",
+        active_version=2,
+        ab_enabled=True,
+        ab_versions={1: 0.7, 2: 0.3},
+        versions={
+            1: PromptVersion(version=1, template="v1", change_note="init"),
+            2: PromptVersion(version=2, template="v2", change_note="tweak"),
+        },
+    )
+    rows = [{"storage_key": "ws-1::code-review", "payload": src.model_dump_json()}]
+    conn = _FakeConn(fetch_results=[rows])
+    with _patch_pool(conn):
+        pairs = await enabled_store.load_all_prompts()
+    assert len(pairs) == 1
+    storage_key, p = pairs[0]
+    assert storage_key == "ws-1::code-review"
+    assert isinstance(p, PromptDefinition)
+    # int version keys survive the JSON round-trip (Pydantic Dict[int, ...]).
+    assert set(p.versions.keys()) == {1, 2}
+    assert all(isinstance(k, int) for k in p.versions)
+    assert p.versions[2].template == "v2"
+    assert p.active_version == 2
+    assert p.ab_enabled is True
+    assert p.ab_versions == {1: 0.7, 2: 0.3}
+    assert "SELECT storage_key, payload FROM prompts" in conn.fetched[0][0]
+
+
+@pytest.mark.asyncio
+async def test_guardrail_prompt_disabled_store_is_noop(monkeypatch):
+    """Store disabled (no DATABASE_URL): guardrail/prompt ops are fail-open no-ops
+    and never acquire a pool."""
+    from litellm_llmrouter.guardrail_policies import GuardrailPolicy, GuardrailType
+    from litellm_llmrouter.prompt_management import PromptDefinition
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    reset_governance_store()
+    store = get_governance_store()
+    assert store.enabled is False
+
+    conn = _FakeConn()
+    with _patch_pool(conn):
+        await store.upsert_guardrail(
+            GuardrailPolicy(
+                guardrail_id="g", name="g", check_type=GuardrailType.REGEX_DENY
+            )
+        )
+        await store.delete_guardrail("g")
+        assert await store.load_all_guardrails() == []
+        await store.upsert_prompt("k", PromptDefinition(name="p"))
+        await store.delete_prompt("k")
+        assert await store.load_all_prompts() == []
+    # No DB call at all when disabled.
+    assert conn.executed == []
+    assert conn.fetched == []
+
+
+# ---------------------------------------------------------------------------
 # Spend ops: atomic accumulator write + durable read
 # ---------------------------------------------------------------------------
 
@@ -437,13 +660,15 @@ async def test_run_migrations_executes_ddl_when_enabled(monkeypatch):
         await run_governance_migrations()
     assert len(conn.executed) == 1
     sql = conn.executed[0][0]
-    # All five tables created in one DDL block.
+    # All durable tables created in one DDL block (incl. guardrails + prompts).
     for table in (
         "governance_orgs",
         "governance_workspaces",
         "governance_keys",
         "usage_policies",
         "governance_spend",
+        "guardrail_policies",
+        "prompts",
     ):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
 
