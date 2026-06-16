@@ -17,6 +17,10 @@ spec:
     matchLabels:
       {{- include "routeiq-gateway.selectorLabels" . | nindent 6 }}
   endpoints:
+    # GET /metrics is served on the main "http" Service port by RouteIQ's
+    # Prometheus exposition endpoint (routes/metrics_endpoint.py, RouteIQ-f60a).
+    # It is unauthenticated/network-scoped (same scope as /_health/*), so no
+    # scrape credential is required here. Previously this path scraped a 404.
     - port: http
       path: /metrics
       interval: {{ .Values.metrics.serviceMonitor.interval | default "30s" }}

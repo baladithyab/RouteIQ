@@ -289,7 +289,10 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
         llmrouter_router,
     )
 
-    # Health router - unauthenticated K8s probes
+    # Health router - unauthenticated K8s probes.
+    # Also carries the Prometheus scrape endpoint GET /metrics (RouteIQ-f60a):
+    # network/admin-scoped (scrapers carry no user key), same scope as /_health/*.
+    # Registered via routes/metrics_endpoint.py importing onto health_router.
     app.include_router(health_router, prefix="")
     logger.debug("Registered health_router")
 
