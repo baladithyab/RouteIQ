@@ -998,6 +998,63 @@ METRIC_CATALOG: tuple[MetricSpec, ...] = (
         ("breaker", "from_state", "to_state"),
         description="Circuit breaker state transitions",
     ),
+    # --- Dark-subsystem instruments (metrics-2) ---
+    _spec(
+        "gateway.routing.selection",
+        MetricType.COUNTER,
+        "{selection}",
+        ("strategy", "model"),
+        description="Model selections made by a routing strategy",
+    ),
+    _spec(
+        "gateway.governance.enforcement.denial",
+        MetricType.COUNTER,
+        "{denial}",
+        ("reason",),
+        description="Governance enforcement denials by reason",
+    ),
+    _spec(
+        "gateway.guardrail.check",
+        MetricType.COUNTER,
+        "{check}",
+        ("check_type", "action"),
+        description="Guardrail checks by check type and action",
+    ),
+    _spec(
+        "gateway.semantic_cache.lookup",
+        MetricType.COUNTER,
+        "{lookup}",
+        ("result",),
+        description="Semantic cache lookups by result (hit/miss)",
+    ),
+    _spec(
+        "gateway.context_optimizer.tokens_saved",
+        MetricType.HISTOGRAM,
+        "{token}",
+        (),
+        description="Estimated tokens saved per context-optimizer pass",
+    ),
+    _spec(
+        "gateway.mcp.tool.invocation",
+        MetricType.COUNTER,
+        "{invocation}",
+        ("result",),
+        description="MCP tool invocations by result (success/error)",
+    ),
+    _spec(
+        "gateway.a2a.invocation",
+        MetricType.COUNTER,
+        "{invocation}",
+        ("result",),
+        description="A2A agent invocations by result (success/error)",
+    ),
+    _spec(
+        "gateway.eval.sample",
+        MetricType.COUNTER,
+        "{sample}",
+        ("verdict",),
+        description="Evaluation samples scored by verdict (pass/fail)",
+    ),
     # --- Cost-aware routing histogram (strategies.py, lazily created) ---
     _spec(
         "routeiq.routing.cost_per_1k_tokens",

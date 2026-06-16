@@ -46,6 +46,26 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _record_lookup_metric(result: str) -> None:
+    """Emit the semantic cache lookup metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        result: ``hit`` or ``miss``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_semantic_cache_lookup(result)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Parameters included in cache key (order doesn't matter, they are sorted)
 CACHE_KEY_PARAMS: list[str] = [
     "frequency_penalty",
@@ -567,10 +587,12 @@ class CacheManager:
     def record_hit(self) -> None:
         """Record a cache hit for aggregate stats."""
         self._total_hits += 1
+        _record_lookup_metric("hit")
 
     def record_miss(self) -> None:
         """Record a cache miss for aggregate stats."""
         self._total_misses += 1
+        _record_lookup_metric("miss")
 
     def get_stats(self) -> dict[str, Any]:
         """

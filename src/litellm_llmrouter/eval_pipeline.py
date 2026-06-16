@@ -46,6 +46,28 @@ __all__ = [
 
 logger = logging.getLogger("litellm_llmrouter.eval_pipeline")
 
+# Score at/above which an evaluated sample counts as a "pass" verdict.
+_EVAL_PASS_THRESHOLD = 0.5
+
+
+def _record_eval_sample_metric(verdict: str) -> None:
+    """Emit the eval sample metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        verdict: ``pass`` or ``fail``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_eval_sample(verdict)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
 
 class EvalMetric(str, Enum):
     """Built-in evaluation metrics."""
@@ -367,6 +389,9 @@ class EvalPipeline:
                 # Record per-model quality
                 avg_score = sum(scores.values()) / len(scores) if scores else 0.5
                 self._tracker.record(sample.model, avg_score)
+                _record_eval_sample_metric(
+                    "pass" if avg_score >= _EVAL_PASS_THRESHOLD else "fail"
+                )
                 evaluated += 1
 
         self._total_evaluated += evaluated

@@ -68,6 +68,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _record_selection_metric(strategy: str, model: str) -> None:
+    """Emit the routing.selection metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_routing_selection(strategy, model)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Static per-model quality biases used for cold-start warm-starting. Imported
 # lazily from personalized_routing at call time so the bandit has no hard import
 # dependency (and degrades to the neutral 0.5 prior if unavailable).
@@ -756,6 +773,7 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
             return None
         if len(cands) == 1:
             self._log_bucket(context.request_id, self._bucket(context))
+            _record_selection_metric(STRATEGY_NAME, self._arm_key(cands[0]))
             return cands[0]
 
         bucket = self._bucket(context)
@@ -769,6 +787,8 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
                 best_draw, best = x, dep
 
         self._log_bucket(context.request_id, bucket)
+        if best is not None:
+            _record_selection_metric(STRATEGY_NAME, self._arm_key(best))
         return best
 
     def validate(self) -> Tuple[bool, Optional[str]]:

@@ -72,6 +72,25 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 
+def _record_mcp_invocation_metric(result: str) -> None:
+    """Emit the MCP tool invocation metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        result: ``success`` or ``error``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_mcp_tool_invocation(result)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 class MCPTransport(str, Enum):
     """MCP transport types."""
 
@@ -858,7 +877,8 @@ class MCPGateway:
         Returns:
             Result of the tool invocation
         """
-        # Check feature flag first - disabled by default for security
+        # Check feature flag first - disabled by default for security.
+        # A disabled call is not a real invocation, so no metric is recorded.
         if not self._tool_invocation_enabled:
             verbose_proxy_logger.warning(
                 "MCP: Tool invocation disabled. Set LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true to enable."
@@ -869,6 +889,17 @@ class MCPGateway:
                 tool_name=tool_name,
             )
 
+        result = await self._invoke_tool_impl(tool_name, arguments)
+        # Telemetry: record the invocation outcome (no-op when OTel is off).
+        _record_mcp_invocation_metric("success" if result.success else "error")
+        return result
+
+    async def _invoke_tool_impl(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> MCPToolResult:
+        """Perform the actual MCP tool invocation (enabled-path body)."""
         server = self.find_server_for_tool(tool_name)
         if not server:
             return MCPToolResult(

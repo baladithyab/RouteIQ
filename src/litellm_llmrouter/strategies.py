@@ -85,6 +85,22 @@ def _get_cost_histogram():
     return _cost_histogram
 
 
+def _record_selection_metric(strategy: str, model: str) -> None:
+    """Emit the routing.selection metric for an ML routing strategy.
+
+    Best-effort: a missing meter (OTel disabled) is a no-op and any recording
+    error is swallowed. Telemetry must never raise.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_routing_selection(strategy, model)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Lazy import for sentence-transformers to avoid startup cost if not needed
 _sentence_transformer_model = None
 _sentence_transformer_lock = threading.Lock()
@@ -2652,6 +2668,8 @@ class LLMRouterStrategyFamily:
                             latency_ms=latency_ms,
                         )
 
+                    if selected_model:
+                        _record_selection_metric(self.strategy_name, selected_model)
                     return selected_model
             except Exception as e:
                 verbose_proxy_logger.warning(f"Observability error: {e}")
@@ -2663,6 +2681,8 @@ class LLMRouterStrategyFamily:
         except Exception as e:
             verbose_proxy_logger.error(f"Routing error (no observability): {e}")
 
+        if selected_model:
+            _record_selection_metric(self.strategy_name, selected_model)
         return selected_model
 
 
@@ -3110,15 +3130,16 @@ class CostAwareRoutingStrategy(RoutingStrategy):
 
         # Emit cost-per-1K-tokens metric for observability
         if best_deployment is not None and best_cost_per_1k is not None:
+            selected_model = best_deployment.get("litellm_params", {}).get(
+                "model", "unknown"
+            )
             histogram = _get_cost_histogram()
             if histogram and best_cost_per_1k != float("inf"):
-                selected_model = best_deployment.get("litellm_params", {}).get(
-                    "model", "unknown"
-                )
                 histogram.record(
                     best_cost_per_1k,
                     {"model": selected_model, "strategy": "cost-aware"},
                 )
+            _record_selection_metric("cost-aware", selected_model)
 
         return best_deployment
 

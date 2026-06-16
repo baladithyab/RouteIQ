@@ -37,6 +37,25 @@ from .auth import get_request_id
 logger = logging.getLogger("litellm_llmrouter.governance")
 
 
+def _record_denial_metric(reason: str) -> None:
+    """Emit the governance enforcement denial metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        reason: ``model_access`` / ``budget`` / ``rate_limit``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_governance_denial(reason)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # -- Roles ------------------------------------------------------------------
 
 
@@ -598,6 +617,7 @@ class GovernanceEngine:
 
         # 1. Model access
         if not await self.check_model_access(ctx, model):
+            _record_denial_metric("model_access")
             logger.warning(
                 "Governance: model access denied key=%s model=%s workspace=%s",
                 key_id,
@@ -619,6 +639,7 @@ class GovernanceEngine:
 
         # 2. Budget
         if not await self.check_budget(ctx):
+            _record_denial_metric("budget")
             logger.warning(
                 "Governance: budget exceeded key=%s workspace=%s used_pct=%.1f%%",
                 key_id,
@@ -642,6 +663,7 @@ class GovernanceEngine:
 
         # 3. Rate limit
         if not await self.check_rate_limit(ctx):
+            _record_denial_metric("rate_limit")
             logger.warning(
                 "Governance: rate limit exceeded key=%s workspace=%s",
                 key_id,

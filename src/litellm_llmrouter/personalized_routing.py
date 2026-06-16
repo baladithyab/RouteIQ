@@ -33,6 +33,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("litellm_llmrouter.personalized_routing")
 
+_PERSONALIZED_STRATEGY_NAME = "personalized"
+
+
+def _record_selection_metric(model: str) -> None:
+    """Emit the routing.selection metric for personalized routing (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_routing_selection(_PERSONALIZED_STRATEGY_NAME, model)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Optional dependency handling
 # ---------------------------------------------------------------------------
@@ -579,7 +598,11 @@ class PersonalizedRouter:
         if not candidates:
             return None
         ranked = await self.rank_models(user_id, candidates)
-        return ranked[0][0] if ranked else None
+        if not ranked:
+            return None
+        selected = ranked[0][0]
+        _record_selection_metric(selected)
+        return selected
 
     async def record_feedback(
         self,

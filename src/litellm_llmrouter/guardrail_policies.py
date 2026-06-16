@@ -34,6 +34,28 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("litellm_llmrouter.guardrail_policies")
 
+
+def _record_check_metric(check_type: str, action: str) -> None:
+    """Emit the guardrail check metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        check_type: The guardrail check type (low cardinality).
+        action: ``pass`` when the check passed, else the policy action
+            (``deny`` / ``log`` / ``alert``).
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_guardrail_check(check_type, action)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Custom HTTP status codes
 HTTP_446_GUARDRAIL_DENIED = 446
 HTTP_246_GUARDRAIL_WARNING = 246
@@ -374,6 +396,12 @@ class GuardrailPolicyEngine:
                 )
 
             results.append(result)
+
+            # Telemetry: record the check outcome (pass vs the policy's action).
+            _record_check_metric(
+                policy.check_type.value,
+                "pass" if result.passed else result.action.value,
+            )
 
             # Log non-pass results
             if not result.passed:

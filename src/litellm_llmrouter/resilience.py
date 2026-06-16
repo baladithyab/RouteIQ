@@ -909,10 +909,35 @@ class CircuitBreaker:
         while self._failures and self._failures[0] < cutoff:
             self._failures.popleft()
 
+    def _record_transition_metric(
+        self,
+        old_state: CircuitBreakerState,
+        new_state: CircuitBreakerState,
+    ) -> None:
+        """Emit the circuit-breaker transition metric (best-effort).
+
+        Telemetry must never raise: a missing meter (OTel disabled) is a no-op
+        and any recording error is swallowed.
+        """
+        try:
+            from litellm_llmrouter.metrics import get_gateway_metrics
+
+            m = get_gateway_metrics()
+            if m is not None:
+                m.record_circuit_breaker_transition(
+                    self.name, old_state.value, new_state.value
+                )
+        except Exception:  # pragma: no cover - telemetry must not break flow
+            pass
+
     async def _transition_to(self, new_state: CircuitBreakerState) -> None:
         """Transition to a new state and broadcast to Redis."""
         old_state = self._state
         self._state = new_state
+
+        # Telemetry: record the transition (no-op when OTel is disabled).
+        if old_state != new_state:
+            self._record_transition_metric(old_state, new_state)
 
         if new_state == CircuitBreakerState.OPEN:
             self._opened_at = time.monotonic()

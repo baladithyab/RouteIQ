@@ -58,6 +58,26 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("litellm_llmrouter.usage_policies")
 
 
+def _record_denial_metric(reason: str) -> None:
+    """Emit the governance enforcement denial metric (best-effort).
+
+    Usage policies are a control-plane enforcement surface alongside core
+    governance, so they share the ``governance.enforcement.denial`` counter.
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op.
+
+    Args:
+        reason: ``budget`` (cost/token limits) or ``rate_limit`` (request limits).
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_governance_denial(reason)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # =============================================================================
 # Enums
 # =============================================================================
@@ -465,6 +485,15 @@ class UsagePolicyEngine:
                 ).lower()
                 if fail_mode == "closed":
                     evaluation.exceeded = True
+
+            # Telemetry: a DENY policy that is over its limit blocks the request.
+            if evaluation.exceeded and policy.action == PolicyAction.DENY:
+                reason = (
+                    "rate_limit"
+                    if policy.limit_type == LimitType.REQUESTS
+                    else "budget"
+                )
+                _record_denial_metric(reason)
 
             results.append(evaluation)
 

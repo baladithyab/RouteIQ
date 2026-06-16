@@ -33,6 +33,7 @@ from litellm_llmrouter.gateway.plugin_manager import (
 )
 from litellm_llmrouter.gateway.plugins.guardrails_base import (
     GuardrailBlockError,
+    record_guardrail_check_metric,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +179,12 @@ class BedrockGuardrailsPlugin(GatewayPlugin):
             return None
 
         result = await self.evaluate(content, source="INPUT")
+
+        # Telemetry: BLOCKED -> deny, ANONYMIZED -> redact, NONE -> pass.
+        action = {"BLOCKED": "deny", "ANONYMIZED": "redact"}.get(
+            result["action"], "pass"
+        )
+        record_guardrail_check_metric("bedrock", action)
 
         if result["action"] == "BLOCKED":
             raise GuardrailBlockError(

@@ -66,6 +66,23 @@ __all__ = [
 
 logger = logging.getLogger("litellm_llmrouter.plugins.context_optimizer")
 
+
+def _record_tokens_saved_metric(tokens_saved: int) -> None:
+    """Emit the context-optimizer tokens-saved metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_context_optimizer_tokens_saved(tokens_saved)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Regex for fenced code blocks (``` or ~~~, with optional language tag)
 _CODE_BLOCK_RE = re.compile(r"(```[\w]*\n.*?\n```|~~~[\w]*\n.*?\n~~~)", re.DOTALL)
 
@@ -205,6 +222,8 @@ class ContextOptimizer:
 
         result.optimized_chars = self._count_chars(msgs)
         result.optimized_estimated_tokens = result.optimized_chars // _CHARS_PER_TOKEN
+        if result.tokens_saved > 0:
+            _record_tokens_saved_metric(result.tokens_saved)
         return msgs, result
 
     # =========================================================================

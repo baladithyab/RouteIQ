@@ -81,6 +81,25 @@ except ImportError:
         return headers
 
 
+def _record_a2a_invocation_metric(result: str) -> None:
+    """Emit the A2A agent invocation metric (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        result: ``success`` or ``error``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_a2a_invocation(result)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # =============================================================================
 # Feature Flags for Streaming Behavior
 # =============================================================================
@@ -940,11 +959,21 @@ class A2AGateway:
         Returns:
             JSONRPCResponse with the result or error
         """
+        # A disabled gateway is not a real invocation, so no metric is recorded.
         if not self.enabled:
             return JSONRPCResponse.error_response(
                 request.id, -32000, "A2A Gateway is not enabled"
             )
 
+        response = await self._invoke_agent_impl(agent_id, request)
+        # Telemetry: record the invocation outcome (no-op when OTel is off).
+        _record_a2a_invocation_metric("success" if response.error is None else "error")
+        return response
+
+    async def _invoke_agent_impl(
+        self, agent_id: str, request: JSONRPCRequest
+    ) -> JSONRPCResponse:
+        """Perform the actual A2A agent invocation (enabled-path body)."""
         # Handle task-level methods that don't require agent lookup
         if request.method == "tasks/get":
             return await self.handle_task_get(request)

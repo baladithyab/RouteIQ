@@ -66,6 +66,30 @@ except ImportError:
     trace = None  # type: ignore[assignment]
 
 
+def record_guardrail_check_metric(check_type: str, action: str) -> None:
+    """Emit the guardrail.check metric (best-effort, shared by all guardrails).
+
+    Both ``GuardrailPlugin`` subclasses and the standalone guardrail plugins
+    (Bedrock, content filter, LlamaGuard) record through this single helper so
+    the ``check_type`` / ``action`` vocabulary stays consistent.
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+
+    Args:
+        check_type: Detection category / check type (low cardinality).
+        action: ``pass`` / ``deny`` / ``redact`` / ``warn`` / ``log``.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_guardrail_check(check_type, action)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Exception
 # ---------------------------------------------------------------------------
@@ -204,6 +228,7 @@ class GuardrailPlugin(GatewayPlugin):
             evaluation_time_ms=(time.perf_counter() - start) * 1000,
         )
         self._emit_otel_attributes(decision)
+        self._record_check_metric(decision)
         self._log_decision(decision)
 
         if not decision.allowed and decision.action_taken == "block":
@@ -244,6 +269,7 @@ class GuardrailPlugin(GatewayPlugin):
             evaluation_time_ms=(time.perf_counter() - start) * 1000,
         )
         self._emit_otel_attributes(decision)
+        self._record_check_metric(decision)
         self._log_decision(decision)
 
     # ----- helpers ----
@@ -272,6 +298,17 @@ class GuardrailPlugin(GatewayPlugin):
             )
         except Exception:
             pass
+
+    def _record_check_metric(self, decision: GuardrailDecision) -> None:
+        """Emit the guardrail.check metric for this decision (best-effort).
+
+        Uses the detection ``category`` as the (low-cardinality) check type and
+        normalises ``block`` -> ``deny`` so the action vocabulary matches the
+        config-driven guardrail-policy engine. Telemetry must never raise: a
+        missing meter (OTel disabled) is a no-op and errors are swallowed.
+        """
+        action = "deny" if decision.action_taken == "block" else decision.action_taken
+        record_guardrail_check_metric(decision.category, action)
 
     def _log_decision(self, decision: GuardrailDecision) -> None:
         if decision.action_taken == "pass":

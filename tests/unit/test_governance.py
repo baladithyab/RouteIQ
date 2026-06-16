@@ -455,3 +455,78 @@ def test_status(engine, sample_workspace, sample_key_gov):
     assert status["workspace_count"] == 1
     assert status["governed_key_count"] == 1
     assert status["cache_entries"] == 0
+
+
+# ============================================================================
+# Enforcement denial metric (metrics-2)
+# ============================================================================
+
+
+@pytest.fixture
+def _denial_metric_reader():
+    """Install GatewayMetrics on an in-memory reader and yield it.
+
+    Resets the singleton afterward so it does not leak into other tests.
+    """
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from litellm_llmrouter.metrics import (
+        init_gateway_metrics,
+        reset_gateway_metrics,
+    )
+
+    reset_gateway_metrics()
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    init_gateway_metrics(provider.get_meter("test-gov-meter", "0.1.0"))
+    yield reader
+    reset_gateway_metrics()
+
+
+def _denial_count(reader, reason: str) -> float:
+    """Count governance denial datapoints with the given reason label."""
+    data = reader.get_metrics_data()
+    total = 0.0
+    if data is None:
+        return total
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if metric.name != "gateway.governance.enforcement.denial":
+                    continue
+                for dp in metric.data.data_points:
+                    if dp.attributes.get("reason") == reason:
+                        total += dp.value
+    return total
+
+
+@pytest.mark.asyncio
+async def test_enforce_model_denial_records_metric(
+    engine, sample_workspace, sample_key_gov, _denial_metric_reader
+):
+    """A model-access denial records the denial counter with reason."""
+    from fastapi import HTTPException
+
+    engine.register_workspace(sample_workspace)
+    engine.register_key_governance(sample_key_gov)
+
+    with pytest.raises(HTTPException):
+        await engine.enforce("key-001", "mistral-large")
+
+    assert _denial_count(_denial_metric_reader, "model_access") == 1
+
+
+@pytest.mark.asyncio
+async def test_enforce_allowed_model_records_no_denial(
+    engine, sample_workspace, sample_key_gov, _denial_metric_reader
+):
+    """An allowed model does not record any denial."""
+    engine.register_workspace(sample_workspace)
+    engine.register_key_governance(sample_key_gov)
+
+    await engine.enforce("key-001", "gpt-4o")
+
+    assert _denial_count(_denial_metric_reader, "model_access") == 0
+    assert _denial_count(_denial_metric_reader, "budget") == 0
+    assert _denial_count(_denial_metric_reader, "rate_limit") == 0

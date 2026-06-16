@@ -54,6 +54,25 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+_CENTROID_STRATEGY_NAME = "llmrouter-nadirclaw-centroid"
+
+
+def _record_selection_metric(model: str) -> None:
+    """Emit the routing.selection metric for centroid routing (best-effort).
+
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op and
+    any recording error is swallowed.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_routing_selection(_CENTROID_STRATEGY_NAME, model)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Optional dependency handling
 # ---------------------------------------------------------------------------
@@ -1252,6 +1271,9 @@ class CentroidRoutingStrategy:
             deployments = filter_by_capabilities(deployments, required_caps)
             deployment = self._match_tier_to_deployment(cached_tier, deployments)
             if deployment is not None:
+                _record_selection_metric(
+                    deployment.get("litellm_params", {}).get("model", "")
+                )
                 return deployment
 
         # Classify prompt
@@ -1374,6 +1396,7 @@ class CentroidRoutingStrategy:
         if deployment is not None:
             model_name = deployment.get("litellm_params", {}).get("model", "")
             self._session_cache.put(session_key, model_name, tier)
+            _record_selection_metric(model_name)
 
         return deployment
 

@@ -275,6 +275,64 @@ class GatewayMetrics:
             unit="{transition}",
         )
 
+        # =================================================================
+        # Dark-subsystem Instruments (metrics-2)
+        # =================================================================
+        #
+        # Low-cardinality instruments for subsystems that previously emitted
+        # no metrics. Labels are deliberately coarse (strategy / model name,
+        # enforcement reason, check type, hit/miss) -- never request ids or
+        # raw user text.
+
+        self.routing_selection: Counter = meter.create_counter(
+            name="gateway.routing.selection",
+            description="Model selections made by a routing strategy",
+            unit="{selection}",
+        )
+
+        self.governance_denial: Counter = meter.create_counter(
+            name="gateway.governance.enforcement.denial",
+            description="Governance enforcement denials by reason",
+            unit="{denial}",
+        )
+
+        self.guardrail_check: Counter = meter.create_counter(
+            name="gateway.guardrail.check",
+            description="Guardrail checks by check type and action",
+            unit="{check}",
+        )
+
+        self.semantic_cache_lookup: Counter = meter.create_counter(
+            name="gateway.semantic_cache.lookup",
+            description="Semantic cache lookups by result (hit/miss)",
+            unit="{lookup}",
+        )
+
+        self.context_optimizer_tokens_saved: Histogram = meter.create_histogram(
+            name="gateway.context_optimizer.tokens_saved",
+            description="Estimated tokens saved per context-optimizer pass",
+            unit="{token}",
+            explicit_bucket_boundaries_advisory=TOKEN_BUCKETS,
+        )
+
+        self.mcp_tool_invocation: Counter = meter.create_counter(
+            name="gateway.mcp.tool.invocation",
+            description="MCP tool invocations by result (success/error)",
+            unit="{invocation}",
+        )
+
+        self.a2a_invocation: Counter = meter.create_counter(
+            name="gateway.a2a.invocation",
+            description="A2A agent invocations by result (success/error)",
+            unit="{invocation}",
+        )
+
+        self.eval_sample: Counter = meter.create_counter(
+            name="gateway.eval.sample",
+            description="Evaluation samples scored by verdict (pass/fail)",
+            unit="{sample}",
+        )
+
         logger.info("GatewayMetrics: all instruments created")
 
     # Aliases for backward compatibility
@@ -337,6 +395,65 @@ class GatewayMetrics:
             self.tokens_per_second.record(tps, base_attrs)
         if total_tokens > 0:
             self.token_usage.record(total_tokens, base_attrs)
+
+    # ----- dark-subsystem record helpers (metrics-2) -----
+
+    def record_routing_selection(self, strategy: str, model: str) -> None:
+        """Record a model selection by a routing strategy (any family)."""
+        self.routing_selection.add(1, {"strategy": strategy, "model": model})
+
+    def record_governance_denial(self, reason: str) -> None:
+        """Record a governance enforcement denial.
+
+        Args:
+            reason: One of ``budget`` / ``rate_limit`` / ``model_access``.
+        """
+        self.governance_denial.add(1, {"reason": reason})
+
+    def record_guardrail_check(self, check_type: str, action: str) -> None:
+        """Record a guardrail check outcome.
+
+        Args:
+            check_type: The guardrail category/check type (low cardinality).
+            action: The action taken (``pass`` / ``deny`` / ``redact`` / ...).
+        """
+        self.guardrail_check.add(1, {"check_type": check_type, "action": action})
+
+    def record_semantic_cache_lookup(self, result: str) -> None:
+        """Record a semantic cache lookup.
+
+        Args:
+            result: ``hit`` or ``miss``.
+        """
+        self.semantic_cache_lookup.add(1, {"result": result})
+
+    def record_context_optimizer_tokens_saved(self, tokens_saved: int) -> None:
+        """Record the estimated tokens saved by one context-optimizer pass."""
+        self.context_optimizer_tokens_saved.record(tokens_saved)
+
+    def record_mcp_tool_invocation(self, result: str) -> None:
+        """Record an MCP tool invocation.
+
+        Args:
+            result: ``success`` or ``error``.
+        """
+        self.mcp_tool_invocation.add(1, {"result": result})
+
+    def record_a2a_invocation(self, result: str) -> None:
+        """Record an A2A agent invocation.
+
+        Args:
+            result: ``success`` or ``error``.
+        """
+        self.a2a_invocation.add(1, {"result": result})
+
+    def record_eval_sample(self, verdict: str) -> None:
+        """Record an evaluation sample scored by the judge.
+
+        Args:
+            verdict: ``pass`` or ``fail``.
+        """
+        self.eval_sample.add(1, {"verdict": verdict})
 
 
 # =============================================================================

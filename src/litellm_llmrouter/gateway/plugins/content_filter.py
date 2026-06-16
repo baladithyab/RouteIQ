@@ -43,6 +43,7 @@ from litellm_llmrouter.gateway.plugin_manager import (
 )
 from litellm_llmrouter.gateway.plugins.guardrails_base import (
     GuardrailBlockError,
+    record_guardrail_check_metric,
 )
 
 if TYPE_CHECKING:
@@ -372,6 +373,11 @@ class ContentFilterPlugin(GatewayPlugin):
         for category, config in self._categories.items():
             score_result = self._score_content(text, category)
             if score_result.score >= config.threshold:
+                # Telemetry: block -> deny; warn / log keep their names.
+                record_guardrail_check_metric(
+                    category,
+                    "deny" if config.action == "block" else config.action,
+                )
                 if config.action == "block":
                     raise GuardrailBlockError(
                         guardrail_name="content-filter",

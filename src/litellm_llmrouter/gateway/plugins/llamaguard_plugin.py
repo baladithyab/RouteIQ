@@ -37,6 +37,7 @@ from litellm_llmrouter.gateway.plugin_manager import (
 )
 from litellm_llmrouter.gateway.plugins.guardrails_base import (
     GuardrailBlockError,
+    record_guardrail_check_metric,
 )
 
 if TYPE_CHECKING:
@@ -179,7 +180,11 @@ class LlamaGuardPlugin(GatewayPlugin):
 
         result = await self.evaluate(content)
 
-        if not result.get("safe", True):
+        safe = result.get("safe", True)
+        # Telemetry: unsafe -> deny, safe -> pass.
+        record_guardrail_check_metric("llamaguard", "pass" if safe else "deny")
+
+        if not safe:
             category = result.get("category", "unknown")
             raise GuardrailBlockError(
                 guardrail_name="llamaguard",
