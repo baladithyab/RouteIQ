@@ -191,6 +191,36 @@ Worker N ──►
 Alternative: Set `PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc` with a
 tmpfs mount for Prometheus pull-based metrics.
 
+## Routing-stats endpoints are per-worker
+
+The in-process routing-stats endpoints — `GET /api/v1/routeiq/stats/global`
+(admin) and `GET /api/v1/routeiq/me/stats` (caller-scoped) — are backed by an
+**in-memory, process-local** accumulator (`RoutingStatsAccumulator` in
+`router_decision_callback.py`). Each uvicorn worker and each replica
+(`--workers N` / `replicaCount > 1`) keeps its **own** copy, and the load
+balancer fans requests across all of them.
+
+Consequences when running more than one serving worker:
+
+- `stats/global` and `me/stats` report only the decisions that landed on the
+  worker that happened to serve that scrape — they **undercount** the true
+  cluster total.
+- Two successive reads can be answered by different workers and return
+  different numbers.
+
+These endpoints are a convenience / debug view, **not** the cluster-wide source
+of truth. For authoritative, cluster-wide counts use the **metrics backend**:
+the RouteIQ OTel instruments are pushed to the OTLP collector and exposed at
+`/metrics`, where Prometheus / Amazon Managed Prometheus (AMP) aggregates across
+every worker and replica. Per-key/per-tenant usage that must be accurate
+cluster-wide (budgets, RPM) is tracked by the governance spend counters, not by
+this accumulator.
+
+> A shared-store backing (Redis / Aurora) that would make these endpoints report
+> true cluster-wide stats is intentionally out of scope; until then, treat the
+> metrics backend as canonical for any number-of-requests figure that must be
+> correct under horizontal scale.
+
 ## Log Level Configuration
 
 ```yaml

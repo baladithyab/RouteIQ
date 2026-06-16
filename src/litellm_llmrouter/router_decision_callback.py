@@ -169,6 +169,26 @@ class RoutingStatsAccumulator:
 
     This is a SINGLETON (see :func:`get_stats_accumulator`); tests MUST call
     :func:`reset_stats_accumulator` in an autouse fixture.
+
+    .. warning:: **Per-worker (process-local) scope — counts are NOT cluster-wide.**
+
+        This accumulator lives in a single Python process.  Each uvicorn worker
+        and each replica (``replicaCount > 1`` / ``--workers N``) keeps its OWN
+        instance, and the load balancer fans requests across all of them.  So
+        :meth:`global_snapshot` (``/stats/global``) and :meth:`key_snapshot`
+        (``/me/stats``) report ONLY the decisions that landed on the serving
+        worker for that scrape — under multiple workers/replicas they
+        **undercount** the true cluster total, and successive reads can hit
+        different workers and return different numbers.
+
+        These endpoints are a convenience / debug view, NOT the cluster-wide
+        source of truth.  The authoritative cluster-wide counts come from the
+        metrics backend: the RouteIQ OTel instruments (``metrics.py``) are pushed
+        to the OTLP collector and exposed at ``/metrics`` (Prometheus/AMP), where
+        the scraper aggregates across every worker and replica.  See
+        ``docs/operations/observability.md`` ("Routing-stats endpoints are
+        per-worker").  A shared-store backing (Redis/Aurora) for true cluster-wide
+        stats endpoints is deliberately out of scope here (tracked separately).
     """
 
     def __init__(self, max_entries: Optional[int] = None) -> None:
@@ -272,7 +292,14 @@ class RoutingStatsAccumulator:
             return self._latency_sum_ms / self._latency_count
 
     def global_snapshot(self) -> Dict[str, Any]:
-        """Return a copy of the global aggregates (admin / dashboard view)."""
+        """Return a copy of the global aggregates (admin / dashboard view).
+
+        PER-WORKER SCOPE: these aggregates cover only the decisions seen by THIS
+        process.  Under multiple uvicorn workers / ``replicaCount > 1`` the
+        returned totals undercount the cluster; the cluster-wide source of truth
+        is the metrics backend (Prometheus/AMP scrape of ``/metrics``).  See the
+        class docstring and ``docs/operations/observability.md``.
+        """
         with self._lock:
             avg = (
                 self._latency_sum_ms / self._latency_count
@@ -297,6 +324,12 @@ class RoutingStatsAccumulator:
 
         Returns zeroed counters (not an error) when the key has no recorded
         decisions yet, so a freshly-issued key still gets a valid response.
+
+        PER-WORKER SCOPE: the rollup reflects only the requests for *key_id* that
+        this process served, so under multiple workers / replicas the caller's
+        ``/me/stats`` undercounts their true usage and may vary between reads.
+        For authoritative per-key/cluster-wide usage consult the metrics backend
+        (or the governance spend counters).  See the class docstring.
         """
         with self._lock:
             rollup = self._key_rollups.get(key_id)
@@ -797,6 +830,13 @@ class RouterDecisionCallback:
             GA.SYSTEM: provider,
         }
 
+        # Is this a streamed response? LiteLLM stamps the resolved request params
+        # onto ``kwargs["optional_params"]`` (same source the upstream OTel
+        # integration reads to gate its TTFT metric). For streamed responses the
+        # combined throughput metric is wired below via ``record_streaming_metrics``.
+        optional_params = kwargs.get("optional_params", {}) or {}
+        is_streaming = bool(optional_params.get("stream", False))
+
         # Feed the real response latency into the stats accumulator so the
         # global / dashboard average reflects actual durations (RouteIQ-aba9).
         try:
@@ -809,7 +849,7 @@ class RouterDecisionCallback:
             # Duration histogram
             gm.request_duration.record(duration_s, attrs)
 
-            # Token usage histograms
+            # Token usage histograms (per-request, split by direction).
             if input_tokens > 0:
                 gm.token_usage.record(
                     input_tokens, {**attrs, "gen_ai.token.type": "input"}
@@ -817,6 +857,23 @@ class RouterDecisionCallback:
             if output_tokens > 0:
                 gm.token_usage.record(
                     output_tokens, {**attrs, "gen_ai.token.type": "output"}
+                )
+
+            # Streaming throughput (RouteIQ-f55a): for streamed responses wire the
+            # previously-uncalled ``record_streaming_metrics`` helper so the
+            # tokens_per_second histogram (and the combined token_usage sample the
+            # helper records) finally has a live caller. TTFT is computed from
+            # LiteLLM's ``completion_start_time`` (when the first chunk arrived);
+            # it is recorded ONCE here, not also via ``observability.record_ttft``,
+            # so there is no double-record. Best-effort: any error is swallowed so
+            # a malformed timestamp never breaks the response path.
+            if is_streaming:
+                self._record_streaming_throughput(
+                    gm,
+                    kwargs=kwargs,
+                    output_tokens=output_tokens,
+                    duration_s=duration_s,
+                    attrs=attrs,
                 )
 
             # Success counter
@@ -846,6 +903,46 @@ class RouterDecisionCallback:
                 span.set_attribute(GA.RESPONSE_ID, response_obj.id)
             if finish_reasons:
                 span.set_attribute(GA.RESPONSE_FINISH_REASONS, finish_reasons)
+
+    def _record_streaming_throughput(
+        self,
+        gm: Any,
+        *,
+        kwargs: Dict[str, Any],
+        output_tokens: int,
+        duration_s: float,
+        attrs: Dict[str, Any],
+    ) -> None:
+        """Record streaming throughput via ``metrics.record_streaming_metrics``.
+
+        Wires the combined TTFT + tokens_per_second + token_usage helper
+        (RouteIQ-f55a) into the streaming success path, which is the only
+        post-response seam that carries the completed token count, the total
+        duration, and LiteLLM's ``completion_start_time`` (the first-chunk
+        timestamp).
+
+        Throughput is generated-tokens / generation-time, where generation time
+        is ``end_time - completion_start_time`` (the post-first-token window) when
+        ``completion_start_time`` is available, else the full request duration as a
+        floor. TTFT is ``completion_start_time - api_call_start_time`` and is
+        recorded ONCE here (``observability.record_ttft`` is not also called for
+        this response), so the time_to_first_token series is not double-counted.
+
+        Best-effort: never raises. Labels are the low-cardinality ``attrs``
+        (model + provider) only -- no per-request / per-user identifiers.
+        """
+        try:
+            ttft_s = _streaming_ttft_seconds(kwargs)
+            gen_window_s = _streaming_generation_seconds(kwargs, duration_s)
+            tps = (output_tokens / gen_window_s) if gen_window_s > 0 else 0.0
+            gm.record_streaming_metrics(
+                ttft_ms=ttft_s * 1000.0,
+                tps=tps,
+                total_tokens=output_tokens,
+                attrs=attrs,
+            )
+        except Exception:  # pragma: no cover - metrics must never break routing
+            logger.debug("Failed to record streaming throughput", exc_info=True)
 
     def log_failure_event(
         self,
@@ -993,6 +1090,58 @@ def _compute_duration(start_time: Any, end_time: Any) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _to_epoch_seconds(value: Any) -> Optional[float]:
+    """Coerce a LiteLLM timestamp (float, int, or datetime) to epoch seconds.
+
+    Returns ``None`` when the value is missing or cannot be coerced, so callers
+    can fall back rather than record a garbage sample.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+    except Exception:
+        return None
+    return None
+
+
+def _streaming_ttft_seconds(kwargs: Dict[str, Any]) -> float:
+    """Time-to-first-token in seconds for a streamed response.
+
+    Computed as ``completion_start_time - api_call_start_time`` (the first-chunk
+    arrival relative to the LLM API call start), mirroring how upstream LiteLLM's
+    OTel integration derives its TTFT. Returns ``0.0`` when either timestamp is
+    absent or non-coercible (the helper's ``ttft_ms`` then records a 0 sample,
+    which the throughput half does not depend on).
+    """
+    start = _to_epoch_seconds(kwargs.get("api_call_start_time"))
+    first_chunk = _to_epoch_seconds(kwargs.get("completion_start_time"))
+    if start is None or first_chunk is None:
+        return 0.0
+    return max(0.0, first_chunk - start)
+
+
+def _streaming_generation_seconds(kwargs: Dict[str, Any], duration_s: float) -> float:
+    """Generation window in seconds used as the tokens_per_second denominator.
+
+    For a streamed response throughput is generated-tokens / generation-time,
+    where generation-time is the post-first-token window
+    (``end_time - completion_start_time``). Falls back to the full request
+    ``duration_s`` when ``completion_start_time`` / ``end_time`` are unavailable,
+    so a tps value is still produced. Never returns a negative window.
+    """
+    first_chunk = _to_epoch_seconds(kwargs.get("completion_start_time"))
+    end = _to_epoch_seconds(kwargs.get("end_time"))
+    if first_chunk is not None and end is not None:
+        window = end - first_chunk
+        if window > 0:
+            return window
+    return max(0.0, duration_s)
 
 
 def _record_decision_stats(

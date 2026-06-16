@@ -23,6 +23,8 @@ from litellm_llmrouter.router_decision_callback import (
     RouterDecisionMiddleware,
     _compute_duration,
     _governance_spend_tracking_enabled,
+    _streaming_generation_seconds,
+    _streaming_ttft_seconds,
     get_router_decision_callback,
     register_router_decision_callback,
     register_router_decision_middleware,
@@ -454,6 +456,95 @@ class TestRouterDecisionCallback:
             assert call_kwargs["reason"] == "fallback_triggered"
             assert call_kwargs["fallback_triggered"] is True
 
+    @patch("litellm_llmrouter.router_decision_callback.ROUTER_CALLBACK_ENABLED", True)
+    def test_streaming_success_records_tokens_per_second(self):
+        """A streamed success wires metrics.record_streaming_metrics (RouteIQ-f55a).
+
+        The helper had no live caller; on a streamed response the success path now
+        calls it with the computed tokens_per_second + token count. tps must be
+        > 0 for a non-empty generation window.
+        """
+        callback = RouterDecisionCallback(enabled=True)
+
+        mock_metrics = MagicMock()
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+
+        with (
+            patch("litellm_llmrouter.router_decision_callback.trace") as mock_trace,
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+        ):
+            mock_trace.get_current_span.return_value = mock_span
+
+            mock_response = MagicMock()
+            mock_response.usage.prompt_tokens = 10
+            mock_response.usage.completion_tokens = 40
+            mock_response.model = "gpt-4"
+
+            # Simulated streamed success: stream=True, with the LiteLLM
+            # first-chunk + end timestamps that drive TTFT + throughput.
+            # 4.0s call start -> 4.5s first chunk -> 6.5s end => 2.0s gen window,
+            # 40 output tokens => 20 tokens/s; TTFT = 0.5s.
+            callback.log_success_event(
+                kwargs={
+                    "model": "gpt-4",
+                    "litellm_params": {},
+                    "optional_params": {"stream": True},
+                    "api_call_start_time": 4.0,
+                    "completion_start_time": 4.5,
+                    "end_time": 6.5,
+                },
+                response_obj=mock_response,
+                start_time=4.0,
+                end_time=6.5,
+            )
+
+            mock_metrics.record_streaming_metrics.assert_called_once()
+            call_kwargs = mock_metrics.record_streaming_metrics.call_args.kwargs
+            assert call_kwargs["tps"] == 20.0
+            assert call_kwargs["total_tokens"] == 40
+            # TTFT passed through once (not double-recorded via record_ttft).
+            assert call_kwargs["ttft_ms"] == 500.0
+
+    @patch("litellm_llmrouter.router_decision_callback.ROUTER_CALLBACK_ENABLED", True)
+    def test_non_streaming_success_skips_streaming_metrics(self):
+        """A non-streamed success must NOT call record_streaming_metrics."""
+        callback = RouterDecisionCallback(enabled=True)
+
+        mock_metrics = MagicMock()
+        mock_span = MagicMock()
+        mock_span.is_recording.return_value = True
+
+        with (
+            patch("litellm_llmrouter.router_decision_callback.trace") as mock_trace,
+            patch(
+                "litellm_llmrouter.metrics.get_gateway_metrics",
+                return_value=mock_metrics,
+            ),
+        ):
+            mock_trace.get_current_span.return_value = mock_span
+
+            mock_response = MagicMock()
+            mock_response.usage.prompt_tokens = 10
+            mock_response.usage.completion_tokens = 20
+            mock_response.model = "gpt-4"
+
+            callback.log_success_event(
+                kwargs={
+                    "model": "gpt-4",
+                    "litellm_params": {},
+                    "optional_params": {"stream": False},
+                },
+                response_obj=mock_response,
+                start_time=time.time(),
+                end_time=time.time() + 0.5,
+            )
+
+            mock_metrics.record_streaming_metrics.assert_not_called()
+
     async def test_async_log_pre_api_call(self):
         """Async variant delegates to sync."""
         callback = RouterDecisionCallback(enabled=False)
@@ -472,6 +563,43 @@ class TestRouterDecisionCallback:
         callback = RouterDecisionCallback(enabled=False)
         await callback.async_post_call_success_hook({}, None, None)
         await callback.async_post_call_failure_hook({}, Exception("x"), None)
+
+
+# =============================================================================
+# Streaming throughput helpers (RouteIQ-f55a)
+# =============================================================================
+
+
+class TestStreamingThroughputHelpers:
+    def test_ttft_from_float_timestamps(self):
+        kwargs = {"api_call_start_time": 4.0, "completion_start_time": 4.5}
+        assert _streaming_ttft_seconds(kwargs) == 0.5
+
+    def test_ttft_from_datetime_timestamps(self):
+        start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        first = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+        kwargs = {"api_call_start_time": start, "completion_start_time": first}
+        assert _streaming_ttft_seconds(kwargs) == 1.0
+
+    def test_ttft_missing_timestamps_is_zero(self):
+        assert _streaming_ttft_seconds({}) == 0.0
+        assert _streaming_ttft_seconds({"completion_start_time": 4.5}) == 0.0
+
+    def test_ttft_never_negative(self):
+        # first chunk earlier than call start (clock skew) clamps to 0.
+        kwargs = {"api_call_start_time": 5.0, "completion_start_time": 4.0}
+        assert _streaming_ttft_seconds(kwargs) == 0.0
+
+    def test_generation_window_uses_post_first_token(self):
+        kwargs = {"completion_start_time": 4.5, "end_time": 6.5}
+        assert _streaming_generation_seconds(kwargs, duration_s=2.6) == 2.0
+
+    def test_generation_window_falls_back_to_duration(self):
+        # No completion_start_time/end_time -> full request duration floor.
+        assert _streaming_generation_seconds({}, duration_s=3.0) == 3.0
+
+    def test_generation_window_never_negative(self):
+        assert _streaming_generation_seconds({}, duration_s=-1.0) == 0.0
 
 
 # =============================================================================

@@ -35,16 +35,28 @@ so the unauthenticated exposition leaks no high-cardinality user data.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Callable, Optional
 
 from fastapi import Response
 
 from . import health_router
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from prometheus_client.registry import CollectorRegistry
 
 logger = logging.getLogger(__name__)
 
 # Prometheus text exposition content type. ``prometheus_client`` exports the
 # canonical value, but we pin a stable fallback so the endpoint always advertises
 # a valid ``text/plain; version=...`` content type even if the symbol moves.
+#
+# The two optional symbols are declared with Optional[...] types so mypy accepts
+# the ``None`` assignments in the degraded-import fallback branch (the try-branch
+# binds a registry / callable; the except-branch binds ``None``). Both are
+# narrowed back to non-None at the call site via the ``_PROM_CLIENT_AVAILABLE``
+# guard plus an explicit ``is not None`` check.
+_PROM_REGISTRY: Optional["CollectorRegistry"]
+_prom_generate_latest: Optional[Callable[..., bytes]]
 try:  # pragma: no cover - import shape only
     from prometheus_client import (
         CONTENT_TYPE_LATEST as _PROM_CONTENT_TYPE,
