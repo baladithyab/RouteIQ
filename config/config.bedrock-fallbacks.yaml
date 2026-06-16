@@ -1,0 +1,138 @@
+# RouteIQ — Bedrock cross-region fallbacks + context-window fallbacks
+# =============================================================================
+# This config is ADDITIVE to RouteIQ's custom ML routing (RouteIQ installs its
+# own `CustomRoutingStrategyBase` via `set_custom_routing_strategy()`, which
+# only replaces the Router's per-attempt *deployment selection*
+# (`get_available_deployment` / `async_get_available_deployment`).
+#
+# The three params below live on a DIFFERENT layer — LiteLLM's model-group
+# completion wrapper (`Router.async_function_with_fallbacks`) reads
+# `self.fallbacks`, `self.context_window_fallbacks`, and
+# `self.content_policy_fallbacks`, which are set in `Router.__init__` from
+# `router_settings` and are NEVER touched by `set_custom_routing_strategy()`.
+# So RouteIQ's ML routing and these fallbacks COMPOSE rather than conflict:
+#
+#   1. ML routing picks a deployment inside the requested model group.
+#   2. If the whole group/attempt fails (e.g. Bedrock 429 region throttling,
+#      ContextWindowExceeded, or a content-policy block), LiteLLM's outer
+#      fallback wrapper retries against the next *model group* declared here.
+#
+# AWS context: Bedrock per-region on-demand throttling (429
+# ThrottlingException / ServiceUnavailableException) is common under burst.
+# The standard mitigation is cross-region failover — route the same logical
+# model to a different AWS region (or a cross-region inference profile) when
+# the primary region is throttled. That is exactly what `fallbacks` expresses
+# at the model-group layer.
+# =============================================================================
+
+# =============================================================================
+# Model List — one model GROUP per region so fallbacks can target a region.
+# =============================================================================
+# NOTE on cross-region inference profiles:
+#   - Per-region on-demand model ids: e.g. `bedrock/anthropic.claude-3-5-sonnet-...`
+#     pinned to a region via `aws_region_name`.
+#   - Cross-region (system-defined) inference profiles use the regional prefix,
+#     e.g. `bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0` (US profile)
+#     or `bedrock/eu.anthropic.claude-3-5-sonnet-20241022-v2:0` (EU profile).
+#     These already spread load across a region group; we ALSO add an explicit
+#     other-region group as a second line of defence for hard regional outages.
+# No api_key needed — Bedrock auth uses the IAM instance/pod identity.
+model_list:
+  # --- Sonnet: primary (us-east-1) + cross-region failover arms ----------
+  - model_name: claude-sonnet-us-east-1
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-east-1
+
+  - model_name: claude-sonnet-us-west-2
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-west-2
+
+  # Cross-region (US) inference-profile arm — spreads across the US region
+  # group automatically; used as the final Sonnet fallback.
+  - model_name: claude-sonnet-us-xregion
+    litellm_params:
+      model: bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-east-1
+
+  # --- Haiku: cheap, large-pool fallback target for context overflow -----
+  - model_name: claude-haiku-us-east-1
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-haiku-20241022-v1:0
+      aws_region_name: us-east-1
+
+  - model_name: claude-haiku-us-west-2
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-haiku-20241022-v1:0
+      aws_region_name: us-west-2
+
+  # --- Long-context arm: Sonnet handles the 200k window when a smaller
+  #     model overflows. (context_window_fallbacks target.) -----------------
+  - model_name: claude-sonnet-longctx
+    litellm_params:
+      model: bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-east-1
+
+# =============================================================================
+# Router Settings — ML routing + model-group fallbacks (COMPOSED, not exclusive)
+# =============================================================================
+router_settings:
+  # RouteIQ ML routing still drives intra-group deployment selection.
+  # `simple-shuffle` is shown here so the file runs with zero ML model present;
+  # swap to `llmrouter-knn` / `llmrouter-hybrid` etc. to enable ML routing —
+  # the fallbacks below are unaffected by that choice.
+  routing_strategy: simple-shuffle
+
+  # --- General fallbacks (429 throttling / 5xx / region outage) -----------
+  # Each dict has EXACTLY ONE key (LiteLLM's `validate_fallbacks` requirement):
+  #   {primary_group: [ordered list of fallback groups]}
+  # On a Bedrock 429 in us-east-1, LiteLLM retries the same logical request
+  # against us-west-2, then the cross-region US inference profile.
+  fallbacks:
+    - claude-sonnet-us-east-1:
+        - claude-sonnet-us-west-2
+        - claude-sonnet-us-xregion
+    - claude-sonnet-us-west-2:
+        - claude-sonnet-us-east-1
+        - claude-sonnet-us-xregion
+    - claude-haiku-us-east-1:
+        - claude-haiku-us-west-2
+
+  # --- Context-window fallbacks (ContextWindowExceededError) --------------
+  # When a request exceeds the chosen model's context window, LiteLLM retries
+  # against a larger-context group instead of failing the request.
+  context_window_fallbacks:
+    - claude-haiku-us-east-1:
+        - claude-sonnet-longctx
+    - claude-haiku-us-west-2:
+        - claude-sonnet-longctx
+
+  # --- Content-policy fallbacks (Bedrock guardrail / content block) -------
+  # Optional: when a model's provider-side content policy blocks a response,
+  # retry against an alternate group. Kept here to show the full triad.
+  content_policy_fallbacks:
+    - claude-sonnet-us-east-1:
+        - claude-sonnet-us-west-2
+
+  # Retry settings (intra-deployment retries BEFORE a model-group fallback).
+  num_retries: 2
+  retry_after: 5
+  timeout: 300
+
+# =============================================================================
+# General Settings
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# =============================================================================
+# LiteLLM Settings
+# =============================================================================
+litellm_settings:
+  set_verbose: false
+  drop_params: true  # Drop unsupported params instead of erroring
+
+  # OpenTelemetry callback for native tracing
+  success_callback: ["otel"]
+  failure_callback: ["otel"]
