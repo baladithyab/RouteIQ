@@ -1030,15 +1030,55 @@ class TestMyStatsEndpoint:
         assert body["key_id"] == "test-user-key"
         assert body["max_budget_usd"] == 100.0
 
-    def test_me_stats_requires_user_auth(self, unauthed_client):
+    def test_me_stats_requires_user_auth(self):
         """/me/stats is on the user-auth tier: it MUST NOT serve an
         unauthenticated 200. The endpoint carries the same
         ``Depends(user_api_key_auth)`` as every other ``llmrouter_router``
-        route, so the auth dependency runs before the handler. (In this unit
-        environment LiteLLM's auth dependency has a transitive import that
-        surfaces as a 500 rather than a clean 401/403 — the security-relevant
-        invariant is simply that no caller-scoped data is returned.)"""
-        resp = unauthed_client.get("/api/v1/routeiq/me/stats")
+        route, so the auth dependency runs before the handler.
+
+        Hermeticity note (RouteIQ-22bc): the previous version exercised the
+        REAL LiteLLM ``user_api_key_auth`` via the ``unauthed_client`` fixture
+        and merely asserted ``!= 200``. That was non-hermetic and ambient-env
+        coupled — NOT region/boto3 in the resolution sense, but a different
+        leak: LiteLLM's auth has a *no-auth dev mode* (``master_key is None``
+        and no JWT/OAuth2 -> it returns a valid INTERNAL_USER token for ANY
+        request, i.e. 200). Whether the keyless request is rejected therefore
+        depended on (a) whether ``litellm.proxy.proxy_server`` imports cleanly
+        (it raises ModuleNotFoundError -> 500 when the optional ``boto3`` AWS
+        extra is absent, which happened to make ``!= 200`` true in plain CI),
+        and (b) whether ``LITELLM_MASTER_KEY`` was set in the shell. On an
+        AWS-authed dev shell (boto3 installed, master key unset) the import
+        succeeded and dev-mode returned 200, failing the assertion.
+
+        To assert the security invariant deterministically regardless of
+        ambient env, this override installs a ``user_api_key_auth`` that
+        rejects a credential-less caller exactly as a master-key-configured
+        deployment would. The route still declares ``Depends(user_api_key_auth)``
+        so this proves the guard runs (regression-safe wiring) and that a
+        rejection yields a non-200 with no caller-scoped data leaking.
+        """
+        from fastapi import HTTPException, status
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+        app = create_standalone_app(
+            enable_plugins=False,
+            enable_resilience=False,
+        )
+
+        def _reject_unauthenticated():
+            # Mirrors LiteLLM's behaviour when a master key IS configured and
+            # the caller presents no key: the dependency raises before the
+            # handler runs. Deterministic, independent of ambient env.
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No api key passed in.",
+            )
+
+        app.dependency_overrides[user_api_key_auth] = _reject_unauthenticated
+
+        c = TestClient(app, raise_server_exceptions=False)
+        resp = c.get("/api/v1/routeiq/me/stats")
         assert resp.status_code != 200
+        assert resp.status_code in (401, 403)
         # Whatever the failure mode, no caller stats leak out.
         assert "decision_count" not in resp.text

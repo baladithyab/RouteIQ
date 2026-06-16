@@ -894,8 +894,18 @@ class TestGetDbPoolIamAuth:
 class TestResolveDbIamRegion:
     """RouteIQ-89a6/6829: region resolution order + fail-loud on unresolved."""
 
-    def test_unresolved_region_raises_fail_loud(self):
-        """No iam_region arg, no parseable host region, no AWS_REGION -> raise."""
+    def test_unresolved_region_raises_fail_loud(self, monkeypatch):
+        """No iam_region arg, no parseable host region, no AWS_REGION -> raise.
+
+        Stub the boto3 session fallback to None so the test is hermetic: a dev
+        shell with AWS_PROFILE / ~/.aws/config set would otherwise have
+        ``_region_from_boto3_session`` read a region off disk (NOT cleared by
+        ``patch.dict(os.environ, ..., clear=True)``) and the fail-loud path would
+        not trigger. CI has no profile so it passed there; locals did not.
+        """
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "_region_from_boto3_session", lambda: None)
         with patch.dict(os.environ, {}, clear=True):
             with pytest.raises(IamRegionUnresolvedError) as exc_info:
                 _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
@@ -997,6 +1007,10 @@ class TestGetDbPoolIamFailLoud:
             raise AssertionError("mint reached despite unresolved region")
 
         monkeypatch.setattr(db_mod, "_mint_db_token", _should_not_mint)
+        # Hermetic: stub the boto3 session fallback so a dev shell with
+        # AWS_PROFILE / ~/.aws/config does not resolve a region off disk
+        # (which clear=True on os.environ cannot scrub) and skip the raise.
+        monkeypatch.setattr(db_mod, "_region_from_boto3_session", lambda: None)
         mock_asyncpg = _mock_asyncpg()
         # IAM on, serverless URL, and NO AWS_REGION / ROUTEIQ_POSTGRES__IAM_REGION.
         env = {"DATABASE_URL": _SERVERLESS_RDS_URL, "ROUTEIQ_DB_IAM_AUTH": "true"}

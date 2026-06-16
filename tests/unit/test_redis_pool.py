@@ -702,10 +702,18 @@ _NO_REGION_ENV = {
 class TestResolveIamRegion:
     """RouteIQ-89a6/6829: region resolution order + fail-loud on unresolved."""
 
-    def test_unresolved_region_raises_fail_loud(self):
-        """No iam_region, no parseable host region, no AWS_REGION -> raise."""
+    def test_unresolved_region_raises_fail_loud(self, monkeypatch):
+        """No iam_region, no parseable host region, no AWS_REGION -> raise.
+
+        Stub the boto3 session fallback to None so the test is hermetic: a dev
+        shell with AWS_PROFILE / ~/.aws/config set would otherwise have
+        ``_region_from_boto3_session`` read a region off disk (NOT cleared by
+        ``patch.dict("os.environ", ..., clear=True)``) and the fail-loud path
+        would not trigger. CI has no profile so it passed there; locals did not.
+        """
         import litellm_llmrouter.redis_pool as rp
 
+        monkeypatch.setattr(rp, "_region_from_boto3_session", lambda: None)
         with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
             reset_settings()
             with pytest.raises(IamRegionUnresolvedError) as exc_info:
@@ -818,6 +826,10 @@ class TestRedisIamFailLoudOnUnresolvedRegion:
             raise AssertionError("mint reached despite unresolved region")
 
         monkeypatch.setattr(rp, "_mint_elasticache_token", _should_not_mint)
+        # Hermetic: stub the boto3 session fallback so a dev shell with
+        # AWS_PROFILE / ~/.aws/config does not resolve a region off disk
+        # (which clear=True on os.environ cannot scrub) and skip the raise.
+        monkeypatch.setattr(rp, "_region_from_boto3_session", lambda: None)
         with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
             reset_settings()
             with patch("redis.asyncio.Redis"):
@@ -832,6 +844,10 @@ class TestRedisIamFailLoudOnUnresolvedRegion:
             raise AssertionError("mint reached despite unresolved region")
 
         monkeypatch.setattr(rp, "_mint_elasticache_token", _should_not_mint)
+        # Hermetic: stub the boto3 session fallback so a dev shell with
+        # AWS_PROFILE / ~/.aws/config does not resolve a region off disk
+        # (which clear=True on os.environ cannot scrub) and skip the raise.
+        monkeypatch.setattr(rp, "_region_from_boto3_session", lambda: None)
         with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
             reset_settings()
             with patch("redis.Redis"):
