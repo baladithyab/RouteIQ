@@ -171,6 +171,54 @@ class TestBackpressureActiveGauge:
         assert await dm.acquire() is True
         await dm.release()
 
+    @pytest.mark.asyncio
+    async def test_gauge_never_negative_on_double_release(
+        self, gateway_metrics, metric_reader
+    ):
+        """A spurious extra release must not drive the in-flight gauge below 0.
+
+        RouteIQ-9e21: ``release`` previously emitted ``-1`` unconditionally,
+        even when the active-request counter was already clamped to 0, so a
+        double-release (or a drain/release race) drifted the gauge negative.
+        The delta is now computed from the ACTUAL change in the counter, so an
+        already-zero release emits 0 and the gauge floors at 0.
+        """
+        dm = DrainManager()
+        await dm.acquire()
+        await dm.release()  # back to 0, gauge == 0
+        await dm.release()  # spurious extra release: counter clamps, gauge stays 0
+
+        assert _sum_value(metric_reader, "gateway.backpressure.active_requests") == 0
+
+    @pytest.mark.asyncio
+    async def test_gauge_never_negative_under_simulated_drain_release_race(
+        self, gateway_metrics, metric_reader
+    ):
+        """Under a flurry of concurrent releases the gauge never reports < 0.
+
+        Simulates the drain/release race: more releases are issued than the
+        counter ever rose to (e.g. a slot released twice while draining). The
+        net gauge must be >= 0 at every observable point and == 0 at rest, with
+        inc/dec strictly paired.
+        """
+        import asyncio
+
+        dm = DrainManager()
+        # Two real acquisitions...
+        await dm.acquire()
+        await dm.acquire()
+        # ...then FOUR concurrent releases (two of them spurious, modelling the
+        # drain/release race where a slot is released more than once).
+        await asyncio.gather(dm.release(), dm.release(), dm.release(), dm.release())
+
+        # Net delta of the gauge can never be negative: +2 acquired, at most -2
+        # actually released, the 2 spurious releases emit 0.
+        net = _sum_value(metric_reader, "gateway.backpressure.active_requests")
+        assert net >= 0
+        assert net == 0
+        # The DrainManager's own counter is also clamped at 0 (never negative).
+        assert dm.active_requests == 0
+
 
 # ---------------------------------------------------------------------------
 # Backpressure: rejection counter (BackpressureMiddleware 503 funnel)

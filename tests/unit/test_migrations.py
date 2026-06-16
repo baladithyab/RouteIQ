@@ -23,6 +23,7 @@ from litellm_llmrouter.migrations import (
     _run_as_leader,
     _wait_as_follower,
     _write_completion_marker,
+    _write_completion_marker_with_retry,
     reset_migration_state,
     run_migrations_if_leader,
 )
@@ -286,14 +287,20 @@ class _FakeConn:
     - ``SELECT version ... WHERE version = $1`` returns a row or ``None``.
     """
 
-    def __init__(self, store: dict):
+    def __init__(self, store: dict, ddl_counter: list[int] | None = None):
         self._store = store
+        # Shared one-element list so DDL executions are counted across every
+        # connection handed out by the pool (RouteIQ-dbbc).
+        self._ddl_counter = ddl_counter
 
     async def execute(self, sql: str, *args):
         if "INSERT INTO" in sql:
             version, holder = args[0], args[1]
             self._store[version] = holder
-        # CREATE TABLE / anything else: no-op
+        elif "CREATE TABLE" in sql:
+            if self._ddl_counter is not None:
+                self._ddl_counter[0] += 1
+        # anything else: no-op
         return "OK"
 
     async def fetchrow(self, sql: str, *args):
@@ -323,9 +330,12 @@ class _FakeMarkerStore:
 
     def __init__(self):
         self.rows: dict[str, str | None] = {}
+        # Counts ``CREATE TABLE`` DDL executions across all acquired connections
+        # so RouteIQ-dbbc (DDL at most once per process) is observable.
+        self.ddl_count: list[int] = [0]
 
     def acquire(self):
-        return _FakeAcquire(_FakeConn(self.rows))
+        return _FakeAcquire(_FakeConn(self.rows, self.ddl_count))
 
 
 def _patch_pool(store: _FakeMarkerStore):
@@ -446,6 +456,141 @@ class TestMarkerExists:
         ):
             with pytest.raises(IamRegionUnresolvedError):
                 await _marker_exists("v1")
+
+
+class TestMarkerTableDDLOncePerProcess:
+    """RouteIQ-dbbc: the ``CREATE TABLE IF NOT EXISTS`` DDL is issued AT MOST
+    ONCE per process; subsequent follower polls are a pure SELECT."""
+
+    async def test_repeated_polls_issue_ddl_once(self):
+        """Many follower polls -> exactly ONE CREATE TABLE across the process."""
+        store = _FakeMarkerStore()
+        reset_migration_state()
+        with _patch_pool(store):
+            for _ in range(10):
+                await _marker_exists("v1")
+        assert store.ddl_count[0] == 1
+
+    async def test_write_then_polls_share_single_ddl(self):
+        """A leader write followed by follower polls still issues the DDL once."""
+        store = _FakeMarkerStore()
+        reset_migration_state()
+        with _patch_pool(store):
+            await _write_completion_marker("v1")  # leader ensures table (DDL #1)
+            for _ in range(5):
+                await _marker_exists("v1")  # followers: pure SELECT, no DDL
+        assert store.ddl_count[0] == 1
+
+    async def test_reset_rearms_ddl_for_next_process(self):
+        """``reset_migration_state`` clears the guard so a fresh 'process' (test)
+        re-issues the DDL exactly once."""
+        store = _FakeMarkerStore()
+        reset_migration_state()
+        with _patch_pool(store):
+            await _marker_exists("v1")
+            assert store.ddl_count[0] == 1
+            reset_migration_state()  # simulate a new process
+            await _marker_exists("v1")
+            assert store.ddl_count[0] == 2
+
+
+class TestWriteCompletionMarkerWithRetry:
+    """RouteIQ-d07f: a transient marker-write failure after a SUCCESSFUL
+    migration is retried so cross-pod followers are not stranded."""
+
+    async def test_retries_then_succeeds(self):
+        """First two writes fail, third succeeds -> overall True, marker present."""
+        reset_migration_state()
+        store = _FakeMarkerStore()
+        calls = {"n": 0}
+
+        async def flaky_write(version):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return False
+            store.rows[version] = "leader"
+            return True
+
+        with patch(
+            "litellm_llmrouter.migrations._write_completion_marker",
+            new=AsyncMock(side_effect=flaky_write),
+        ):
+            with patch("litellm_llmrouter.migrations.asyncio.sleep", new=AsyncMock()):
+                result = await _write_completion_marker_with_retry("v1")
+        assert result is True
+        assert calls["n"] == 3
+        assert "v1" in store.rows
+
+    async def test_returns_false_after_exhausting_retries(self):
+        """Every attempt fails -> returns False (migration still succeeded, but
+        the un-marked condition is observable to the caller)."""
+        reset_migration_state()
+        with patch(
+            "litellm_llmrouter.migrations._write_completion_marker",
+            new=AsyncMock(return_value=False),
+        ) as mock_write:
+            with patch("litellm_llmrouter.migrations.asyncio.sleep", new=AsyncMock()):
+                result = await _write_completion_marker_with_retry("v1")
+        assert result is False
+        from litellm_llmrouter import migrations
+
+        assert mock_write.await_count == migrations._MARKER_WRITE_MAX_ATTEMPTS
+
+    async def test_first_attempt_success_no_retry(self):
+        """A clean first write does not retry."""
+        reset_migration_state()
+        with patch(
+            "litellm_llmrouter.migrations._write_completion_marker",
+            new=AsyncMock(return_value=True),
+        ) as mock_write:
+            result = await _write_completion_marker_with_retry("v1")
+        assert result is True
+        assert mock_write.await_count == 1
+
+    async def test_leader_retries_marker_write_after_successful_migration(
+        self, tmp_path
+    ):
+        """End-to-end: a clean migration whose first marker write fails still
+        ends with a durable marker thanks to the retry (RouteIQ-d07f)."""
+        schema = tmp_path / "proxy" / "schema.prisma"
+        schema.parent.mkdir(parents=True)
+        schema.write_text("// schema")
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok", stderr=""
+        )
+        store = _FakeMarkerStore()
+        calls = {"n": 0}
+
+        async def flaky_write(version):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False  # transient blip on the first write
+            store.rows[version] = "leader"
+            return True
+
+        with patch(
+            "litellm_llmrouter.migrations._find_prisma_schema",
+            return_value=str(schema),
+        ):
+            with patch(
+                "litellm_llmrouter.migrations._run_prisma_db_push",
+                return_value=completed,
+            ):
+                with patch(
+                    "litellm_llmrouter.migrations._write_completion_marker",
+                    new=AsyncMock(side_effect=flaky_write),
+                ):
+                    with patch(
+                        "litellm_llmrouter.migrations.asyncio.sleep",
+                        new=AsyncMock(),
+                    ):
+                        reset_migration_state()
+                        result = await _run_as_leader()
+        assert result is True
+        # The retry landed the durable marker despite the first-write blip.
+        assert len(store.rows) == 1
+        assert calls["n"] >= 2
 
 
 class TestCrossPodBarrier:
@@ -650,3 +795,63 @@ class TestRunLeaderMigrationsIfEnabled:
             ):
                 # Should not raise
                 run_leader_migrations_if_enabled()
+
+
+class TestRunLeaderMigrationsFailClosed:
+    """RouteIQ-be1d: a non-leader migration-barrier TimeoutError must abort
+    startup (fail-closed) by default, not be swallowed so the pod boots against
+    a possibly-un-migrated DB."""
+
+    def _run_with_timeout(self, env):
+        from litellm_llmrouter.startup import run_leader_migrations_if_enabled
+
+        mock_election = MagicMock()
+        mock_election.is_leader = False  # this pod is a follower
+
+        async def mock_init():
+            return mock_election
+
+        async def mock_migrate(is_leader):
+            # The follower path raises TimeoutError when the durable marker
+            # never appears (RouteIQ-2166 fail-closed barrier).
+            raise TimeoutError("durable marker never observed")
+
+        with patch.dict(os.environ, env):
+            with patch(
+                "litellm_llmrouter.leader_election.initialize_leader_election",
+                side_effect=mock_init,
+            ):
+                with patch(
+                    "litellm_llmrouter.migrations.run_migrations_if_leader",
+                    side_effect=mock_migrate,
+                ):
+                    run_leader_migrations_if_enabled()
+
+    def test_timeout_aborts_startup_by_default(self):
+        """Default (fail-closed): the barrier timeout calls sys.exit(1)."""
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_with_timeout({"ROUTEIQ_LEADER_MIGRATIONS": "true"})
+        assert exc_info.value.code == 1
+
+    def test_fail_open_opt_out_continues_startup(self):
+        """With ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN=true the timeout is logged
+        and startup continues (no SystemExit)."""
+        # Must NOT raise SystemExit.
+        self._run_with_timeout(
+            {
+                "ROUTEIQ_LEADER_MIGRATIONS": "true",
+                "ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN": "true",
+            }
+        )
+
+    def test_fail_closed_helper_default(self):
+        from litellm_llmrouter.startup import _migration_barrier_fail_closed
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert _migration_barrier_fail_closed() is True
+
+    def test_fail_closed_helper_opt_out(self):
+        from litellm_llmrouter.startup import _migration_barrier_fail_closed
+
+        with patch.dict(os.environ, {"ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN": "true"}):
+            assert _migration_barrier_fail_closed() is False

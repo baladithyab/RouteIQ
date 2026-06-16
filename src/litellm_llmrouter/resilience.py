@@ -265,14 +265,27 @@ class DrainManager:
         return True
 
     async def release(self) -> None:
-        """Release a request slot."""
+        """Release a request slot.
+
+        The gauge delta is computed INSIDE the lock from the actual change in
+        ``_active_requests`` so the in-flight gauge can never drift negative
+        under a drain/release race or a spurious double-release (RouteIQ-9e21).
+        When the counter was already at 0 the clamp leaves it at 0 and we emit
+        a delta of 0 -- inc and dec stay strictly paired with the gauge.
+        """
         async with self._lock:
+            before = self._active_requests
             self._active_requests -= 1
             if self._active_requests <= 0:
                 self._active_requests = 0
                 if self._draining:
                     self._drain_event.set()
-        _emit_backpressure_active(-1)
+            # Only the slots we ACTUALLY released count toward the gauge: if the
+            # counter was already 0 (double-release / drain race), the clamp
+            # makes this 0, so we never push the gauge below zero.
+            delta = self._active_requests - before
+        if delta:
+            _emit_backpressure_active(delta)
 
     def attach(self, app: Any) -> None:
         """

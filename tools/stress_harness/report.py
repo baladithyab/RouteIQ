@@ -23,10 +23,26 @@ from .models import AnalysisResult
 from .verdicts import family_for, registered_families
 
 
+def _dispatched_family(result: AnalysisResult) -> str:
+    """The family the dispatch ACTUALLY produced for this run (RouteIQ-0be9).
+
+    Read it from ``result.verdict.family`` -- the authoritative family the
+    dispatch landed on -- rather than recomputing ``family_for(active_strategy)``.
+    The two DIVERGE when a verdict plugin errors: ``dispatch_verdict`` degrades
+    to the ``generic`` family (carrying the error note) while
+    ``family_for(active_strategy)`` would still name the matched-but-failed
+    family, mislabelling the report. Falls back to ``family_for`` only when no
+    verdict was computed.
+    """
+    if result.verdict is not None:
+        return result.verdict.family
+    return family_for(result.active_strategy)
+
+
 def build_json(result: AnalysisResult) -> dict[str, Any]:
     """Project the ``AnalysisResult`` to a JSON-able dict."""
     data = asdict(result)
-    data["verdict_family"] = family_for(result.active_strategy)
+    data["verdict_family"] = _dispatched_family(result)
     data["registered_verdict_families"] = registered_families()
     return data
 
@@ -52,7 +68,7 @@ def build_markdown(result: AnalysisResult) -> str:
     add("")
     strategy = result.active_strategy or "<unknown>"
     add(f"- **Active routing strategy**: `{strategy}`")
-    add(f"- Verdict family dispatched: `{family_for(result.active_strategy)}`")
+    add(f"- Verdict family dispatched: `{_dispatched_family(result)}`")
     if result.available_strategies:
         add(
             f"- Available strategies ({len(result.available_strategies)}): "

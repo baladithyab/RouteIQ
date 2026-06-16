@@ -74,12 +74,38 @@ def register_router_decision_callback():
         return None
 
 
+def _migration_barrier_fail_closed() -> bool:
+    """Whether a non-leader migration-barrier timeout aborts startup.
+
+    Fail-closed is the DEFAULT (RouteIQ-be1d / RouteIQ-2166): a non-leader
+    that times out waiting for the durable cross-pod completion marker has
+    NOT confirmed the DB is migrated. Booting anyway lets the pod serve
+    against a possibly-un-migrated schema, defeating the barrier. Operators
+    can opt OUT (fail-open, legacy behaviour) by setting
+    ``ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN=true`` -- the pod then logs the
+    timeout and continues startup.
+    """
+    return os.getenv("ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN", "false").lower() not in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 def run_leader_migrations_if_enabled():
     """Run DB migrations via leader election if ROUTEIQ_LEADER_MIGRATIONS=true.
 
     Initialises leader election, checks leadership, and delegates to
     :func:`litellm_llmrouter.migrations.run_migrations_if_leader`.
     This is a no-op when the feature is disabled.
+
+    Fail-closed (RouteIQ-be1d): a non-leader that times out waiting for the
+    leader's durable cross-pod completion marker raises ``TimeoutError`` from
+    ``run_migrations_if_leader``. By DEFAULT that timeout aborts startup
+    (``sys.exit(1)``) so the pod crash-loops until the leader marker appears,
+    rather than booting against a possibly-un-migrated DB. Set
+    ``ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN=true`` to revert to the legacy
+    log-and-continue behaviour.
     """
     if os.getenv("ROUTEIQ_LEADER_MIGRATIONS", "false").lower() not in (
         "true",
@@ -105,6 +131,27 @@ def run_leader_migrations_if_enabled():
             _asyncio.get_event_loop().run_until_complete(_do_migrations())
         except RuntimeError:
             _asyncio.run(_do_migrations())
+    except TimeoutError as e:
+        # Fail-closed (RouteIQ-be1d): the non-leader never observed the durable
+        # cross-pod completion marker, so the DB may be un-migrated. Abort
+        # startup so the pod crash-loops until the leader's marker appears,
+        # rather than silently serving against a possibly-un-migrated schema.
+        if _migration_barrier_fail_closed():
+            logger.error(
+                "Leader migration barrier timed out (fail-closed): %s. "
+                "Aborting startup so the pod crash-loops until the leader's "
+                "durable completion marker appears. Set "
+                "ROUTEIQ_LEADER_MIGRATIONS_FAIL_OPEN=true to continue anyway.",
+                e,
+            )
+            print(f"❌ Leader migration barrier timed out (fail-closed): {e}")
+            sys.exit(1)
+        logger.warning(
+            "Leader migration barrier timed out but fail-open is enabled; "
+            "continuing startup against a possibly-un-migrated DB: %s",
+            e,
+        )
+        print(f"⚠️ Leader migration barrier timed out (fail-open, continuing): {e}")
     except ImportError as e:
         logger.debug(f"Could not run leader migrations: {e}")
     except Exception as e:

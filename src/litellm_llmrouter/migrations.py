@@ -57,6 +57,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MIGRATION_TIMEOUT = 120
 _DEFAULT_POLL_INTERVAL = 2
 
+# Bounded retry for the durable marker write after a SUCCESSFUL migration
+# (RouteIQ-d07f). A transient marker-write failure leaves no durable marker, so
+# cross-pod followers time out even though the leader migrated cleanly. We retry
+# the write a few times before giving up; an unrecoverable failure is logged at
+# ERROR (distinct from the per-attempt warnings inside _write_completion_marker).
+_MARKER_WRITE_MAX_ATTEMPTS = 3
+_MARKER_WRITE_RETRY_DELAY = 1.0
+
 # Default marker version used when no explicit version is supplied. Operators
 # may override via ``ROUTEIQ_MIGRATION_VERSION`` to force a re-coordination
 # (e.g. after a schema change) so non-leaders do not observe a stale marker.
@@ -78,6 +86,13 @@ CREATE TABLE IF NOT EXISTS {_MARKER_TABLE} (
 # source of truth (an asyncio.Event is per-process). The durable marker row is
 # authoritative for coordination across pods. See RouteIQ-2166.
 _migration_complete = asyncio.Event()
+
+# Per-process guard so the marker-table DDL (``CREATE TABLE IF NOT EXISTS``) is
+# issued AT MOST ONCE per process (RouteIQ-dbbc). Without it a non-leader runs
+# the DDL on EVERY poll (~60x/startup at the default 2s interval over 120s).
+# Once the table is ensured (by the leader's first write or the follower's
+# first poll) subsequent follower polls become a pure SELECT.
+_marker_table_ensured = False
 
 
 def _is_leader_migrations_enabled() -> bool:
@@ -150,6 +165,21 @@ def _run_prisma_db_push(schema_path: str) -> subprocess.CompletedProcess:
 # =============================================================================
 
 
+async def _ensure_marker_table(conn) -> None:
+    """Issue the marker-table DDL at most once per process (RouteIQ-dbbc).
+
+    ``CREATE TABLE IF NOT EXISTS`` is idempotent but not free: running it on
+    every follower poll wastes a round-trip and a catalog lookup ~60x/startup.
+    A per-process flag collapses that to a single DDL; subsequent follower
+    polls are a pure SELECT.
+    """
+    global _marker_table_ensured
+    if _marker_table_ensured:
+        return
+    await conn.execute(_MARKER_TABLE_SQL)
+    _marker_table_ensured = True
+
+
 async def _write_completion_marker(version: str) -> bool:
     """Write the durable completion marker for *version* via the shared pool.
 
@@ -174,7 +204,7 @@ async def _write_completion_marker(version: str) -> bool:
             )
             return False
         async with pool.acquire() as conn:
-            await conn.execute(_MARKER_TABLE_SQL)
+            await _ensure_marker_table(conn)
             await conn.execute(
                 f"""
                 INSERT INTO {_MARKER_TABLE} (version, completed_at, holder_id)
@@ -200,6 +230,44 @@ async def _write_completion_marker(version: str) -> bool:
         return False
 
 
+async def _write_completion_marker_with_retry(version: str) -> bool:
+    """Write the durable marker, retrying a transient failure (RouteIQ-d07f).
+
+    ``_write_completion_marker`` returning ``False`` after a SUCCESSFUL
+    migration is dangerous: with no durable marker, cross-pod followers time
+    out even though the leader migrated cleanly. We retry the write up to
+    :data:`_MARKER_WRITE_MAX_ATTEMPTS` times (with a short backoff) before
+    giving up. ``IamRegionUnresolvedError`` is boot-critical and propagates
+    immediately (no retry).
+
+    Returns ``True`` if the marker was eventually written, ``False`` if every
+    attempt returned ``False`` (a distinct ERROR is logged on final failure so
+    the un-marked-success condition is observable).
+    """
+    for attempt in range(1, _MARKER_WRITE_MAX_ATTEMPTS + 1):
+        if await _write_completion_marker(version):
+            if attempt > 1:
+                logger.info(
+                    "Leader migrations: durable marker written on retry "
+                    f"(attempt {attempt}/{_MARKER_WRITE_MAX_ATTEMPTS})"
+                )
+            return True
+        if attempt < _MARKER_WRITE_MAX_ATTEMPTS:
+            logger.warning(
+                "Leader migrations: durable marker write failed after a "
+                f"successful migration (attempt {attempt}/"
+                f"{_MARKER_WRITE_MAX_ATTEMPTS}); retrying in "
+                f"{_MARKER_WRITE_RETRY_DELAY}s"
+            )
+            await asyncio.sleep(_MARKER_WRITE_RETRY_DELAY)
+    logger.error(
+        "Leader migrations: durable marker write FAILED after a successful "
+        f"migration and {_MARKER_WRITE_MAX_ATTEMPTS} attempts; cross-pod "
+        "followers will time out (RouteIQ-d07f). Migration itself succeeded."
+    )
+    return False
+
+
 async def _marker_exists(version: str) -> bool:
     """Return ``True`` if the durable completion marker for *version* exists.
 
@@ -216,8 +284,10 @@ async def _marker_exists(version: str) -> bool:
             return False
         async with pool.acquire() as conn:
             # Ensure the table exists so a SELECT before the leader's first
-            # write does not raise "relation does not exist" on every poll.
-            await conn.execute(_MARKER_TABLE_SQL)
+            # write does not raise "relation does not exist". Guarded so the
+            # DDL is issued at most once per process (RouteIQ-dbbc) -- after
+            # the first ensure, the follower poll is a pure SELECT.
+            await _ensure_marker_table(conn)
             row = await conn.fetchrow(
                 f"SELECT version FROM {_MARKER_TABLE} WHERE version = $1",
                 version,
@@ -287,8 +357,8 @@ async def _run_as_leader() -> bool:
             "Leader migrations: Prisma schema not found, skipping migrations"
         )
         # Nothing to migrate -> mark complete so non-leaders proceed. Write the
-        # durable marker first (best-effort) then the same-process Event.
-        await _write_completion_marker(version)
+        # durable marker first (retried) then the same-process Event.
+        await _write_completion_marker_with_retry(version)
         _migration_complete.set()
         return True
 
@@ -323,8 +393,11 @@ async def _run_as_leader() -> bool:
         return False
 
     # Migrations succeeded: write the DURABLE cross-pod marker first (source of
-    # truth for non-leaders on other pods), then the same-process Event.
-    await _write_completion_marker(version)
+    # truth for non-leaders on other pods), then the same-process Event. The
+    # write is RETRIED (RouteIQ-d07f) -- a transient marker-write failure after
+    # a clean migration would otherwise leave no durable marker and strand
+    # cross-pod followers in a timeout.
+    await _write_completion_marker_with_retry(version)
     _migration_complete.set()
     return True
 
@@ -379,5 +452,6 @@ async def _wait_as_follower(*, timeout: int, poll_interval: int) -> bool:
 
 def reset_migration_state() -> None:
     """Reset module state. For testing only."""
-    global _migration_complete
+    global _migration_complete, _marker_table_ensured
     _migration_complete = asyncio.Event()
+    _marker_table_ensured = False

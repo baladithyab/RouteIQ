@@ -1167,3 +1167,72 @@ class TestBedrockDiscoverySourceRegionsEnv:
         # The _split_csv field validator still serves direct/programmatic use.
         s = BedrockDiscoverySettings(source_regions="us-east-1, eu-west-1")
         assert s.source_regions == ["us-east-1", "eu-west-1"]
+
+
+# ============================================================================
+# EvalPipelineSettings: flat ROUTEIQ_EVAL_PIPELINE bool env var (RouteIQ-778e)
+# ============================================================================
+
+
+class TestEvalPipelineFlatEnvVar:
+    """Regression: the DOCUMENTED flat ``ROUTEIQ_EVAL_PIPELINE`` bool env var
+    must NOT crash ``GatewaySettings()``.
+
+    The flat var collides with the nested ``eval_pipeline`` BaseModel field
+    (env_prefix ``ROUTEIQ_``): pydantic-settings JSON-decodes the bool ``true``
+    and then validates it against ``EvalPipelineSettings``, raising
+    ``ValidationError`` and aborting ALL of ``GatewaySettings()``.
+    ``_RouteIQEnvSettingsSource`` expands the bare bool onto ``{"enabled": ...}``
+    at the env-source decode point so the documented enable var boots cleanly.
+    """
+
+    def test_flat_true_constructs_and_enables(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE", "true")
+        reset_settings()
+        # MUST NOT raise -- the whole gateway used to fail here.
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is True
+        # Sibling fields keep their defaults (the bool only sets ``enabled``).
+        assert s.eval_pipeline.sample_rate == 0.1
+
+    def test_flat_false_constructs_and_disables(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE", "false")
+        reset_settings()
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is False
+
+    def test_flat_one_enables(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE", "1")
+        reset_settings()
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is True
+
+    def test_flat_yes_enables(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE", "yes")
+        reset_settings()
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is True
+
+    def test_nested_enabled_env_form_still_works(self, monkeypatch):
+        # The ``__``-nested form must remain unaffected by the flat-bool shim.
+        monkeypatch.delenv("ROUTEIQ_EVAL_PIPELINE", raising=False)
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE__ENABLED", "true")
+        reset_settings()
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is True
+
+    def test_default_disabled_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("ROUTEIQ_EVAL_PIPELINE", raising=False)
+        reset_settings()
+        s = GatewaySettings()
+        assert s.eval_pipeline.enabled is False
+
+    def test_get_settings_does_not_raise_on_documented_var(self, monkeypatch):
+        """The acceptance contract: get_settings() must NOT raise when the
+        documented enable var is set."""
+        from litellm_llmrouter.settings import get_settings
+
+        monkeypatch.setenv("ROUTEIQ_EVAL_PIPELINE", "true")
+        reset_settings()
+        s = get_settings()  # would have raised ValidationError before the fix
+        assert s.eval_pipeline.enabled is True

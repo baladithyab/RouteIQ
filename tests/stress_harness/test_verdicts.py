@@ -215,3 +215,58 @@ def test_generic_fallback_handles_empty_run():
     verdict = dispatch_verdict("anything", [], None, result)
     assert verdict.family == "generic"
     assert verdict.findings["distinct_models"] == 0
+
+
+# --- a BUGGY plugin must degrade to generic, never crash (RouteIQ-f239) ----
+
+
+def test_buggy_plugin_degrades_to_generic_with_note(monkeypatch):
+    """A verdict plugin that RAISES must not crash the run: the dispatch
+    catches it, falls back to the generic distribution verdict, and APPENDS a
+    note naming the failed family + exception so the failure is visible."""
+    from stress_harness import verdicts
+
+    def _boom(active_strategy, records, stats, result):
+        raise ValueError("synthetic plugin failure")
+
+    # Register the raising plugin under the family ``kumaraswamy-thompson``
+    # resolves to (``fan-out``), so dispatch routes to it then has it blow up.
+    monkeypatch.setitem(verdicts._REGISTRY, "fan-out", _boom)
+
+    records = [_ok_record("math", "model-a"), _ok_record("code", "model-b")]
+    result = _result_from(records)
+
+    verdict = dispatch_verdict("kumaraswamy-thompson", records, None, result)
+
+    # Degraded to the generic verdict (never raised).
+    assert verdict.family == "generic"
+    # The dispatch appended a note naming the failed family + the exception.
+    joined = " ".join(verdict.messages)
+    assert "fan-out" in joined
+    assert "errored" in joined.lower()
+    assert "ValueError" in joined
+    assert "synthetic plugin failure" in joined
+
+
+def test_buggy_plugin_note_carried_through_to_report_family(monkeypatch):
+    """When a plugin errors, the report's dispatched family must read the
+    DEGRADED family (generic), not recompute family_for(active_strategy)
+    (RouteIQ-0be9 + RouteIQ-f239 together)."""
+    from stress_harness import report, verdicts
+
+    def _boom(active_strategy, records, stats, result):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setitem(verdicts._REGISTRY, "fan-out", _boom)
+
+    records = [_ok_record("math", "model-a")]
+    result = _result_from(records)
+    result.active_strategy = "kumaraswamy-thompson"
+    result.verdict = dispatch_verdict("kumaraswamy-thompson", records, None, result)
+
+    # family_for would still say "fan-out"; the verdict degraded to "generic".
+    assert family_for("kumaraswamy-thompson") == "fan-out"
+    assert result.verdict.family == "generic"
+    # The report must read the DEGRADED family from the verdict, not recompute.
+    assert report._dispatched_family(result) == "generic"
+    assert report.build_json(result)["verdict_family"] == "generic"

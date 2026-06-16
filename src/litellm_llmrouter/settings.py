@@ -1578,6 +1578,22 @@ class HASettings(BaseModel):
 #: comma-separated and the JSON-list env forms construct cleanly.
 _CSV_LIST_ENV_FIELDS = frozenset({"source_regions"})
 
+#: Nested BaseModel fields whose DOCUMENTED flat env var is a bare bool that
+#: should map onto the sub-model's ``enabled`` flag (RouteIQ-778e).  The flat
+#: ``ROUTEIQ_EVAL_PIPELINE=true`` collides with the nested ``eval_pipeline``
+#: BaseModel field: pydantic-settings JSON-decodes the bool ``true`` and then
+#: tries to validate it as an ``EvalPipelineSettings`` model, raising
+#: ``ValidationError`` and aborting ALL of ``GatewaySettings()``.  We expand the
+#: bare bool to ``{"enabled": <bool>}`` at the decode point so the documented
+#: enable var constructs cleanly (the ``__``-nested forms such as
+#: ``ROUTEIQ_EVAL_PIPELINE__ENABLED=true`` are handled by pydantic natively and
+#: are unaffected).
+_FLAT_BOOL_MODEL_ENV_FIELDS = frozenset({"eval_pipeline"})
+
+# Bare-bool string spellings accepted for a flat model-enable env var.
+_TRUE_BOOL_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_BOOL_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
 
 class _RouteIQEnvSettingsSource(EnvSettingsSource):
     """``EnvSettingsSource`` that accepts comma-separated lists for a few fields.
@@ -1589,6 +1605,11 @@ class _RouteIQEnvSettingsSource(EnvSettingsSource):
     ``["a","b"]`` still works).  This is what makes
     ``ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS=us-east-1,eu-west-1`` boot the
     gateway instead of crashing it.
+
+    For the fields in :data:`_FLAT_BOOL_MODEL_ENV_FIELDS` we accept a DOCUMENTED
+    flat bool (e.g. ``ROUTEIQ_EVAL_PIPELINE=true``) and expand it onto the
+    sub-model's ``enabled`` flag, so the bare bool does not crash
+    ``GatewaySettings()`` against the nested BaseModel (RouteIQ-778e).
     """
 
     def decode_complex_value(
@@ -1600,6 +1621,17 @@ class _RouteIQEnvSettingsSource(EnvSettingsSource):
             # bare comma-separated form needs the shim.
             if not stripped.startswith(("[", '"')):
                 return [r.strip() for r in stripped.split(",") if r.strip()]
+        if field_name in _FLAT_BOOL_MODEL_ENV_FIELDS and isinstance(value, str):
+            stripped = value.strip()
+            # Defer to JSON when the operator gave a JSON object (the
+            # ``{"enabled": true, ...}`` form, or a ``__``-nested expansion);
+            # only the DOCUMENTED bare bool needs the shim.
+            if not stripped.startswith("{"):
+                lowered = stripped.lower()
+                if lowered in _TRUE_BOOL_STRINGS:
+                    return {"enabled": True}
+                if lowered in _FALSE_BOOL_STRINGS:
+                    return {"enabled": False}
         return super().decode_complex_value(field_name, field, value)
 
 
