@@ -637,3 +637,94 @@ class TestCircuitBreakerMetrics:
         await cb.force_closed()
         assert not _data_points(metric_reader, "gateway.circuit_breaker.transitions")
         reset_shared_circuit_breaker_state()
+
+
+# ---------------------------------------------------------------------------
+# Routing strategies: personalized selection (RouteIQ-2914)
+# ---------------------------------------------------------------------------
+
+
+class TestPersonalizedRoutingMetric:
+    """The routing.selection metric must fire from the LIVE personalized path.
+
+    metrics-2 originally emitted ``gateway.routing.selection`` from
+    ``PersonalizedRouter.get_top_model()``, but that method is not on the live
+    dispatch path -- ``_route_via_personalized`` calls ``rank_models`` directly
+    and selects ``ranked[0][0]``. These tests drive that live path end-to-end
+    (mocking ``rank_models``) and pin that the selection metric fires exactly
+    once with ``strategy=personalized`` and the chosen model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_route_via_personalized_records_selection(
+        self, gateway_metrics, metric_reader
+    ):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from litellm_llmrouter.custom_routing_strategy import RouteIQRoutingStrategy
+
+        deployments = [_dep("g", "gpt-4o"), _dep("g", "claude-3")]
+        router = _FakeRouter(deployments)
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+
+        # Mocked personalized router: rank_models picks claude-3 as the winner.
+        p_router = MagicMock()
+        p_router.rank_models = AsyncMock(
+            return_value=[("claude-3", 0.9), ("gpt-4o", 0.4)]
+        )
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.get_personalized_router",
+            return_value=p_router,
+        ):
+            result = await strategy._route_via_personalized("g", {"user": "alice"})
+
+        # The live path selected the top-ranked model and mapped it.
+        assert result is not None
+        assert result["litellm_params"]["model"] == "claude-3"
+        p_router.rank_models.assert_awaited_once()
+
+        # Exactly one selection recorded for the personalized strategy/model.
+        assert (
+            _counter_value(
+                metric_reader,
+                "gateway.routing.selection",
+                {"strategy": "personalized", "model": "claude-3"},
+            )
+            == 1
+        )
+        # And nothing recorded for any other strategy.
+        assert (
+            _counter_value(
+                metric_reader,
+                "gateway.routing.selection",
+                {"strategy": "personalized"},
+            )
+            == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_selection_metric_when_no_user(
+        self, gateway_metrics, metric_reader
+    ):
+        """No user id -> personalized routing bails before any selection."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from litellm_llmrouter.custom_routing_strategy import RouteIQRoutingStrategy
+
+        deployments = [_dep("g", "gpt-4o"), _dep("g", "claude-3")]
+        router = _FakeRouter(deployments)
+        strategy = RouteIQRoutingStrategy(router_instance=router)
+
+        p_router = MagicMock()
+        p_router.rank_models = AsyncMock(return_value=[("claude-3", 0.9)])
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.get_personalized_router",
+            return_value=p_router,
+        ):
+            result = await strategy._route_via_personalized("g", {})
+
+        assert result is None
+        p_router.rank_models.assert_not_awaited()
+        assert not _data_points(metric_reader, "gateway.routing.selection")

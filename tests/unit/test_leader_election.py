@@ -865,68 +865,49 @@ class TestAutoDemotion:
 
         assert election._consecutive_renewal_failures == 0
 
-    def test_auto_demotion_after_two_failures_in_renew_loop(self):
-        """Leader should auto-demote after 2 consecutive renewal failures in _renew_loop."""
-        election = LeaderElection(
-            database_url=None,
-            renew_interval_seconds=0,  # No wait
+    def test_renew_loop_does_not_loop_counter_demote(self):
+        """_renew_loop must NOT auto-demote off a loop counter.
+
+        The loop-counter auto-demotion branch was removed because it was
+        unreachable (RouteIQ-a93a): ``try_acquire`` is the sole owner of
+        demotion. This test drives the REAL ``_renew_loop`` against a DB that
+        always returns a non-matching row -- so ``try_acquire`` self-demotes on
+        the FIRST renew. The instance ends up demoted (via try_acquire, not a
+        counter) and the failure counter never accrues toward a separate
+        loop-driven demotion.
+        """
+        mock_conn = AsyncMock()
+        mock_conn.close = AsyncMock()
+        # fetchrow returns a row owned by SOMEONE ELSE -> not acquired.
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "holder_id": "another-holder",
+                "expires_at": datetime.now(timezone.utc) + timedelta(seconds=30),
+                "generation": 9,
+            }
         )
-        # Pretend we are leader
-        election._is_leader = True
-        election._lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=300)
 
         callback_values = []
 
-        def callback(is_leader):
-            callback_values.append(is_leader)
+        with patch_db_pool(mock_conn):
+            election = LeaderElection(
+                database_url="postgresql://localhost/test",
+                holder_id="test-holder",
+                renew_interval_seconds=0,
+            )
+            election._is_leader = True
+            election._lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=300
+            )
 
-        election._on_leadership_change = callback
+            election.start_renewal(
+                on_leadership_change=lambda x: callback_values.append(x)
+            )
+            time.sleep(0.3)
+            election.stop_renewal()
 
-        # Make renew() always return False (simulate failure)
-        async def mock_renew():
-            return False
-
-        election.renew = mock_renew
-
-        # Manually simulate what _renew_loop does for 2 iterations
-        # Iteration 1: failure -> consecutive_failures=1, still leader
-        loop = asyncio.new_event_loop()
-        try:
-            renewed = loop.run_until_complete(election.renew())
-        finally:
-            loop.close()
-
-        assert not renewed
-        # Simulate the _renew_loop logic
-        if not renewed and election._is_leader:
-            election._consecutive_renewal_failures += 1
-            if election._consecutive_renewal_failures >= 2:
-                election._is_leader = False
-                election._lease_expires_at = None
-                if election._on_leadership_change:
-                    election._on_leadership_change(False)
-
-        assert election._consecutive_renewal_failures == 1
-        assert election._is_leader is True  # Still leader after 1 failure
-
-        # Iteration 2: failure -> consecutive_failures=2, auto-demote
-        loop = asyncio.new_event_loop()
-        try:
-            renewed = loop.run_until_complete(election.renew())
-        finally:
-            loop.close()
-
-        if not renewed and election._is_leader:
-            election._consecutive_renewal_failures += 1
-            if election._consecutive_renewal_failures >= 2:
-                election._is_leader = False
-                election._lease_expires_at = None
-                if election._on_leadership_change:
-                    election._on_leadership_change(False)
-
-        assert election._consecutive_renewal_failures == 2
+        # Demotion happened via try_acquire's self-demotion, not a loop counter.
         assert election._is_leader is False
-        assert election._lease_expires_at is None
         assert False in callback_values
 
     def test_auto_demotion_via_renew_loop_thread(self):
@@ -969,38 +950,20 @@ class TestAutoDemotion:
         assert election._is_leader is False
         assert False in callback_values
 
-    def test_renew_loop_db_exception_path_does_not_drive_counter_demotion(self):
-        """Document why the _renew_loop loop-counter demotion branch is unreachable.
+    def test_renew_loop_db_exception_path_keeps_leadership(self):
+        """A raising renew query must keep leadership (favour stability).
 
-        ``_renew_loop`` (leader_election.py:972-993) has an ``elif self._is_leader``
-        branch that increments ``_consecutive_renewal_failures`` and auto-demotes
-        once the counter reaches 2 -- demotion driven by the LOOP COUNTER rather
-        than by ``try_acquire`` itself.
+        The loop-counter auto-demotion branch that used to live in
+        ``_renew_loop`` was REMOVED (RouteIQ-a93a) because it was unreachable:
+        ``try_acquire`` owns demotion. This test pins the EXCEPTION failure
+        mode that proves the old branch could never fire.
 
-        That branch is genuinely UNREACHABLE through the real ``renew()`` flow,
-        and this test pins the two reasons so a future refactor that "fixes"
-        ``try_acquire`` is forced to revisit it:
-
-        1. NULL / not-our-row path: ``try_acquire`` self-demotes (sets
-           ``_is_leader = False``) *before* returning ``False`` (lines 822-835).
-           So by the time ``_renew_loop`` evaluates ``elif self._is_leader`` the
-           flag is already ``False`` -- the loop counter never runs. (That self-
-           demotion path is what ``test_auto_demotion_via_renew_loop_thread``
-           exercises -- demotion comes from ``try_acquire``, not the counter.)
-
-        2. EXCEPTION path: when the renew query (``fetchrow``) or
-           ``get_db_pool`` RAISES, ``try_acquire`` swallows the exception and
-           returns ``self._is_leader`` -- which is still ``True`` (lines 837-841,
-           "favour stability"). ``renew()`` therefore returns ``True``, the loop
-           sees ``renewed`` truthy and RESETS ``_consecutive_renewal_failures``
-           to 0. The failure counter is never incremented, so it can never reach
-           2 via a raising DB.
-
-        This test drives the REAL ``_renew_loop`` through multiple iterations
-        where the DB query RAISES every time and asserts the observed behavior:
-        the instance STAYS leader, the counter stays at 0, and no demotion
-        callback fires. (f62a: the loop-counter branch cannot be covered without
-        modifying leader_election.py, which is out of scope for this cluster.)
+        When the renew query (``fetchrow``) RAISES, ``try_acquire`` swallows
+        the exception and returns ``self._is_leader`` -- still ``True``
+        ("favour stability"). ``renew()`` therefore returns ``True``, the loop
+        sees ``renewed`` truthy and RESETS ``_consecutive_renewal_failures``
+        to 0. Leadership is retained and no demotion callback fires, even
+        across many raising iterations.
         """
         renew_calls = []
 
