@@ -3,6 +3,8 @@ import apiClient from './client'
 import type {
     GatewayStatus,
     RoutingStats,
+    GlobalStats,
+    MyStats,
     ModelInfo,
     RoutingConfig,
     UpdateRoutingConfig,
@@ -37,6 +39,22 @@ export function useRoutingStats() {
         queryKey: ['routing-stats'],
         queryFn: () => apiClient.get<RoutingStats>('/api/v1/routeiq/routing/stats'),
         refetchInterval: 10_000,
+    })
+}
+
+export function useGlobalStats() {
+    return useQuery<GlobalStats>({
+        queryKey: ['global-stats'],
+        queryFn: () => apiClient.get<GlobalStats>('/api/v1/routeiq/stats/global'),
+        refetchInterval: 10_000,
+    })
+}
+
+export function useUserStats() {
+    return useQuery<MyStats>({
+        queryKey: ['user-stats'],
+        queryFn: () => apiClient.get<MyStats>('/api/v1/routeiq/me/stats'),
+        refetchInterval: 15_000,
     })
 }
 

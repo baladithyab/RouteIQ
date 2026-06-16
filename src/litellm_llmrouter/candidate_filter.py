@@ -84,8 +84,12 @@ _ALWAYS_BANNED_TOKEN_SEQS: tuple[tuple[str, ...], ...] = (
 
 # Split on the separators that appear in provider/region-prefixed model ids:
 # ``/`` (provider), ``.`` (region/vendor segments), ``-`` and ``_`` (name parts),
-# and whitespace. Reused to tokenize both the arm and the group name.
-_TOKEN_SPLIT_RE = re.compile(r"[/._\- ]+")
+# whitespace, AND the version-glue separators ``:`` / ``@`` / ``#`` (RouteIQ-9fce).
+# Version-tagged spellings glue the version onto the family with one of these --
+# ``claude-fable-5:v1`` / ``claude-fable-5@1`` / ``claude-fable-5#latest`` -- so
+# without them the terminal token fuses (``5:v1``) and the ``(fable, 5)`` run is
+# missed. Reused to tokenize both the arm and the group name.
+_TOKEN_SPLIT_RE = re.compile(r"[/._\-:@# ]+")
 
 
 def _normalize(s: str) -> str:

@@ -1080,7 +1080,7 @@ class ObservabilityManager:
             self._meter_provider = cast(MeterProvider, existing_provider)
             logger.info("Using existing MeterProvider")
         else:
-            # Create OTLP metric exporter
+            # Create OTLP metric exporter (push path — never removed)
             otlp_metric_exporter = OTLPMetricExporter(
                 endpoint=self.otlp_endpoint, insecure=True
             )
@@ -1088,9 +1088,29 @@ class ObservabilityManager:
                 otlp_metric_exporter, export_interval_millis=60000
             )
 
+            # An OTel MetricReader can only be attached at MeterProvider
+            # CONSTRUCTION — there is no public post-construction registration
+            # API. To expose the RouteIQ instruments on the pull-based
+            # /metrics scrape endpoint (RouteIQ-bd7d / RouteIQ-f60a) we must
+            # therefore build the PrometheusMetricReader HERE and pass it in
+            # the metric_readers list ALONGSIDE the OTLP push reader (additive;
+            # the OTLP push is never replaced). The PrometheusMetricReader
+            # registers itself with the prometheus_client default REGISTRY,
+            # which routes/metrics_endpoint.py serves via generate_latest().
+            #
+            # opentelemetry-exporter-prometheus is an OPTIONAL dependency (the
+            # `otel` extra). Its absence must never break boot — when it is not
+            # importable we simply skip the Prometheus reader and keep OTLP
+            # push (the scrape endpoint then serves the process-level default
+            # registry only).
+            readers: list[Any] = [metric_reader]
+            prom_reader = self._build_prometheus_metric_reader()
+            if prom_reader is not None:
+                readers.append(prom_reader)
+
             # Create new provider
             self._meter_provider = MeterProvider(
-                resource=self.resource, metric_readers=[metric_reader]
+                resource=self.resource, metric_readers=readers
             )
             metrics.set_meter_provider(self._meter_provider)
             logger.info("Created new MeterProvider")
@@ -1108,6 +1128,44 @@ class ObservabilityManager:
             logger.warning(f"Failed to initialize GatewayMetrics: {e}")
 
         logger.info(f"Metrics initialized with OTLP endpoint: {self.otlp_endpoint}")
+
+    def _build_prometheus_metric_reader(self) -> Optional[Any]:
+        """Construct an OTel ``PrometheusMetricReader`` for the /metrics scrape.
+
+        Returns a ``PrometheusMetricReader`` instance to include in the
+        ``MeterProvider``'s ``metric_readers`` at construction, or ``None`` when
+        the optional ``opentelemetry-exporter-prometheus`` package is not
+        installed. The reader self-registers with the ``prometheus_client``
+        default ``REGISTRY``, which the pull-based ``GET /metrics`` endpoint
+        (``routes/metrics_endpoint.py``) exposes — that is how the RouteIQ OTel
+        instruments surface in a Prometheus scrape in ADDITION to the OTLP push.
+
+        Never raises: a missing optional dependency (or any wiring failure) is
+        logged at debug and degrades to OTLP-push-only — it must not break boot.
+        """
+        try:
+            from opentelemetry.exporter.prometheus import (  # type: ignore[import-not-found]
+                PrometheusMetricReader,
+            )
+        except Exception:
+            logger.debug(
+                "opentelemetry-exporter-prometheus not installed; skipping the "
+                "in-process Prometheus metric reader (OTLP push unaffected; the "
+                "/metrics scrape will serve the process-level default registry)"
+            )
+            return None
+
+        try:
+            reader = PrometheusMetricReader()
+            logger.info(
+                "Constructed PrometheusMetricReader as an ADDITIONAL metric "
+                "reader (OTLP push reader left intact) — RouteIQ instruments "
+                "will surface on the /metrics scrape endpoint"
+            )
+            return reader
+        except Exception:  # pragma: no cover - defensive: never break boot
+            logger.debug("Failed to construct PrometheusMetricReader", exc_info=True)
+            return None
 
     def get_tracer(self) -> trace.Tracer:
         """Get the tracer instance for creating spans."""

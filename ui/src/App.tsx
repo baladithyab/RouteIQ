@@ -6,6 +6,7 @@ import Governance from './pages/Governance'
 import Guardrails from './pages/Guardrails'
 import Prompts from './pages/Prompts'
 import Observability from './pages/Observability'
+import UserStats from './pages/UserStats'
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
           <Route path="guardrails" element={<Guardrails />} />
           <Route path="prompts" element={<Prompts />} />
           <Route path="observability" element={<Observability />} />
+          <Route path="user-stats" element={<UserStats />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

@@ -83,6 +83,13 @@ otel = [
     "opentelemetry-instrumentation-fastapi>=0.43b0",
     "opentelemetry-instrumentation-httpx>=0.43b0",
     "opentelemetry-instrumentation-requests>=0.43b0",
+    # OTel->Prometheus pull bridge (RouteIQ-bd7d / RouteIQ-f60a): supplies the
+    # PrometheusMetricReader that observability.py wires into the MeterProvider
+    # at construction so the RouteIQ OTel instruments surface on GET /metrics.
+    # Rolled up into `prod` via this `otel` extra. Versioned as the 0.x beta
+    # line that tracks the opentelemetry-sdk 1.x pin (same scheme as the
+    # instrumentation packages above).
+    "opentelemetry-exporter-prometheus>=0.43b0",
 ]
 # Cloud provider SDKs (optional, includes boto3 for AWS S3 config sync)
 # kubernetes: required for K8s Lease API leader election (ADR-0015)

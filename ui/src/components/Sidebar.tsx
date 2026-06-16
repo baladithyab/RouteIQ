@@ -7,6 +7,7 @@ const navItems = [
   { to: '/guardrails', label: 'Guardrails', icon: '\u{1F6E1}' },
   { to: '/prompts', label: 'Prompts', icon: '\u{1F4DD}' },
   { to: '/observability', label: 'Observability', icon: '\u{1F50D}' },
+  { to: '/user-stats', label: 'User Stats', icon: '\u{1F464}' },
 ]
 
 export default function Sidebar() {

@@ -72,7 +72,10 @@ except ImportError:
 
 # Import personalized routing with graceful fallback
 try:
-    from litellm_llmrouter.personalized_routing import get_personalized_router
+    from litellm_llmrouter.personalized_routing import (
+        _record_selection_metric as _record_personalized_selection,
+        get_personalized_router,
+    )
 
     PERSONALIZED_ROUTING_AVAILABLE = True
 except ImportError:
@@ -733,6 +736,11 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             # Select the top-ranked model and map to deployment
             top_model = ranked[0][0]
             result = self._match_deployment(top_model, model, healthy_deployments)
+
+            # Emit the routing.selection metric from the LIVE personalized path.
+            # (get_top_model() is not on the live dispatch path, so the metric
+            # must be recorded here where the selection actually happens.)
+            _record_personalized_selection(top_model)
 
             if result is not None:
                 logger.debug(

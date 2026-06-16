@@ -1,4 +1,4 @@
-import { useGatewayStatus, useRoutingStats, useModels } from '../api/queries'
+import { useGatewayStatus, useRoutingStats, useGlobalStats, useModels } from '../api/queries'
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -92,9 +92,46 @@ function StrategyBar({ distribution }: { distribution: Record<string, number> })
   )
 }
 
+function DistTable({ label, distribution }: { label: string; distribution: Record<string, number> }) {
+  const entries = Object.entries(distribution).sort(([, a], [, b]) => b - a)
+  const total = entries.reduce((sum, [, c]) => sum + c, 0)
+  return (
+    <div>
+      <h4 className="text-sm font-medium text-gray-700 mb-3">{label}</h4>
+      {entries.length === 0 ? (
+        <p className="text-gray-500 text-sm">No data yet</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200">
+                <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Name</th>
+                <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Decisions</th>
+                <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Share</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map(([name, count]) => (
+                <tr key={name} className="border-b border-gray-50 hover:bg-gray-50">
+                  <td className="py-2.5 px-3 font-medium text-gray-900 font-mono text-xs">{name}</td>
+                  <td className="py-2.5 px-3 text-right text-gray-700 font-mono">{count.toLocaleString()}</td>
+                  <td className="py-2.5 px-3 text-right text-gray-500">
+                    {total > 0 ? ((count / total) * 100).toFixed(1) : '0.0'}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const status = useGatewayStatus()
   const stats = useRoutingStats()
+  const global = useGlobalStats()
   const models = useModels()
 
   return (
@@ -184,10 +221,51 @@ export default function Dashboard() {
               </div>
               <h4 className="text-sm font-medium text-gray-700 mb-3">Strategy Distribution</h4>
               <StrategyBar distribution={stats.data.strategy_distribution} />
+              <h4 className="text-sm font-medium text-gray-700 mt-5 mb-3">Profile Distribution</h4>
+              <StrategyBar distribution={stats.data.profile_distribution} />
             </div>
           )}
         </Card>
       </div>
+
+      {/* Global Routing Rollup - full width (admin /stats/global) */}
+      <Card
+        title="Global Routing Rollup"
+        isLoading={global.isLoading}
+        isError={global.isError}
+        error={global.error as Error}
+        onRetry={() => global.refetch()}
+      >
+        {global.data && (
+          <div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+              <div className="text-center p-3 bg-gray-50 rounded-lg">
+                <div className="text-2xl font-bold text-gray-900">{global.data.total_decisions.toLocaleString()}</div>
+                <div className="text-xs text-gray-500 mt-1">Total Decisions</div>
+              </div>
+              <div className="text-center p-3 bg-gray-50 rounded-lg">
+                <div className="text-2xl font-bold text-gray-900">{global.data.tracked_keys.toLocaleString()}</div>
+                <div className="text-xs text-gray-500 mt-1">Tracked Keys</div>
+              </div>
+              <div className="text-center p-3 bg-gray-50 rounded-lg">
+                <div className="text-2xl font-bold text-gray-900">{global.data.centroid_decisions.toLocaleString()}</div>
+                <div className="text-xs text-gray-500 mt-1">Centroid Decisions</div>
+              </div>
+              <div className="text-center p-3 bg-gray-50 rounded-lg">
+                <div className="text-2xl font-bold text-gray-900">{global.data.average_latency_ms.toFixed(1)}</div>
+                <div className="text-xs text-gray-500 mt-1">Avg Latency (ms)</div>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <DistTable label="Per-Strategy" distribution={global.data.strategy_distribution} />
+              <DistTable label="Per-Model" distribution={global.data.model_distribution} />
+              <DistTable label="Per-Key" distribution={global.data.key_distribution} />
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <div className="mb-6" />
 
       {/* Model Overview - full width */}
       <Card

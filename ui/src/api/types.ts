@@ -19,6 +19,29 @@ export interface RoutingStats {
     average_latency_ms: number
 }
 
+// Org-wide rollup from GET /api/v1/routeiq/stats/global (admin auth)
+export interface GlobalStats {
+    total_decisions: number
+    strategy_distribution: Record<string, number>
+    profile_distribution: Record<string, number>
+    model_distribution: Record<string, number>
+    key_distribution: Record<string, number>
+    centroid_decisions: number
+    average_latency_ms: number
+    tracked_keys: number
+}
+
+// Caller-scoped usage from GET /api/v1/routeiq/me/stats (user auth, own-scope only)
+export interface MyStats {
+    key_id: string
+    decision_count: number
+    recent_models: string[]
+    budget_remaining_usd: number | null
+    budget_used_pct: number | null
+    spend_usd: number | null
+    max_budget_usd: number | null
+}
+
 // Model info from GET /api/v1/routeiq/models
 export interface ModelInfo {
     model_name: string

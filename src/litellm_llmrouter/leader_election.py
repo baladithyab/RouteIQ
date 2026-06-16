@@ -971,46 +971,25 @@ class LeaderElection:
 
                 if renewed:
                     self._consecutive_renewal_failures = 0
-                elif self._is_leader:
-                    # Renewal returned False while we think we're leader
+                else:
+                    # Demotion is owned entirely by ``try_acquire``: on a lost
+                    # lease it self-demotes (sets ``_is_leader = False``) before
+                    # returning False, and on a DB error it swallows the
+                    # exception and returns the prior leader state ("favour
+                    # stability"). A loop-counter auto-demotion here was
+                    # therefore unreachable -- by the time we observe a False
+                    # renew we are already demoted -- so it has been removed.
                     self._consecutive_renewal_failures += 1
                     verbose_proxy_logger.warning(
-                        f"Leader election: Renewal failed "
-                        f"(consecutive_failures="
-                        f"{self._consecutive_renewal_failures})"
+                        "Leader election: Renewal failed "
+                        f"(consecutive_failures={self._consecutive_renewal_failures})"
                     )
-
-                    # Auto-demote after 2 consecutive failures
-                    if self._consecutive_renewal_failures >= 2:
-                        verbose_proxy_logger.error(
-                            "Leader election: Auto-demoting after "
-                            f"{self._consecutive_renewal_failures} "
-                            "consecutive renewal failures"
-                        )
-                        self._is_leader = False
-                        self._lease_expires_at = None
-                        if self._on_leadership_change:
-                            self._on_leadership_change(False)
 
             except Exception as e:
+                # ``renew()``/``try_acquire`` swallow their own exceptions, so
+                # this is a defensive backstop for the renewal scaffolding
+                # (event-loop teardown, etc.). It does not change leadership.
                 verbose_proxy_logger.error(f"Leader election: Renewal error: {e}")
-                if self._is_leader:
-                    self._consecutive_renewal_failures += 1
-                    verbose_proxy_logger.warning(
-                        f"Leader election: Renewal exception "
-                        f"(consecutive_failures="
-                        f"{self._consecutive_renewal_failures})"
-                    )
-                    if self._consecutive_renewal_failures >= 2:
-                        verbose_proxy_logger.error(
-                            "Leader election: Auto-demoting after "
-                            f"{self._consecutive_renewal_failures} "
-                            "consecutive renewal failures (exception)"
-                        )
-                        self._is_leader = False
-                        self._lease_expires_at = None
-                        if self._on_leadership_change:
-                            self._on_leadership_change(False)
 
             # Wait for next renewal interval
             self._stop_event.wait(self.renew_interval_seconds)
@@ -1337,7 +1316,13 @@ class MultiBackendLeaderElection:
 
                 if renewed:
                     self._consecutive_renewal_failures = 0
-                elif self._is_leader:
+                else:
+                    # Demotion is owned entirely by ``try_acquire`` (it
+                    # self-demotes before returning False, and swallows DB
+                    # errors returning the prior leader state). The
+                    # loop-counter auto-demotion that used to live here was
+                    # unreachable for the same reason as the Postgres backend,
+                    # so it has been removed.
                     self._consecutive_renewal_failures += 1
                     verbose_proxy_logger.warning(
                         "Leader election [%s]: Renewal failed "
@@ -1346,31 +1331,15 @@ class MultiBackendLeaderElection:
                         self._consecutive_renewal_failures,
                     )
 
-                    if self._consecutive_renewal_failures >= 2:
-                        verbose_proxy_logger.error(
-                            "Leader election [%s]: Auto-demoting after "
-                            "%d consecutive renewal failures",
-                            self.backend.value,
-                            self._consecutive_renewal_failures,
-                        )
-                        self._is_leader = False
-                        self._lease_expires_at = None
-                        if self._on_leadership_change:
-                            self._on_leadership_change(False)
-
             except Exception as exc:
+                # ``renew()``/``try_acquire`` swallow their own exceptions;
+                # this backstop covers the renewal scaffolding only and does
+                # not change leadership.
                 verbose_proxy_logger.error(
                     "Leader election [%s]: Renewal error: %s",
                     self.backend.value,
                     exc,
                 )
-                if self._is_leader:
-                    self._consecutive_renewal_failures += 1
-                    if self._consecutive_renewal_failures >= 2:
-                        self._is_leader = False
-                        self._lease_expires_at = None
-                        if self._on_leadership_change:
-                            self._on_leadership_change(False)
 
             self._stop_event.wait(self.renew_interval_seconds)
 

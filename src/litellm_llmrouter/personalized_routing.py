@@ -600,9 +600,7 @@ class PersonalizedRouter:
         ranked = await self.rank_models(user_id, candidates)
         if not ranked:
             return None
-        selected = ranked[0][0]
-        _record_selection_metric(selected)
-        return selected
+        return ranked[0][0]
 
     async def record_feedback(
         self,

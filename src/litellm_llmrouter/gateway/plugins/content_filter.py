@@ -372,36 +372,44 @@ class ContentFilterPlugin(GatewayPlugin):
 
         for category, config in self._categories.items():
             score_result = self._score_content(text, category)
-            if score_result.score >= config.threshold:
-                # Telemetry: block -> deny; warn / log keep their names.
-                record_guardrail_check_metric(
-                    category,
-                    "deny" if config.action == "block" else config.action,
+            if score_result.score < config.threshold:
+                # Record one guardrail.check per evaluated category INCLUDING the
+                # clean (under-threshold) case, so deny/(deny+pass) is a
+                # well-defined pass-rate -- matching the base GuardrailPlugin
+                # ._record_check_metric convention (every decision is recorded,
+                # not only breaches) and guardrail_policies / llamaguard. Without
+                # the pass record the denominator is uncomputable (RouteIQ-9aed).
+                record_guardrail_check_metric(category, "pass")
+                continue
+            # Threshold breached. Telemetry: block -> deny; warn / log keep names.
+            record_guardrail_check_metric(
+                category,
+                "deny" if config.action == "block" else config.action,
+            )
+            if config.action == "block":
+                raise GuardrailBlockError(
+                    guardrail_name="content-filter",
+                    category=category,
+                    message=(
+                        f"Content violation: {category} "
+                        f"(score: {score_result.score:.2f}, "
+                        f"threshold: {config.threshold})"
+                    ),
+                    score=score_result.score,
                 )
-                if config.action == "block":
-                    raise GuardrailBlockError(
-                        guardrail_name="content-filter",
-                        category=category,
-                        message=(
-                            f"Content violation: {category} "
-                            f"(score: {score_result.score:.2f}, "
-                            f"threshold: {config.threshold})"
-                        ),
-                        score=score_result.score,
-                    )
-                elif config.action == "warn":
-                    logger.warning(
-                        f"Content filter warning: {category} "
-                        f"score={score_result.score:.2f} "
-                        f"for model={model}"
-                    )
-                else:
-                    # action == "log"
-                    logger.info(
-                        f"Content filter log: {category} "
-                        f"score={score_result.score:.2f} "
-                        f"for model={model}"
-                    )
+            elif config.action == "warn":
+                logger.warning(
+                    f"Content filter warning: {category} "
+                    f"score={score_result.score:.2f} "
+                    f"for model={model}"
+                )
+            else:
+                # action == "log"
+                logger.info(
+                    f"Content filter log: {category} "
+                    f"score={score_result.score:.2f} "
+                    f"for model={model}"
+                )
 
         return None
 
