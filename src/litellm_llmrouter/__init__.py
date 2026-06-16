@@ -101,6 +101,10 @@ from .strategies import (
     LLMRouterStrategyFamily,
     register_llmrouter_strategies,
     LLMROUTER_STRATEGIES,
+    CostCascadeRoutingStrategy,
+    SemanticIntentRoutingStrategy,
+    register_cost_cascade_strategy,
+    register_semantic_intent_strategy,
 )
 from .config_loader import (
     download_config_from_s3,
@@ -233,6 +237,10 @@ __all__ = [
     "LLMRouterStrategyFamily",
     "register_llmrouter_strategies",
     "LLMROUTER_STRATEGIES",
+    "CostCascadeRoutingStrategy",
+    "SemanticIntentRoutingStrategy",
+    "register_cost_cascade_strategy",
+    "register_semantic_intent_strategy",
     # Strategy registry (A/B testing)
     "RoutingStrategy",
     "RoutingStrategyRegistry",

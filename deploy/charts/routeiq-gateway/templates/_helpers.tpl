@@ -77,6 +77,57 @@ Supports digest (immutable) or tag
 {{- end }}
 
 {{/*
+ADOT collector resource name (Deployment / ConfigMap / Service share it).
+*/}}
+{{- define "routeiq-gateway.adotCollectorName" -}}
+{{- printf "%s-adot-collector" (include "routeiq-gateway.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+ADOT collector selector labels (distinct app name so its Service/Deployment
+selector never matches the gateway pods).
+*/}}
+{{- define "routeiq-gateway.adotCollectorSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "routeiq-gateway.name" . }}-adot-collector
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: adot-collector
+{{- end }}
+
+{{/*
+ADOT collector full label set: chart/version/managed-by (from the common labels,
+minus the gateway selectorLabels that would collide with the collector's own
+app name) PLUS the collector selector labels. Kept as ONE block so resources do
+not emit duplicate app.kubernetes.io/name keys (invalid YAML / yamllint error).
+*/}}
+{{- define "routeiq-gateway.adotCollectorLabels" -}}
+helm.sh/chart: {{ include "routeiq-gateway.chart" . }}
+{{ include "routeiq-gateway.adotCollectorSelectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: {{ include "routeiq-gateway.name" . }}
+{{- end }}
+
+{{/*
+Resolve the effective OTLP endpoint the gateway exports to.
+Precedence (first non-empty wins):
+  1. gateway.otel.endpoint           (explicit operator override)
+  2. externalOtel.endpoint           (point at an out-of-cluster collector)
+  3. in-cluster ADOT collector DNS   (only when otel.collector.enabled)
+Returns "" when none apply (keeps the no-observability render byte-stable).
+*/}}
+{{- define "routeiq-gateway.otelEndpoint" -}}
+{{- if .Values.gateway.otel.endpoint -}}
+{{- .Values.gateway.otel.endpoint -}}
+{{- else if .Values.externalOtel.endpoint -}}
+{{- .Values.externalOtel.endpoint -}}
+{{- else if .Values.gateway.otel.collector.enabled -}}
+{{- printf "http://%s.%s.svc.cluster.local:%v" (include "routeiq-gateway.adotCollectorName" .) .Release.Namespace (.Values.gateway.otel.collector.service.grpcPort | int) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Return the secret name
 */}}
 {{- define "routeiq-gateway.secretName" -}}
@@ -273,9 +324,16 @@ Environment variables for gateway configuration
   value: {{ .Values.gateway.otel.metricsExporter | quote }}
 - name: OTEL_LOGS_EXPORTER
   value: {{ .Values.gateway.otel.logsExporter | quote }}
-{{- if .Values.gateway.otel.endpoint }}
+{{- /* Single source of truth for the OTLP target (routeiq-gateway.otelEndpoint):
+       explicit gateway.otel.endpoint > externalOtel.endpoint > in-cluster ADOT
+       collector DNS (when otel.collector.enabled). Emitting it here AND in the
+       externalOtel block would yield a duplicate (ambiguous) env var, so the
+       endpoint is emitted ONCE here and the externalOtel block only adds the
+       protocol. */ -}}
+{{- $otelEndpoint := include "routeiq-gateway.otelEndpoint" . }}
+{{- if $otelEndpoint }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
-  value: {{ .Values.gateway.otel.endpoint | quote }}
+  value: {{ $otelEndpoint | quote }}
 {{- end }}
 
 # SSRF protection
@@ -370,10 +428,11 @@ Environment variables for gateway configuration
 {{- end }}
 {{- end }}
 
-# External OTel Collector
-{{- if .Values.externalOtel.endpoint }}
-- name: OTEL_EXPORTER_OTLP_ENDPOINT
-  value: {{ .Values.externalOtel.endpoint | quote }}
+# OTLP protocol. The OTEL_EXPORTER_OTLP_ENDPOINT itself is emitted ONCE in the
+# OTEL settings block above (routeiq-gateway.otelEndpoint) to avoid a duplicate
+# env var. The protocol is emitted whenever there IS a resolved endpoint, so the
+# in-cluster ADOT collector path gets a protocol too (defaults to grpc -> :4317).
+{{- if include "routeiq-gateway.otelEndpoint" . }}
 - name: OTEL_EXPORTER_OTLP_PROTOCOL
   value: {{ .Values.externalOtel.protocol | default "grpc" | quote }}
 {{- end }}

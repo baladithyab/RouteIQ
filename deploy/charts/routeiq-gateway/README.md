@@ -320,13 +320,79 @@ adapter (ADR-0026 / RouteIQ-4333) via its `ROUTEIQ_CONFIG_SYNC__APPCONFIG_*`
 settings; the pod-role grant (`appconfigdata:StartConfigurationSession` +
 `GetLatestConfiguration` scoped to the profile ARN) is **RouteIQ-569f**, applied
 CDK-side. `aws.amp.remoteWriteUrl` is emitted as `AMP_REMOTE_WRITE_URL` for an
-**ADOT collector sidecar** to read; the sidecar itself is a documented follow-up
-(`sidecars: []` is the seam) — this ships the env-var consume seam, not the
-collector. The pod-role `aps:RemoteWrite` grant is **RouteIQ-74c0/717b**, applied
-CDK-side.
+ADOT collector to read; the pod-role `aps:RemoteWrite` grant is
+**RouteIQ-74c0/717b**, applied CDK-side. (The chart now bundles an ADOT collector
+for CloudWatch/X-Ray — see *Bundled ADOT collector* below; wiring a
+`prometheusremotewrite` exporter at `AMP_REMOTE_WRITE_URL` into that collector's
+pipeline is the remaining AMP follow-up.)
 
 Every `aws.*` value defaults empty, so the env vars are emitted only when set and
 a non-AWS / no-observability deploy renders byte-identically.
+
+### Bundled ADOT collector -> CloudWatch / X-Ray (RouteIQ-85e3, P1)
+
+The gateway (`observability.py`) already speaks OTLP, but the chart used to ship
+`tracesExporter`/`metricsExporter`/`logsExporter: none` + `endpoint: ""` — so **out
+of the box nothing reached CloudWatch**. The chart now bundles an **ADOT (AWS
+Distro for OpenTelemetry) collector** (`templates/adot-collector.yaml`) and
+**defaults the gateway to OTLP**, so spans/metrics/logs actually leave the pod:
+
+- **Collector** (`otel.collector.enabled`, default **ON**): a `Deployment` +
+  `ConfigMap` + `Service` + `ServiceAccount` running the
+  `public.ecr.aws/aws-observability/aws-otel-collector` image. The pipeline is
+  **OTLP in** (gRPC `:4317`, HTTP `:4318`) → **`awsemf`** (metrics → CloudWatch
+  Embedded Metric Format, powering CloudWatch GenAI Observability) + **`awsxray`**
+  (traces → X-Ray, which Transaction Search reads). The config is delivered via the
+  mounted `ConfigMap` and loaded with an explicit `--config=/etc/otel/collector.yaml`
+  (the stock image silently loads its own default config otherwise — skill
+  `adot-ecs-fargate-telemetry-gotchas`).
+- **Gateway wiring**: `gateway.otel.{traces,metrics,logs}Exporter` now default
+  `otlp`, and `OTEL_EXPORTER_OTLP_ENDPOINT` is **auto-targeted** at the in-cluster
+  collector Service DNS (`http://<release>-routeiq-gateway-adot-collector.<ns>.svc.cluster.local:4317`).
+  Precedence for the endpoint: `gateway.otel.endpoint` (explicit override) >
+  `externalOtel.endpoint` (your own collector) > the bundled collector DNS. It is
+  emitted **once** (no duplicate env var).
+
+```bash
+# Defaults already render the collector + OTLP-targeted gateway. Add a region so
+# the awsemf/awsxray exporters know where to write:
+helm template routeiq deploy/charts/routeiq-gateway \
+  --set aws.region=us-west-2 \
+  --show-only templates/adot-collector.yaml
+
+# Disable the bundled collector (e.g. you run a cluster-wide collector):
+helm upgrade routeiq deploy/charts/routeiq-gateway \
+  --set gateway.otel.collector.enabled=false \
+  --set externalOtel.endpoint=http://my-collector.monitoring:4317
+```
+
+> **Live CloudWatch/X-Ray delivery is OPERATOR-GATED (IAM).** The collector
+> **renders and runs without AWS creds** — the chart stays installable on any
+> cluster — but it can only **PUT** to CloudWatch/X-Ray once its pod has an IAM
+> identity granting `cloudwatch:PutMetricData` + `logs:CreateLogGroup` /
+> `logs:CreateLogStream` / `logs:PutLogEvents` (EMF) + `xray:PutTraceSegments`.
+> On EKS bind a role to the collector ServiceAccount
+> (`<fullname>-adot-collector`) via a **Pod Identity association CDK-side**
+> (mirroring the gateway SA contract), or set
+> `gateway.otel.collector.serviceAccount.annotations` with an
+> `eks.amazonaws.com/role-arn` (IRSA). In a **private subnet** the collector also
+> needs a `com.amazonaws.<region>.xray` **Interface VPC Endpoint** or X-Ray egress
+> times out silently. None of this is provable by `helm template` — verify on a
+> live cluster (CloudWatch metrics namespace `RouteIQ/Gateway`, X-Ray service map).
+
+> **Region is load-bearing.** `gateway.otel.collector.region` (falls back to
+> `aws.region`) threads into both the `awsemf` and `awsxray` exporters and the
+> collector's `AWS_REGION`/`AWS_DEFAULT_REGION`. With no region set the collector
+> still renders (cloud-agnostic), but the exporters cannot write.
+
+Disabling the collector (`otel.collector.enabled=false`) removes all four
+collector resources **and** drops the gateway's auto-targeted
+`OTEL_EXPORTER_OTLP_ENDPOINT` — point `externalOtel.endpoint` (or
+`gateway.otel.endpoint`) at your own collector instead. The render contract
+(collector + OTLP endpoint present when enabled, absent when disabled, exporters
+`awsemf`/`awsxray` wired) is pinned by
+`tests/test_render_adot_collector.py`. **Unblocks RouteIQ-ebf8** (CloudWatch GenAI
+Observability) + **RouteIQ-3c0a** (X-Ray).
 
 ### Fluent Bit routing-JSON promotion (RouteIQ-27b6 / RouteIQ-547d)
 

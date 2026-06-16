@@ -468,6 +468,97 @@ class RoutingSettings(BaseModel):
     )
 
 
+class CostCascadeSettings(BaseModel):
+    """Cost-aware speculative-cascade routing strategy configuration (RouteIQ-90d0).
+
+    Distinct from :class:`CostAwareRoutingStrategy` (heuristic Pareto, single-shot):
+    the cascade orders deployments cheapest -> strongest and routes to the
+    CHEAPEST capable rung first.  Each selection exposes the ordered escalation
+    ladder in ``deployment["metadata"]["routeiq_cascade"]`` so the caller can
+    retry UP the ladder on a low-quality/low-confidence signal (mode (a)).  When
+    a prior-attempt confidence/rung signal is present in
+    ``context.request_kwargs`` / ``context.metadata`` (keys ``cascade_rung`` or
+    ``cascade_confidence``), the strategy advances to the NEXT rung itself
+    (mode (b), confidence-gated).
+
+    Costs are read from ``litellm.model_cost``; arms with unknown cost sort LAST
+    (treated as most expensive) so the cheap-first invariant degrades gracefully.
+
+    Env vars: ``ROUTEIQ_COST_CASCADE__ENABLED``,
+    ``ROUTEIQ_COST_CASCADE__CONFIDENCE_THRESHOLD``,
+    ``ROUTEIQ_COST_CASCADE__MAX_RUNGS`` (``__`` nested delimiter).
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Register the cost-aware cascade strategy at startup.",
+    )
+    confidence_threshold: float = Field(
+        0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum prior-attempt confidence below which the cascade escalates "
+            "to the next (pricier/stronger) rung.  Only consulted in the "
+            "confidence-gated mode (b) when a prior signal is present."
+        ),
+    )
+    max_rungs: int = Field(
+        4,
+        ge=1,
+        le=32,
+        description=(
+            "Maximum number of rungs to expose on the escalation ladder "
+            "(cheapest -> strongest).  Bounds the ladder length in the returned "
+            "metadata and caps how far mode (b) can escalate."
+        ),
+    )
+
+
+class SemanticIntentSettings(BaseModel):
+    """Semantic / embedding intent-router configuration (RouteIQ-7936).
+
+    Routes by request INTENT -> model-group.  Classifies the request via
+    embedding similarity to per-intent centroids (reusing the shared
+    SentenceTransformer encoder), then maps the winning intent to a configured
+    model-group / deployment subset.
+
+    HOT-PATH DISCIPLINE: the embedding model is NEVER cold-loaded on the request
+    path.  The strategy only classifies when the shared encoder is ALREADY
+    loaded (mirrors the centroid_routing discipline); otherwise it falls through
+    to a graceful fallback deployment.  Pre-warm at startup to enable
+    classification.
+
+    Env vars: ``ROUTEIQ_SEMANTIC_INTENT__ENABLED``,
+    ``ROUTEIQ_SEMANTIC_INTENT__INTENT_MODEL_GROUPS`` (JSON map),
+    ``ROUTEIQ_SEMANTIC_INTENT__SIMILARITY_THRESHOLD`` (``__`` nested delimiter).
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Register the semantic intent router at startup.",
+    )
+    intent_model_groups: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of intent label -> list of model name patterns that form the "
+            "target model group for that intent (e.g. "
+            '``{"code": ["gpt-4o", "claude-sonnet"], "chat": ["gpt-4o-mini"]}``). '
+            "A request classified to an intent is routed to a deployment whose "
+            "model matches one of the patterns; an unmapped intent falls back."
+        ),
+    )
+    similarity_threshold: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum top-1 cosine similarity to accept an intent classification. "
+            "Below this the request is treated as UNMAPPED and falls back."
+        ),
+    )
+
+
 class SecuritySettings(BaseModel):
     """Security, auth, and access control configuration.
 
@@ -1784,6 +1875,14 @@ class GatewaySettings(BaseSettings):
     bedrock_discovery: BedrockDiscoverySettings = Field(
         default_factory=BedrockDiscoverySettings,  # type: ignore[arg-type]
         description="In-process Bedrock model auto-discovery settings (default off).",
+    )
+    cost_cascade: CostCascadeSettings = Field(
+        default_factory=CostCascadeSettings,  # type: ignore[arg-type]
+        description="Cost-aware speculative-cascade routing strategy settings.",
+    )
+    semantic_intent: SemanticIntentSettings = Field(
+        default_factory=SemanticIntentSettings,  # type: ignore[arg-type]
+        description="Semantic / embedding intent-router strategy settings.",
     )
 
     # ------------------------------------------------------------------

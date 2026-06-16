@@ -1859,8 +1859,11 @@ LLMROUTER_STRATEGIES = [
     "llmrouter-custom",  # User-defined custom router
     # Cost-aware routers
     "llmrouter-cost-aware",  # CostAwareRoutingStrategy - cheapest adequate model
+    "llmrouter-cost-cascade",  # CostCascadeRoutingStrategy - cheapest-first speculative escalation
     # Centroid-based routers
     "llmrouter-nadirclaw-centroid",  # CentroidRoutingStrategy - zero-config intelligent routing
+    # Semantic / intent routers
+    "llmrouter-semantic-intent",  # SemanticIntentRoutingStrategy - intent->model-group dispatch
 ]
 
 
@@ -1934,6 +1937,14 @@ DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
         "confidence_threshold": 0.06,
         "session_ttl": 1800,
         "profile": "auto",
+    },
+    "cost-cascade": {
+        "confidence_threshold": 0.7,
+        "max_rungs": 4,
+    },
+    "semantic-intent": {
+        "intent_model_groups": {},
+        "similarity_threshold": 0.0,
     },
 }
 
@@ -3180,18 +3191,638 @@ class CostAwareRoutingStrategy(RoutingStrategy):
         return True, None
 
 
+class CostCascadeRoutingStrategy(RoutingStrategy):
+    """Cost-aware speculative-cascade / escalation router (RouteIQ-90d0).
+
+    DISTINCT from :class:`CostAwareRoutingStrategy` (heuristic Pareto, single
+    shot, NOT a cascade). This strategy implements a *cascade*: route first to
+    the CHEAPEST capable deployment, and escalate to a stronger/pricier
+    deployment on a low-confidence / low-quality signal.
+
+    Because one :meth:`select_deployment` call returns exactly one deployment,
+    the cascade is realized in two complementary modes -- the strategy supports
+    BOTH simultaneously and the active mode is decided per request:
+
+    * **Mode (a) -- ladder-in-metadata (default).** The deployments are ordered
+      cheapest -> strongest and the cheapest rung is returned. The full ordered
+      escalation ladder (a list of ``{"model", "model_name", "cost_per_1k"}``
+      rung descriptors) is exposed on the returned deployment under
+      ``deployment["metadata"]["routeiq_cascade"]`` so the *caller* can retry up
+      the ladder on a low-quality response.
+
+      NOTE: the ladder is attached to a SHALLOW COPY of the selected deployment
+      (``{**dep, "metadata": {...}}``) so the router's shared ``model_list``
+      dict is never mutated -- the cascade metadata is per-decision.
+
+    * **Mode (b) -- confidence-gated escalation.** When the caller supplies a
+      prior-attempt signal in ``context.request_kwargs`` or ``context.metadata``
+      -- key ``cascade_rung`` (0-based index of the rung already tried) and/or
+      ``cascade_confidence`` (float in ``[0, 1]``) -- the strategy reads it and
+      picks the NEXT rung up the ladder. Escalation happens when the prior rung
+      is explicitly named, or when ``cascade_confidence`` is BELOW
+      ``confidence_threshold``. The chosen rung is clamped to the ladder length
+      (capped by ``max_rungs``).
+
+    Cost ordering uses ``litellm.model_cost`` (input+output per-token, averaged).
+    Arms with UNKNOWN cost sort LAST (``+inf``) so the cheap-first invariant
+    degrades gracefully -- an all-unknown-cost group still routes (to its first
+    member) instead of returning ``None``.
+
+    Configuration (via ``ROUTEIQ_COST_CASCADE__*`` /
+    :class:`~litellm_llmrouter.settings.CostCascadeSettings`):
+        confidence_threshold: escalate below this prior-attempt confidence
+            (default 0.7).
+        max_rungs: cap the exposed/escalatable ladder length (default 4).
+
+    Stress-harness validation: ``tools/stress_harness`` resolves the live active
+    strategy by name and dispatches a per-strategy verdict; ``cost-cascade`` is
+    not (yet) a registered verdict family, so it hits the harness's generic
+    distribution verdict (``stress_harness.verdicts.generic_verdict``) which
+    asserts the per-bucket routing distribution is non-degenerate. To exercise
+    the cheap-first invariant explicitly, point the harness's easy-bucket at this
+    strategy and confirm the cheapest rung dominates (the ladder is observable in
+    the ``routeiq_cascade`` decision metadata via the routing-decision log).
+    """
+
+    def __init__(
+        self,
+        confidence_threshold: float = 0.7,
+        max_rungs: int = 4,
+        **kwargs: Any,
+    ):
+        self._confidence_threshold = max(0.0, min(1.0, confidence_threshold))
+        self._max_rungs = max(1, int(max_rungs))
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-cost-cascade"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    # ------------------------------------------------------------------
+    # Cost lookup (litellm.model_cost; unknown -> +inf so it sorts last)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_model_cost(model: str) -> float:
+        """Average cost per 1K tokens for a model, or ``+inf`` if unknown.
+
+        Reads ``litellm.model_cost`` (input+output per-token, averaged, scaled
+        to 1K). Unknown / zero-cost models return ``+inf`` so they sort LAST in
+        the cheapest-first ordering -- the graceful-degrade contract.
+        """
+        try:
+            import litellm
+
+            cost_info = litellm.model_cost.get(model, {}) or {}
+            input_cost = (cost_info.get("input_cost_per_token", 0) or 0) * 1000
+            output_cost = (cost_info.get("output_cost_per_token", 0) or 0) * 1000
+            avg = (input_cost + output_cost) / 2
+            return avg if avg > 0 else float("inf")
+        except Exception:
+            return float("inf")
+
+    def _get_candidates(self, context: RoutingContext) -> List[Dict]:
+        """Candidate deployments for the requested model group.
+
+        Mirrors :meth:`CostAwareRoutingStrategy._get_candidates`: reads the
+        static ``healthy_deployments`` and applies the RouteIQ pre-scoring
+        cooldown / gov-ban filter (the RouteIQ path bypasses LiteLLM's pipeline).
+        """
+        router = context.router
+        if router is None:
+            return []
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", [])
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
+
+    def _ordered_ladder(self, candidates: List[Dict]) -> List[Tuple[Dict, float]]:
+        """Order candidates cheapest -> strongest (by ascending cost).
+
+        Returns ``(deployment, cost_per_1k)`` tuples. Stable sort keeps the
+        config order for equal-cost arms. Capped at ``max_rungs``.
+        """
+        scored = [
+            (dep, self._get_model_cost(dep.get("litellm_params", {}).get("model", "")))
+            for dep in candidates
+        ]
+        scored.sort(key=lambda pair: pair[1])
+        return scored[: self._max_rungs]
+
+    @staticmethod
+    def _rung_descriptor(dep: Dict, cost: float) -> Dict[str, Any]:
+        """Build a JSON-safe rung descriptor for the ladder metadata."""
+        return {
+            "model": dep.get("litellm_params", {}).get("model", ""),
+            "model_name": dep.get("model_name", ""),
+            "cost_per_1k": (None if cost == float("inf") else cost),
+        }
+
+    def _read_prior_signal(
+        self, context: RoutingContext
+    ) -> Tuple[Optional[int], Optional[float]]:
+        """Read a prior-attempt cascade signal from the context (mode (b)).
+
+        Looks in ``request_kwargs`` first, then ``metadata`` for ``cascade_rung``
+        (int, 0-based) and ``cascade_confidence`` (float). Returns
+        ``(rung, confidence)`` with ``None`` for absent / unparseable values.
+        """
+        sources: List[Dict] = []
+        if context.request_kwargs:
+            sources.append(context.request_kwargs)
+        if context.metadata:
+            sources.append(context.metadata)
+
+        rung: Optional[int] = None
+        confidence: Optional[float] = None
+        for src in sources:
+            if rung is None and "cascade_rung" in src:
+                try:
+                    rung = int(src["cascade_rung"])
+                except (TypeError, ValueError):
+                    rung = None
+            if confidence is None and "cascade_confidence" in src:
+                try:
+                    confidence = float(src["cascade_confidence"])
+                except (TypeError, ValueError):
+                    confidence = None
+        return rung, confidence
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        """Select the cheapest capable rung, or escalate on a prior signal.
+
+        Returns a SHALLOW COPY of the selected deployment with the ordered
+        escalation ladder attached under ``metadata["routeiq_cascade"]`` (never
+        mutates the router's shared deployment dict). Returns ``None`` only when
+        there are no candidates.
+        """
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        ladder = self._ordered_ladder(candidates)
+        if not ladder:
+            return None
+
+        # Mode (b): confidence-gated escalation from a prior attempt.
+        prior_rung, prior_confidence = self._read_prior_signal(context)
+        target_index = 0
+        escalated = False
+        if prior_rung is not None:
+            # The caller already tried rung ``prior_rung`` -> advance one rung.
+            target_index = prior_rung + 1
+            escalated = True
+        elif prior_confidence is not None and (
+            prior_confidence < self._confidence_threshold
+        ):
+            # Low-confidence prior result with no explicit rung: escalate once.
+            target_index = 1
+            escalated = True
+
+        # Clamp to the ladder (cannot escalate past the strongest rung).
+        if target_index >= len(ladder):
+            target_index = len(ladder) - 1
+
+        selected_dep, selected_cost = ladder[target_index]
+
+        ladder_meta = [self._rung_descriptor(dep, cost) for dep, cost in ladder]
+        existing_meta = dict(selected_dep.get("metadata", {}) or {})
+        existing_meta["routeiq_cascade"] = {
+            "ladder": ladder_meta,
+            "selected_rung": target_index,
+            "escalated": escalated,
+            "confidence_threshold": self._confidence_threshold,
+            "max_rungs": self._max_rungs,
+        }
+        result = {**selected_dep, "metadata": existing_meta}
+
+        selected_model = selected_dep.get("litellm_params", {}).get("model", "unknown")
+        histogram = _get_cost_histogram()
+        if histogram and selected_cost != float("inf"):
+            histogram.record(
+                selected_cost,
+                {"model": selected_model, "strategy": "cost-cascade"},
+            )
+        _record_selection_metric("cost-cascade", selected_model)
+
+        return result
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        """Validate the strategy is ready to serve requests."""
+        if not (0.0 <= self._confidence_threshold <= 1.0):
+            return False, "confidence_threshold must be between 0.0 and 1.0"
+        if self._max_rungs < 1:
+            return False, "max_rungs must be >= 1"
+        return True, None
+
+
+class SemanticIntentRoutingStrategy(RoutingStrategy):
+    """Semantic / embedding intent router (RouteIQ-7936).
+
+    Routes by request INTENT -> model-group. The request text (last user
+    message / system prompt, extracted from ``context.messages`` or
+    ``context.input``) is classified into an intent label by EMBEDDING
+    SIMILARITY to per-intent centroids, then the winning intent is mapped to a
+    configured model group (a list of model-name patterns) and the request is
+    routed to the cheapest-listed matching deployment.
+
+    HOT-PATH DISCIPLINE (mirrors :mod:`centroid_routing`): the SentenceTransformer
+    encoder is NEVER cold-loaded on the request path. The strategy only
+    classifies when the shared encoder is ALREADY loaded -- it checks the module
+    singleton ``strategies._sentence_transformer_model`` WITHOUT triggering a
+    load, and falls through to a graceful fallback deployment if it is ``None``
+    (classifier-not-loaded). The intent centroids are likewise built lazily and
+    cached -- and only AFTER the encoder is confirmed loaded.
+
+    The intent centroids are derived from the configured intent labels
+    themselves (the label string + its model-group patterns are encoded as the
+    centroid seed text). This is a zero-extra-artifact approach: no separate
+    centroid ``.npy`` files are required -- the intent map IS the classifier
+    definition. Operators pre-warm the encoder at startup (e.g. via the centroid
+    warmup hook) to enable classification; until then the router degrades
+    gracefully.
+
+    Configuration (via ``ROUTEIQ_SEMANTIC_INTENT__*`` /
+    :class:`~litellm_llmrouter.settings.SemanticIntentSettings`):
+        intent_model_groups: ``{intent_label: [model_pattern, ...]}``.
+        similarity_threshold: minimum top-1 similarity to accept a
+            classification (below -> unmapped -> fallback).
+
+    Dispatch outcomes:
+        * intent classified + mapped -> route to a deployment in that group.
+        * intent classified but UNMAPPED (no group / below threshold) -> fallback.
+        * encoder NOT loaded -> graceful fallthrough (NO cold load) -> fallback.
+
+    Stress-harness validation: ``tools/stress_harness`` resolves the active
+    strategy by name; ``semantic-intent`` is not a registered verdict family, so
+    it hits the generic distribution verdict
+    (``stress_harness.verdicts.generic_verdict``), which confirms the routing
+    distribution across the 5 workload buckets is non-degenerate. Because the
+    harness fires categorized buckets (code / reasoning / chat / ...), a correct
+    intent map produces a bucket-correlated model-group dispatch the generic
+    verdict's per-bucket distribution surfaces.
+    """
+
+    def __init__(
+        self,
+        intent_model_groups: Optional[Dict[str, List[str]]] = None,
+        similarity_threshold: float = 0.0,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        **kwargs: Any,
+    ):
+        self._intent_model_groups = intent_model_groups or {}
+        self._similarity_threshold = max(0.0, min(1.0, similarity_threshold))
+        self._embedding_model = embedding_model
+        # Lazily-built, cached intent centroids: {intent_label: np.ndarray}.
+        self._centroids: Optional[Dict[str, Any]] = None
+        self._centroid_lock = threading.Lock()
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-semantic-intent"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    # ------------------------------------------------------------------
+    # Hot-path discipline: only classify if the encoder is ALREADY loaded
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encoder_is_loaded() -> bool:
+        """True iff the shared SentenceTransformer is already in memory.
+
+        Reads the module-level singleton WITHOUT triggering a load. This is the
+        hot-path guard: a cold encoder means we must NOT classify (no cold load
+        on the request path) and instead fall through to the fallback.
+        """
+        return _sentence_transformer_model is not None
+
+    def _build_centroids(self) -> Optional[Dict[str, Any]]:
+        """Build (once) and cache per-intent centroid embeddings.
+
+        Only called AFTER the encoder is confirmed loaded. The centroid seed
+        text for each intent is the label plus its model-group patterns, encoded
+        and unit-normalized. Returns ``None`` if numpy is unavailable or no
+        intents are configured.
+        """
+        if self._centroids is not None:
+            return self._centroids
+        if not self._intent_model_groups:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+
+        with self._centroid_lock:
+            if self._centroids is not None:
+                return self._centroids
+            encoder = _get_sentence_transformer(self._embedding_model)
+            centroids: Dict[str, Any] = {}
+            for intent, patterns in self._intent_model_groups.items():
+                seed = " ".join([intent, *(patterns or [])]).strip() or intent
+                emb = encoder.encode([seed], show_progress_bar=False)[0]
+                norm = float(np.linalg.norm(emb))
+                if norm > 0:
+                    emb = emb / norm
+                centroids[intent] = emb
+            self._centroids = centroids
+            return self._centroids
+
+    def _classify_intent(self, text: str) -> Tuple[Optional[str], float]:
+        """Classify ``text`` into an intent by max cosine similarity.
+
+        Returns ``(intent_label, similarity)``. Returns ``(None, 0.0)`` when the
+        encoder is not loaded (graceful, NO cold load), numpy is missing, no
+        centroids are configured, or the top-1 similarity is below the
+        configured ``similarity_threshold`` (UNMAPPED).
+        """
+        if not text or not self._encoder_is_loaded():
+            return None, 0.0
+        try:
+            import numpy as np
+        except ImportError:
+            return None, 0.0
+
+        centroids = self._build_centroids()
+        if not centroids:
+            return None, 0.0
+
+        encoder = _get_sentence_transformer(self._embedding_model)
+        emb = encoder.encode([text], show_progress_bar=False)[0]
+        norm = float(np.linalg.norm(emb))
+        if norm > 0:
+            emb = emb / norm
+
+        best_intent: Optional[str] = None
+        best_sim = -1.0
+        for intent, centroid in centroids.items():
+            sim = float(np.dot(emb, centroid))
+            if sim > best_sim:
+                best_sim = sim
+                best_intent = intent
+
+        if best_intent is None or best_sim < self._similarity_threshold:
+            return None, max(0.0, best_sim)
+        return best_intent, best_sim
+
+    @staticmethod
+    def _extract_text(context: RoutingContext) -> str:
+        """Extract classification text from messages or input.
+
+        Prefers the last user message text; falls back to the system prompt,
+        then to ``context.input`` (string or first list element).
+        """
+        messages = context.messages or []
+        if not messages and context.request_kwargs:
+            messages = context.request_kwargs.get("messages", []) or []
+
+        system_text = ""
+        last_user = ""
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(parts)
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            if role in ("system", "developer"):
+                system_text = content
+            elif role == "user":
+                last_user = content
+
+        if last_user:
+            return last_user
+        if system_text:
+            return system_text
+
+        inp = context.input
+        if isinstance(inp, str):
+            return inp
+        if isinstance(inp, list) and inp:
+            return str(inp[0])
+        return ""
+
+    def _get_candidates(self, context: RoutingContext) -> List[Dict]:
+        """Candidate deployments for the requested model group (filtered)."""
+        router = context.router
+        if router is None:
+            return []
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", [])
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
+
+    def _match_group(self, intent: str, candidates: List[Dict]) -> Optional[Dict]:
+        """Return the candidate whose model best matches the intent's group.
+
+        The group is the ordered list of patterns mapped to ``intent``. Matching
+        is two-pass to avoid substring collisions (e.g. pattern ``"gpt-4o"``
+        is a substring of BOTH ``"gpt-4o"`` and ``"gpt-4o-mini"``):
+
+        1. EXACT (case-insensitive) model-name equality, in pattern order, so a
+           pattern that names a model exactly always wins over a broader match.
+        2. SUBSTRING fallback, in pattern order, for patterns meant as prefixes
+           / families.
+
+        Returns ``None`` when the intent has no group or nothing matches.
+        """
+        patterns = self._intent_model_groups.get(intent)
+        if not patterns:
+            return None
+
+        # Pass 1: exact model-name match (pattern order = priority).
+        for pattern in patterns:
+            p = pattern.lower()
+            for dep in candidates:
+                model = dep.get("litellm_params", {}).get("model", "").lower()
+                if model == p:
+                    return dep
+
+        # Pass 2: substring match (pattern order = priority).
+        for pattern in patterns:
+            p = pattern.lower()
+            for dep in candidates:
+                model = dep.get("litellm_params", {}).get("model", "").lower()
+                if p in model:
+                    return dep
+        return None
+
+    @staticmethod
+    def _fallback_deployment(candidates: List[Dict]) -> Optional[Dict]:
+        """Graceful fallback: first available candidate, or ``None``."""
+        return candidates[0] if candidates else None
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        """Route by classified intent -> model group, with graceful fallback.
+
+        Flow: extract text -> (if encoder loaded) classify intent -> map intent
+        to a model group -> route to a matching candidate. Every off-path
+        condition (encoder not loaded, unmapped intent, no group match) falls
+        back to the first available candidate. Returns ``None`` only when there
+        are no candidates at all.
+        """
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        text = self._extract_text(context)
+        intent, _sim = self._classify_intent(text)
+        if intent is None:
+            # encoder-not-loaded / unmapped / below-threshold -> graceful fallback
+            return self._fallback_deployment(candidates)
+
+        matched = self._match_group(intent, candidates)
+        if matched is None:
+            return self._fallback_deployment(candidates)
+
+        selected_model = matched.get("litellm_params", {}).get("model", "unknown")
+        _record_selection_metric("semantic-intent", selected_model)
+        return matched
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        """Validate the strategy is ready to serve requests."""
+        if not (0.0 <= self._similarity_threshold <= 1.0):
+            return False, "similarity_threshold must be between 0.0 and 1.0"
+        return True, None
+
+
+def register_cost_cascade_strategy() -> bool:
+    """Register the cost-aware cascade strategy in the routing registry.
+
+    Makes :class:`CostCascadeRoutingStrategy` available as
+    ``"llmrouter-cost-cascade"`` for direct selection / A/B testing. Opt-in:
+    only registers when ``settings.cost_cascade.enabled`` is True (RouteIQ-90d0).
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().cost_cascade
+    except Exception:
+        return False
+
+    if not cfg.enabled:
+        verbose_proxy_logger.debug(
+            "Cost-cascade routing disabled (ROUTEIQ_COST_CASCADE__ENABLED=false)"
+        )
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        registry.register(
+            "llmrouter-cost-cascade",
+            CostCascadeRoutingStrategy(
+                confidence_threshold=cfg.confidence_threshold,
+                max_rungs=cfg.max_rungs,
+            ),
+        )
+        verbose_proxy_logger.info(
+            "Registered cost-cascade strategy as 'llmrouter-cost-cascade'"
+        )
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(f"Failed to register cost-cascade strategy: {e}")
+        return False
+
+
+def register_semantic_intent_strategy() -> bool:
+    """Register the semantic intent router in the routing registry.
+
+    Makes :class:`SemanticIntentRoutingStrategy` available as
+    ``"llmrouter-semantic-intent"`` for direct selection / A/B testing. Opt-in:
+    only registers when ``settings.semantic_intent.enabled`` is True
+    (RouteIQ-7936).
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().semantic_intent
+    except Exception:
+        return False
+
+    if not cfg.enabled:
+        verbose_proxy_logger.debug(
+            "Semantic-intent routing disabled (ROUTEIQ_SEMANTIC_INTENT__ENABLED=false)"
+        )
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        registry.register(
+            "llmrouter-semantic-intent",
+            SemanticIntentRoutingStrategy(
+                intent_model_groups=cfg.intent_model_groups,
+                similarity_threshold=cfg.similarity_threshold,
+            ),
+        )
+        verbose_proxy_logger.info(
+            "Registered semantic-intent strategy as 'llmrouter-semantic-intent'"
+        )
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(
+            f"Failed to register semantic-intent strategy: {e}"
+        )
+        return False
+
+
 def register_llmrouter_strategies():
     """
     Log available LLMRouter strategies and return their names.
 
-    Despite its name, this function does NOT register strategies in any
-    runtime registry.  The ``llmrouter-*`` strategies are activated at
-    request time through the monkey-patch system in
-    ``custom_routing_strategy.py`` (see :func:`install_routeiq_strategy`).
+    Despite its name, the ``llmrouter-*`` ML strategies are activated at request
+    time through the ``RouteIQRoutingStrategy`` plugin (see
+    ``custom_routing_strategy.py``); this function does NOT register them in the
+    runtime registry.
 
-    This function exists to:
-    1. Enumerate the known strategy names at startup for diagnostics.
-    2. Log them so operators can confirm which strategies are available.
+    It DOES opt-in-register the two RouteIQ-native, registry-backed strategies
+    when enabled via settings:
+    - ``llmrouter-cost-cascade`` (RouteIQ-90d0) via
+      :func:`register_cost_cascade_strategy`
+    - ``llmrouter-semantic-intent`` (RouteIQ-7936) via
+      :func:`register_semantic_intent_strategy`
+
+    This mirrors the centroid pattern (``register_centroid_strategy``): both are
+    no-ops unless their respective ``enabled`` flag is set, so default startup
+    behavior is unchanged.
 
     Returns:
         List of available strategy name strings (e.g. ["llmrouter-knn", ...]).
@@ -3204,5 +3835,9 @@ def register_llmrouter_strategies():
     # Log available strategies
     for strategy in LLMROUTER_STRATEGIES:
         verbose_proxy_logger.debug(f"  - {strategy}")
+
+    # Opt-in registry-backed RouteIQ-native strategies (no-op unless enabled).
+    register_cost_cascade_strategy()
+    register_semantic_intent_strategy()
 
     return LLMROUTER_STRATEGIES

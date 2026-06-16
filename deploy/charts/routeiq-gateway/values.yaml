@@ -324,15 +324,90 @@ gateway:
     runMigrations: false
 
   # OTEL/Observability settings
+  #
+  # RouteIQ-85e3 (P1): OTLP is the DEFAULT exporter and points at the in-cluster
+  # ADOT collector shipped by this chart (otel.collector below, default ON). The
+  # app (observability.py) already speaks OTLP; this wires the Helm/deploy seam so
+  # spans/metrics/logs actually leave the pod. With the bundled collector the
+  # endpoint is computed automatically (routeiq-gateway.otelEndpoint -> the
+  # collector Service DNS), so `endpoint` stays empty here and the render is still
+  # cloud-agnostic (the collector only reaches CloudWatch once the pod has IAM via
+  # Pod Identity/IRSA -- an OPERATOR concern, see otel.collector docs + README).
   otel:
     enabled: true
     serviceName: litellm-gateway
-    # Exporter type: none, otlp, jaeger, zipkin
-    tracesExporter: none
-    metricsExporter: none
-    logsExporter: none
-    # OTEL Collector endpoint (when using otlp)
+    # Exporter type: none, otlp, jaeger, zipkin.
+    # P1: default otlp so the app exports to the in-cluster ADOT collector.
+    tracesExporter: otlp
+    metricsExporter: otlp
+    logsExporter: otlp
+    # Explicit OTLP endpoint OVERRIDE. Leave empty to auto-target the bundled ADOT
+    # collector (otel.collector.enabled). Precedence: this > externalOtel.endpoint
+    # > in-cluster collector DNS. Set this (or externalOtel.endpoint) to point at a
+    # collector you manage instead.
     endpoint: ""
+
+    # ----------------------------------------------------------------------------
+    # Bundled ADOT (AWS Distro for OpenTelemetry) collector (RouteIQ-85e3, P1)
+    # ----------------------------------------------------------------------------
+    # Ships a Deployment + ConfigMap + Service running the aws-otel-collector image
+    # with an OTLP receiver and a CloudWatch awsemf (metrics->EMF) + awsxray
+    # (traces->X-Ray/Transaction Search) exporter pipeline, so the gateway's OTLP
+    # output lands in CloudWatch GenAI Observability (UNBLOCKS RouteIQ-ebf8) and
+    # X-Ray (UNBLOCKS RouteIQ-3c0a).
+    #
+    # OPERATOR CONCERN -- LIVE CW DELIVERY NEEDS IAM. The collector renders and runs
+    # WITHOUT AWS creds (the chart stays installable on any cluster), but it can
+    # only PUT to CloudWatch/X-Ray once its pod has an IAM identity granting
+    # cloudwatch:PutMetricData + logs:* (EMF) + xray:PutTraceSegments. On EKS bind a
+    # role to serviceAccount.name (Pod Identity association CDK-side, mirroring the
+    # gateway SA) or set collector.serviceAccount.annotations with an IRSA role-arn.
+    # In a private subnet the collector also needs a com.amazonaws.<region>.xray
+    # Interface VPC Endpoint or X-Ray egress times out silently (operator concern;
+    # skill adot-ecs-fargate-telemetry-gotchas).
+    collector:
+      # Default ON: out of the box the gateway emits OTLP to a real collector.
+      # Set false to disable the collector (e.g. you point externalOtel.endpoint at
+      # your own collector, or run a cluster-wide one).
+      enabled: true
+      image:
+        repository: public.ecr.aws/aws-observability/aws-otel-collector
+        tag: "v0.43.3"
+        pullPolicy: IfNotPresent
+      replicaCount: 1
+      # The AWS region the awsemf/awsxray exporters write to. Falls back to
+      # aws.region. LOAD-BEARING for live delivery (the exporters need a region).
+      region: ""
+      # CloudWatch EMF metrics namespace + log group the awsemf exporter writes to.
+      emf:
+        namespace: "RouteIQ/Gateway"
+        logGroupName: "/aws/routeiq/otel"
+      service:
+        # OTLP receiver ports the gateway dials. 4317 = gRPC, 4318 = HTTP/protobuf.
+        grpcPort: 4317
+        httpPort: 4318
+      # Dedicated SA so an operator can bind the collector's IAM role independently
+      # of the gateway SA. Empty name == <fullname>-adot-collector.
+      serviceAccount:
+        create: true
+        name: ""
+        annotations: {}
+          # IRSA path (non-Pod-Identity clusters):
+          # eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/routeiq-adot-collector
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      podAnnotations: {}
+      nodeSelector: {}
+      tolerations: []
+      # Raw OTel-collector pipeline config OVERRIDE. Leave empty to use the chart's
+      # default OTLP-in -> awsemf/awsxray-out pipeline (rendered from the values
+      # above). Set a full collector config string to take full control.
+      config: ""
 
   # SSRF protection
   ssrf:
