@@ -77,15 +77,41 @@ RouteIQ-shape** (the `model_list`/`general:`/`router:` shape check). Guardrail
 plugin gating for `public` routes is *not yet enforced* by the validator. A bad
 config never becomes the deployed version — the deployment fails closed.
 
-### Day-2 GitOps path (`config_state_construct.py:929-1108`)
+### Day-2 GitOps path
 
-Operators commit `config.yaml` to the source bucket; a CodePipeline (Source →
-[Approve, prod only] → Deploy) assumes a narrow deployer role and runs
-`appconfig create-hosted-configuration-version` + `start-deployment`
-(`:1022-1038`). The deployer role holds exactly five AppConfig actions and an
-explicit **deny** of `Update/DeleteConfigurationProfile` so the validator can
-never be stripped (`:711-819`). Mutation of the profile fires an EventBridge →
-SNS alarm (`:880-927`).
+> **Scope note (RouteIQ-1669).** The full vllm-sr CodePipeline + deployer role
+> (`config_state_construct.py:929-1108`, `:711-819`) is a **FUTURE tier**, NOT
+> shipped by RouteIQ's `ConfigStateConstruct` today. The construct ships the
+> AppConfig core (application/environment/profile/strategy/version/deployment +
+> the LAMBDA validator) and, as a flag-gated `enable_config_audit` option
+> (DEFAULT OFF), the validator-mutation audit (a TLS-enforced SNS topic + an
+> EventBridge rule on `Update/DeleteConfigurationProfile`). It does **not** build
+> a CodePipeline, a source bucket, an approval stage, or a deployer IAM role. See
+> "Current scope" below.
+
+The intended Day-2 path (when the future deployer tier lands): operators commit
+`config.yaml` to a source bucket; a CodePipeline (Source → [Approve, prod only] →
+Deploy) assumes a narrow deployer role and runs
+`appconfig create-hosted-configuration-version` + `start-deployment`. The deployer
+role holds exactly five AppConfig actions and an explicit **deny** of
+`Update/DeleteConfigurationProfile` so the validator can never be stripped.
+
+**What ships today:** operators push real config day-2 via the `aws appconfig`
+CLI (`create-hosted-configuration-version` + `start-deployment`), which AppConfig
+validates with the LAMBDA validator before it becomes authoritative. With
+`enable_config_audit` on, any attempt to mutate the profile (which could strip the
+validator) fires the EventBridge → SNS audit alarm.
+
+### Current scope (what `config_state_construct.py` actually builds)
+
+| Component | Status |
+|-----------|--------|
+| AppConfig Application/Environment/Profile/Strategy/HostedVersion/Deployment | **Shipped** |
+| LAMBDA validator + invoke permission | **Shipped** |
+| Validator-mutation EventBridge → SNS audit | **Shipped, flag-gated** (`enable_config_audit`, default off) |
+| CodePipeline (Source → Approve → Deploy) | **Future tier** (not built) |
+| Deployer IAM role (5 AppConfig actions + deny Update/Delete profile) | **Future tier** (not built) |
+| S3 source bucket / CloudTrail trail / `spike_infra_only` posture | **Dropped** (not a RouteIQ deliverable) |
 
 ### RouteIQ runtime retrieval
 
@@ -109,8 +135,10 @@ remains the fallback when AppConfig is not configured.
 - **Staged rollout + bake.** Linear-20%-over-12-min + 5-min bake means a bad
   config never flips 100% of pods at once; AppConfig can auto-rollback on a
   CloudWatch alarm during the bake.
-- **Audit + approval.** GitOps pipeline with a prod approval gate and an SNS
-  alarm on any attempt to remove the validator.
+- **Audit.** The flag-gated `enable_config_audit` option fires an SNS alarm on
+  any attempt to mutate (and thereby potentially strip the validator from) the
+  configuration profile. The GitOps pipeline with a prod approval gate + deployer
+  role is a future tier (see "Day-2 GitOps path" scope note).
 - **Reuses RouteIQ's own machinery.** No new in-process reload path — the
   existing `HotReloadManager` callback fires on the new version; the validator
   Lambda reuses RouteIQ's config parser.

@@ -278,19 +278,24 @@ def test_initial_deployment_depends_on_validator_permission() -> None:
 
 
 def test_vsr_state_bucket_and_pipeline_extras_are_dropped() -> None:
-    """The VSR S3-state-bucket / CloudTrail / CodePipeline / EventBridge extras are
-    NOT part of the RouteIQ P2 config-state substrate.
+    """The VSR S3-state-bucket / CloudTrail / CodePipeline extras are NOT part of
+    the RouteIQ P2 config-state substrate.
 
     The RouteIQ port trims the AppConfig core out of the VSR construct: there is NO
-    S3 state bucket, NO CloudTrail audit trail, NO CodePipeline deployer pipeline,
-    NO EventBridge validator-mutation rule in this construct. (The only S3/IAM/etc.
-    the lake needs lives in DataLakeConstruct, a separate flag-gated construct.)
+    S3 state bucket, NO CloudTrail audit trail, NO CodePipeline deployer pipeline
+    (the full GitOps pipeline + deployer role remain a future tier - RouteIQ-1669).
+    The EventBridge validator-mutation rule is now an OPT-IN audit core
+    (enable_config_audit, DEFAULT OFF), so the DEFAULT surface still emits ZERO
+    AWS::Events::Rule / AWS::SNS::Topic (asserted here); see test_config_audit.py
+    for the flag-on assertions.
     """
     template = _config_state_template()
     template.resource_count_is("AWS::S3::Bucket", 0)
     template.resource_count_is("AWS::CloudTrail::Trail", 0)
     template.resource_count_is("AWS::CodePipeline::Pipeline", 0)
+    # DEFAULT (audit off): zero EventBridge rule / SNS topic.
     template.resource_count_is("AWS::Events::Rule", 0)
+    template.resource_count_is("AWS::SNS::Topic", 0)
 
 
 # ------------------------------------------------------ placeholder config + secrets

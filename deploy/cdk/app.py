@@ -102,6 +102,21 @@ def main() -> None:
     waf_crs_block = _bool_ctx(app, "routeiq:waf_crs_block", False)
     waf_rate_block = _bool_ctx(app, "routeiq:waf_rate_block", False)
 
+    # RouteIQ-acdc (GPU NodePool): DEFAULT OFF. The two AWS-managed Auto Mode node
+    # pools are CPU-only, so a pod requesting nvidia.com/gpu sits Pending forever.
+    # When true the foundation emits a GpuNodePoolManifest CfnOutput carrying the
+    # custom GPU NodePool + EC2 NodeClass YAML the operator/GitOps applies
+    # out-of-band. Off keeps the default synth byte-stable (zero GPU surface).
+    enable_gpu_nodepool = _bool_ctx(app, "routeiq:enable_gpu_nodepool", False)
+
+    # RouteIQ-c0be (Native Bedrock Guardrail): DEFAULT OFF. AUTHORING STAGE - when
+    # true the foundation mints an IaC-owned CfnGuardrail + a pinned
+    # CfnGuardrailVersion + GuardrailId/VersionNumber CfnOutputs. The data-path
+    # activation (feeding those into the bedrock_guardrails plugin) is a separate
+    # wave (RouteIQ-9f14). Off keeps the default synth byte-stable (zero
+    # AWS::Bedrock::Guardrail resources).
+    enable_native_guardrail = _bool_ctx(app, "routeiq:enable_native_guardrail", False)
+
     # P1 state-plane context keys (ADR-0028 Aurora + ADR-0029 ElastiCache). The
     # state stack is a SEPARATE stack/CI-stage per the ~30-min-rollback rule, so
     # it is gated on enable_state_stack (default true) and is byte-stable off.
@@ -143,6 +158,8 @@ def main() -> None:
         waf_rate_limit=waf_rate_limit,
         waf_crs_block=waf_crs_block,
         waf_rate_block=waf_rate_block,
+        enable_gpu_nodepool=enable_gpu_nodepool,
+        enable_native_guardrail=enable_native_guardrail,
     )
 
     # P1 state stack (Aurora + ElastiCache), wired cross-stack to the P0
@@ -184,6 +201,11 @@ def main() -> None:
             routing_log_group_name=(_ctx(app, "routeiq:routing_log_group_name", None) or None),
             enable_amg=_bool_ctx(app, "routeiq:enable_amg", False),
             enable_data_lake=_bool_ctx(app, "routeiq:enable_data_lake", False),
+            # RouteIQ-1669 (ADR-0026 audit core): DEFAULT OFF. When true the
+            # config-state construct adds a TLS SNS topic + an EventBridge rule on
+            # mutating AppConfig profile API calls (the validator-mutation audit).
+            # The full GitOps CodePipeline + deployer role remain a future tier.
+            enable_config_audit=_bool_ctx(app, "routeiq:enable_config_audit", False),
             notify_emails=_split_csv_or_list(_ctx(app, "routeiq:notify_emails", [])),
         )
 

@@ -21,10 +21,21 @@ Resource graph (the P2 deliverable):
 
 DROPPED relative to the VSR source (NOT P2 deliverables for the RouteIQ
 config-state substrate): the S3 state bucket, the CloudTrail audit trail, the
-CodePipeline deployer pipeline, the EventBridge validator-mutation rule, the
-deployer IAM role, and the ``spike_infra_only`` posture. RouteIQ does not need
+CodePipeline deployer pipeline, and the deployer IAM role. RouteIQ does not need
 those for P2 config-state; the operator pushes real config day-2 via the
-``aws appconfig`` CLI (a later P-tier pipeline is tracked separately).
+``aws appconfig`` CLI (the full GitOps CodePipeline + deployer role is tracked as
+a FUTURE tier - RouteIQ-1669; ADR-0026's "Day-2 GitOps path" was corrected to
+mark it as not-yet-shipped).
+
+ADDED back as a flag-gated, DEFAULT-OFF cred-free CORE (RouteIQ-1669): the
+``EventBridge validator-mutation rule -> SNS`` audit. ADR-0026 calls out that the
+validator is the single load-bearing config gate, and that any attempt to strip
+it (an Update/DeleteConfigurationProfile call) must fire an alarm. That alarm is
+small + self-contained, so it ships as ``enable_config_audit`` (DEFAULT OFF):
+when on it adds a TLS-enforced SNS topic + an EventBridge rule matching the two
+mutating AppConfig profile API calls via CloudTrail; when off (the default) NO
+audit resources are emitted and the snapshot stays byte-stable. The full
+CodePipeline/deployer remains a future tier (NOT built speculatively).
 
 P0-established patterns preserved:
   * ``env_name`` kwarg, no positional flags;
@@ -59,11 +70,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from aws_cdk import Aws, BundlingOptions, Duration, RemovalPolicy, Stack
+from aws_cdk import Aws, BundlingOptions, CfnOutput, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_appconfig as appconfig
+from aws_cdk import aws_events as events
+from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_sns as sns
 from cdk_nag import NagPackSuppression, NagSuppressions
 from constructs import Construct
 
@@ -122,6 +136,17 @@ general:
 """
 
 
+# The mutating AppConfig profile API calls the validator-mutation audit watches
+# (RouteIQ-1669 / ADR-0026): an UpdateConfigurationProfile can strip the
+# Validators array (removing the load-bearing config gate); a
+# DeleteConfigurationProfile removes the profile (and its validator) outright.
+# EventBridge sees these as ``aws.appconfig`` CloudTrail API-call events.
+_AUDIT_MUTATING_ACTIONS = [
+    "UpdateConfigurationProfile",
+    "DeleteConfigurationProfile",
+]
+
+
 class ConfigStateConstruct(Construct):
     """RouteIQ AppConfig application/environment/profile/strategy + validator."""
 
@@ -131,6 +156,13 @@ class ConfigStateConstruct(Construct):
         construct_id: str,
         *,
         env_name: str,
+        # RouteIQ-1669: the flag-gated, DEFAULT-OFF validator-mutation audit core
+        # (ADR-0026's "alarm on any attempt to remove the validator"). When True a
+        # TLS-enforced SNS topic + an EventBridge rule on the mutating AppConfig
+        # profile API calls are added; when False (the default) NO audit resources
+        # are emitted so the synth/snapshot stays byte-stable. The full GitOps
+        # CodePipeline + deployer role remain a future tier (not built here).
+        enable_config_audit: bool | None = None,
         # RouteIQ-4772: make the validator Lambda synth DETERMINISTIC. The default
         # (False) ALWAYS takes the inline placeholder path -- the byte-stable,
         # host-Docker-INDEPENDENT path the cred-free gate + the snapshot exercise.
@@ -164,6 +196,23 @@ class ConfigStateConstruct(Construct):
                 bundle_validator_asset = str(ctx).strip().lower() in ("true", "1", "yes")
         self.bundle_validator_asset = bundle_validator_asset
 
+        # Resolve the validator-mutation audit toggle (RouteIQ-1669): explicit
+        # kwarg wins; else the ``routeiq:enable_config_audit`` context flag (CLI
+        # string or cdk.json bool); else the DEFAULT-OFF (no audit resources, so
+        # the synth/snapshot stays byte-stable).
+        if enable_config_audit is None:
+            ctx = self.node.try_get_context("routeiq:enable_config_audit")
+            if isinstance(ctx, bool):
+                enable_config_audit = ctx
+            elif ctx is None:
+                enable_config_audit = False
+            else:
+                enable_config_audit = str(ctx).strip().lower() in ("true", "1", "yes")
+        self.enable_config_audit = enable_config_audit
+        # Public attrs the audit populates (None when off, so consumers can guard).
+        self.audit_topic: sns.Topic | None = None
+        self.audit_rule: events.Rule | None = None
+
         (
             self.appconfig_application,
             self.appconfig_environment,
@@ -190,6 +239,82 @@ class ConfigStateConstruct(Construct):
                 f"{self.appconfig_application_id}/environment/"
                 f"{self.appconfig_environment_id}/configuration/"
                 f"{self.appconfig_profile_id}"
+            ),
+        )
+
+        # RouteIQ-1669: the flag-gated validator-mutation audit core. DEFAULT OFF
+        # so the default synth/snapshot is byte-stable.
+        if self.enable_config_audit:
+            self._build_config_audit(env_name)
+
+    def _build_config_audit(self, env_name: str) -> None:
+        """Build the validator-mutation EventBridge -> SNS audit (RouteIQ-1669).
+
+        ADR-0026 makes the validator the single load-bearing config gate and calls
+        for an alarm on any attempt to remove it. This is the small, self-contained
+        cred-free CORE of ADR-0026's "Day-2 GitOps path" (the full CodePipeline +
+        deployer role remain a future tier, NOT built here):
+
+          * a TLS-enforced SNS topic (a DenyInsecureTransport resource policy
+            mirrors ObservabilityConstruct.alarm_topic - so cdk-nag SNS2/SNS3 stay
+            clean);
+          * an EventBridge rule matching the two MUTATING AppConfig profile API
+            calls (Update/DeleteConfigurationProfile) via CloudTrail, targeting the
+            SNS topic. An UpdateConfigurationProfile can strip the Validators array;
+            a DeleteConfigurationProfile removes the profile + validator outright.
+
+        EventBridge sees these as ``aws.appconfig`` ``AWS API Call via CloudTrail``
+        events (CloudTrail management events are on by default). The rule does NOT
+        narrow on the specific profile id (the event detail carries the profile in
+        ``requestParameters``, but matching on the two mutating actions over the
+        appconfig source is the load-bearing signal and avoids a brittle nested
+        pattern). ASCII-only descriptions.
+        """
+        self.audit_topic = sns.Topic(
+            self,
+            "ConfigAuditTopic",
+            topic_name=f"routeiq-{env_name}-config-audit",
+            display_name=f"routeiq {env_name} config-validator audit",
+        )
+        # DenyInsecureTransport: deny non-TLS publish/subscribe (cdk-nag SNS3).
+        self.audit_topic.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="DenyInsecureTransport",
+                effect=iam.Effect.DENY,
+                principals=[iam.AnyPrincipal()],
+                actions=["sns:Publish", "sns:Subscribe"],
+                resources=[self.audit_topic.topic_arn],
+                conditions={"Bool": {"aws:SecureTransport": "false"}},
+            )
+        )
+
+        self.audit_rule = events.Rule(
+            self,
+            "ConfigAuditRule",
+            rule_name=f"routeiq-{env_name}-config-validator-mutation",
+            description=(
+                "Fires on a mutating AppConfig configuration-profile API call "
+                "(Update/Delete) so an attempt to strip the RouteIQ config "
+                "validator raises an audit alarm (ADR-0026)."
+            ),
+            event_pattern=events.EventPattern(
+                source=["aws.appconfig"],
+                detail_type=["AWS API Call via CloudTrail"],
+                detail={
+                    "eventSource": ["appconfig.amazonaws.com"],
+                    "eventName": list(_AUDIT_MUTATING_ACTIONS),
+                },
+            ),
+            targets=[events_targets.SnsTopic(self.audit_topic)],
+        )
+
+        CfnOutput(
+            self,
+            "ConfigAuditTopicArn",
+            value=self.audit_topic.topic_arn,
+            description=(
+                "SNS topic that fires on a mutating AppConfig profile API call "
+                "(config-validator-mutation audit). Subscribe on-call here."
             ),
         )
 

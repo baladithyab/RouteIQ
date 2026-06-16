@@ -71,6 +71,39 @@ _EKS_VERSION = "1.33"
 # NOT author NodePool/EC2NodeClass CRs for them (that is the point of Auto Mode).
 _AUTO_MODE_NODE_POOLS = ["general-purpose", "system"]
 
+# -- GPU NodePool + NodeClass (RouteIQ-acdc; flag-gated, DEFAULT OFF) ----------
+# The two AWS-managed Auto Mode node pools (general-purpose / system) are
+# CPU-ONLY, so a pod requesting ``nvidia.com/gpu`` sits ``Pending`` forever -
+# there is no GPU-family NodePool for Karpenter to provision against. To serve
+# GPU inference (e.g. a vLLM sidecar / self-hosted model) on this Auto Mode
+# cluster the operator must author a CUSTOM Karpenter NodePool selecting GPU
+# instance families + a custom EC2 NodeClass that carries the node role.
+#
+# Auto Mode supplies the NVIDIA device plugin, the GPU drivers, and the
+# accelerated Bottlerocket AMI itself when a GPU is requested - so RouteIQ does
+# NOT install the NVIDIA device plugin or the GPU Operator (that is the point of
+# Auto Mode). These CRs are Kubernetes manifests applied OUT-OF-BAND via
+# kubectl/helm/GitOps, exactly like the rest of the app layer (this construct
+# never uses CDK ``KubernetesManifest`` over the L1 ``CfnCluster``). The CDK
+# deliverable is therefore the RENDERED manifest, surfaced as a ``CfnOutput`` the
+# operator/GitOps applies - flag-gated so the default synth/snapshot is byte-stable.
+#
+# Instance selection: the ``g`` + ``p`` accelerated categories (g6/g6e + the
+# p-family) with a generation floor so legacy g4/p3 are excluded; amd64 only
+# (Auto Mode is Linux-only and the accelerated AMIs are x86); spot + on-demand so
+# Auto Mode can cost-optimize. The ``nvidia.com/gpu`` taint isolates the pool so
+# only GPU-tolerating pods land on the (expensive) accelerated nodes.
+_GPU_NODE_POOL_NAME = "routeiq-gpu"
+_GPU_NODE_CLASS_NAME = "routeiq-gpu"
+# Karpenter NodePool requirement keys/values. Authored as a structured dict so
+# the test can assert the shape and the YAML render is deterministic.
+_GPU_INSTANCE_CATEGORIES = ["g", "p"]
+# Gt floor: generation STRICTLY GREATER than this, so "4" -> gen 5+ (g5/g6/g6e +
+# p5/p6 family), excluding legacy g4dn/p3/p4 (gen <= 4).
+_GPU_INSTANCE_GENERATION_FLOOR = "4"
+_GPU_CPU_LIMIT = "1000"
+_GPU_MEMORY_LIMIT = "1000Gi"
+
 
 class EksClusterConstruct(Construct):
     """Minimal EKS Auto Mode cluster (L1 CfnCluster) + IAM roles + Pod Identity.
@@ -414,3 +447,119 @@ class EksClusterConstruct(Construct):
         # emitter produces), so even flipped on it matched ZERO events. It is DELETED
         # here (single owner = P2); P0 only owns the log group the P2 filters attach
         # to. P0's default surface emits 0 MetricFilters.
+
+    def gpu_node_pool_manifest(self) -> str:
+        """Render the GPU Karpenter NodePool + EC2 NodeClass YAML (RouteIQ-acdc).
+
+        Returns a deterministic, ``kubectl apply -f -`` ready manifest for a
+        CUSTOM GPU NodePool + NodeClass on this Auto Mode cluster. It is rendered
+        by :meth:`enable_gpu_node_pool` into a ``CfnOutput`` so the operator/GitOps
+        applies it out-of-band (this construct never uses CDK
+        ``KubernetesManifest`` over the L1 ``CfnCluster`` - the app layer is
+        kubectl/helm-applied, section docstring above).
+
+        Shape (re-derived from the AWS EKS Auto Mode GPU-inference guidance):
+
+          * ``NodeClass`` (``eks.amazonaws.com/v1``) carries ``role: <node-role>``
+            - REUSING the existing Auto Mode node role (its NAME is the
+            :attr:`node_role` ``role_name`` + the ``NodeRoleName`` CfnOutput). The
+            existing EC2-type ``CfnAccessEntry`` over that role already permits the
+            nodes it launches to join, so no new access entry is needed. Subnet +
+            security-group selectors key on the EKS-managed discovery tags Auto
+            Mode stamps on the cluster's subnets/SGs.
+          * ``NodePool`` (``karpenter.sh/v1``) selects the ``g`` + ``p`` GPU
+            instance categories at generation > 4 (gen 5+: g5/g6/g6e + p5/p6,
+            excludes legacy g4dn/p3/p4), amd64, spot + on-demand, and carries the
+            ``nvidia.com/gpu`` NoSchedule taint so ONLY GPU-tolerating pods land
+            on the accelerated nodes.
+
+        Auto Mode supplies the NVIDIA device plugin + drivers + accelerated
+        Bottlerocket AMI itself when a pod requests ``nvidia.com/gpu`` - so the
+        manifest does NOT install the device plugin or the GPU Operator.
+
+        Hand-rolled (no PyYAML) so the rendered string is byte-deterministic
+        across synths (matching the ConfigStateConstruct placeholder approach).
+        """
+        node_role_name = self.node_role.role_name
+        categories = ", ".join(f'"{c}"' for c in _GPU_INSTANCE_CATEGORIES)
+        return (
+            "# RouteIQ GPU NodePool + EC2 NodeClass (RouteIQ-acdc).\n"
+            "# Apply OUT-OF-BAND: kubectl apply -f - <<'EOF' (or via GitOps).\n"
+            "# Auto Mode supplies the NVIDIA device plugin + drivers + the\n"
+            "# accelerated Bottlerocket AMI; do NOT install the device plugin or\n"
+            "# the GPU Operator. GPU pods must tolerate the nvidia.com/gpu taint.\n"
+            "---\n"
+            "apiVersion: eks.amazonaws.com/v1\n"
+            "kind: NodeClass\n"
+            "metadata:\n"
+            f"  name: {_GPU_NODE_CLASS_NAME}\n"
+            "spec:\n"
+            # role REUSES the Auto Mode node role (the NodeRoleName CfnOutput).
+            f"  role: {node_role_name}\n"
+            "  subnetSelectorTerms:\n"
+            f"    - tags:\n        kubernetes.io/cluster/{self.cluster_name}: owned\n"
+            "  securityGroupSelectorTerms:\n"
+            f"    - tags:\n        kubernetes.io/cluster/{self.cluster_name}: owned\n"
+            "---\n"
+            "apiVersion: karpenter.sh/v1\n"
+            "kind: NodePool\n"
+            "metadata:\n"
+            f"  name: {_GPU_NODE_POOL_NAME}\n"
+            "spec:\n"
+            "  template:\n"
+            "    metadata:\n"
+            "      labels:\n"
+            "        routeiq.ai/nodepool: gpu\n"
+            "    spec:\n"
+            "      nodeClassRef:\n"
+            "        group: eks.amazonaws.com\n"
+            "        kind: NodeClass\n"
+            f"        name: {_GPU_NODE_CLASS_NAME}\n"
+            "      taints:\n"
+            "        - key: nvidia.com/gpu\n"
+            "          effect: NoSchedule\n"
+            "      requirements:\n"
+            '        - key: "eks.amazonaws.com/instance-category"\n'
+            "          operator: In\n"
+            f"          values: [{categories}]\n"
+            '        - key: "eks.amazonaws.com/instance-generation"\n'
+            "          operator: Gt\n"
+            f'          values: ["{_GPU_INSTANCE_GENERATION_FLOOR}"]\n'
+            '        - key: "kubernetes.io/arch"\n'
+            "          operator: In\n"
+            '          values: ["amd64"]\n'
+            '        - key: "karpenter.sh/capacity-type"\n'
+            "          operator: In\n"
+            '          values: ["spot", "on-demand"]\n'
+            "  limits:\n"
+            f'    cpu: "{_GPU_CPU_LIMIT}"\n'
+            f"    memory: {_GPU_MEMORY_LIMIT}\n"
+        )
+
+    def enable_gpu_node_pool(self, construct_id: str) -> None:
+        """Emit the GPU NodePool + NodeClass manifest as an operator CfnOutput.
+
+        Flag-gated by the composition root (``routeiq:enable_gpu_nodepool``,
+        DEFAULT OFF). When NOT called the stack carries ZERO GPU surface, so the
+        default synth/snapshot is byte-stable; when called it adds a single
+        ``CfnOutput`` (``GpuNodePoolManifest``) whose value is the
+        :meth:`gpu_node_pool_manifest` YAML the operator/GitOps applies.
+
+        A ``CfnOutput`` (not a ``KubernetesManifest``) is the right surface: this
+        construct deliberately applies the entire app/CRD layer out-of-band over
+        the L1 ``CfnCluster`` (no L2 ``ICluster`` to ``addManifest`` on), and a
+        cred-free ``Template.from_stack`` can assert the output is present-when-on
+        / absent-when-off.
+        """
+        self.gpu_node_pool_manifest_value = self.gpu_node_pool_manifest()
+        CfnOutput(
+            self,
+            construct_id,
+            value=self.gpu_node_pool_manifest_value,
+            description=(
+                "GPU Karpenter NodePool + EC2 NodeClass manifest. Apply "
+                "out-of-band (kubectl apply -f - / GitOps) so nvidia.com/gpu pods "
+                "schedule on accelerated Auto Mode nodes. Auto Mode supplies the "
+                "NVIDIA device plugin + drivers."
+            ),
+        )

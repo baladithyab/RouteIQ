@@ -117,6 +117,7 @@ class RouteIqObservabilityStack(Stack):
         routing_log_group_name: str | None = None,
         enable_amg: bool = False,
         enable_data_lake: bool = False,
+        enable_config_audit: bool = False,
         notify_emails: list[str] | None = None,
         cost_center: str | None = None,
         team: str | None = None,
@@ -168,10 +169,15 @@ class RouteIqObservabilityStack(Stack):
             )
 
         # -- 1. AppConfig config-state -----------------------------------------
+        # enable_config_audit (RouteIQ-1669) is threaded through DEFAULT OFF so the
+        # default P2 synth/snapshot stays byte-stable; when on, the construct adds a
+        # TLS-enforced SNS topic + an EventBridge rule on mutating AppConfig profile
+        # API calls (the validator-mutation audit core of ADR-0026).
         self.config_state = ConfigStateConstruct(
             self,
             "ConfigStateConstruct",
             env_name=env_name,
+            enable_config_audit=enable_config_audit,
         )
 
         # -- 2. AMP + flag-gated AMG + TLS SNS + routing filters/alarms ---------

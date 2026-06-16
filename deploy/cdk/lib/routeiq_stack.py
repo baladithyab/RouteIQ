@@ -46,6 +46,7 @@ from .ecr_construct import EcrConstruct
 from .eks_cluster_construct import EksClusterConstruct
 from .nag_suppressions import apply_nag_suppressions
 from .naming import routing_log_group_export_name
+from .native_guardrail_construct import NativeGuardrailConstruct
 from .network_construct import NetworkConstruct
 from .waf_construct import WafConstruct
 
@@ -76,6 +77,8 @@ class RouteIqStack(Stack):
         waf_rate_limit: int | None = None,
         waf_crs_block: bool = False,
         waf_rate_block: bool = False,
+        enable_gpu_nodepool: bool = False,
+        enable_native_guardrail: bool = False,
         cost_center: str | None = None,
         team: str | None = None,
         tenant: str | None = None,
@@ -97,6 +100,8 @@ class RouteIqStack(Stack):
         self._waf_rate_limit = waf_rate_limit
         self._waf_crs_block = bool(waf_crs_block)
         self._waf_rate_block = bool(waf_rate_block)
+        self._enable_gpu_nodepool = bool(enable_gpu_nodepool)
+        self._enable_native_guardrail = bool(enable_native_guardrail)
 
         # Stack tag on every taggable resource (Tags.of propagates). Cost tags
         # are emitted ONLY when supplied so the default synth stays byte-stable
@@ -140,6 +145,17 @@ class RouteIqStack(Stack):
         # dimensioned RoutingLatencyByModel MetricFilter is PREP-ONLY / deferred
         # (data-source-blocked) and flag-gated off inside the construct.
         self.eks_cluster.enable_container_insights("ContainerInsights")
+
+        # GPU NodePool + EC2 NodeClass manifest (RouteIQ-acdc; flag-gated, DEFAULT
+        # OFF). The two AWS-managed Auto Mode node pools are CPU-only, so a pod
+        # requesting nvidia.com/gpu sits Pending forever. When
+        # routeiq:enable_gpu_nodepool is True this emits a single GpuNodePoolManifest
+        # CfnOutput carrying the custom GPU NodePool + NodeClass YAML the
+        # operator/GitOps applies out-of-band (Auto Mode supplies the NVIDIA device
+        # plugin + drivers). DEFAULT OFF -> zero GPU surface -> the default
+        # synth/snapshot stays byte-stable.
+        if self._enable_gpu_nodepool:
+            self.eks_cluster.enable_gpu_node_pool("GpuNodePoolManifest")
 
         # -- 3. ECR GHCR pull-through cache surface ---------------------------
         # The credential secret ARN is a deploy-time CfnParameter, NEVER a literal
@@ -230,6 +246,24 @@ class RouteIqStack(Stack):
                 rate_limit=self._waf_rate_limit,
                 crs_block=self._waf_crs_block,
                 rate_block=self._waf_rate_block,
+            )
+
+        # -- 5c. Native Bedrock Guardrail (RouteIQ-c0be; flag-gated, DEFAULT OFF)
+        # Authors an IaC-owned CfnGuardrail + a PINNED CfnGuardrailVersion when
+        # routeiq:enable_native_guardrail=true. AUTHORING STAGE ONLY: the data-path
+        # activation (wiring the guardrail id/version into the bedrock_guardrails
+        # plugin) is RouteIQ-9f14, a SEPARATE wave - this stack does NOT touch the
+        # plugin and there is zero live consumer this wave. With the flag OFF (the
+        # default surface) NO construct is built, so the stack emits ZERO
+        # AWS::Bedrock::Guardrail / AWS::Bedrock::GuardrailVersion resources and the
+        # snapshot stays byte-stable. The construct's GuardrailId / VersionNumber
+        # CfnOutputs are the two values RouteIQ-9f14 feeds the plugin.
+        self.native_guardrail: NativeGuardrailConstruct | None = None
+        if self._enable_native_guardrail:
+            self.native_guardrail = NativeGuardrailConstruct(
+                self,
+                "NativeGuardrailConstruct",
+                env_name=env_name,
             )
 
         # -- 6. cdk-nag suppressions (LAST, by path) --------------------------

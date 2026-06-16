@@ -49,6 +49,8 @@ DEFAULT_STACK_FLAGS: dict[str, Any] = {
     "waf_rate_limit": None,
     "waf_crs_block": False,
     "waf_rate_block": False,
+    "enable_gpu_nodepool": False,
+    "enable_native_guardrail": False,
 }
 
 
@@ -135,6 +137,7 @@ def make_obs_stack(
     env_name: str = "dev",
     enable_amg: bool = False,
     enable_data_lake: bool = False,
+    enable_config_audit: bool = False,
     notify_emails: list[str] | None = None,
     construct_id: str | None = None,
     foundation_id: str | None = None,
@@ -169,6 +172,7 @@ def make_obs_stack(
         foundation=foundation,
         enable_amg=enable_amg,
         enable_data_lake=enable_data_lake,
+        enable_config_audit=enable_config_audit,
         notify_emails=notify_emails,
     )
     return app, foundation, obs
