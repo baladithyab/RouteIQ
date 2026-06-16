@@ -64,24 +64,55 @@ def _region_from_rds_host(host: str | None) -> str | None:
         return None
 
 
+def _region_from_boto3_session() -> str | None:
+    """Last-resort region from boto3's own default-resolution chain.
+
+    Lets boto3 resolve the region the way it does for every other AWS call --
+    ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` env, the active profile's config, or
+    EC2/ECS IMDS. RouteIQ-86ff: the explicit env chain above does NOT cover the
+    profile/IMDS sources, so a deployment that relies on them (region only in the
+    profile or instance metadata) would otherwise wrongly fail loud. Wrapped so a
+    missing/broken boto3 returns None and the caller still raises its clear error.
+    """
+    try:
+        import boto3
+
+        return boto3.session.Session().region_name or None
+    except Exception:
+        return None
+
+
 def _resolve_db_iam_region(host: str | None, iam_region: str | None) -> str:
     """Resolve the AWS region for the rds-db:connect IAM mint, or FAIL LOUD.
 
     Resolution order: ``settings.postgres.iam_region`` -> region parsed from the
-    RDS/Aurora endpoint host -> ``AWS_REGION``. Serverless Aurora endpoints do
-    not always carry a parseable region label, so config or the environment must
-    supply it.
+    RDS/Aurora endpoint host -> ``AWS_REGION`` -> ``AWS_DEFAULT_REGION`` ->
+    boto3's own default-resolution chain (profile / EC2/ECS IMDS). Serverless
+    Aurora endpoints do not always carry a parseable region label, so config or
+    the environment must supply it.
 
     RouteIQ-89a6 / RouteIQ-6829: when none of the sources yield a region we used
     to call ``generate_db_auth_token(Region=None)`` -- an invalid SigV4 token that
     fails AUTH at connect time. Instead raise a clear, actionable error naming the
     missing env so the misconfiguration surfaces at pool-build time.
+
+    RouteIQ-86ff: the old explicit chain stopped at ``AWS_REGION`` and dropped the
+    boto3 session default chain, so a deployment with only ``AWS_DEFAULT_REGION``
+    (or a profile / IMDS region) set -- which boto3 itself would resolve fine --
+    wrongly raised. ``AWS_DEFAULT_REGION`` is added and a boto3 ``Session()``
+    region lookup is the final fallback before raising.
     """
-    region = iam_region or _region_from_rds_host(host) or os.getenv("AWS_REGION")
+    region = (
+        iam_region
+        or _region_from_rds_host(host)
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or _region_from_boto3_session()
+    )
     if not region:
         raise IamRegionUnresolvedError(
             "cannot resolve AWS region for RDS/Aurora IAM auth: set "
-            "ROUTEIQ_POSTGRES__IAM_REGION or the AWS_REGION environment variable"
+            "ROUTEIQ_POSTGRES__IAM_REGION, AWS_REGION, or AWS_DEFAULT_REGION"
         )
     return region
 

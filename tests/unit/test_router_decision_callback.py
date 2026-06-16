@@ -15,15 +15,19 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+import os
+
 from litellm_llmrouter.router_decision_callback import (
     LLM_API_PATHS,
     RouterDecisionCallback,
     RouterDecisionMiddleware,
     _compute_duration,
+    _governance_spend_tracking_enabled,
     get_router_decision_callback,
     register_router_decision_callback,
     register_router_decision_middleware,
 )
+from litellm_llmrouter.settings import get_settings, reset_settings
 
 
 # =============================================================================
@@ -559,3 +563,64 @@ class TestGetRouterDecisionCallback:
     def test_returns_class(self):
         cls = get_router_decision_callback()
         assert cls is RouterDecisionCallback
+
+
+# =============================================================================
+# RouteIQ-9f9f -- governance spend tracking gate reads settings (ADR-0013)
+# =============================================================================
+#
+# The live reader migrated off a direct ``os.getenv`` to
+# ``get_settings().llmrouter_governance_spend_tracking``, with the raw env read
+# kept ONLY as a graceful fallback when ``get_settings()`` throws.
+
+
+class TestGovernanceSpendTrackingGate:
+    def test_default_is_on(self):
+        """No override -> default ON (settings default True)."""
+        reset_settings()
+        get_settings()
+        assert _governance_spend_tracking_enabled() is True
+
+    def test_honors_settings_value_true(self):
+        """RouteIQ-9f9f: the gate honors the settings field (set via override).
+
+        The field carries a ``validation_alias`` so the override is supplied
+        under the alias key (the Python-name kwarg is ignored by Pydantic when an
+        alias is present)."""
+        reset_settings()
+        get_settings(LLMROUTER_GOVERNANCE_SPEND_TRACKING=True)
+        assert _governance_spend_tracking_enabled() is True
+
+    def test_honors_settings_value_false(self):
+        """A False settings value disables the gate (read via get_settings)."""
+        reset_settings()
+        get_settings(LLMROUTER_GOVERNANCE_SPEND_TRACKING=False)
+        assert _governance_spend_tracking_enabled() is False
+
+    def test_settings_read_from_env_alias(self, monkeypatch):
+        """The settings field binds the bare env name via validation_alias."""
+        monkeypatch.setenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", "false")
+        reset_settings()
+        get_settings()
+        assert _governance_spend_tracking_enabled() is False
+
+    def test_env_fallback_when_settings_throws(self, monkeypatch):
+        """If get_settings() throws, the gate falls back to the raw env read."""
+        import litellm_llmrouter.settings as settings_mod
+
+        def _boom(*a, **kw):
+            raise RuntimeError("settings exploded")
+
+        monkeypatch.setattr(settings_mod, "get_settings", _boom)
+
+        # Env says OFF -> the fallback env reader must honor it.
+        with patch.dict(
+            os.environ, {"LLMROUTER_GOVERNANCE_SPEND_TRACKING": "no"}, clear=False
+        ):
+            assert _governance_spend_tracking_enabled() is False
+
+        # Env says ON -> fallback honors it too.
+        with patch.dict(
+            os.environ, {"LLMROUTER_GOVERNANCE_SPEND_TRACKING": "on"}, clear=False
+        ):
+            assert _governance_spend_tracking_enabled() is True

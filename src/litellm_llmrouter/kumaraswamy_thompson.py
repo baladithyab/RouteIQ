@@ -179,20 +179,22 @@ def sample_kumaraswamy(a: float, b: float, rng: random.Random) -> float:
 # The key observation: at a FIXED ``a``, the mean is strictly monotone in ``b``,
 # so ``_solve_b_for_mean`` pins the mean EXACTLY by bisection. That collapses
 # the problem to one free variable ``a``: choose ``a`` so the variance matches.
-# ``var_K(a, b_solve(a, mean))`` is U-shaped in ``a`` at a fixed mean (a minimum
-# achievable "variance floor"), so the fit is:
-#   1. golden-section to the variance floor ``a_min``;
-#   2. if the target variance is FEASIBLE (>= floor), bisect the low-``a`` branch
-#      ``[tiny, a_min]`` where variance decreases monotonically -> exact match;
-#   3. if INFEASIBLE (target below the floor -- high-evidence near-symmetric
-#      posteriors), return ``a_min``: the tightest Kumaraswamy at the correct
-#      mean. Its variance is slightly ABOVE target (more exploration), which is
-#      the doc's degradation contract -- never a wrong mean, never UNDER-
-#      exploration.
+# At a fixed mean, ``var_K(a, b_solve(a, mean))`` is monotone-DECREASING in ``a``
+# across the holdable low-``a`` branch ``[tiny, a_cap]`` (``a_cap`` is the largest
+# ``a`` whose mean ``_solve_b_for_mean`` can still hold before ``b`` exceeds the
+# bisection ceiling -- see ``fit_kumaraswamy_moments``). So the fit is a SINGLE
+# bisection over that branch (RouteIQ-37d6: this replaced the earlier golden-
+# section variance-floor search; there is no golden-section step any more):
+#   1. if the target variance is FEASIBLE (>= the variance at ``a_cap``), bisect
+#      ``[tiny, a_cap]`` for the exact variance match -> exact mean + variance;
+#   2. if INFEASIBLE (target below the tightest reachable variance -- high-
+#      evidence near-symmetric posteriors past the ceiling), return ``a_cap``:
+#      the tightest Kumaraswamy at the correct mean. Its variance is slightly
+#      ABOVE target (more exploration), which is the doc's degradation contract
+#      -- never a wrong mean, never UNDER-exploration.
 # This holds the mean to ~1e-7 and the variance to ~1.0x across the full
 # evidence grid (the old 2-D Newton inflated variance ~3-7x on peaked
 # posteriors -> over-exploration). Pure stdlib ``math`` only (no numpy).
-_GOLDEN_RATIO = (math.sqrt(5.0) - 1.0) / 2.0
 
 
 def _lbeta(x: float, y: float) -> float:

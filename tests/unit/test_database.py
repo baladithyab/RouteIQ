@@ -930,6 +930,60 @@ class TestResolveDbIamRegion:
                 == "ap-southeast-2"
             )
 
+    def test_resolves_from_aws_default_region_env(self):
+        """RouteIQ-86ff: AWS_DEFAULT_REGION-only deployments resolve (used to raise)."""
+        with patch.dict(os.environ, {"AWS_DEFAULT_REGION": "eu-central-1"}, clear=True):
+            assert (
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+                == "eu-central-1"
+            )
+
+    def test_aws_region_precedes_aws_default_region(self):
+        """AWS_REGION wins over AWS_DEFAULT_REGION when both are set."""
+        with patch.dict(
+            os.environ,
+            {"AWS_REGION": "us-east-1", "AWS_DEFAULT_REGION": "eu-central-1"},
+            clear=True,
+        ):
+            assert (
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+                == "us-east-1"
+            )
+
+    def test_resolves_from_boto3_session_when_env_empty(self, monkeypatch):
+        """RouteIQ-86ff: boto3 Session().region_name (profile/IMDS) is the final
+        fallback before raising -- mocked so no real boto3/network is needed."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(
+            db_mod, "_region_from_boto3_session", lambda: "ca-central-1"
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            assert (
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+                == "ca-central-1"
+            )
+
+    def test_raises_when_boto3_session_also_empty(self, monkeypatch):
+        """Still fails loud when NOTHING resolves (boto3 session yields None too)."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "_region_from_boto3_session", lambda: None)
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(IamRegionUnresolvedError) as exc_info:
+                _resolve_db_iam_region("my-aurora-sl.cluster-abc.serverless", None)
+        msg = str(exc_info.value)
+        assert "ROUTEIQ_POSTGRES__IAM_REGION" in msg
+        assert "AWS_DEFAULT_REGION" in msg
+
+    def test_boto3_session_helper_fails_soft_without_boto3(self):
+        """_region_from_boto3_session returns None (never raises) if boto3 missing."""
+        import litellm_llmrouter.database as db_mod
+
+        with patch.dict(sys.modules, {"boto3": None}):
+            # boto3=None makes `import boto3` raise ImportError -> caught -> None.
+            assert db_mod._region_from_boto3_session() is None
+
 
 class TestGetDbPoolIamFailLoud:
     """get_db_pool fails loud when IAM is on but the region is unresolvable."""

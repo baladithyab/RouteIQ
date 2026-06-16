@@ -50,14 +50,10 @@ OVERRIDE_STRATEGY_NAME = os.getenv(
 )
 
 
-def _governance_spend_tracking_enabled() -> bool:
-    """Whether post-response governance spend tracking is enabled (default ON).
+def _governance_spend_tracking_env() -> bool:
+    """Raw-env reader for the spend-tracking gate (graceful fallback path).
 
-    Read fresh each call (not module-level) so tests can toggle it via env
-    without re-import.  This is INDEPENDENT of ROUTER_CALLBACK_ENABLED (which is
-    OTEL-gated): the spend write path is the WRITER for the governance budget /
-    rpm counters and must work even when OTEL telemetry is off.  Env:
-    ``LLMROUTER_GOVERNANCE_SPEND_TRACKING`` (true/1/yes/on).
+    Env ``LLMROUTER_GOVERNANCE_SPEND_TRACKING`` (true/1/yes/on); default ON.
     """
     return os.getenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", "true").lower() in (
         "true",
@@ -65,6 +61,28 @@ def _governance_spend_tracking_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _governance_spend_tracking_enabled() -> bool:
+    """Whether post-response governance spend tracking is enabled (default ON).
+
+    Read fresh each call (not module-level) so tests can toggle it without
+    re-import.  This is INDEPENDENT of ROUTER_CALLBACK_ENABLED (which is OTEL-
+    gated): the spend write path is the WRITER for the governance budget / rpm
+    counters and must work even when OTEL telemetry is off.
+
+    RouteIQ-9f9f: settings-first per ADR-0013 -- reads
+    ``get_settings().llmrouter_governance_spend_tracking`` (bound via
+    ``validation_alias`` to the same ``LLMROUTER_GOVERNANCE_SPEND_TRACKING`` env
+    + default).  Falls back to the raw env read if ``get_settings()`` throws,
+    matching the module's other settings-first-with-env-fallback patterns.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return bool(get_settings().llmrouter_governance_spend_tracking)
+    except Exception:
+        return _governance_spend_tracking_env()
 
 
 # =============================================================================

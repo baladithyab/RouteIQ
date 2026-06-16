@@ -724,6 +724,60 @@ class TestResolveIamRegion:
             reset_settings()
             assert rp._resolve_iam_region(_SERVERLESS_HOST) == "ap-southeast-2"
 
+    def test_resolves_from_aws_default_region_env(self):
+        """RouteIQ-86ff: AWS_DEFAULT_REGION-only resolves on the redis path too."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {**_NO_REGION_ENV, "AWS_DEFAULT_REGION": "eu-central-1"}
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            assert rp._resolve_iam_region(_SERVERLESS_HOST) == "eu-central-1"
+
+    def test_aws_region_precedes_aws_default_region(self):
+        """AWS_REGION wins over AWS_DEFAULT_REGION when both are set."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {
+            **_NO_REGION_ENV,
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "eu-central-1",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            assert rp._resolve_iam_region(_SERVERLESS_HOST) == "us-east-1"
+
+    def test_resolves_from_boto3_session_when_env_empty(self, monkeypatch):
+        """RouteIQ-86ff: boto3 Session().region_name is the final fallback
+        before raising (mocked -- no real boto3/network)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        monkeypatch.setattr(rp, "_region_from_boto3_session", lambda: "ca-central-1")
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            assert rp._resolve_iam_region(_SERVERLESS_HOST) == "ca-central-1"
+
+    def test_raises_when_boto3_session_also_empty(self, monkeypatch):
+        """Still fails loud when NOTHING resolves (boto3 session None too)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        monkeypatch.setattr(rp, "_region_from_boto3_session", lambda: None)
+        with patch.dict("os.environ", _NO_REGION_ENV, clear=True):
+            reset_settings()
+            with pytest.raises(IamRegionUnresolvedError) as exc_info:
+                rp._resolve_iam_region(_SERVERLESS_HOST)
+        msg = str(exc_info.value)
+        assert "ROUTEIQ_REDIS__IAM_REGION" in msg
+        assert "AWS_DEFAULT_REGION" in msg
+
+    def test_boto3_session_helper_fails_soft_without_boto3(self):
+        """_region_from_boto3_session returns None (never raises) if boto3 missing."""
+        import sys
+
+        import litellm_llmrouter.redis_pool as rp
+
+        with patch.dict(sys.modules, {"boto3": None}):
+            assert rp._region_from_boto3_session() is None
+
     def test_resolves_from_settings_iam_region(self):
         """ROUTEIQ_REDIS__IAM_REGION takes precedence over host + AWS_REGION."""
         import litellm_llmrouter.redis_pool as rp

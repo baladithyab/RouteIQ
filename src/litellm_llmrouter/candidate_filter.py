@@ -43,6 +43,7 @@ own already-ban-filtered input).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -54,24 +55,73 @@ logger = logging.getLogger(__name__)
 # it to live routing config" must hold with ZERO operator config. Relying on
 # ``GovernanceSettings.banned_models`` alone left it unenforced out-of-the-box
 # (the default is empty), so a bare deployment that happened to list a Fable 5
-# arm could route it. These substrings are matched (normalized, see
-# ``_normalize``) against BOTH the arm key (``litellm_params.model``) and the
-# group name (``model_name``) IN ADDITION TO the config-driven bans, so the
-# control survives an empty / cleared / glitched ``banned_models``.
+# arm could route it. The family is matched (normalized, see ``_tokens``)
+# against BOTH the arm key (``litellm_params.model``) and the group name
+# (``model_name``) IN ADDITION TO the config-driven bans, so the control survives
+# an empty / cleared / glitched ``banned_models``.
 #
-# Substrings (not exact strings) so every provider-prefixed and region-prefixed
-# variant is caught: ``bedrock/global.anthropic.claude-fable-5``,
-# ``anthropic/claude-fable-5``, the bare ``claude-fable-5``, and the model-id
-# ``claude-fable-5`` all contain ``claude-fable-5``.
-_ALWAYS_BANNED_SUBSTRINGS: tuple[str, ...] = (
-    "claude-fable-5",
-    "claude-fable5",
+# Matched on a TOKEN/SEGMENT BOUNDARY (RouteIQ-2e1f), not a raw substring. The
+# arm + group name are normalized by splitting on any of ``[/._- ]`` (and lower-
+# casing), then the Fable 5 family is matched as a BOUNDED token SUBSEQUENCE. So
+# every provider/region-prefixed and separator variant is caught --
+# ``bedrock/global.anthropic.claude-fable-5``, ``anthropic/claude-fable-5``, the
+# bare ``claude-fable-5``, ``claude_fable_5``, ``claude.fable.5`` -- while a
+# look-alike whose terminal version TOKEN differs is NOT (``claude-fable-50``
+# tokenizes to ``[..., fable, 50]`` and ``50`` != the token ``5``; the fused
+# ``claude-fable50`` -> ``[..., fable50]`` likewise misses ``(fable5,)``). The
+# match keys on the token VALUE, not on whether a trailing segment follows, so a
+# clean ``(fable, 5)`` run anywhere (e.g. the ``claude-fable-5-group`` group
+# name, or a ``claude-fable-5-mini`` variant) IS banned -- the safe direction for
+# a compliance ban.
+#
+# Each entry is the family expressed as the ordered token tuple a model name
+# tokenizes to: ``claude-fable-5`` -> ``(fable, 5)`` and ``claude-fable5`` ->
+# ``(fable5,)`` (the no-separator spelling is its own single token).
+_ALWAYS_BANNED_TOKEN_SEQS: tuple[tuple[str, ...], ...] = (
+    ("fable", "5"),
+    ("fable5",),
 )
+
+# Split on the separators that appear in provider/region-prefixed model ids:
+# ``/`` (provider), ``.`` (region/vendor segments), ``-`` and ``_`` (name parts),
+# and whitespace. Reused to tokenize both the arm and the group name.
+_TOKEN_SPLIT_RE = re.compile(r"[/._\- ]+")
 
 
 def _normalize(s: str) -> str:
     """Lowercase + strip whitespace for case/format-insensitive ban matching."""
     return str(s or "").strip().lower()
+
+
+def _tokens(s: str) -> list[str]:
+    """Tokenize a (normalized) model id on ``[/._- ]`` boundaries, dropping empties."""
+    return [t for t in _TOKEN_SPLIT_RE.split(_normalize(s)) if t]
+
+
+def _contains_token_seq(tokens: list[str], seq: tuple[str, ...]) -> bool:
+    """True if ``seq`` appears as a contiguous run within ``tokens``.
+
+    A bounded match: ``(fable, 5)`` matches ``[..., fable, 5, ...]`` but NOT
+    ``[..., fable, 50]`` (token ``50`` != token ``5``) nor a fused ``fable5``.
+    """
+    n = len(seq)
+    if n == 0:
+        return False
+    for i in range(len(tokens) - n + 1):
+        if tuple(tokens[i : i + n]) == seq:
+            return True
+    return False
+
+
+def _is_always_banned(*names: str) -> bool:
+    """True if ANY of the given model names tokenizes to a banned Fable 5 family
+    token sequence (RouteIQ-513e always-on ban, RouteIQ-2e1f boundary-matched)."""
+    for name in names:
+        toks = _tokens(name)
+        for seq in _ALWAYS_BANNED_TOKEN_SEQS:
+            if _contains_token_seq(toks, seq):
+                return True
+    return False
 
 
 def cooled_down_ids(router: Any) -> set[str]:
@@ -146,8 +196,11 @@ def is_gov_banned(deployment: Dict[str, Any]) -> bool:
     Banned when EITHER the arm key (``litellm_params.model``) OR the group name
     (``model_name``) is banned, by EITHER:
 
-    - the always-on Fable 5 family ban (:data:`_ALWAYS_BANNED_SUBSTRINGS`,
-      normalized substring match — RouteIQ-513e, holds with zero config), OR
+    - the always-on Fable 5 family ban (:data:`_ALWAYS_BANNED_TOKEN_SEQS`,
+      token/segment-boundary match — RouteIQ-513e holds with zero config,
+      RouteIQ-2e1f tightens it so a different terminal version token
+      ``claude-fable-50`` is NOT banned while separator variants
+      ``claude_fable_5`` / ``claude.fable.5`` ARE), OR
     - the operator config (:func:`banned_model_keys`, exact normalized match —
       RouteIQ-badb).
 
@@ -157,10 +210,9 @@ def is_gov_banned(deployment: Dict[str, Any]) -> bool:
     arm = _normalize((deployment.get("litellm_params") or {}).get("model", ""))
     name = _normalize(deployment.get("model_name", ""))
 
-    # Always-on family ban (substring, zero-config).
-    for sub in _ALWAYS_BANNED_SUBSTRINGS:
-        if sub in arm or sub in name:
-            return True
+    # Always-on family ban (token/segment boundary, zero-config).
+    if _is_always_banned(arm, name):
+        return True
 
     # Operator-configured ban (exact, normalized).
     configured = {_normalize(m) for m in banned_model_keys()}

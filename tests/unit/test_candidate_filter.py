@@ -233,3 +233,76 @@ def test_drop_gov_banned_byte_stable_when_nothing_banned():
     get_settings()
     cands = [_dep("claude", "bedrock/anthropic.claude-3-sonnet", "d1")]
     assert drop_gov_banned(cands) is cands
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-2e1f — Fable 5 ban matched on a TOKEN/SEGMENT BOUNDARY
+# ---------------------------------------------------------------------------
+#
+# The old raw-substring match OVER-matched look-alikes that merely share the
+# ``claude-fable-5`` prefix (``claude-fable-50``, ``claude-fable-5-mini``) and
+# UNDER-matched separator variants (``claude_fable_5``, ``claude.fable.5``). The
+# boundary match fixes BOTH directions.
+
+
+def test_fable5_under_match_separator_variants_now_banned():
+    """UNDER-match fix: ``_`` and ``.`` separator variants ARE banned (were not)."""
+    reset_settings()
+    get_settings()  # zero operator config -> relies on the always-on family ban
+    under_match_variants = [
+        "claude_fable_5",
+        "claude.fable.5",
+        "bedrock/global.anthropic.claude_fable_5",
+        "anthropic/claude.fable.5",
+    ]
+    for arm in under_match_variants:
+        assert is_gov_banned(_dep("grp", arm, "d")), arm
+        # And via the group name (model_name) too.
+        assert is_gov_banned(_dep(arm, "bedrock/safe-arm", "d")), arm
+
+
+def test_fable5_over_match_lookalikes_not_banned():
+    """OVER-match fix: a DIFFERENT terminal version token (``50``, not ``5``) is
+    NOT banned (it used to match the raw ``claude-fable-5`` substring).
+
+    NB: ``claude-fable-5-mini`` IS still banned — it carries ``(fable, 5)`` as a
+    clean token run, exactly like the protected ``claude-fable-5-group`` group
+    name in ``test_fable5_family_ban_catches_all_prefix_variants``. The boundary
+    match keys on the TOKEN value (``50`` != ``5``), not on whether a suffix
+    follows."""
+    reset_settings()
+    get_settings()
+    over_match_lookalikes = [
+        "claude-fable-50",
+        "claude_fable_50",
+        "claude-fable50",  # fused look-alike (token ``fable50`` != ``fable5``)
+        "bedrock/global.anthropic.claude-fable-50",
+        "anthropic/claude-fable-500",
+    ]
+    for arm in over_match_lookalikes:
+        assert not is_gov_banned(_dep("grp", arm, "d")), arm
+        assert not is_gov_banned(_dep(arm, "bedrock/safe-arm", "d")), arm
+
+
+def test_fable5_bare_and_fused_token_still_banned():
+    """The bare and no-separator (``claude-fable5``) spellings remain banned."""
+    reset_settings()
+    get_settings()
+    for arm in (
+        "claude-fable-5",
+        "claude-fable5",
+        "bedrock/global.anthropic.claude-fable5",
+    ):
+        assert is_gov_banned(_dep("grp", arm, "d")), arm
+    # ...but the fused-token look-alike ``claude-fable50`` is NOT banned.
+    assert not is_gov_banned(_dep("grp", "claude-fable50", "d"))
+
+
+def test_fable5_boundary_drop_keeps_lookalike_arm():
+    """A look-alike arm survives drop_gov_banned; a real fable-5 arm is removed."""
+    reset_settings()
+    get_settings()
+    lookalike = _dep("grp", "bedrock/anthropic.claude-fable-50", "d1")
+    banned = _dep("grp", "bedrock/global.anthropic.claude_fable_5", "d2")
+    out = drop_gov_banned([lookalike, banned])
+    assert out == [lookalike]

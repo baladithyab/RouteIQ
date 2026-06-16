@@ -228,29 +228,56 @@ def _region_from_cache_host(host: str | None) -> str | None:
     return None
 
 
+def _region_from_boto3_session() -> str | None:
+    """Last-resort region from boto3's own default-resolution chain.
+
+    Mirrors ``database._region_from_boto3_session`` (RouteIQ-86ff): lets boto3
+    resolve the region the way it does for every other AWS call -- ``AWS_REGION``
+    / ``AWS_DEFAULT_REGION`` env, the active profile's config, or EC2/ECS IMDS.
+    The explicit env chain above does NOT cover the profile/IMDS sources, so a
+    deployment that relies on them would otherwise wrongly fail loud. Wrapped so a
+    missing/broken boto3 returns None and the caller still raises its clear error.
+    """
+    try:
+        import boto3
+
+        return boto3.session.Session().region_name or None
+    except Exception:
+        return None
+
+
 def _resolve_iam_region(host: str) -> str:
     """Resolve the AWS region for the ElastiCache IAM SigV4 mint, or FAIL LOUD.
 
     Resolution order: ``settings.redis.iam_region`` -> region parsed from the
-    cache endpoint host -> ``AWS_REGION``. Serverless ElastiCache endpoints carry
-    only a SHORTENED region token (``use1``) that ``_region_from_cache_host``
-    deliberately refuses, so on serverless the host contributes nothing and the
-    region MUST come from config or the environment.
+    cache endpoint host -> ``AWS_REGION`` -> ``AWS_DEFAULT_REGION`` -> boto3's own
+    default-resolution chain (profile / EC2/ECS IMDS). Serverless ElastiCache
+    endpoints carry only a SHORTENED region token (``use1``) that
+    ``_region_from_cache_host`` deliberately refuses, so on serverless the host
+    contributes nothing and the region MUST come from config or the environment.
 
     RouteIQ-89a6 / RouteIQ-6829: when none of the sources yield a region we used
     to sign the token with ``region=None`` -- an invalid SigV4 token that fails
     AUTH at connect time with an opaque error. Instead raise a clear, actionable
     error naming the missing env so the misconfiguration surfaces at mint time.
+
+    RouteIQ-86ff: the old explicit chain stopped at ``AWS_REGION`` and dropped the
+    boto3 session default chain, so a deployment with only ``AWS_DEFAULT_REGION``
+    (or a profile / IMDS region) set -- which boto3 itself would resolve fine --
+    wrongly raised. ``AWS_DEFAULT_REGION`` is added and a boto3 ``Session()``
+    region lookup is the final fallback before raising.
     """
     region = (
         get_settings().redis.iam_region
         or _region_from_cache_host(host)
         or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or _region_from_boto3_session()
     )
     if not region:
         raise IamRegionUnresolvedError(
             "cannot resolve AWS region for ElastiCache IAM auth: set "
-            "ROUTEIQ_REDIS__IAM_REGION or the AWS_REGION environment variable "
+            "ROUTEIQ_REDIS__IAM_REGION, AWS_REGION, or AWS_DEFAULT_REGION "
             "(serverless ElastiCache endpoints do not carry a usable region)"
         )
     return region
