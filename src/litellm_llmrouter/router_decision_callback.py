@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 # Strategy name used by the centroid router (centroid decision identification).
 _CENTROID_STRATEGY_NAME = "llmrouter-nadirclaw-centroid"
 
+# Cap on the response text captured into an EvalSample (COLLECT arm).  Keeps the
+# captured pair cheap; the LLM-as-judge re-truncates downstream regardless.
+_EVAL_RESPONSE_CONTENT_CAP = 8192
+
 # Feature flag: Enable router decision callback
 # Default to true if OTEL is configured, false otherwise
 _OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
@@ -1029,6 +1033,14 @@ class RouterDecisionCallback:
         Also drives the governance/usage-policy spend WRITE path (P4) on a
         feature gate INDEPENDENT of the OTEL-gated telemetry ``_enabled`` flag,
         so budget/RPM counters are written even when OTEL is off.  Fail-open.
+
+        This is ALSO the COLLECT arm of the eval pipeline (RouteIQ-295a): the
+        success callback is the only post-response seam that carries both the
+        request (``kwargs``: model + messages + metadata) and the response
+        (``response_obj``: usage + content), so it is where request/response
+        pairs are captured into the closed MLOps loop.  Gated behind the eval
+        pipeline being enabled (``get_eval_pipeline()`` may return ``None`` --
+        no-op) and the pipeline's own sample rate; fully fail-open.
         """
         if self._enabled:
             self.log_success_event(kwargs, response_obj, start_time, end_time)
@@ -1038,6 +1050,10 @@ class RouterDecisionCallback:
                 await _record_post_response_spend(kwargs, response_obj)
             except Exception as e:  # fail-open: never break the response path
                 logger.debug("Governance spend tracking skipped: %s", e)
+
+        # COLLECT arm: feed the request/response pair into the eval pipeline.
+        # Safe no-op when the pipeline is disabled/absent; never raises.
+        _collect_eval_sample(kwargs, response_obj, start_time, end_time)
 
     async def async_log_failure_event(
         self,
@@ -1187,6 +1203,153 @@ def _record_decision_stats(
         )
     except Exception:  # pragma: no cover - stats must never break routing
         logger.debug("Failed to record decision stats", exc_info=True)
+
+
+def _extract_response_content(response_obj: Any) -> str:
+    """Best-effort extraction of the assistant text from an LLM response.
+
+    Reads ``response_obj.choices[0].message.content`` (the OpenAI-compatible
+    shape LiteLLM normalizes to).  Returns ``""`` on any structural surprise so
+    a malformed/streamed response never breaks collection.  Bounded to keep the
+    captured sample cheap; the judge re-truncates downstream regardless.
+    """
+    try:
+        choices = getattr(response_obj, "choices", None)
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        if isinstance(content, str):
+            return content[:_EVAL_RESPONSE_CONTENT_CAP]
+    except Exception:
+        return ""
+    return ""
+
+
+def _resolve_tier_from_model(model: str) -> str:
+    """Derive a coarse complexity tier from the model name (heuristic).
+
+    Mirrors the middleware's tier heuristic so collected samples carry a tier
+    even when none was stamped into metadata.  Returns ``""`` for an empty
+    model name.
+    """
+    if not model:
+        return ""
+    model_lower = model.lower()
+    if any(ind in model_lower for ind in ("o1", "o3", "o4", "reasoner")):
+        return "reasoning"
+    if any(
+        ind in model_lower
+        for ind in ("mini", "nano", "haiku", "flash", "small", "light")
+    ):
+        return "simple"
+    return "complex"
+
+
+def _collect_eval_sample(
+    kwargs: Dict[str, Any],
+    response_obj: Any,
+    start_time: Any,
+    end_time: Any,
+) -> None:
+    """COLLECT arm: capture one request/response pair into the eval pipeline.
+
+    This is the live wiring (RouteIQ-295a) of the previously-dead COLLECT stage:
+    EVALUATE/AGGREGATE/FEEDBACK were already running, but nothing was feeding
+    ``EvalPipeline.collect``.  Called from the success callback, which is the
+    only post-response seam carrying both the request and the response.
+
+    Gating + safety contract:
+      * ``get_eval_pipeline()`` returns ``None`` when the pipeline is disabled
+        (``ROUTEIQ_EVAL_PIPELINE`` off) -- this function then no-ops.
+      * Sampling is delegated to the pipeline's own ``should_sample()`` so the
+        configured ``sample_rate`` is honored and most requests are skipped
+        cheaply (the EvalSample is only built for sampled requests).
+      * Fully fail-open: any error is swallowed so the hot response path is
+        never broken by eval bookkeeping.
+
+    PII discipline: only the fields the ``EvalSample`` schema asks for are
+    captured (model/strategy/tier, messages, response text, token counts,
+    latency, and the caller's key/user/workspace scope).  No secrets, headers,
+    or governance stamps are copied; nothing is logged.
+    """
+    try:
+        from litellm_llmrouter.eval_pipeline import EvalSample, get_eval_pipeline
+
+        pipeline = get_eval_pipeline()
+        if pipeline is None:
+            return
+
+        # Honor the pipeline's configured sample rate BEFORE building a sample
+        # so the un-sampled common case stays cheap.
+        should_sample = getattr(pipeline, "should_sample", None)
+        if callable(should_sample) and not should_sample():
+            return
+
+        metadata = kwargs.get("metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        model = kwargs.get("model", "") or ""
+        strategy = (
+            metadata.get("routing_strategy") or OVERRIDE_STRATEGY_NAME or "unknown"
+        )
+        tier = metadata.get("_routing_tier") or _resolve_tier_from_model(model)
+
+        messages = kwargs.get("messages", []) or []
+        if not isinstance(messages, list):
+            messages = []
+
+        # Token usage from the response usage object (best-effort).
+        input_tokens = 0
+        output_tokens = 0
+        usage = getattr(response_obj, "usage", None)
+        if usage is not None:
+            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            output_tokens = getattr(usage, "completion_tokens", 0) or 0
+
+        # Caller scope: prefer the resolved governance stamp (raw key_id), then
+        # fall back to the raw metadata hints -- same precedence the stats path
+        # uses.  These are identifiers the EvalSample schema models, not secrets.
+        key_id: Optional[str] = None
+        user_id: Optional[str] = None
+        workspace_id: Optional[str] = None
+        gctx = metadata.get("_governance_ctx")
+        if isinstance(gctx, dict):
+            key_id = gctx.get("key_id")
+            workspace_id = gctx.get("workspace_id")
+        if not key_id:
+            key_id = metadata.get("user_api_key") or metadata.get("_key")
+        if not workspace_id:
+            workspace_id = metadata.get("workspace_id") or metadata.get("_workspace")
+        user_id = (
+            metadata.get("user_api_key_user_id")
+            or metadata.get("user_id")
+            or metadata.get("_user")
+        )
+
+        latency_ms = _compute_duration(start_time, end_time) * 1000.0
+
+        sample = EvalSample(
+            sample_id=str(
+                kwargs.get("litellm_call_id") or f"eval-{time.time()}-{id(kwargs)}"
+            ),
+            timestamp=time.time(),
+            model=str(model),
+            strategy=str(strategy),
+            tier=str(tier),
+            messages=messages,
+            request_tokens=int(input_tokens),
+            response_content=_extract_response_content(response_obj),
+            response_tokens=int(output_tokens),
+            latency_ms=float(latency_ms),
+            user_id=str(user_id) if user_id else None,
+            workspace_id=str(workspace_id) if workspace_id else None,
+            prompt_name=metadata.get("prompt_name"),
+        )
+        pipeline.collect(sample)
+    except Exception:  # pragma: no cover - collection must never break routing
+        logger.debug("Failed to collect eval sample", exc_info=True)
 
 
 def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:
