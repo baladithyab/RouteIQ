@@ -752,6 +752,7 @@ from litellm_llmrouter.database import (  # noqa: E402
     _region_from_rds_host,
     _resolve_db_iam_region,
     get_db_pool,
+    run_migrations,
 )
 from litellm_llmrouter.settings import reset_settings  # noqa: E402
 
@@ -1033,3 +1034,43 @@ class TestGetDbPoolIamFailLoud:
             user="routeiq",
             region="ap-southeast-2",
         )
+
+
+# =============================================================================
+# RouteIQ-0921 -- run_migrations() is a BOOT-CRITICAL DB caller: fail loud
+# =============================================================================
+#
+# run_migrations() (invoked from the gateway lifespan) calls get_db_pool() inside
+# a broad ``except Exception``. get_db_pool already re-raises IamRegionUnresolvedError
+# past ITS broad handler; run_migrations must NOT re-swallow it -- an unresolved
+# region under RDS/Aurora IAM auth is a fail-loud startup misconfig, not a soft
+# "skip migrations" degradation. A generic DB error still soft-degrades (logged,
+# swallowed) so a transient outage never blocks boot.
+
+
+class TestRunMigrationsBootFailLoud:
+    async def test_run_migrations_reraises_iam_region_error(self, monkeypatch):
+        """run_migrations re-raises IamRegionUnresolvedError (fail loud at boot)."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "get_database_url", lambda: _SERVERLESS_RDS_URL)
+        monkeypatch.setattr(
+            db_mod,
+            "get_db_pool",
+            AsyncMock(side_effect=IamRegionUnresolvedError("no region")),
+        )
+        with pytest.raises(IamRegionUnresolvedError):
+            await run_migrations()
+
+    async def test_run_migrations_soft_degrades_on_generic_error(self, monkeypatch):
+        """A non-IAM DB error is swallowed (boot continues, migrations skipped)."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "get_database_url", lambda: _RDS_URL)
+        monkeypatch.setattr(
+            db_mod,
+            "get_db_pool",
+            AsyncMock(side_effect=RuntimeError("transient DB outage")),
+        )
+        # No raise: generic errors keep the soft-degrade behaviour.
+        await run_migrations()

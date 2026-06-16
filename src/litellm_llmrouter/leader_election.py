@@ -554,6 +554,11 @@ class RedisLeaderElection:
         Returns ``True`` if the key was set (we acquired leadership) or
         if we already hold the key (renewal).
         """
+        # RouteIQ-0921: imported here (not module top) to keep redis_pool an
+        # optional dependency for non-Redis backends, and so the fail-loud
+        # ``except`` clause below can name the redis_pool error class.
+        from .redis_pool import IamRegionUnresolvedError
+
         try:
             client = await self._get_client()
 
@@ -581,6 +586,15 @@ class RedisLeaderElection:
 
             return False
 
+        except IamRegionUnresolvedError:
+            # RouteIQ-0921: BOOT-CRITICAL (reached at startup via
+            # initialize_leader_election). An unresolved AWS region under
+            # ElastiCache IAM auth must FAIL LOUD here rather than be logged and
+            # folded into a False "could not acquire" -- a region misconfig should
+            # surface at boot, not silently leave this replica a non-leader. The
+            # token-mint here is local SigV4 (no network), so reaching this means
+            # the operator forgot to set a region, which they must fix.
+            raise
         except Exception as exc:
             verbose_proxy_logger.error(
                 "Redis leader election: error acquiring lease: %s", exc
@@ -724,7 +738,7 @@ class LeaderElection:
             return False
 
         try:
-            from .database import get_db_pool
+            from .database import IamRegionUnresolvedError, get_db_pool
 
             pool = await get_db_pool(self._db_url)
             if pool is None:
@@ -736,6 +750,17 @@ class LeaderElection:
                 await conn.execute(LEADER_ELECTION_TABLE_SQL)
                 verbose_proxy_logger.debug("Leader election: Table created/verified")
                 return True
+        except IamRegionUnresolvedError:
+            # RouteIQ-0921: leader election runs at BOOT (initialize_leader_election
+            # -> ensure_table_exists/try_acquire). An unresolved AWS region on the
+            # RDS/Aurora IAM path is a fail-loud startup misconfiguration -- if it
+            # were swallowed here the pool would never build and this replica would
+            # silently mis-coordinate (e.g. try_acquire's pool-None branch assumes
+            # single-instance and self-promotes). Re-raise past the broad handler
+            # so the misconfig surfaces at startup. (Soft-degrade callers that
+            # SHOULD swallow IAM region errors -- centroid_routing, resilience,
+            # service_discovery telemetry -- are intentionally left untouched.)
+            raise
         except Exception as e:
             verbose_proxy_logger.error(f"Leader election: Error creating table: {e}")
             return False
@@ -763,7 +788,7 @@ class LeaderElection:
 
         try:
             from datetime import timedelta
-            from .database import get_db_pool
+            from .database import IamRegionUnresolvedError, get_db_pool
 
             pool = await get_db_pool(self._db_url)
             if pool is None:
@@ -834,6 +859,14 @@ class LeaderElection:
 
                     return False
 
+        except IamRegionUnresolvedError:
+            # RouteIQ-0921: BOOT-CRITICAL. try_acquire is reached at startup via
+            # initialize_leader_election(). An unresolved AWS region under
+            # RDS/Aurora IAM auth must FAIL LOUD here rather than be folded into
+            # the "favour stability" branch below -- otherwise a region misconfig
+            # silently leaves this replica in its prior leadership state instead
+            # of surfacing at boot. Re-raise past the broad handler.
+            raise
         except Exception as e:
             self._last_renewal_error = str(e)
             verbose_proxy_logger.error(f"Leader election: Error acquiring lease: {e}")
@@ -1175,6 +1208,10 @@ class MultiBackendLeaderElection:
 
         # K8s or Redis delegate
         assert self._delegate is not None
+        # RouteIQ-0921: name the redis_pool fail-loud error so the broad handler
+        # below does not re-swallow what RedisLeaderElection.try_acquire re-raised.
+        from .redis_pool import IamRegionUnresolvedError
+
         try:
             acquired = await self._delegate.try_acquire(
                 identity=self.holder_id,
@@ -1212,6 +1249,13 @@ class MultiBackendLeaderElection:
 
             return acquired
 
+        except IamRegionUnresolvedError:
+            # RouteIQ-0921: BOOT-CRITICAL fail-loud. Let the ElastiCache IAM region
+            # misconfig propagate past this "favour stability" handler so it
+            # surfaces at startup instead of being folded into the prior leader
+            # state. (Postgres backend re-raises via _postgres_election.try_acquire
+            # above, outside this try block, so it already propagates.)
+            raise
         except Exception as exc:
             self._last_renewal_error = str(exc)
             verbose_proxy_logger.error(

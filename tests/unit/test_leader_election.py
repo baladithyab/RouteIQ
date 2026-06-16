@@ -17,13 +17,18 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
+from litellm_llmrouter.database import IamRegionUnresolvedError as DbIamRegionError
 from litellm_llmrouter.leader_election import (
     LeaderElection,
+    LeaderElectionBackend,
     LeaseInfo,
+    MultiBackendLeaderElection,
+    RedisLeaderElection,
     get_leader_election_config,
     DEFAULT_LEASE_SECONDS,
     DEFAULT_RENEW_INTERVAL_SECONDS,
 )
+from litellm_llmrouter.redis_pool import IamRegionUnresolvedError as RedisIamRegionError
 
 
 # Where LeaderElection's DB methods look up the pool factory. The methods do
@@ -1162,3 +1167,128 @@ class TestConfigSyncIntegration:
             assert "leader_election" in status
             assert "enabled" in status["leader_election"]
             assert "is_leader" in status["leader_election"]
+
+
+# =============================================================================
+# RouteIQ-0921: BOOT-CRITICAL IAM region fail-loud
+# =============================================================================
+#
+# Leader election runs at BOOT (initialize_leader_election -> ensure_table_exists
+# + try_acquire). When IAM auth is on and no AWS region resolves, the pool/token
+# builders raise IamRegionUnresolvedError. The boot-critical leader-election
+# callers must RE-RAISE it (fail loud) rather than swallow it into their broad
+# "favour stability" / "table not created" handlers -- otherwise a region
+# misconfig silently leaves a replica mis-coordinated (e.g. the pool-None branch
+# self-promotes to single-instance leader).
+#
+# NOTE: telemetry/cache/routing callers (centroid_routing, resilience,
+# service_discovery) intentionally KEEP their broad except and soft-degrade --
+# they are NOT touched by this change and are not exercised here.
+
+
+class TestPostgresBootFailLoud:
+    """Postgres-backed leader election re-raises the DB IAM region error."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_table_exists_reraises_iam_region_error(self):
+        """ensure_table_exists must NOT swallow IamRegionUnresolvedError."""
+        with patch(
+            GET_DB_POOL_TARGET,
+            AsyncMock(side_effect=DbIamRegionError("no region for rds-db IAM")),
+        ):
+            election = LeaderElection(database_url="postgresql://localhost/test")
+            with pytest.raises(DbIamRegionError):
+                await election.ensure_table_exists()
+
+    @pytest.mark.asyncio
+    async def test_try_acquire_reraises_iam_region_error(self):
+        """try_acquire must fail loud, not fall into 'favour stability'."""
+        election = LeaderElection(
+            database_url="postgresql://localhost/test",
+            holder_id="test-holder",
+        )
+        # Pre-set a prior leadership state to prove we do NOT return it.
+        election._is_leader = True
+        with patch(
+            GET_DB_POOL_TARGET,
+            AsyncMock(side_effect=DbIamRegionError("no region for rds-db IAM")),
+        ):
+            with pytest.raises(DbIamRegionError):
+                await election.try_acquire()
+
+    @pytest.mark.asyncio
+    async def test_try_acquire_still_soft_degrades_on_generic_db_error(self):
+        """A non-IAM DB error keeps the prior leader state (favour stability)."""
+        election = LeaderElection(
+            database_url="postgresql://localhost/test",
+            holder_id="test-holder",
+        )
+        election._is_leader = True
+        with patch(
+            GET_DB_POOL_TARGET,
+            AsyncMock(side_effect=RuntimeError("transient DB outage")),
+        ):
+            # No raise: generic errors still soft-degrade.
+            result = await election.try_acquire()
+        assert result is True  # prior leader state preserved
+        assert election._last_renewal_error is not None
+
+
+class TestRedisBootFailLoud:
+    """Redis-backed leader election re-raises the ElastiCache IAM region error."""
+
+    @pytest.mark.asyncio
+    async def test_redis_try_acquire_reraises_iam_region_error(self):
+        """RedisLeaderElection.try_acquire must fail loud on the IAM region error."""
+        election = RedisLeaderElection(key="routeiq:leader:test")
+        with patch(
+            "litellm_llmrouter.redis_pool.get_async_redis_client",
+            AsyncMock(side_effect=RedisIamRegionError("no region for elasticache")),
+        ):
+            with pytest.raises(RedisIamRegionError):
+                await election.try_acquire(identity="holder-1", ttl_seconds=30)
+
+    @pytest.mark.asyncio
+    async def test_redis_try_acquire_soft_degrades_on_generic_error(self):
+        """A generic Redis error returns False (could not acquire), not a raise."""
+        election = RedisLeaderElection(key="routeiq:leader:test")
+        with patch(
+            "litellm_llmrouter.redis_pool.get_async_redis_client",
+            AsyncMock(side_effect=RuntimeError("redis down")),
+        ):
+            result = await election.try_acquire(identity="holder-1", ttl_seconds=30)
+        assert result is False
+
+
+class TestMultiBackendBootFailLoud:
+    """The MultiBackend wrapper propagates the boot-critical IAM region error."""
+
+    @pytest.mark.asyncio
+    async def test_postgres_backend_propagates_iam_region_error(self):
+        """POSTGRES backend: error from the inner election bubbles up."""
+        election = MultiBackendLeaderElection(
+            backend=LeaderElectionBackend.POSTGRES,
+            database_url="postgresql://localhost/test",
+        )
+        with patch(
+            GET_DB_POOL_TARGET,
+            AsyncMock(side_effect=DbIamRegionError("no region")),
+        ):
+            with pytest.raises(DbIamRegionError):
+                await election.try_acquire()
+
+    @pytest.mark.asyncio
+    async def test_redis_backend_propagates_iam_region_error(self):
+        """REDIS backend: the delegate's re-raise is NOT re-swallowed by the wrapper."""
+        election = MultiBackendLeaderElection(
+            backend=LeaderElectionBackend.REDIS,
+            lock_name="config_sync",
+        )
+        # Prior leader state would otherwise be returned by 'favour stability'.
+        election._is_leader = True
+        with patch(
+            "litellm_llmrouter.redis_pool.get_async_redis_client",
+            AsyncMock(side_effect=RedisIamRegionError("no region for elasticache")),
+        ):
+            with pytest.raises(RedisIamRegionError):
+                await election.try_acquire()

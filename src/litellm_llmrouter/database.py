@@ -638,6 +638,16 @@ async def run_migrations() -> None:
 
         await run_governance_migrations()
 
+    except IamRegionUnresolvedError:
+        # RouteIQ-0921: run_migrations() is a BOOT-CRITICAL DB caller (invoked
+        # from the gateway lifespan). get_db_pool() already re-raises this past
+        # its own broad handler; we must NOT re-swallow it here. An unresolved
+        # AWS region under RDS/Aurora IAM auth is a fail-loud startup misconfig,
+        # not a soft "skip migrations" degradation -- surface it so the operator
+        # fixes the region rather than booting against an un-migrated DB. (The
+        # telemetry/cache/routing callers -- centroid_routing, resilience,
+        # service_discovery -- keep their broad except and soft-degrade.)
+        raise
     except Exception as e:
         verbose_proxy_logger.error(f"A2A DB: Error running migrations: {e}")
 

@@ -18,6 +18,18 @@ Design:
   is reached
 - Falls back gracefully: if Prisma or the schema cannot be found, logs a
   warning and continues startup
+
+RouteIQ-0921 (IAM region fail-loud, ADR-0028): this module does NOT build a
+RouteIQ-managed asyncpg pool. It shells out to the Prisma CLI (``prisma db
+push``), which reads ``DATABASE_URL`` itself and never goes through
+``database.get_db_pool`` / ``_resolve_db_iam_region``. So no
+``IamRegionUnresolvedError`` can originate here and there is nothing to
+re-raise. The boot-critical IAM region fail-loud belongs to the pool-building
+callers: ``database.get_db_pool`` (re-raises directly),
+``database.run_migrations`` (RouteIQ-native CREATE-IF-NOT-EXISTS migrations),
+and ``leader_election`` (``ensure_table_exists`` / ``try_acquire``). Telemetry /
+cache / routing callers (centroid_routing, resilience, service_discovery) keep
+their broad ``except`` and intentionally soft-degrade.
 """
 
 import asyncio
