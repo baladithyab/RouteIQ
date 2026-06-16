@@ -104,6 +104,41 @@ _GPU_INSTANCE_GENERATION_FLOOR = "4"
 _GPU_CPU_LIMIT = "1000"
 _GPU_MEMORY_LIMIT = "1000Gi"
 
+# -- EFA multi-node NodePool (RouteIQ-2f97 / C3-deep; flag-gated, DEFAULT OFF) --
+# The C3-deep tier serves a model TOO BIG FOR ONE NODE: one logical replica spans
+# GPUs across multiple nodes (tensor/pipeline parallel), and the high-bandwidth
+# cross-node path is AWS EFA - the only RDMA fabric on AWS (no InfiniBand/RoCE).
+# SHAPE 1 (Karpenter-native, the cred-free deliverable here; doc 51 section 1.1):
+# extend the GPU NodePool to EFA-capable p5/p6 families + install the
+# ``eks/aws-efa-k8s-device-plugin`` scoped to the NodePool. This forgoes the
+# topology-aware EFA-DRA driver (GPU<->EFA affinity + EFA device sharing), which is
+# node-group-only (Shape 2) - but the AWS EFA Kubernetes device plugin (which
+# advertises ``vpc.amazonaws.com/efa``, what NIXL-LIBFABRIC binds to) IS supported
+# on Karpenter / Auto Mode, so functional multi-node EFA RDMA is provisionable here.
+#
+# The CDK deliverable is the RENDERED manifest (NodePool + NodeClass + the EFA
+# device-plugin install), surfaced as CfnOutputs the operator/GitOps applies
+# out-of-band - this construct never uses CDK ``KubernetesManifest`` over the L1
+# ``CfnCluster``. Flag-gated so the default synth/snapshot is byte-stable.
+#
+# CRITICAL LIVE SILENT TRAP (operator-gated, documented not built): NIXL MUST
+# select the LIBFABRIC backend (KVBM: ``DYN_KVBM_NIXL_BACKEND_LIBFABRIC=true``;
+# vLLM: ``backends:[LIBFABRIC]``). If NIXL lands on UCX it silently falls back to
+# ~TCP speed - NO error, ~100x slower (~98s TTFT vs ~1s). A runtime probe asserting
+# NIXL=LIBFABRIC is the operator step; CDK cannot express it.
+_EFA_NODE_POOL_NAME = "routeiq-efa"
+_EFA_NODE_CLASS_NAME = "routeiq-efa"
+# EFA-capable GPU families (doc 51 section 1.1 instance table): p5/p5e/p5en
+# (gen 5) + p6/p6e (gen 6). These both expose EFA NICs AND carry the local NVMe
+# the KVBM disk tier wants. Pinned as explicit instance families (NOT the broad
+# g+p category) so only EFA-capable nodes back the pool.
+_EFA_INSTANCE_FAMILIES = ["p5", "p5e", "p5en", "p6", "p6e"]
+# One EFA NIC per node is requested by default (the pool advertises
+# ``vpc.amazonaws.com/efa`` as the extended resource; the gang pod requests it).
+_EFA_DEVICE_PLUGIN_NAMESPACE = "kube-system"
+_EFA_CPU_LIMIT = "10000"
+_EFA_MEMORY_LIMIT = "20000Gi"
+
 
 class EksClusterConstruct(Construct):
     """Minimal EKS Auto Mode cluster (L1 CfnCluster) + IAM roles + Pod Identity.
@@ -561,5 +596,191 @@ class EksClusterConstruct(Construct):
                 "out-of-band (kubectl apply -f - / GitOps) so nvidia.com/gpu pods "
                 "schedule on accelerated Auto Mode nodes. Auto Mode supplies the "
                 "NVIDIA device plugin + drivers."
+            ),
+        )
+
+    def efa_node_pool_manifest(self) -> str:
+        """Render the EFA multi-node Karpenter NodePool + NodeClass YAML (RouteIQ-2f97).
+
+        Returns a deterministic, ``kubectl apply -f -`` ready manifest for an
+        EFA-capable GPU NodePool + NodeClass (C3-deep Shape-1: Karpenter-native).
+        Rendered by :meth:`enable_efa_node_pool` into a ``CfnOutput`` so the
+        operator/GitOps applies it out-of-band (this construct never uses CDK
+        ``KubernetesManifest`` over the L1 ``CfnCluster``).
+
+        Shape (re-derived from the AWS EKS "Manage EFA devices" + the Dynamo EKS
+        EFA guidance, doc 51 section 1.1):
+
+          * ``NodeClass`` (``eks.amazonaws.com/v1``) REUSES the existing Auto Mode
+            node role (its NAME = :attr:`node_role` ``role_name``), like the GPU
+            NodePool. Subnet + SG selectors key on the Auto-Mode discovery tags.
+          * ``NodePool`` (``karpenter.sh/v1``) pins the EFA-capable p5/p6 instance
+            FAMILIES (not the broad g+p category), amd64, on-demand ONLY (a
+            multi-node tensor-parallel gang is placement-sensitive; spot churn
+            breaks an all-or-nothing gang), and carries the ``nvidia.com/gpu``
+            NoSchedule taint so only GPU-tolerating gang pods land here.
+
+        Multi-node EFA RDMA is provisionable on Karpenter via the EFA device
+        plugin (which advertises ``vpc.amazonaws.com/efa``); what Shape-1 forgoes
+        is only the node-group-only topology-aware EFA-DRA driver. The gang pod
+        requests ``vpc.amazonaws.com/efa`` (see :meth:`efa_device_plugin_manifest`
+        for the device-plugin install + the pod resource contract).
+
+        Hand-rolled (no PyYAML) so the rendered string is byte-deterministic.
+        """
+        node_role_name = self.node_role.role_name
+        families = ", ".join(f'"{f}"' for f in _EFA_INSTANCE_FAMILIES)
+        return (
+            "# RouteIQ EFA multi-node Karpenter NodePool + EC2 NodeClass (RouteIQ-2f97).\n"
+            "# C3-deep Shape-1 (Karpenter-native): EFA-capable p5/p6 GPU nodes for a\n"
+            "# model too big for ONE node (tensor/pipeline parallel across nodes over\n"
+            "# AWS EFA RDMA). Apply OUT-OF-BAND: kubectl apply -f - (or via GitOps).\n"
+            "# Also apply efa_device_plugin_manifest (the EFA device plugin advertises\n"
+            "# vpc.amazonaws.com/efa). Auto Mode supplies the NVIDIA device plugin +\n"
+            "# drivers + accelerated AMI; do NOT install the GPU Operator.\n"
+            "# LIVE TRAP: NIXL must select LIBFABRIC (not UCX) or it silently falls\n"
+            "# back to ~TCP (~100x slower, NO error) - an operator probe asserts this.\n"
+            "---\n"
+            "apiVersion: eks.amazonaws.com/v1\n"
+            "kind: NodeClass\n"
+            "metadata:\n"
+            f"  name: {_EFA_NODE_CLASS_NAME}\n"
+            "spec:\n"
+            f"  role: {node_role_name}\n"
+            "  subnetSelectorTerms:\n"
+            f"    - tags:\n        kubernetes.io/cluster/{self.cluster_name}: owned\n"
+            "  securityGroupSelectorTerms:\n"
+            f"    - tags:\n        kubernetes.io/cluster/{self.cluster_name}: owned\n"
+            "---\n"
+            "apiVersion: karpenter.sh/v1\n"
+            "kind: NodePool\n"
+            "metadata:\n"
+            f"  name: {_EFA_NODE_POOL_NAME}\n"
+            "spec:\n"
+            "  template:\n"
+            "    metadata:\n"
+            "      labels:\n"
+            "        routeiq.ai/nodepool: efa\n"
+            "    spec:\n"
+            "      nodeClassRef:\n"
+            "        group: eks.amazonaws.com\n"
+            "        kind: NodeClass\n"
+            f"        name: {_EFA_NODE_CLASS_NAME}\n"
+            "      taints:\n"
+            "        - key: nvidia.com/gpu\n"
+            "          effect: NoSchedule\n"
+            "      requirements:\n"
+            '        - key: "eks.amazonaws.com/instance-family"\n'
+            "          operator: In\n"
+            f"          values: [{families}]\n"
+            '        - key: "kubernetes.io/arch"\n'
+            "          operator: In\n"
+            '          values: ["amd64"]\n'
+            # On-demand ONLY: a multi-node tensor-parallel gang is all-or-nothing +
+            # placement-sensitive, so spot reclamation would break the gang.
+            '        - key: "karpenter.sh/capacity-type"\n'
+            "          operator: In\n"
+            '          values: ["on-demand"]\n'
+            "  limits:\n"
+            f'    cpu: "{_EFA_CPU_LIMIT}"\n'
+            f"    memory: {_EFA_MEMORY_LIMIT}\n"
+        )
+
+    def efa_device_plugin_manifest(self) -> str:
+        """Render the EFA device-plugin install + the gang-pod EFA contract (RouteIQ-2f97).
+
+        The AWS EFA Kubernetes device plugin (``eks/aws-efa-k8s-device-plugin``)
+        advertises ``vpc.amazonaws.com/efa`` as an extended resource pods request.
+        It IS supported on Karpenter / Auto Mode (doc 51 section 1.1). Rendered as a
+        Helm-install hint + the pod resource/securityContext contract a multi-node
+        gang pod needs, surfaced as a ``CfnOutput`` the operator applies out-of-band.
+
+        The pod contract (doc 51 section 1.1, all required for NIXL over EFA):
+          * request ``vpc.amazonaws.com/efa`` (the extended resource the plugin
+            advertises) AND ``nvidia.com/gpu``;
+          * ``hugepages-2Mi: 5120Mi``;
+          * ``securityContext.privileged: true`` - REQUIRED for NIXL to register
+            CUDA VRAM via ``fi_mr_reg`` (``IPC_LOCK`` alone is INSUFFICIENT);
+          * ``hostIPC: true`` + a large ``/dev/shm``.
+
+        This is a hand-rolled scaffold (no live cluster touched) so the cred-free
+        synth is byte-deterministic. The LIVE gang-schedule (LWS/JobSet on the EFA
+        NodePool) + the NIXL=LIBFABRIC probe are operator-gated.
+        """
+        return (
+            "# RouteIQ EFA device-plugin install + gang-pod EFA contract (RouteIQ-2f97).\n"
+            "# Install the AWS EFA Kubernetes device plugin SCOPED to the EFA NodePool\n"
+            "# (it advertises vpc.amazonaws.com/efa - the extended resource the gang\n"
+            "# pod requests + what NIXL-LIBFABRIC binds to). Supported on Karpenter /\n"
+            "# Auto Mode. Apply OUT-OF-BAND (helm) - NOT via CDK KubernetesManifest:\n"
+            "#\n"
+            "#   helm repo add eks https://aws.github.io/eks-charts\n"
+            f"#   helm upgrade --install aws-efa-k8s-device-plugin "
+            f"eks/aws-efa-k8s-device-plugin \\\n"
+            f"#     --namespace {_EFA_DEVICE_PLUGIN_NAMESPACE} \\\n"
+            '#     --set nodeSelector."routeiq\\.ai/nodepool"=efa\n'
+            "#\n"
+            "# A multi-node gang pod (LWS / JobSet) on the EFA NodePool MUST set:\n"
+            "#   resources.limits:\n"
+            "#     vpc.amazonaws.com/efa: 1        # the EFA NIC (the device plugin)\n"
+            "#     nvidia.com/gpu: 8\n"
+            "#     hugepages-2Mi: 5120Mi\n"
+            "#   securityContext.privileged: true  # REQUIRED for NIXL fi_mr_reg on\n"
+            "#                                     # CUDA VRAM (IPC_LOCK insufficient)\n"
+            "#   hostIPC: true                     # + a large /dev/shm\n"
+            "#\n"
+            "# LIVE TRAP (operator-gated probe, CDK cannot express it): NIXL MUST\n"
+            "# select LIBFABRIC - KVBM: DYN_KVBM_NIXL_BACKEND_LIBFABRIC=true; vLLM:\n"
+            "# backends:[LIBFABRIC]. On UCX it silently falls back to ~TCP (~100x\n"
+            "# slower, NO error). On GB200/arm64 64K-page kernels pin libfabric v2.5.1\n"
+            "# (ofiwg/libfabric#12019: fi_mr_reg fails on CUDA VRAM).\n"
+            "vpc.amazonaws.com/efa\n"
+        )
+
+    def enable_efa_node_pool(self, construct_id: str) -> None:
+        """Emit the EFA NodePool + device-plugin manifests as operator CfnOutputs.
+
+        Flag-gated by the composition root (``routeiq:enable_efa``, DEFAULT OFF).
+        When NOT called the stack carries ZERO EFA surface, so the default
+        synth/snapshot is byte-stable; when called it adds two ``CfnOutput``s -
+        ``EfaNodePoolManifest`` (the EFA NodePool + NodeClass YAML) and
+        ``EfaDevicePluginManifest`` (the ``eks/aws-efa-k8s-device-plugin`` install
+        hint + the gang-pod EFA resource/securityContext contract) - the
+        operator/GitOps applies out-of-band.
+
+        A ``CfnOutput`` (not a ``KubernetesManifest``) is the right surface: this
+        construct applies the entire app/CRD layer out-of-band over the L1
+        ``CfnCluster`` (no L2 ``ICluster`` to ``addManifest`` on), and a cred-free
+        ``Template.from_stack`` can assert the outputs are present-when-on /
+        absent-when-off.
+
+        CRED-FREE / OPERATOR-GATED SPLIT: the CDK/manifest authored here is
+        cred-free + byte-stable-when-off + test-covered. The LIVE half - p5/p6 GPU
+        hardware, the multi-node gang schedule (LWS/JobSet), and the
+        NIXL=LIBFABRIC-not-UCX runtime probe - is operator-gated (it needs real
+        hardware + a live cluster and cannot be expressed in CDK).
+        """
+        self.efa_node_pool_manifest_value = self.efa_node_pool_manifest()
+        self.efa_device_plugin_manifest_value = self.efa_device_plugin_manifest()
+        CfnOutput(
+            self,
+            construct_id,
+            value=self.efa_node_pool_manifest_value,
+            description=(
+                "EFA multi-node Karpenter NodePool + EC2 NodeClass manifest "
+                "(C3-deep Shape-1). Apply out-of-band so a multi-node "
+                "tensor/pipeline-parallel gang requesting vpc.amazonaws.com/efa "
+                "schedules on EFA-capable p5/p6 nodes for cross-node RDMA."
+            ),
+        )
+        CfnOutput(
+            self,
+            f"{construct_id}DevicePlugin",
+            value=self.efa_device_plugin_manifest_value,
+            description=(
+                "EFA device-plugin install hint (eks/aws-efa-k8s-device-plugin, "
+                "advertises vpc.amazonaws.com/efa) + the gang-pod EFA resource + "
+                "securityContext.privileged contract. NIXL must select LIBFABRIC "
+                "(not UCX) - operator-gated runtime probe."
             ),
         )

@@ -19,13 +19,16 @@ Resource graph (the P2 deliverable):
       -> CfnPermission allowing appconfig.amazonaws.com to invoke (scoped to the
          profile-only ARN)
 
-DROPPED relative to the VSR source (NOT P2 deliverables for the RouteIQ
-config-state substrate): the S3 state bucket, the CloudTrail audit trail, the
-CodePipeline deployer pipeline, and the deployer IAM role. RouteIQ does not need
-those for P2 config-state; the operator pushes real config day-2 via the
-``aws appconfig`` CLI (the full GitOps CodePipeline + deployer role is tracked as
-a FUTURE tier - RouteIQ-1669; ADR-0026's "Day-2 GitOps path" was corrected to
-mark it as not-yet-shipped).
+SPLIT OUT of this construct (NOT part of the AppConfig config-state substrate):
+the S3 state bucket + the CloudTrail audit trail are DROPPED (not RouteIQ
+deliverables). The full GitOps CodePipeline + deployer IAM role from the VSR source
+now ship as a SEPARATE flag-gated construct, ``GitOpsPipelineConstruct``
+(``gitops_pipeline_construct.py``, ``enable_gitops_pipeline`` DEFAULT OFF, wired in
+``RouteIqObservabilityStack``) - RouteIQ-1669 is now FULL on the cred-free axis
+(audit core + pipeline both cred-free-built; the live deploy is operator-gated).
+The operator can still push real config day-2 via the ``aws appconfig`` CLI when
+the pipeline is off. ADR-0026's "Day-2 GitOps path" is updated to mark the GitOps
+tier as SHIPPED (flag-gated).
 
 ADDED back as a flag-gated, DEFAULT-OFF cred-free CORE (RouteIQ-1669): the
 ``EventBridge validator-mutation rule -> SNS`` audit. ADR-0026 calls out that the
@@ -35,7 +38,8 @@ small + self-contained, so it ships as ``enable_config_audit`` (DEFAULT OFF):
 when on it adds a TLS-enforced SNS topic + an EventBridge rule matching the two
 mutating AppConfig profile API calls via CloudTrail; when off (the default) NO
 audit resources are emitted and the snapshot stays byte-stable. The full
-CodePipeline/deployer remains a future tier (NOT built speculatively).
+CodePipeline + deployer role now ship as ``GitOpsPipelineConstruct`` (flag-gated
+``enable_gitops_pipeline``, also DEFAULT OFF) - see that module + ADR-0026.
 
 P0-established patterns preserved:
   * ``env_name`` kwarg, no positional flags;
@@ -227,6 +231,9 @@ class ConfigStateConstruct(Construct):
         self.appconfig_application_id: str = self.appconfig_application.ref
         self.appconfig_environment_id: str = self.appconfig_environment.ref
         self.appconfig_profile_id: str = self.appconfig_profile.ref
+        # Exposed for the GitOps deployer (RouteIQ-1669): start-deployment binds the
+        # version to this strategy, so the deployer role + buildspec need its id.
+        self.appconfig_strategy_id: str = self.appconfig_strategy.ref
 
         # The env-scoped runtime poll ARN, per the AppConfigPoll contract. This
         # is the form a RouteIQ replica uses to poll AppConfig for new config

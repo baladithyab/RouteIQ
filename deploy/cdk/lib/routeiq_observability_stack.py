@@ -83,6 +83,7 @@ from constructs import Construct
 
 from .config_state_construct import ConfigStateConstruct
 from .data_lake_construct import DataLakeConstruct
+from .gitops_pipeline_construct import GitOpsPipelineConstruct
 from .naming import routing_log_group_name as _routing_log_group_name
 from .obs_nag_suppressions import apply_observability_nag_suppressions
 from .observability_construct import ObservabilityConstruct
@@ -118,6 +119,7 @@ class RouteIqObservabilityStack(Stack):
         enable_amg: bool = False,
         enable_data_lake: bool = False,
         enable_config_audit: bool = False,
+        enable_gitops_pipeline: bool = False,
         notify_emails: list[str] | None = None,
         cost_center: str | None = None,
         team: str | None = None,
@@ -179,6 +181,31 @@ class RouteIqObservabilityStack(Stack):
             env_name=env_name,
             enable_config_audit=enable_config_audit,
         )
+
+        # -- 1b. GitOps deploy tier (RouteIQ-1669; flag-gated, DEFAULT OFF) -----
+        # The REMAINING cred-free half of ADR-0026's "Day-2 GitOps path" (the
+        # validator-mutation audit CORE shipped in 761a4ee). When
+        # enable_gitops_pipeline=True this adds a CodePipeline
+        # (Source[config bucket] -> [Approve, prod only] -> Deploy) + the NARROW
+        # deployer IAM role: exactly the 5 AppConfig deploy actions + an explicit
+        # DENY of Update/DeleteConfigurationProfile so the deployer cannot strip the
+        # load-bearing config validator. DEFAULT OFF -> zero CodePipeline/CodeBuild/
+        # deployer-role resources -> the default P2 synth/snapshot stays byte-stable.
+        # The LIVE deploy (real config commits, the prod approval, an actual
+        # AppConfig deployment) is operator-gated. It reuses the ConfigStateConstruct
+        # AppConfig ids so the deployer is scoped to THIS application's profile/
+        # environment/strategy (never a wildcard).
+        self.gitops_pipeline: GitOpsPipelineConstruct | None = None
+        if enable_gitops_pipeline:
+            self.gitops_pipeline = GitOpsPipelineConstruct(
+                self,
+                "GitOpsPipelineConstruct",
+                env_name=env_name,
+                appconfig_application_id=self.config_state.appconfig_application_id,
+                appconfig_environment_id=self.config_state.appconfig_environment_id,
+                appconfig_profile_id=self.config_state.appconfig_profile_id,
+                appconfig_strategy_id=self.config_state.appconfig_strategy_id,
+            )
 
         # -- 2. AMP + flag-gated AMG + TLS SNS + routing filters/alarms ---------
         # Attribute name MUST be ``observability`` - obs_nag_suppressions reads

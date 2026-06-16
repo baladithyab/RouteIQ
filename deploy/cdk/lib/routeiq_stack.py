@@ -78,6 +78,7 @@ class RouteIqStack(Stack):
         waf_crs_block: bool = False,
         waf_rate_block: bool = False,
         enable_gpu_nodepool: bool = False,
+        enable_efa: bool = False,
         enable_native_guardrail: bool = False,
         cost_center: str | None = None,
         team: str | None = None,
@@ -101,6 +102,7 @@ class RouteIqStack(Stack):
         self._waf_crs_block = bool(waf_crs_block)
         self._waf_rate_block = bool(waf_rate_block)
         self._enable_gpu_nodepool = bool(enable_gpu_nodepool)
+        self._enable_efa = bool(enable_efa)
         self._enable_native_guardrail = bool(enable_native_guardrail)
 
         # Stack tag on every taggable resource (Tags.of propagates). Cost tags
@@ -156,6 +158,18 @@ class RouteIqStack(Stack):
         # synth/snapshot stays byte-stable.
         if self._enable_gpu_nodepool:
             self.eks_cluster.enable_gpu_node_pool("GpuNodePoolManifest")
+
+        # EFA multi-node NodePool (RouteIQ-2f97 / C3-deep; flag-gated, DEFAULT OFF).
+        # The C3-deep tier serves a model TOO BIG FOR ONE NODE: one logical replica
+        # spans GPUs across multiple nodes (tensor/pipeline parallel) over AWS EFA
+        # RDMA. Shape-1 (Karpenter-native): extend the GPU NodePool to EFA-capable
+        # p5/p6 families + the eks/aws-efa-k8s-device-plugin (advertises
+        # vpc.amazonaws.com/efa). When routeiq:enable_efa is True this emits the
+        # EfaNodePoolManifest + EfaDevicePluginManifest CfnOutputs the operator/GitOps
+        # applies out-of-band. DEFAULT OFF -> zero EFA surface -> byte-stable. The
+        # LIVE gang-schedule + the NIXL=LIBFABRIC-not-UCX probe are operator-gated.
+        if self._enable_efa:
+            self.eks_cluster.enable_efa_node_pool("EfaNodePoolManifest")
 
         # -- 3. ECR GHCR pull-through cache surface ---------------------------
         # The credential secret ARN is a deploy-time CfnParameter, NEVER a literal

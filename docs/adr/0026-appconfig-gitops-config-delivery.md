@@ -79,28 +79,45 @@ config never becomes the deployed version — the deployment fails closed.
 
 ### Day-2 GitOps path
 
-> **Scope note (RouteIQ-1669).** The full vllm-sr CodePipeline + deployer role
-> (`config_state_construct.py:929-1108`, `:711-819`) is a **FUTURE tier**, NOT
-> shipped by RouteIQ's `ConfigStateConstruct` today. The construct ships the
-> AppConfig core (application/environment/profile/strategy/version/deployment +
-> the LAMBDA validator) and, as a flag-gated `enable_config_audit` option
-> (DEFAULT OFF), the validator-mutation audit (a TLS-enforced SNS topic + an
-> EventBridge rule on `Update/DeleteConfigurationProfile`). It does **not** build
-> a CodePipeline, a source bucket, an approval stage, or a deployer IAM role. See
-> "Current scope" below.
+> **Scope note (RouteIQ-1669) — UPDATED: now SHIPPED, flag-gated.** Both halves of
+> the Day-2 GitOps path are now built cred-free in RouteIQ's CDK, each
+> flag-gated DEFAULT OFF so the default synth/snapshot stays byte-stable:
+>
+> 1. **Validator-mutation audit** — `ConfigStateConstruct(enable_config_audit=...)`:
+>    a TLS-enforced SNS topic + an EventBridge rule on
+>    `Update/DeleteConfigurationProfile` (shipped first, commit 761a4ee).
+> 2. **GitOps CodePipeline + deployer role** — `GitOpsPipelineConstruct`
+>    (`lib/gitops_pipeline_construct.py`), wired into `RouteIqObservabilityStack`
+>    behind `enable_gitops_pipeline` (DEFAULT OFF): a config source bucket +
+>    a CodePipeline (Source → [Approve, prod only] → Deploy) + a narrow CodeBuild
+>    **deployer role** carrying exactly five AppConfig actions and an explicit
+>    **deny** of `Update/DeleteConfigurationProfile`.
+>
+> The **LIVE deploy** (real config commits to the source bucket, the prod approval
+> click, an actual AppConfig deployment against real hardware) is the **operator
+> half** — there is zero live consumer in IaC; the construct authors the pipeline
+> + role only. See "Current scope" below.
 
-The intended Day-2 path (when the future deployer tier lands): operators commit
-`config.yaml` to a source bucket; a CodePipeline (Source → [Approve, prod only] →
-Deploy) assumes a narrow deployer role and runs
+The Day-2 path: operators commit a zipped `config.yaml` to the source bucket; the
+CodePipeline (Source → [Approve, prod only] → Deploy) runs a CodeBuild Deploy
+project whose service role **is** the narrow deployer role, executing
 `appconfig create-hosted-configuration-version` + `start-deployment`. The deployer
-role holds exactly five AppConfig actions and an explicit **deny** of
-`Update/DeleteConfigurationProfile` so the validator can never be stripped.
+role holds exactly five AppConfig actions
+(`CreateHostedConfigurationVersion`, `StartDeployment`, `GetConfigurationProfile`,
+`GetEnvironment`, `GetDeploymentStrategy`) ARN-scoped to this application's
+profile/environment/strategy, and an explicit **deny** of
+`Update/DeleteConfigurationProfile` so the validator can never be stripped (an
+explicit IAM Deny beats any Allow — the invariant is enforced at the principal
+level, not just by the audit alarm). The approval stage is inserted **only for
+prod** (`env_name == "prod"`); dev/stage flow straight Source → Deploy.
 
-**What ships today:** operators push real config day-2 via the `aws appconfig`
-CLI (`create-hosted-configuration-version` + `start-deployment`), which AppConfig
-validates with the LAMBDA validator before it becomes authoritative. With
-`enable_config_audit` on, any attempt to mutate the profile (which could strip the
-validator) fires the EventBridge → SNS audit alarm.
+**What ships today (flag-gated, cred-free):** the AppConfig core + the LAMBDA
+validator (always on), plus the audit (`enable_config_audit`) and the GitOps
+pipeline + deployer role (`enable_gitops_pipeline`), both DEFAULT OFF. With the
+pipeline off, operators still push config via the `aws appconfig` CLI; with it on,
+the CodePipeline is the GitOps path. Either way AppConfig validates with the
+LAMBDA validator before a version becomes authoritative, and (with
+`enable_config_audit` on) any profile mutation fires the EventBridge → SNS alarm.
 
 ### Current scope (what `config_state_construct.py` actually builds)
 
@@ -109,9 +126,11 @@ validator) fires the EventBridge → SNS audit alarm.
 | AppConfig Application/Environment/Profile/Strategy/HostedVersion/Deployment | **Shipped** |
 | LAMBDA validator + invoke permission | **Shipped** |
 | Validator-mutation EventBridge → SNS audit | **Shipped, flag-gated** (`enable_config_audit`, default off) |
-| CodePipeline (Source → Approve → Deploy) | **Future tier** (not built) |
-| Deployer IAM role (5 AppConfig actions + deny Update/Delete profile) | **Future tier** (not built) |
-| S3 source bucket / CloudTrail trail / `spike_infra_only` posture | **Dropped** (not a RouteIQ deliverable) |
+| CodePipeline (Source → [Approve, prod] → Deploy) | **Shipped, flag-gated** (`enable_gitops_pipeline`, default off) |
+| Deployer IAM role (5 AppConfig actions + deny Update/Delete profile) | **Shipped, flag-gated** (`enable_gitops_pipeline`, default off) |
+| Config source bucket (KMS-SSE, versioned, BPA, enforce_ssl) | **Shipped, flag-gated** (`enable_gitops_pipeline`, default off) |
+| LIVE deploy (real commits / prod approval click / AppConfig deployment) | **Operator-gated** (zero live consumer in IaC) |
+| CloudTrail trail / `spike_infra_only` posture | **Dropped** (not a RouteIQ deliverable) |
 
 ### RouteIQ runtime retrieval
 
@@ -137,8 +156,13 @@ remains the fallback when AppConfig is not configured.
   CloudWatch alarm during the bake.
 - **Audit.** The flag-gated `enable_config_audit` option fires an SNS alarm on
   any attempt to mutate (and thereby potentially strip the validator from) the
-  configuration profile. The GitOps pipeline with a prod approval gate + deployer
-  role is a future tier (see "Day-2 GitOps path" scope note).
+  configuration profile.
+- **GitOps deploy + approval + structural validator protection.** The flag-gated
+  `enable_gitops_pipeline` option ships the CodePipeline (Source → [Approve, prod
+  only] → Deploy) + the narrow deployer role. The deployer's explicit IAM deny of
+  `Update/DeleteConfigurationProfile` makes it *structurally* unable to strip the
+  validator (an explicit Deny beats any Allow), complementing the audit alarm. The
+  live deploy is operator-gated.
 - **Reuses RouteIQ's own machinery.** No new in-process reload path — the
   existing `HotReloadManager` callback fires on the new version; the validator
   Lambda reuses RouteIQ's config parser.

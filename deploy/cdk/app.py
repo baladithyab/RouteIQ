@@ -109,6 +109,16 @@ def main() -> None:
     # out-of-band. Off keeps the default synth byte-stable (zero GPU surface).
     enable_gpu_nodepool = _bool_ctx(app, "routeiq:enable_gpu_nodepool", False)
 
+    # RouteIQ-2f97 (EFA multi-node / C3-deep): DEFAULT OFF. The C3-deep tier serves a
+    # model too big for ONE node - one replica spans GPUs across multiple nodes over
+    # AWS EFA RDMA. Shape-1 (Karpenter-native): when true the foundation emits the
+    # EfaNodePoolManifest + EfaDevicePluginManifest CfnOutputs (EFA-capable p5/p6
+    # NodePool + the eks/aws-efa-k8s-device-plugin advertising vpc.amazonaws.com/efa)
+    # the operator/GitOps applies out-of-band. Off keeps the default synth byte-stable
+    # (zero EFA surface). The LIVE gang-schedule + the NIXL=LIBFABRIC probe are
+    # operator-gated.
+    enable_efa = _bool_ctx(app, "routeiq:enable_efa", False)
+
     # RouteIQ-c0be (Native Bedrock Guardrail): DEFAULT OFF. AUTHORING STAGE - when
     # true the foundation mints an IaC-owned CfnGuardrail + a pinned
     # CfnGuardrailVersion + GuardrailId/VersionNumber CfnOutputs. The data-path
@@ -159,6 +169,7 @@ def main() -> None:
         waf_crs_block=waf_crs_block,
         waf_rate_block=waf_rate_block,
         enable_gpu_nodepool=enable_gpu_nodepool,
+        enable_efa=enable_efa,
         enable_native_guardrail=enable_native_guardrail,
     )
 
@@ -206,6 +217,12 @@ def main() -> None:
             # mutating AppConfig profile API calls (the validator-mutation audit).
             # The full GitOps CodePipeline + deployer role remain a future tier.
             enable_config_audit=_bool_ctx(app, "routeiq:enable_config_audit", False),
+            # RouteIQ-1669 (ADR-0026 GitOps deploy tier): DEFAULT OFF. When true the
+            # P2 stack adds a CodePipeline (Source -> [Approve, prod] -> Deploy) + a
+            # narrow AppConfig deployer role (5 actions + explicit deny of profile
+            # mutation). The LIVE deploy is operator-gated. Off keeps the default
+            # synth byte-stable (zero CodePipeline/CodeBuild/deployer resources).
+            enable_gitops_pipeline=_bool_ctx(app, "routeiq:enable_gitops_pipeline", False),
             notify_emails=_split_csv_or_list(_ctx(app, "routeiq:notify_emails", [])),
         )
 
