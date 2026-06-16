@@ -11,9 +11,11 @@
 # $.level). The EKS Container Insights add-on's Fluent Bit WRAPS each container
 # stdout line as a stringified `log` field, so those top-level keys resolve to
 # NULL and the filters/lake stay INERT. This config JSON-parses the `log` field
-# and MERGES the inner router JSON to the record top level (skill
-# eks-container-insights-fluentbit-wraps-stdout, Fix A) so the $.field paths
-# resolve.
+# via a dedicated [FILTER] parser (Format=json) that lifts the inner router JSON
+# to the record TOP LEVEL (skill eks-container-insights-fluentbit-wraps-stdout,
+# Fix A) so the $.field paths resolve. The kubernetes filter deliberately keeps
+# Merge_Log Off + Keep_Log On so it neither nests the JSON nor deletes `log`
+# before the parser filter promotes it.
 #
 # DEPLOY CONTRACT (load-bearing): the add-on's `application-log.conf` REPLACES
 # (does NOT append to) the default pipeline. So this content carries the FULL
@@ -58,20 +60,31 @@ data:
 
     # Attach pod/namespace/container metadata (the standard Container Insights
     # enrichment); kept so the routing stream is still identifiable per-pod.
+    #
+    # CRITICAL: Merge_Log MUST stay Off and Keep_Log MUST stay On here. The
+    # kubernetes filter's own Merge_Log would (a) nest the parsed router JSON
+    # under a sub-key (Merge_Log_Key) instead of the record TOP LEVEL the CW
+    # metric filters need, and (b) Keep_Log Off would DELETE the `log` field
+    # before the [FILTER] parser below can read it (Key_Name log) - leaving the
+    # promotion a silent no-op. The TOP-LEVEL promotion is owned solely by the
+    # [FILTER] parser below (Format json + Reserve_Data On lifts keys to the
+    # root). So: Merge_Log Off (no nested pre-parse) + Keep_Log On (preserve the
+    # `log` string for the parser filter to consume).
     [FILTER]
         Name                kubernetes
         Match               {{ $fb.tag }}
         Kube_Tag_Prefix     {{ $fb.tag }}.var.log.containers.
-        Merge_Log           On
-        Merge_Log_Key       log_processed
-        Keep_Log            Off
+        Merge_Log           Off
+        Keep_Log            On
         K8S-Logging.Parser  On
         K8S-Logging.Exclude On
 
-    # The load-bearing promotion: JSON-parse the wrapped `log` field and MERGE
-    # its keys to the record top level so $.event / $.latency_ms /
+    # The load-bearing promotion: JSON-parse the wrapped `log` field and lift its
+    # keys to the record TOP LEVEL so $.event / $.latency_ms /
     # $.["gen_ai.response.model"] / $.level resolve for the CW metric filters +
-    # the data lake. Without Merge_Log the router JSON stays a string under `log`.
+    # the data lake. A Format=json parser merges the decoded object at the root
+    # (NOT nested); Reserve_Data On keeps the kubernetes metadata alongside;
+    # Preserve_Key Off drops the now-redundant `log` string after promotion.
     [FILTER]
         Name      parser
         Match     {{ $fb.tag }}

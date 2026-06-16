@@ -350,9 +350,20 @@ helm template routeiq deploy/charts/routeiq-gateway \
 
 This renders a `ConfigMap` carrying `parsers.conf` (a JSON `[PARSER]`) and
 `routeiq-routing.conf` (a full pipeline: a routing `[INPUT] tail`, a
-`kubernetes` filter, the load-bearing `[FILTER] parser`/`Merge_Log` that promotes
-the wrapped `log` JSON to top level, and a `cloudwatch_logs [OUTPUT]` targeting
-the dedicated `/aws/containerinsights/<cluster>/routeiq-routing` group).
+`kubernetes` filter with `Merge_Log Off` + `Keep_Log On` so it leaves `log`
+intact, the load-bearing `[FILTER] parser` (`Format json`, `Reserve_Data On`)
+that lifts the wrapped `log` JSON to the record top level, and a
+`cloudwatch_logs [OUTPUT]` targeting the dedicated
+`/aws/containerinsights/<cluster>/routeiq-routing` group).
+
+> **Why the parser filter and not `Merge_Log`.** The kubernetes filter's own
+> `Merge_Log On` would nest the parsed router JSON under a sub-key (`Merge_Log_Key`)
+> rather than the record root the metric filters scan, and `Keep_Log Off` would
+> delete `log` before the parser filter could read it — a silent no-op. So the
+> top-level promotion is owned solely by the `[FILTER] parser`; the kubernetes
+> filter keeps `Merge_Log Off` + `Keep_Log On`. The static promotion contract
+> (parser is `Format json`; kubernetes does not consume `log`; the chain promotes
+> the inner keys) is pinned by `tests/unit/test_fluent_bit_routing_promotion.py`.
 
 > **Deploy contract — read before relying on this.** The
 > `amazon-cloudwatch-observability` add-on's `extraFiles["application-log.conf"]`

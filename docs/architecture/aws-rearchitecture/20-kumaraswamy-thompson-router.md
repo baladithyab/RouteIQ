@@ -388,3 +388,63 @@ otherwise the experiment is uninterpretable.
 **Promotion.** Only after the treatment wins cumulative-reward at fixed cost-weight, holds the
 latency budget, and shows lower oracle-regret does it go from `stage_strategy` → `promote_staged`
 (`:830`) to active.
+
+---
+
+## 9. Decision: defer the `moment_fit` default-flip to a canary (RouteIQ-c299, 2026-06-15)
+
+§3.1 ships the option-1 `a=alpha, b=beta` shortcut as the default and gates the option-2
+moment-fit behind an eval/observation result. RouteIQ-f9e9 implemented that option-2 fit in
+`kumaraswamy_thompson.py` (`fit_kumaraswamy_moments`, `Posterior.shape(moment_fit=...)`) behind
+the setting `ROUTEIQ_KUMARASWAMY_THOMPSON__MOMENT_FIT` (`settings.py`
+`KumaraswamyThompsonSettings.moment_fit`), **default `False`**. This note records the decision
+on whether to flip that default ON now.
+
+**The math is verified correct and safe.** The moment-fit's `fit_kumaraswamy_moments`:
+
+- preserves the three exact special cases (`Kuma(1,b)=Beta(1,b)`, `Kuma(a,1)=Beta(a,1)`,
+  `Kuma(1,1)=Uniform`) as byte-stable corners (`kumaraswamy_thompson.py:301`);
+- restores the posterior **mean** to within ~1e-8 of the Beta mean (vs the shortcut's gross
+  distortion — e.g. `Beta(51,51)` mean `0.5` → shortcut Kumaraswamy mean `0.9155`, which can
+  *invert the exploit decision*);
+- tracks the **variance** at ~1.0x the Beta variance across the feasible region (verified at
+  `Beta(2,2)`, `(8,8)`, `(51,51)`, `(100,200)`, `(1000,3)`: ratio `1.000`); for an extremely
+  sharply-peaked symmetric posterior past the holdable-`a` floor the infeasible branch returns
+  the cap and the variance runs slightly high (`Beta(500,500)` → ~1.67x), where high variance =
+  slightly more exploration with **the mean held exact** (`d ~ 3.7e-7`) —
+  `kumaraswamy_thompson.py:337-340`. The mean-fidelity (which drives the exploit decision) is
+  preserved in every case; only the exploration rate is perturbed at the floor;
+- is **off the hot path**: the fit is cached on the exact `(alpha, beta)` (RouteIQ-f9e9 defect-1
+  fix; a log-spaced bucket key served stale fits within a bucket), recomputed only on an actual
+  evidence change — ~30 `lgamma`/bisection calls per miss, and arms update at most once per
+  request (`kumaraswamy_thompson.py:385-397`).
+
+So the change is **mathematically a strict improvement** to the sampled-mean fidelity, and the
+default-off posture exists purely for byte-stable backward-compat, not because the fit is wrong.
+
+**Why the flip is DEFERRED, not done here.** Flipping the default ON is a **live bandit
+behavior change**: it shifts the sampled `(a,b)` for every non-corner posterior, which shifts
+the Thompson draw distribution and therefore the **arm-selection distribution** in production.
+That is exactly the class of change that must be observed on real traffic before it becomes the
+default, and that observation **cannot be run cred-free** (no live cluster / traffic here). This
+is an explicit, justified deferral — not a skip.
+
+**Acceptance gate for the flip (run on a canary with a live cluster).** Stage the moment-fit as
+the treatment arm (it is a per-instance flag, so A/B it via the existing registry weights / a
+canary deploy with `MOMENT_FIT=true` on the treatment replicas) and confirm, over a real
+traffic window:
+
+1. **Arm-selection distribution** under moment-fit vs the option-1 shortcut differs in the
+   expected direction (the corrected mean should pull selection toward the empirically-better
+   arm), and **cumulative regret** is **<=** the shortcut's at fixed cost-weight (§8's oracle-
+   regret + cumulative-reward metrics) — i.e. it does not *worsen* selection.
+2. **No latency regression**: the ~2.3ms cache-miss fit at production arm counts stays within
+   the p50/p99 routing-latency budget (§8 secondary metric 4). Since the fit is cached per
+   `(alpha,beta)` and runs at most once per feedback update, the steady-state hot path should be
+   a cache hit; verify the cold-fit cost does not breach the budget at peak arm counts.
+
+**On acceptance**, flip the code default (`KumaraswamyThompsonSettings.moment_fit` →
+`True`), and update the "Default off for byte-stable backward-compat" note in `settings.py` +
+`Posterior.shape`'s docstring to record that the default is now the moment-fit and the option-1
+shortcut is the opt-out (the byte-stable-corner guarantee is unchanged either way). Until then
+the default stays `False`.
