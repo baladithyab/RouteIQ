@@ -11,6 +11,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Always refer to this project as **RouteIQ**. Do not rename `LITELLM_*` environment
 variables. Do not claim RouteIQ implements features only inherited from upstream LiteLLM.
 
+## Execution Model (MANDATORY) — orchestrate, don't hand-code
+
+**Default to multi-agent orchestration. Do NOT work on substantive tasks directly in
+the main loop.** The main loop's job is to *frame, decompose, dispatch, gate, and
+synthesize* — not to be the one editing files, running the audit, or writing the
+feature by hand. Direct main-loop work is reserved only for the exceptions listed
+below.
+
+### The rule
+
+For any task beyond a trivial exception, drive it through a **deep-work mega-loop**:
+
+1. Invoke the **`deep-work-loop-tiered`** skill (the tiered DWL superset: Frame →
+   Discover → Research → Plan → Act → Review → Ship, with bounded backflow). It is the
+   canonical orchestration shape for this repo.
+2. Author the loop as a **`Workflow`** script. Fan out work across **subagents**
+   running in **parallel by default** (`parallel()` / `pipeline()`), never serially
+   when the work is independent. Synchronous, one-thing-at-a-time work is a regression
+   — it is what this mandate exists to prevent.
+3. Right-size each `agent()` by **blast radius** (per the skill's per-stage tier table):
+   scale-setters (Frame / Plan / Verdict) are solo Fable points; Discover/Act/Review
+   fan out on Opus; mechanical glue and research-volume on Sonnet.
+4. Embed the **hyperresearch** pipeline for the Research phase — **research before
+   acting**, never skip it for non-trivial unknowns.
+5. **Adversarially verify.** Every fan-out of findings/edits gets a concurrent critique
+   stage that re-checks against disk (disk-is-truth). Run the critique team
+   *concurrently* with the work, not after.
+6. **Isolate parallel file-mutating work in git worktrees** (see the worktree +
+   parallel-wave patterns in memory) so disjoint clusters don't collide; the main loop
+   does the central `git apply`/gate/commit.
+
+### When the main loop MAY act directly (the only exceptions)
+
+- Conversational turns (answering a question, explaining, planning out loud).
+- A single trivial mechanical edit (one-line fix, a typo, a rename) already fully
+  understood — no investigation required.
+- The orchestration plumbing itself: authoring/launching/iterating the Workflow,
+  reading agent results, running the authoritative gate, committing, filing seeds,
+  updating memory.
+
+If you catch yourself opening files to implement a feature, audit a subsystem, or
+research an unknown **without a workflow**, stop — that is the anti-pattern this
+section forbids. Spin up the loop instead.
+
+### Discoveries become seeds, never inline fixes
+
+While orchestrating, **never fix a discovered problem inline.** File it as a seed
+(`sd create`), set priority, wire dependencies (`sd dep add <issue> <depends-on>`), and
+enqueue it. Drive the backlog to zero *through the loop*, not by side-quests. See the
+**Issue Tracking (Seeds)** section below.
+
 ## Development Commands
 
 ### Install & Run
@@ -320,6 +371,12 @@ Background sync via `config_sync.py`.
 Each feature follows: create branch (`tg<id>-desc`) -> develop locally ->
 squash merge to main -> commit as `feat: complete TG<id> description` ->
 push via `rr push` if blocked.
+
+**Execute the TG through the mega-loop, not by hand.** Per the **Execution Model
+(MANDATORY)** section above, a TG is dispatched as a `deep-work-loop-tiered` Workflow:
+decompose into file-disjoint workstreams, fan them out to subagents in parallel
+worktrees, run an adversarial critique team concurrently, then the main loop gates +
+squash-merges + commits. Do not implement a TG synchronously in the main loop.
 
 ### Common Environment Variables
 

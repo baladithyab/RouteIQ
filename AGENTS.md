@@ -23,6 +23,55 @@ Cursor, Codex, etc.) working in the RouteIQ Gateway repository.
 > product as **RouteIQ**. Do not rename `LITELLM_*` environment variables. Do not claim
 > RouteIQ implements features only inherited from upstream.
 
+## EXECUTION MODEL (MANDATORY) — Orchestrate, Don't Hand-Code
+
+**Default to multi-agent orchestration. Do NOT work on substantive tasks directly.**
+Your role is to *frame, decompose, dispatch, gate, and synthesize* — not to be the one
+hand-editing files, auditing a subsystem, or writing a feature serially. Synchronous,
+one-thing-at-a-time work is the regression this mandate exists to prevent.
+
+### The rule
+
+For any task beyond a trivial exception:
+
+1. **Drive it through a deep-work mega-loop.** In Claude Code, invoke the
+   **`deep-work-loop-tiered`** skill — the canonical orchestration shape (Frame →
+   Discover → Research → Plan → Act → Review → Ship, with bounded backflow) — and author
+   it as a **`Workflow`** script.
+2. **Fan out across subagents, parallel by default.** Use `parallel()` / `pipeline()`
+   for independent work; never run independent units serially. Size each `agent()` by
+   blast radius (scale-setters solo on the frontier model; Discover/Act/Review fan out;
+   mechanical glue + research-volume on the cheaper tier).
+3. **Research before acting.** Embed the **hyperresearch** pipeline (or equivalent
+   web/codebase research subagents) for any non-trivial unknown. Never skip research and
+   guess.
+4. **Adversarially verify, concurrently.** Every fan-out of findings or edits gets a
+   critique team that re-checks against disk (disk-is-truth), run *concurrently* with
+   the work, not after.
+5. **Isolate parallel file-mutating work in git worktrees** so disjoint clusters don't
+   collide; the orchestrator does the central apply / gate / commit.
+
+> **Agents without a Workflow/Skill tool** (Cursor, Codex, etc.): honor the same intent
+> with the strongest mechanism you have — spawn parallel subagents/tasks, research
+> before editing, and run an independent verification pass. The principle (orchestrate +
+> parallelize + verify, don't hand-code serially) is tool-agnostic.
+
+### The only exceptions (when you MAY act directly)
+
+- Conversational turns (answering, explaining, planning out loud).
+- A single trivial mechanical edit already fully understood (one-line fix, typo, rename).
+- The orchestration plumbing itself: authoring/launching/iterating the loop, reading
+  agent results, running the authoritative gate, committing, filing seeds, memory.
+
+If you catch yourself opening files to implement/audit/research **without a loop**, stop
+and spin one up.
+
+### Discoveries become seeds, never inline fixes
+
+While orchestrating, **never fix a discovered problem inline.** File it as a seed
+(`sd create`), set priority, wire dependencies (`sd dep add <issue> <depends-on>`), and
+enqueue it. Drive the backlog to zero *through the loop*. See `## WORKFLOW`.
+
 ## REPOSITORY STRUCTURE
 
 ```
@@ -506,13 +555,22 @@ uv run pytest tests/unit/test_file.py -x --tb=long  # Stop on first failure, ful
 
 ### Task Group (TG) Workflow
 
-Development follows a Task Group pattern with quality gates:
+Development follows a Task Group pattern with quality gates. **Execute the TG through
+the mega-loop, not by hand** (see `## EXECUTION MODEL (MANDATORY)`): decompose into
+file-disjoint workstreams, fan them out to subagents in parallel worktrees, run an
+adversarial critique team concurrently, then the orchestrator gates + squash-merges +
+commits.
 
-1. **Create Feature Branch**: `git checkout -b tg<id>-<short-desc>`
-2. **Local Development**: Commit freely, run tests locally
-3. **Squash Merge to Main**: `git checkout main && git merge --squash tg<id>-branch`
-4. **Single Commit**: `git commit -m "feat: complete TG<id> description"`
-5. **Push via `rr push`** if local push is blocked
+1. **Decompose & Dispatch**: frame the TG, split into disjoint workstreams, launch the
+   `deep-work-loop-tiered` Workflow (subagents in parallel worktrees)
+2. **Create Feature Branch**: `git checkout -b tg<id>-<short-desc>`
+3. **Subagent Development**: agents implement workstreams; research + adversarial
+   critique run concurrently
+4. **Gate**: the orchestrator (you) runs the authoritative test/lint/type gate on the
+   merged snapshot — agent gates are advisory
+5. **Squash Merge to Main**: `git checkout main && git merge --squash tg<id>-branch`
+6. **Single Commit**: `git commit -m "feat: complete TG<id> description"`
+7. **Push via `rr push`** if local push is blocked
 
 ### Environment Variables Reference
 
