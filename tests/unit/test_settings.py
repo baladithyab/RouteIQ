@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from litellm_llmrouter.settings import (
     AuditFailMode,
+    BedrockDiscoverySettings,
     CacheSettings,
     ConfigSyncSettings,
     ConversationAffinitySettings,
@@ -1102,3 +1103,67 @@ class TestKumaraswamyThompsonReservedFields:
         # ``durable`` and ``cost_reward_alpha`` are the reserved set.
         assert "durable" in doc
         assert "cost_reward_alpha" in doc
+
+
+# ============================================================================
+# BedrockDiscoverySettings.source_regions env parsing
+# ============================================================================
+
+
+class TestBedrockDiscoverySourceRegionsEnv:
+    """Regression: the DOCUMENTED env form of ``source_regions`` must NOT crash.
+
+    pydantic-settings JSON-decodes complex types (``list[str]``) from env BEFORE
+    any field/model validator runs, so a comma-separated string used to raise
+    ``SettingsError`` and abort the WHOLE of ``GatewaySettings()`` (not just the
+    bedrock_discovery sub-model). ``_RouteIQEnvSettingsSource`` normalises the
+    CSV form at the env-source decode point so the documented env form boots.
+    These tests exercise the FULL env path (the original suite only tested
+    direct Python construction, which masked the crash).
+    """
+
+    def test_csv_env_form_constructs_and_parses(self, monkeypatch):
+        # The DOCUMENTED comma-separated env form.
+        monkeypatch.setenv(
+            "ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS", "us-east-1,eu-west-1"
+        )
+        reset_settings()
+        # MUST NOT raise SettingsError -- the whole gateway used to fail here.
+        s = GatewaySettings()
+        assert s.bedrock_discovery.source_regions == ["us-east-1", "eu-west-1"]
+
+    def test_json_list_env_form_constructs_and_parses(self, monkeypatch):
+        # The DOCUMENTED JSON-list env form (banned_models precedent) still works.
+        monkeypatch.setenv(
+            "ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS",
+            '["us-east-1","eu-west-1"]',
+        )
+        reset_settings()
+        s = GatewaySettings()
+        assert s.bedrock_discovery.source_regions == ["us-east-1", "eu-west-1"]
+
+    def test_csv_env_form_single_region(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS", "us-east-1")
+        reset_settings()
+        s = GatewaySettings()
+        assert s.bedrock_discovery.source_regions == ["us-east-1"]
+
+    def test_csv_env_form_strips_whitespace_and_blanks(self, monkeypatch):
+        monkeypatch.setenv(
+            "ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS",
+            "  us-east-1 , eu-west-1 ,",
+        )
+        reset_settings()
+        s = GatewaySettings()
+        assert s.bedrock_discovery.source_regions == ["us-east-1", "eu-west-1"]
+
+    def test_default_empty_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS", raising=False)
+        reset_settings()
+        s = GatewaySettings()
+        assert s.bedrock_discovery.source_regions == []
+
+    def test_direct_python_csv_construction_still_works(self):
+        # The _split_csv field validator still serves direct/programmatic use.
+        s = BedrockDiscoverySettings(source_regions="us-east-1, eu-west-1")
+        assert s.source_regions == ["us-east-1", "eu-west-1"]

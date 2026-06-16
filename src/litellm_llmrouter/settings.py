@@ -28,7 +28,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource
 
 logger = logging.getLogger(__name__)
 
@@ -1353,6 +1355,100 @@ class AdapterFrameworkSettings(BaseModel):
     )
 
 
+class BedrockDiscoverySettings(BaseModel):
+    """In-process AWS Bedrock model auto-discovery configuration (control plane).
+
+    Drives :mod:`litellm_llmrouter.bedrock_discovery`, which enumerates every
+    provider's serverless foundation models and cross-region inference profiles
+    across ``source_regions`` and maps them into LiteLLM ``model_list`` entries.
+
+    The scan is a CONTROL-PLANE concern -- it uses ``boto3.client("bedrock")``
+    (NOT ``bedrock-runtime``) and only issues the three read-only control APIs
+    ``ListFoundationModels`` / ``ListInferenceProfiles`` /
+    ``GetFoundationModelAvailability``.
+
+    Default DISABLED (opt-in): with ``enabled=False`` the discovery module is a
+    byte-stable no-op, so importing it or calling ``discover_models()`` changes
+    nothing until an operator turns it on.  Live multi-region scanning is
+    therefore operator-gated.
+
+    Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix):
+    ``ROUTEIQ_BEDROCK_DISCOVERY__ENABLED``,
+    ``ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS`` (accepts a plain
+    comma-separated string ``us-east-1,eu-west-1`` OR a JSON list
+    ``["us-east-1","eu-west-1"]`` -- the CSV form is normalised at the env-source
+    decode point by :class:`_RouteIQEnvSettingsSource`, the JSON form mirrors the
+    ``governance.banned_models`` nested-list convention; either form constructs
+    ``GatewaySettings()`` cleanly),
+    ``ROUTEIQ_BEDROCK_DISCOVERY__CHECK_AVAILABILITY``,
+    ``ROUTEIQ_BEDROCK_DISCOVERY__RESIDENCY_CONSTRAINT``,
+    ``ROUTEIQ_BEDROCK_DISCOVERY__REGISTER_COST``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable in-process Bedrock model auto-discovery. Default OFF -- the "
+            "discovery module no-ops and the model_list is untouched until an "
+            "operator opts in (live multi-region scan is operator-gated)."
+        ),
+    )
+    source_regions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "AWS regions to scan for serverless foundation models + inference "
+            "profiles. Intersected with get_available_regions('bedrock'). Empty "
+            "falls back to the boto3 session default region (AWS_REGION / profile "
+            "/ IMDS). Env ``ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS`` accepts "
+            "EITHER a comma-separated string (e.g. ``us-east-1,eu-west-1``) OR a "
+            'JSON list (e.g. ``["us-east-1","eu-west-1"]``); the CSV form is '
+            "normalised by the RouteIQ env source so neither crashes "
+            "GatewaySettings()."
+        ),
+    )
+    check_availability: bool = Field(
+        False,
+        description=(
+            "Gate discovered models through GetFoundationModelAvailability "
+            "(entitlement check). Default off -- the extra per-model control call "
+            "is opt-in; when off all ACTIVE serverless models are kept."
+        ),
+    )
+    residency_constraint: bool = Field(
+        False,
+        description=(
+            "When True the selector SKIPS the global.* inference-profile tier and "
+            "prefers an in-geo geographic profile (or the raw modelId) so traffic "
+            "stays in-region (data-residency guard, spec #11-12). Default off "
+            "(global-first)."
+        ),
+    )
+    register_cost: bool = Field(
+        True,
+        description=(
+            "When mapping to LiteLLM model_list, register a cost-key stub for "
+            "global.* ids (often missing from LiteLLM's model_prices JSON, which "
+            "breaks provider detection -- issue #17286). Default on."
+        ),
+    )
+
+    @field_validator("source_regions", mode="before")
+    @classmethod
+    def _split_csv(cls, v: Any) -> Any:
+        """Accept a comma-separated string OR a list for ``source_regions``.
+
+        This handles DIRECT/programmatic construction
+        (``BedrockDiscoverySettings(source_regions="us-east-1,eu-west-1")``).
+        The ENV form is normalised earlier, at the source level, by
+        :class:`_RouteIQEnvSettingsSource` -- a field validator alone cannot fix
+        the env path because pydantic-settings JSON-decodes the complex
+        ``list[str]`` before any validator runs.
+        """
+        if isinstance(v, str):
+            return [r.strip() for r in v.split(",") if r.strip()]
+        return v
+
+
 class HASettings(BaseModel):
     """High-availability and leader election configuration.
 
@@ -1376,6 +1472,44 @@ class HASettings(BaseModel):
             "When empty, auto-detected from environment."
         ),
     )
+
+
+# ============================================================================
+# Custom env source -- comma-separated coercion for documented list fields
+# ============================================================================
+
+#: Nested env fields (``list[str]``) whose DOCUMENTED env form is a plain
+#: comma-separated string.  pydantic-settings JSON-decodes complex types
+#: (``list[str]``) straight out of the env BEFORE any field/model validator
+#: runs, so a CSV string would raise ``SettingsError`` and abort the WHOLE of
+#: ``GatewaySettings()`` (not just the affected sub-model).  We normalise the
+#: CSV form to a real list at the env-source decode point so both the
+#: comma-separated and the JSON-list env forms construct cleanly.
+_CSV_LIST_ENV_FIELDS = frozenset({"source_regions"})
+
+
+class _RouteIQEnvSettingsSource(EnvSettingsSource):
+    """``EnvSettingsSource`` that accepts comma-separated lists for a few fields.
+
+    The base source JSON-decodes every complex (``list[str]`` etc.) nested env
+    var.  For the fields in :data:`_CSV_LIST_ENV_FIELDS` we instead accept a
+    plain comma-separated string (``a,b,c``) -- the documented env form -- and
+    fall back to JSON for anything that parses as JSON (so a real JSON list
+    ``["a","b"]`` still works).  This is what makes
+    ``ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS=us-east-1,eu-west-1`` boot the
+    gateway instead of crashing it.
+    """
+
+    def decode_complex_value(
+        self, field_name: str, field: FieldInfo, value: Any
+    ) -> Any:
+        if field_name in _CSV_LIST_ENV_FIELDS and isinstance(value, str):
+            stripped = value.strip()
+            # Defer to JSON when the operator gave a JSON list/scalar; only the
+            # bare comma-separated form needs the shim.
+            if not stripped.startswith(("[", '"')):
+                return [r.strip() for r in stripped.split(",") if r.strip()]
+        return super().decode_complex_value(field_name, field, value)
 
 
 # ============================================================================
@@ -1647,6 +1781,10 @@ class GatewaySettings(BaseSettings):
         default_factory=AdapterFrameworkSettings,  # type: ignore[arg-type]
         description="Strategy-agnostic routing-adapter framework settings.",
     )
+    bedrock_discovery: BedrockDiscoverySettings = Field(
+        default_factory=BedrockDiscoverySettings,  # type: ignore[arg-type]
+        description="In-process Bedrock model auto-discovery settings (default off).",
+    )
 
     # ------------------------------------------------------------------
     # Validators
@@ -1792,7 +1930,14 @@ class GatewaySettings(BaseSettings):
         2. Environment variables (with ROUTEIQ_ prefix)
         3. Dotenv files
         4. File secrets
+
+        The default ``env_settings`` source is swapped for
+        :class:`_RouteIQEnvSettingsSource` so the DOCUMENTED comma-separated env
+        form of CSV-list fields (e.g.
+        ``ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS=us-east-1,eu-west-1``) is
+        accepted instead of crashing ``GatewaySettings()`` on the JSON decode.
         """
+        env_settings = _RouteIQEnvSettingsSource(settings_cls)
         return (
             init_settings,
             env_settings,
