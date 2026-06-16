@@ -998,6 +998,30 @@ METRIC_CATALOG: tuple[MetricSpec, ...] = (
         ("breaker", "from_state", "to_state"),
         description="Circuit breaker state transitions",
     ),
+    _spec(
+        "gateway.circuit_breaker.state",
+        MetricType.UP_DOWN_COUNTER,
+        "{breaker}",
+        ("breaker", "state"),
+        description=(
+            "Current circuit breaker state (1=active state, 0=inactive) "
+            "labelled by breaker + state"
+        ),
+    ),
+    _spec(
+        "gateway.backpressure.active_requests",
+        MetricType.UP_DOWN_COUNTER,
+        "{request}",
+        (),
+        description="Number of in-flight requests tracked by backpressure",
+    ),
+    _spec(
+        "gateway.backpressure.rejections",
+        MetricType.COUNTER,
+        "{request}",
+        ("reason",),
+        description="Requests rejected by backpressure (over capacity / draining)",
+    ),
     # --- Dark-subsystem instruments (metrics-2) ---
     _spec(
         "gateway.routing.selection",

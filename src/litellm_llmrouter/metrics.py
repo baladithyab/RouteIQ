@@ -275,6 +275,36 @@ class GatewayMetrics:
             unit="{transition}",
         )
 
+        # Current circuit-breaker state as a gauge-like UpDownCounter
+        # (per-breaker). Value is 1 for the breaker's current state and 0 for
+        # the others, keyed by the ``state`` label (closed/open/half_open) so a
+        # PromQL ``max by (breaker) (gateway_circuit_breaker_state * on(state) ...)``
+        # / KEDA scaler can read the live state without scraping logs.
+        self.circuit_breaker_state: UpDownCounter = meter.create_up_down_counter(
+            name="gateway.circuit_breaker.state",
+            description=(
+                "Current circuit breaker state (1=active state, 0=inactive) "
+                "labelled by breaker + state"
+            ),
+            unit="{breaker}",
+        )
+
+        # In-flight (active) requests tracked by the backpressure middleware /
+        # drain manager. KEDA scales on this gauge-like UpDownCounter.
+        self.backpressure_active_requests: UpDownCounter = meter.create_up_down_counter(
+            name="gateway.backpressure.active_requests",
+            description="Number of in-flight requests tracked by backpressure",
+            unit="{request}",
+        )
+
+        # Backpressure rejections (503 over-capacity / drain). Monotonic counter
+        # so the Prometheus name gets the ``_total`` suffix.
+        self.backpressure_rejections: Counter = meter.create_counter(
+            name="gateway.backpressure.rejections",
+            description="Requests rejected by backpressure (over capacity / draining)",
+            unit="{request}",
+        )
+
         # =================================================================
         # Dark-subsystem Instruments (metrics-2)
         # =================================================================
@@ -370,6 +400,54 @@ class GatewayMetrics:
                 "to_state": to_state,
             },
         )
+
+    # All three possible circuit-breaker states, kept module-coupled-free so we
+    # don't import the enum from resilience.py (avoids an import cycle).
+    _CB_STATES = ("closed", "open", "half_open")
+
+    def record_circuit_breaker_state(
+        self, breaker_name: str, from_state: str, to_state: str
+    ) -> None:
+        """Set the per-breaker state gauge.
+
+        Emits the breaker's current state as a 0/1 gauge-like signal: the
+        ``to_state`` series is driven to 1 and the previous ``from_state``
+        series back to 0. Because OTel has no push-style synchronous gauge in
+        this codebase (the no-op adapter doesn't implement observable gauges),
+        we model the gauge with an UpDownCounter delta so a Prometheus / KEDA
+        query can ``max by (breaker)`` over the ``state`` label.
+
+        No-op when ``from_state == to_state``.
+        """
+        if from_state == to_state:
+            return
+        # Drop the previous state's series to 0 (only if it was a known state).
+        if from_state in self._CB_STATES:
+            self.circuit_breaker_state.add(
+                -1, {"breaker": breaker_name, "state": from_state}
+            )
+        # Drive the new state's series to 1.
+        if to_state in self._CB_STATES:
+            self.circuit_breaker_state.add(
+                1, {"breaker": breaker_name, "state": to_state}
+            )
+
+    def inc_backpressure_active(self, delta: int = 1) -> None:
+        """Adjust the in-flight (active) request gauge by ``delta``.
+
+        Called with ``+1`` when a request enters the backpressure-tracked path
+        and ``-1`` when it completes (including streamed responses).
+        """
+        if delta:
+            self.backpressure_active_requests.add(delta)
+
+    def record_backpressure_rejection(self, reason: str = "over_capacity") -> None:
+        """Record a request rejected by backpressure.
+
+        Args:
+            reason: ``over_capacity`` (semaphore exhausted) or ``draining``.
+        """
+        self.backpressure_rejections.add(1, {"reason": reason})
 
     def record_streaming_metrics(
         self,

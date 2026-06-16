@@ -95,6 +95,35 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
+
+def _emit_backpressure_active(delta: int) -> None:
+    """Adjust the in-flight backpressure gauge (best-effort, never raises).
+
+    A missing meter (OTel disabled) is a no-op and any recording error is
+    swallowed -- telemetry must never break the request path.
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.inc_backpressure_active(delta)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
+def _emit_backpressure_rejection(reason: str) -> None:
+    """Record a backpressure rejection (best-effort, never raises)."""
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+        if m is not None:
+            m.record_backpressure_rejection(reason)
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
+
+
 # Default configuration
 DEFAULT_MAX_CONCURRENT_REQUESTS = 0  # 0 = disabled
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 30
@@ -228,7 +257,12 @@ class DrainManager:
             if self._draining:
                 return False
             self._active_requests += 1
-            return True
+            acquired_count = self._active_requests
+        # Emit the in-flight gauge outside the lock (telemetry is best-effort
+        # and must not extend lock hold time). Only count slots we actually took.
+        if acquired_count:
+            _emit_backpressure_active(1)
+        return True
 
     async def release(self) -> None:
         """Release a request slot."""
@@ -238,6 +272,7 @@ class DrainManager:
                 self._active_requests = 0
                 if self._draining:
                     self._drain_event.set()
+        _emit_backpressure_active(-1)
 
     def attach(self, app: Any) -> None:
         """
@@ -364,9 +399,18 @@ class BackpressureMiddleware:
         return path in self._config.excluded_paths
 
     async def _send_503_response(
-        self, send: Send, request_id: str | None = None
+        self,
+        send: Send,
+        request_id: str | None = None,
+        reason: str = "over_capacity",
     ) -> None:
-        """Send a 503 over-capacity JSON response."""
+        """Send a 503 over-capacity JSON response.
+
+        Also records the backpressure rejection metric (best-effort) keyed by
+        ``reason`` (``over_capacity`` or ``draining``) so a Prometheus / KEDA
+        scaler can observe load-shedding.
+        """
+        _emit_backpressure_rejection(reason)
         body = {
             "error": "over_capacity",
             "message": "Server is at capacity, please retry later",
@@ -420,7 +464,7 @@ class BackpressureMiddleware:
         if self._drain_manager.is_draining:
             # During drain, reject new requests
             request_id = self._extract_request_id(scope)
-            await self._send_503_response(send, request_id)
+            await self._send_503_response(send, request_id, reason="draining")
             return
 
         # Try to acquire semaphore (non-blocking check first)
@@ -914,10 +958,15 @@ class CircuitBreaker:
         old_state: CircuitBreakerState,
         new_state: CircuitBreakerState,
     ) -> None:
-        """Emit the circuit-breaker transition metric (best-effort).
+        """Emit the circuit-breaker transition + state metrics (best-effort).
 
         Telemetry must never raise: a missing meter (OTel disabled) is a no-op
         and any recording error is swallowed.
+
+        Emits two instruments:
+        - ``gateway.circuit_breaker.transitions`` (monotonic counter)
+        - ``gateway.circuit_breaker.state`` (per-breaker 0/1 gauge so a
+          Prometheus ServiceMonitor / KEDA scaler can read the live state)
         """
         try:
             from litellm_llmrouter.metrics import get_gateway_metrics
@@ -925,6 +974,9 @@ class CircuitBreaker:
             m = get_gateway_metrics()
             if m is not None:
                 m.record_circuit_breaker_transition(
+                    self.name, old_state.value, new_state.value
+                )
+                m.record_circuit_breaker_state(
                     self.name, old_state.value, new_state.value
                 )
         except Exception:  # pragma: no cover - telemetry must not break flow
