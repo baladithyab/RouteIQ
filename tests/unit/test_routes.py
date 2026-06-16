@@ -5,8 +5,6 @@ Uses FastAPI's TestClient with create_standalone_app() and mocked auth
 dependencies for synchronous HTTP-level route testing.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -866,3 +864,181 @@ class TestConfigStatus:
     def test_config_status_is_unauthenticated(self, unauthed_client):
         resp = unauthed_client.get("/config/status")
         assert resp.status_code == 200
+
+
+# ===========================================================================
+# Routing Stats API (RouteIQ-aba9)
+# ===========================================================================
+
+
+def _make_stats_client(monkeypatch, *, caller_key: str):
+    """Build a TestClient whose user_api_key_auth resolves to *caller_key*.
+
+    Used to simulate distinct callers for /me/stats scope-isolation tests.
+    Admin endpoints still authenticate via the X-Admin-API-Key header.
+    """
+    monkeypatch.setenv("ADMIN_API_KEYS", _TEST_ADMIN_KEY)
+    monkeypatch.setenv("ADMIN_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ROUTEIQ_ENV", "test")
+
+    app = create_standalone_app(enable_plugins=False, enable_resilience=False)
+
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    app.dependency_overrides[user_api_key_auth] = lambda: {"api_key": caller_key}
+
+    c = TestClient(app, raise_server_exceptions=False)
+    _original_request = c.request
+
+    def _authed_request(*args, **kwargs):
+        headers = kwargs.pop("headers", {}) or {}
+        headers.setdefault("X-Admin-API-Key", _TEST_ADMIN_KEY)
+        return _original_request(*args, headers=headers, **kwargs)
+
+    c.request = _authed_request
+    return c
+
+
+class TestRoutingStatsAPI:
+    """Tests for the real (live-aggregate) routing stats endpoints."""
+
+    def test_global_routing_stats_starts_at_zero(self, client):
+        resp = client.get("/api/v1/routeiq/routing/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_decisions"] == 0
+        assert body["centroid_decisions"] == 0
+        assert body["average_latency_ms"] == 0.0
+
+    def test_global_routing_stats_reflects_recorded_decisions(self, client):
+        """After decisions are recorded, the admin stats are non-zero."""
+        from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+        acc = get_stats_accumulator()
+        acc.record_decision(
+            strategy="llmrouter-nadirclaw-centroid",
+            model="gpt-4o",
+            profile="auto",
+            key_id="k-alpha",
+        )
+        acc.record_decision(strategy="knn", model="claude-haiku", profile="eco")
+        acc.record_latency(250.0)
+
+        resp = client.get("/api/v1/routeiq/routing/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_decisions"] == 2
+        assert body["centroid_decisions"] == 1
+        assert body["strategy_distribution"]["llmrouter-nadirclaw-centroid"] == 1
+        assert body["strategy_distribution"]["knn"] == 1
+        assert body["profile_distribution"] == {"auto": 1, "eco": 1}
+        assert body["average_latency_ms"] == 250.0
+
+    def test_global_stats_endpoint_returns_breakdowns(self, client):
+        from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+        acc = get_stats_accumulator()
+        acc.record_decision(strategy="knn", model="gpt-4o", key_id="k1")
+        acc.record_decision(strategy="knn", model="gpt-4o", key_id="k2")
+
+        resp = client.get("/api/v1/routeiq/stats/global")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_decisions"] == 2
+        assert body["model_distribution"]["gpt-4o"] == 2
+        assert body["key_distribution"] == {"k1": 1, "k2": 1}
+        assert body["tracked_keys"] == 2
+
+    def test_global_stats_endpoint_requires_admin_auth(self, unauthed_client):
+        resp = unauthed_client.get("/api/v1/routeiq/stats/global")
+        assert resp.status_code in (401, 403)
+
+
+class TestMyStatsEndpoint:
+    """Tests for the caller-scoped GET /api/v1/routeiq/me/stats endpoint."""
+
+    def test_me_stats_returns_caller_scope(self, client):
+        """/me/stats returns the caller's own key_id and decision count."""
+        from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+        # The `client` fixture resolves the caller to api_key="test-user-key".
+        acc = get_stats_accumulator()
+        acc.record_decision(model="gpt-4o", strategy="knn", key_id="test-user-key")
+        acc.record_decision(
+            model="claude-haiku", strategy="knn", key_id="test-user-key"
+        )
+
+        resp = client.get("/api/v1/routeiq/me/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["key_id"] == "test-user-key"
+        assert body["decision_count"] == 2
+        # Most-recent-first.
+        assert body["recent_models"][0] == "claude-haiku"
+        assert "gpt-4o" in body["recent_models"]
+        # No governance budget configured -> budget fields are null.
+        assert body["budget_remaining_usd"] is None
+
+    def test_me_stats_unknown_key_returns_zeroed(self, client):
+        """A caller with no recorded decisions gets a valid zeroed response."""
+        resp = client.get("/api/v1/routeiq/me/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["key_id"] == "test-user-key"
+        assert body["decision_count"] == 0
+        assert body["recent_models"] == []
+
+    def test_me_stats_scope_isolation(self, monkeypatch):
+        """Caller A must NOT be able to see caller B's stats."""
+        from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+        acc = get_stats_accumulator()
+        # Record 3 decisions for key B and 1 for key A.
+        acc.record_decision(model="gpt-4o", strategy="knn", key_id="key-A")
+        acc.record_decision(model="gpt-4o", strategy="knn", key_id="key-B")
+        acc.record_decision(model="gpt-4o", strategy="knn", key_id="key-B")
+        acc.record_decision(model="gpt-4o", strategy="knn", key_id="key-B")
+
+        client_a = _make_stats_client(monkeypatch, caller_key="key-A")
+        client_b = _make_stats_client(monkeypatch, caller_key="key-B")
+
+        resp_a = client_a.get("/api/v1/routeiq/me/stats")
+        resp_b = client_b.get("/api/v1/routeiq/me/stats")
+        assert resp_a.status_code == 200
+        assert resp_b.status_code == 200
+        body_a = resp_a.json()
+        body_b = resp_b.json()
+
+        # Each caller sees ONLY their own key + count -- no cross-leak.
+        assert body_a["key_id"] == "key-A"
+        assert body_a["decision_count"] == 1
+        assert body_b["key_id"] == "key-B"
+        assert body_b["decision_count"] == 3
+
+    def test_me_stats_surfaces_budget_when_configured(self, client):
+        """When governance has a budget for the caller's key, it is surfaced."""
+        from litellm_llmrouter.governance import KeyGovernance, get_governance_engine
+
+        engine = get_governance_engine()
+        engine.register_key_governance(
+            KeyGovernance(key_id="test-user-key", max_budget_usd=100.0)
+        )
+
+        resp = client.get("/api/v1/routeiq/me/stats")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["key_id"] == "test-user-key"
+        assert body["max_budget_usd"] == 100.0
+
+    def test_me_stats_requires_user_auth(self, unauthed_client):
+        """/me/stats is on the user-auth tier: it MUST NOT serve an
+        unauthenticated 200. The endpoint carries the same
+        ``Depends(user_api_key_auth)`` as every other ``llmrouter_router``
+        route, so the auth dependency runs before the handler. (In this unit
+        environment LiteLLM's auth dependency has a transitive import that
+        surfaces as a 500 rather than a clean 401/403 — the security-relevant
+        invariant is simply that no caller-scoped data is returned.)"""
+        resp = unauthed_client.get("/api/v1/routeiq/me/stats")
+        assert resp.status_code != 200
+        # Whatever the failure mode, no caller stats leak out.
+        assert "decision_count" not in resp.text

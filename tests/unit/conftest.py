@@ -150,6 +150,10 @@ def _reset_all_singletons():
 
     reset_redis_clients()
 
+    from litellm_llmrouter.router_decision_callback import reset_stats_accumulator
+
+    reset_stats_accumulator()
+
     # KumaraswamyThompsonStrategy keeps no module-level singleton (it is
     # constructed fresh per register_*() and lives in the routing registry,
     # which reset_routing_singletons() above already clears). The MLOps

@@ -26,13 +26,18 @@ Environment Variables:
 
 import logging
 import os
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from opentelemetry import trace
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
+
+# Strategy name used by the centroid router (centroid decision identification).
+_CENTROID_STRATEGY_NAME = "llmrouter-nadirclaw-centroid"
 
 # Feature flag: Enable router decision callback
 # Default to true if OTEL is configured, false otherwise
@@ -83,6 +88,238 @@ def _governance_spend_tracking_enabled() -> bool:
         return bool(get_settings().llmrouter_governance_spend_tracking)
     except Exception:
         return _governance_spend_tracking_env()
+
+
+# =============================================================================
+# In-process Routing Stats Accumulator (RouteIQ-aba9)
+# =============================================================================
+
+# Bound on the number of distinct per-key / per-user / per-model rollup entries
+# retained.  Keeps the accumulator's memory footprint constant under high key
+# cardinality (eviction is oldest-first, LRU-ish on insert order).
+_DEFAULT_MAX_ROLLUP_ENTRIES = 10_000
+
+# Bound on how many recent model names are remembered per key (for /me/stats).
+_MAX_RECENT_MODELS_PER_KEY = 10
+
+
+def _stats_max_rollup_entries() -> int:
+    """Resolve the per-rollup-map size cap (settings-first, env fallback).
+
+    Reads ``ROUTEIQ_STATS_MAX_ROLLUP_ENTRIES`` to let operators bound the
+    accumulator under pathological key cardinality.  Defaults to
+    ``_DEFAULT_MAX_ROLLUP_ENTRIES``.  Never raises -- a bad value falls back to
+    the default so the hot path is unaffected.
+    """
+    try:
+        raw = os.getenv("ROUTEIQ_STATS_MAX_ROLLUP_ENTRIES")
+        if raw is None:
+            return _DEFAULT_MAX_ROLLUP_ENTRIES
+        value = int(raw)
+        return value if value > 0 else _DEFAULT_MAX_ROLLUP_ENTRIES
+    except Exception:
+        return _DEFAULT_MAX_ROLLUP_ENTRIES
+
+
+class _KeyRollup:
+    """Per-key usage rollup (process-local).
+
+    Holds the decision count and a bounded recent-models list for ONE resolved
+    key_id.  Mutated only under :class:`RoutingStatsAccumulator`'s lock.
+    """
+
+    __slots__ = ("decisions", "recent_models")
+
+    def __init__(self) -> None:
+        self.decisions: int = 0
+        # Most-recent-last; bounded to _MAX_RECENT_MODELS_PER_KEY distinct names.
+        self.recent_models: "OrderedDict[str, None]" = OrderedDict()
+
+    def record(self, model: str) -> None:
+        self.decisions += 1
+        if model:
+            # Move-to-end so the list reflects recency; cap the size.
+            self.recent_models.pop(model, None)
+            self.recent_models[model] = None
+            while len(self.recent_models) > _MAX_RECENT_MODELS_PER_KEY:
+                self.recent_models.popitem(last=False)
+
+
+class RoutingStatsAccumulator:
+    """Thread-safe, bounded, process-local routing-decision counter store.
+
+    Fed by :class:`RouterDecisionCallback` / :class:`RouterDecisionMiddleware`
+    on every routing decision.  Read back by the stats API endpoints
+    (admin global stats + the caller-scoped ``/me/stats``).
+
+    All mutation/read goes through a single :class:`threading.Lock` so it is
+    safe to feed from sync callbacks and read from async route handlers.  The
+    per-key / per-user / per-model maps are bounded (oldest-evicted) so memory
+    stays constant regardless of key cardinality.
+
+    This is a SINGLETON (see :func:`get_stats_accumulator`); tests MUST call
+    :func:`reset_stats_accumulator` in an autouse fixture.
+    """
+
+    def __init__(self, max_entries: Optional[int] = None) -> None:
+        self._lock = threading.Lock()
+        self._max_entries = max_entries or _stats_max_rollup_entries()
+        self._total_decisions: int = 0
+        self._centroid_decisions: int = 0
+        self._latency_sum_ms: float = 0.0
+        self._latency_count: int = 0
+        self._strategy_counts: Dict[str, int] = {}
+        self._profile_counts: Dict[str, int] = {}
+        self._model_counts: "OrderedDict[str, int]" = OrderedDict()
+        self._key_rollups: "OrderedDict[str, _KeyRollup]" = OrderedDict()
+        self._user_counts: "OrderedDict[str, int]" = OrderedDict()
+
+    @staticmethod
+    def _bump_bounded(
+        store: "OrderedDict[str, int]", key: str, max_entries: int
+    ) -> None:
+        """Increment ``store[key]`` with oldest-first eviction past *max_entries*."""
+        store[key] = store.get(key, 0) + 1
+        while len(store) > max_entries:
+            store.popitem(last=False)
+
+    def record_decision(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        model: Optional[str] = None,
+        profile: Optional[str] = None,
+        latency_ms: Optional[float] = None,
+        key_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Record a single routing decision.
+
+        Every argument is optional so partial telemetry (e.g. the middleware
+        path, which has no resolved model) still increments the global total.
+        Never raises -- the caller wraps it, but we also guard internally so a
+        bad value cannot break the request path.
+        """
+        try:
+            with self._lock:
+                self._total_decisions += 1
+
+                if strategy:
+                    self._strategy_counts[strategy] = (
+                        self._strategy_counts.get(strategy, 0) + 1
+                    )
+                    if strategy == _CENTROID_STRATEGY_NAME:
+                        self._centroid_decisions += 1
+
+                if profile:
+                    self._profile_counts[profile] = (
+                        self._profile_counts.get(profile, 0) + 1
+                    )
+
+                if latency_ms is not None and latency_ms >= 0:
+                    self._latency_sum_ms += float(latency_ms)
+                    self._latency_count += 1
+
+                if model:
+                    self._bump_bounded(self._model_counts, model, self._max_entries)
+
+                if key_id:
+                    rollup = self._key_rollups.get(key_id)
+                    if rollup is None:
+                        rollup = _KeyRollup()
+                        self._key_rollups[key_id] = rollup
+                        while len(self._key_rollups) > self._max_entries:
+                            self._key_rollups.popitem(last=False)
+                    rollup.record(model or "")
+
+                if user_id:
+                    self._bump_bounded(self._user_counts, user_id, self._max_entries)
+        except Exception:  # pragma: no cover - stats must never break routing
+            logger.debug(
+                "RoutingStatsAccumulator.record_decision failed", exc_info=True
+            )
+
+    def record_latency(self, latency_ms: float) -> None:
+        """Record a routing/response latency sample (decoupled from decisions).
+
+        Fed from the post-response success path where the REAL duration is
+        known, so the average reflects actual latency rather than the pre-call
+        placeholder.  Does NOT increment the decision counter.
+        """
+        try:
+            if latency_ms is None or latency_ms < 0:
+                return
+            with self._lock:
+                self._latency_sum_ms += float(latency_ms)
+                self._latency_count += 1
+        except Exception:  # pragma: no cover - stats must never break routing
+            logger.debug("RoutingStatsAccumulator.record_latency failed", exc_info=True)
+
+    def average_latency_ms(self) -> float:
+        with self._lock:
+            if self._latency_count == 0:
+                return 0.0
+            return self._latency_sum_ms / self._latency_count
+
+    def global_snapshot(self) -> Dict[str, Any]:
+        """Return a copy of the global aggregates (admin / dashboard view)."""
+        with self._lock:
+            avg = (
+                self._latency_sum_ms / self._latency_count
+                if self._latency_count
+                else 0.0
+            )
+            return {
+                "total_decisions": self._total_decisions,
+                "strategy_distribution": dict(self._strategy_counts),
+                "profile_distribution": dict(self._profile_counts),
+                "centroid_decisions": self._centroid_decisions,
+                "average_latency_ms": avg,
+                "model_distribution": dict(self._model_counts),
+                "key_distribution": {
+                    k: r.decisions for k, r in self._key_rollups.items()
+                },
+                "tracked_keys": len(self._key_rollups),
+            }
+
+    def key_snapshot(self, key_id: str) -> Dict[str, Any]:
+        """Return the per-key usage rollup for *key_id* (caller-scoped view).
+
+        Returns zeroed counters (not an error) when the key has no recorded
+        decisions yet, so a freshly-issued key still gets a valid response.
+        """
+        with self._lock:
+            rollup = self._key_rollups.get(key_id)
+            if rollup is None:
+                return {"decisions": 0, "recent_models": []}
+            # recent_models is most-recent-last; surface most-recent-first.
+            return {
+                "decisions": rollup.decisions,
+                "recent_models": list(reversed(rollup.recent_models.keys())),
+            }
+
+
+# Singleton --------------------------------------------------------------------
+
+_stats_accumulator: Optional[RoutingStatsAccumulator] = None
+_stats_accumulator_lock = threading.Lock()
+
+
+def get_stats_accumulator() -> RoutingStatsAccumulator:
+    """Get or create the process-local routing stats accumulator singleton."""
+    global _stats_accumulator
+    if _stats_accumulator is None:
+        with _stats_accumulator_lock:
+            if _stats_accumulator is None:
+                _stats_accumulator = RoutingStatsAccumulator()
+    return _stats_accumulator
+
+
+def reset_stats_accumulator() -> None:
+    """Reset the stats accumulator singleton (for tests)."""
+    global _stats_accumulator
+    with _stats_accumulator_lock:
+        _stats_accumulator = None
 
 
 # =============================================================================
@@ -473,6 +710,11 @@ class RouterDecisionCallback:
         if provider:
             span.set_attribute(GA.SYSTEM, provider)
 
+        # Feed the in-process stats accumulator (RouteIQ-aba9).  This is the
+        # per-decision seam with the resolved model + strategy + governance
+        # scope, so the global stats + /me/stats endpoints read real aggregates.
+        _record_decision_stats(model, strategy, metadata)
+
         logger.debug(
             f"Emitted router telemetry: model={model}, strategy={strategy}, "
             f"candidates={candidates}, outcome={outcome}"
@@ -544,6 +786,13 @@ class RouterDecisionCallback:
             GA.REQUEST_MODEL: model,
             GA.SYSTEM: provider,
         }
+
+        # Feed the real response latency into the stats accumulator so the
+        # global / dashboard average reflects actual durations (RouteIQ-aba9).
+        try:
+            get_stats_accumulator().record_latency(duration_s * 1000.0)
+        except Exception:  # pragma: no cover - stats must never break routing
+            logger.debug("Failed to record latency stats", exc_info=True)
 
         gm = get_gateway_metrics()
         if gm:
@@ -734,6 +983,51 @@ def _compute_duration(start_time: Any, end_time: Any) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _record_decision_stats(
+    model: str,
+    strategy: str,
+    metadata: Dict[str, Any],
+) -> None:
+    """Feed one routing decision into the process-local stats accumulator.
+
+    Resolves the caller's key scope from the SAME ``_governance_ctx`` stamp the
+    spend writer uses (raw ``key_id``, never LiteLLM's hashed token), and the
+    routing profile from the stamp's ``effective_profile`` (falling back to the
+    ``_routing_profile`` hint).  Fully fail-open: any error is swallowed so the
+    request path is never broken by stats bookkeeping.
+    """
+    try:
+        key_id: Optional[str] = None
+        user_id: Optional[str] = None
+        profile: Optional[str] = None
+
+        gctx = metadata.get("_governance_ctx") if isinstance(metadata, dict) else None
+        if isinstance(gctx, dict):
+            key_id = gctx.get("key_id")
+            profile = gctx.get("effective_profile")
+
+        if isinstance(metadata, dict):
+            if not profile:
+                profile = metadata.get("_routing_profile")
+            if not key_id:
+                key_id = metadata.get("user_api_key") or metadata.get("_key")
+            user_id = (
+                metadata.get("user_api_key_user_id")
+                or metadata.get("user_id")
+                or metadata.get("_user")
+            )
+
+        get_stats_accumulator().record_decision(
+            strategy=strategy,
+            model=model,
+            profile=profile,
+            key_id=str(key_id) if key_id else None,
+            user_id=str(user_id) if user_id else None,
+        )
+    except Exception:  # pragma: no cover - stats must never break routing
+        logger.debug("Failed to record decision stats", exc_info=True)
 
 
 def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:

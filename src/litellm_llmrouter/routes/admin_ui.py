@@ -15,10 +15,12 @@ import os
 import time
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
-from . import admin_router
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+from . import admin_router, llmrouter_router
 
 # Module-level start time for uptime calculation
 _start_time = time.time()
@@ -56,6 +58,36 @@ class RoutingStatsResponse(BaseModel):
     profile_distribution: dict[str, int]
     centroid_decisions: int
     average_latency_ms: float
+
+
+class GlobalStatsResponse(BaseModel):
+    """Org-wide routing rollups for the admin dashboard + future panels."""
+
+    total_decisions: int
+    strategy_distribution: dict[str, int]
+    profile_distribution: dict[str, int]
+    model_distribution: dict[str, int]
+    key_distribution: dict[str, int]
+    centroid_decisions: int
+    average_latency_ms: float
+    tracked_keys: int
+
+
+class MyStatsResponse(BaseModel):
+    """Caller-scoped usage stats for ``/me/stats``.
+
+    Returns ONLY the authenticated caller's own key usage. Budget fields are
+    populated only when the governance engine has a budget configured for the
+    caller's key; otherwise they are ``None``.
+    """
+
+    key_id: str
+    decision_count: int
+    recent_models: list[str]
+    budget_remaining_usd: float | None = None
+    budget_used_pct: float | None = None
+    spend_usd: float | None = None
+    max_budget_usd: float | None = None
 
 
 class ModelInfoResponse(BaseModel):
@@ -142,6 +174,32 @@ def _is_centroid_enabled() -> bool:
     return os.environ.get("ROUTEIQ_CENTROID_ROUTING", "true").lower() == "true"
 
 
+def _resolve_caller_key_id(auth: Any) -> str:
+    """Resolve the CALLER's own raw key_id from the user_api_key_auth context.
+
+    Fail-closed to the caller's own identity: this NEVER reads a key_id from
+    request input (query/body), so a caller can only ever see their own scope.
+    Accepts either LiteLLM's ``UserAPIKeyAuth`` object or the dict the test
+    fixture overrides it with.
+
+    Precedence mirrors the governance scope token: the RAW ``api_key`` (the
+    same value the governance engine keys ``key_id`` on), then the hashed
+    ``token``, then ``user_id``. Returns ``"anonymous"`` only when the auth
+    context carries no identity at all.
+    """
+
+    def _get(field: str) -> Any:
+        if isinstance(auth, dict):
+            return auth.get(field)
+        return getattr(auth, field, None)
+
+    for field in ("api_key", "token", "user_id", "key_alias"):
+        value = _get(field)
+        if value:
+            return str(value)
+    return "anonymous"
+
+
 def _get_models() -> list[dict[str, str]]:
     """Get configured models from LiteLLM proxy config."""
     models: list[dict[str, str]] = []
@@ -226,30 +284,37 @@ async def get_gateway_status():
 
 @admin_router.get("/api/v1/routeiq/routing/stats", response_model=RoutingStatsResponse)
 async def get_routing_stats():
-    """Get routing decision statistics."""
-    strategy_distribution: dict[str, int] = {}
+    """Get routing decision statistics.
 
+    Reads live aggregates from the in-process routing stats accumulator
+    (fed by ``router_decision_callback`` on every decision). Seeds the
+    strategy distribution with all registered strategies (at 0) so the
+    dashboard shows the full strategy set, then overlays live counts.
+    """
+    from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+    snapshot = get_stats_accumulator().global_snapshot()
+
+    # Seed strategy distribution with all registered strategies, then overlay
+    # the live per-strategy decision counts from the accumulator.
+    strategy_distribution: dict[str, int] = {}
     try:
         from litellm_llmrouter.strategy_registry import get_routing_registry
 
         registry = get_routing_registry()
         status = registry.get_status()
-        # Build strategy distribution from registered strategies
         for name in status.get("registered_strategies", []):
             strategy_distribution[name] = 0
-        # If there's an active strategy, mark it
-        active = status.get("active_strategy")
-        if active and active in strategy_distribution:
-            strategy_distribution[active] = 1  # Placeholder
     except Exception:
         pass
+    strategy_distribution.update(snapshot["strategy_distribution"])
 
     return RoutingStatsResponse(
-        total_decisions=0,  # MVP: not yet tracked
+        total_decisions=snapshot["total_decisions"],
         strategy_distribution=strategy_distribution,
-        profile_distribution={},  # MVP: not yet tracked
-        centroid_decisions=0,  # MVP: not yet tracked
-        average_latency_ms=0.0,  # MVP: not yet tracked
+        profile_distribution=snapshot["profile_distribution"],
+        centroid_decisions=snapshot["centroid_decisions"],
+        average_latency_ms=snapshot["average_latency_ms"],
     )
 
 
@@ -370,6 +435,79 @@ async def get_models():
     """Get configured models with deployment info."""
     models = _get_models()
     return [ModelInfoResponse(**m) for m in models]
+
+
+@llmrouter_router.get("/api/v1/routeiq/me/stats", response_model=MyStatsResponse)
+async def get_my_stats(auth: Any = Depends(user_api_key_auth)):
+    """Return the CALLER's OWN usage stats (user-auth, scope-isolated).
+
+    The caller's key_id is resolved from the ``user_api_key_auth`` context
+    only -- never from request input -- so a user can see ONLY their own
+    stats and can never read another key's usage. Budget fields are populated
+    when the governance engine has a budget configured for the caller's key.
+    """
+    key_id = _resolve_caller_key_id(auth)
+
+    from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+    key_stats = get_stats_accumulator().key_snapshot(key_id)
+
+    response = MyStatsResponse(
+        key_id=key_id,
+        decision_count=key_stats["decisions"],
+        recent_models=key_stats["recent_models"],
+    )
+
+    # Overlay governance budget/spend for THIS key only, if configured.
+    try:
+        from litellm_llmrouter.governance import get_governance_engine
+
+        engine = get_governance_engine()
+        ctx = await engine.resolve_context(key_id)
+        if ctx.effective_max_budget_usd is not None:
+            # check_budget populates budget_remaining_usd / budget_used_pct
+            # from the spend store (best-effort; tolerates store outage).
+            try:
+                await engine.check_budget(ctx)
+            except Exception:
+                pass
+            response.max_budget_usd = ctx.effective_max_budget_usd
+            response.budget_remaining_usd = ctx.budget_remaining_usd
+            response.budget_used_pct = ctx.budget_used_pct
+            if (
+                ctx.budget_remaining_usd is not None
+                and ctx.effective_max_budget_usd is not None
+            ):
+                response.spend_usd = max(
+                    0.0, ctx.effective_max_budget_usd - ctx.budget_remaining_usd
+                )
+    except Exception:
+        # Governance unavailable -> return usage stats without budget fields.
+        pass
+
+    return response
+
+
+@admin_router.get("/api/v1/routeiq/stats/global", response_model=GlobalStatsResponse)
+async def get_global_stats():
+    """Org-wide routing rollups (admin auth).
+
+    Exposes the per-strategy / per-model / per-key breakdowns the admin
+    Dashboard and future analytics panels need, on top of the global totals.
+    """
+    from litellm_llmrouter.router_decision_callback import get_stats_accumulator
+
+    snapshot = get_stats_accumulator().global_snapshot()
+    return GlobalStatsResponse(
+        total_decisions=snapshot["total_decisions"],
+        strategy_distribution=snapshot["strategy_distribution"],
+        profile_distribution=snapshot["profile_distribution"],
+        model_distribution=snapshot["model_distribution"],
+        key_distribution=snapshot["key_distribution"],
+        centroid_decisions=snapshot["centroid_decisions"],
+        average_latency_ms=snapshot["average_latency_ms"],
+        tracked_keys=snapshot["tracked_keys"],
+    )
 
 
 @admin_router.get("/api/v1/routeiq/ui-config")
