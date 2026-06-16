@@ -36,6 +36,8 @@ from litellm_llmrouter.oidc import (
     OIDCProviderMetadata,
     TokenExchangeRequest,
     TokenExchangeResponse,
+    _BoundedTTLDict,
+    _deserialize_entry,
     _exchanged_keys,
     _generate_state,
     _hash_token,
@@ -43,6 +45,12 @@ from litellm_llmrouter.oidc import (
     _pending_auth_states,
     _prune_expired_identities,
     _prune_expired_states,
+    _REDIS_EXCHANGED_KEY_PREFIX,
+    _REDIS_IDENTITY_KEY_PREFIX,
+    _serialize_entry,
+    _shared_get,
+    _shared_pop,
+    _shared_set,
     create_oidc_router,
     get_oidc_config,
     reset_oidc,
@@ -1421,3 +1429,274 @@ class TestAuthLibNotAvailable:
 
             resp = client.post("/auth/token-exchange", json={})
             assert resp.status_code == 501
+
+
+# =============================================================================
+# 11. Redis-backed shared store (cross-pod visibility) — RouteIQ-0716
+# =============================================================================
+
+
+class _FakeRedis:
+    """Minimal async stand-in for ``redis.asyncio.Redis``.
+
+    Backs a single in-memory dict so multiple ``_BoundedTTLDict`` instances
+    (simulating distinct pods) can share state through it. Records every key it
+    is asked to store so tests can assert the raw api-key / token is NEVER used
+    as a Redis key (only its SHA-256 hash).
+    """
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.seen_keys: list[str] = []
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.seen_keys.append(key)
+        self.store[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def delete(self, key: str) -> None:
+        self.store.pop(key, None)
+
+
+class TestSharedStoreSerialization:
+    """Tests for the (identity, expires_at) <-> JSON round-trip."""
+
+    def test_serialize_deserialize_round_trip(self):
+        identity = OIDCIdentity(
+            user_id="u1",
+            email="a@b.com",
+            display_name="Alice",
+            team_ids=["eng"],
+            org_id="acme",
+            roles=["internal_user"],
+            raw_claims={"sub": "u1"},
+        )
+        data = _serialize_entry(identity, 1234.5)
+        rebuilt = _deserialize_entry(data)
+        assert rebuilt is not None
+        rebuilt_identity, expires_at = rebuilt
+        assert rebuilt_identity.user_id == "u1"
+        assert rebuilt_identity.email == "a@b.com"
+        assert rebuilt_identity.team_ids == ["eng"]
+        assert rebuilt_identity.roles == ["internal_user"]
+        assert expires_at == 1234.5
+
+    def test_serialize_does_not_contain_secret(self):
+        """The serialized payload never carries the api-key/token itself."""
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+        data = _serialize_entry(identity, 99.0)
+        # Only the hash is ever the Redis KEY; the VALUE must not embed a raw key.
+        assert "sk-oidc-" not in data
+
+    def test_deserialize_malformed_returns_none(self):
+        assert _deserialize_entry("not-json") is None
+        assert _deserialize_entry('{"identity": {}}') is None  # missing user_id
+
+
+class TestSharedStoreNoRedis:
+    """No Redis configured -> byte-stable in-process behaviour (no Redis calls)."""
+
+    @pytest.mark.asyncio
+    async def test_set_then_get_in_process_only(self):
+        local = _BoundedTTLDict()
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+
+        # _get_shared_redis returns None when REDIS_HOST is not set; assert that.
+        assert await _oidc_mod._get_shared_redis() is None
+
+        await _shared_set(
+            local,
+            _REDIS_EXCHANGED_KEY_PREFIX,
+            "h1",
+            identity,
+            999.0,
+            ttl_seconds=600,
+        )
+        # Lands in the in-process dict.
+        assert local.get("h1") is not None
+
+        got = await _shared_get(local, _REDIS_EXCHANGED_KEY_PREFIX, "h1")
+        assert got is not None
+        assert got[0].user_id == "u1"
+
+    @pytest.mark.asyncio
+    async def test_get_miss_returns_none_without_redis(self):
+        local = _BoundedTTLDict()
+        assert await _shared_get(local, _REDIS_IDENTITY_KEY_PREFIX, "absent") is None
+
+    @pytest.mark.asyncio
+    async def test_non_positive_ttl_skips_redis_write(self):
+        """An already-expired entry is not pushed to Redis."""
+        fake = _FakeRedis()
+        local = _BoundedTTLDict()
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            await _shared_set(
+                local,
+                _REDIS_EXCHANGED_KEY_PREFIX,
+                "h1",
+                identity,
+                1.0,
+                ttl_seconds=0,
+            )
+        # Local write still happened; Redis write was skipped.
+        assert local.get("h1") is not None
+        assert fake.store == {}
+
+
+class TestSharedStoreCrossPod:
+    """With a shared (fake) Redis, an entry written by one pod is visible to
+    another pod's separate in-process cache."""
+
+    @pytest.mark.asyncio
+    async def test_exchanged_key_visible_across_pods(self):
+        fake = _FakeRedis()  # one Redis shared by both pods
+        pod_a_local = _BoundedTTLDict()
+        pod_b_local = _BoundedTTLDict()
+        identity = OIDCIdentity(user_id="u1", email="a@b.com", roles=["internal_user"])
+        key_hash = _hash_token("sk-oidc-shared-key")
+
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            # Pod A mints + stores the exchanged key.
+            await _shared_set(
+                pod_a_local,
+                _REDIS_EXCHANGED_KEY_PREFIX,
+                key_hash,
+                identity,
+                time.time() + 3600,
+                ttl_seconds=3600,
+            )
+            # Pod B has a COLD in-process cache (sticky session lands elsewhere).
+            assert pod_b_local.get(key_hash) is None
+            # Pod B resolves it via the shared store.
+            got = await _shared_get(pod_b_local, _REDIS_EXCHANGED_KEY_PREFIX, key_hash)
+
+        assert got is not None
+        assert got[0].user_id == "u1"
+        # Cross-pod read warmed pod B's local cache.
+        assert pod_b_local.get(key_hash) is not None
+
+    @pytest.mark.asyncio
+    async def test_identity_cache_visible_across_pods(self):
+        fake = _FakeRedis()
+        pod_a_local = _BoundedTTLDict()
+        pod_b_local = _BoundedTTLDict()
+        identity = OIDCIdentity(user_id="jwt-u", email="j@b.com")
+        token_hash = _hash_token("some.jwt.token")
+
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            await _shared_set(
+                pod_a_local,
+                _REDIS_IDENTITY_KEY_PREFIX,
+                token_hash,
+                identity,
+                time.monotonic() + 600,
+                ttl_seconds=600,
+            )
+            got = await _shared_get(pod_b_local, _REDIS_IDENTITY_KEY_PREFIX, token_hash)
+
+        assert got is not None
+        assert got[0].user_id == "jwt-u"
+
+    @pytest.mark.asyncio
+    async def test_redis_key_is_hash_not_raw_token(self):
+        """Secret-safety: Redis keys are the SHA-256 hash + prefix, never raw."""
+        fake = _FakeRedis()
+        local = _BoundedTTLDict()
+        raw_key = "sk-oidc-supersecret"
+        key_hash = _hash_token(raw_key)
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            await _shared_set(
+                local,
+                _REDIS_EXCHANGED_KEY_PREFIX,
+                key_hash,
+                identity,
+                time.time() + 3600,
+                ttl_seconds=3600,
+            )
+
+        assert fake.seen_keys == [_REDIS_EXCHANGED_KEY_PREFIX + key_hash]
+        # The raw secret never appears in any Redis key.
+        assert all(raw_key not in k for k in fake.seen_keys)
+
+    @pytest.mark.asyncio
+    async def test_shared_pop_evicts_both_stores(self):
+        fake = _FakeRedis()
+        local = _BoundedTTLDict()
+        key_hash = _hash_token("sk-oidc-evict-me")
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            await _shared_set(
+                local,
+                _REDIS_EXCHANGED_KEY_PREFIX,
+                key_hash,
+                identity,
+                time.time() + 3600,
+                ttl_seconds=3600,
+            )
+            assert fake.store  # present in Redis
+            await _shared_pop(local, _REDIS_EXCHANGED_KEY_PREFIX, key_hash)
+
+        assert local.get(key_hash) is None
+        assert fake.store == {}
+
+    @pytest.mark.asyncio
+    async def test_redis_failure_degrades_to_local(self):
+        """A Redis error during GET must not raise — falls back to local miss."""
+        broken = MagicMock()
+        broken.get = AsyncMock(side_effect=RuntimeError("redis down"))
+        broken.set = AsyncMock(side_effect=RuntimeError("redis down"))
+        local = _BoundedTTLDict()
+        identity = OIDCIdentity(user_id="u1", email="a@b.com")
+
+        with patch.object(
+            _oidc_mod, "_get_shared_redis", AsyncMock(return_value=broken)
+        ):
+            # SET swallows the Redis error; local still gets written.
+            await _shared_set(
+                local,
+                _REDIS_EXCHANGED_KEY_PREFIX,
+                "h1",
+                identity,
+                time.time() + 3600,
+                ttl_seconds=3600,
+            )
+            assert local.get("h1") is not None
+            # GET on a cold key swallows the Redis error -> None.
+            assert await _shared_get(local, _REDIS_EXCHANGED_KEY_PREFIX, "cold") is None
+
+
+@_requires_authlib
+class TestResolveIdentityCrossPod:
+    """End-to-end: resolve_identity() on a 'cold' pod resolves a key minted
+    elsewhere via the shared Redis store."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_exchanged_key_from_redis_when_local_cold(self):
+        fake = _FakeRedis()
+        setup_oidc(_make_config())
+
+        identity = OIDCIdentity(user_id="u1", email="a@b.com", roles=["internal_user"])
+        api_key = "sk-oidc-cross-pod"
+        key_hash = _hash_token(api_key)
+
+        # Simulate pod A having written the key to the shared Redis only
+        # (this pod's _exchanged_keys dict is empty after reset_oidc()).
+        fake.store[_REDIS_EXCHANGED_KEY_PREFIX + key_hash] = _serialize_entry(
+            identity, time.time() + 3600
+        )
+        assert _exchanged_keys.get(key_hash) is None  # cold locally
+
+        request = MagicMock(spec=Request)
+        request.headers = {"x-api-key": api_key}
+
+        with patch.object(_oidc_mod, "_get_shared_redis", AsyncMock(return_value=fake)):
+            result = await resolve_identity(request)
+
+        assert result is not None
+        assert result.user_id == "u1"

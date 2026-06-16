@@ -731,7 +731,9 @@ class _BoundedTTLDict:
         return len(self._data)
 
 
-# Maps state nonce -> (timestamp, redirect_uri, code_verifier) for CSRF protection
+# Maps state nonce -> (timestamp, redirect_uri, code_verifier) for CSRF protection.
+# CSRF state is single-pod by design (PKCE verifier never leaves the pod that
+# minted the login redirect), so it is NOT shared and stays in-process only.
 _pending_auth_states: _BoundedTTLDict = _BoundedTTLDict()
 
 # Maps api_key_hash -> (OIDCIdentity, expires_at) for exchanged tokens
@@ -739,6 +741,151 @@ _exchanged_keys: _BoundedTTLDict = _BoundedTTLDict()
 
 # Validated identity cache: token_hash -> (OIDCIdentity, expires_at)
 _identity_cache: _BoundedTTLDict = _BoundedTTLDict()
+
+
+# =============================================================================
+# Optional Redis-backed shared store (cross-pod visibility) — RouteIQ-0716
+# =============================================================================
+#
+# By default the exchanged-key map and the validated-identity cache live in the
+# per-pod ``_BoundedTTLDict`` instances above. With ``replicaCount=2`` an
+# ``sk-oidc-*`` key minted on pod A is unknown to pod B, so resolution becomes
+# sticky-session-dependent. When a Redis client is available these two maps are
+# ALSO mirrored to Redis (a SHA-256-hashed key + a JSON value, with a bounded
+# TTL), and reads fall through to Redis on a local miss — so a key minted on one
+# pod is visible on every pod.
+#
+# Default behaviour (no Redis configured -> ``get_async_redis_client()`` returns
+# ``None``) is BYTE-STABLE: nothing is serialized, no Redis call is made, and the
+# in-process dict is the sole source of truth. The mirror is purely additive.
+#
+# Secret-safe: only the SHA-256 hash of the api-key / token is ever used as the
+# Redis key (callers pass ``_hash_token(...)``), and the raw key is never logged.
+
+# Redis key namespaces for the two shared maps.
+_REDIS_EXCHANGED_KEY_PREFIX = "routeiq:oidc:exch:"
+_REDIS_IDENTITY_KEY_PREFIX = "routeiq:oidc:ident:"
+
+
+async def _get_shared_redis() -> Optional[Any]:
+    """Return the shared async Redis client, or ``None`` when unavailable.
+
+    Reuses the process-wide singleton from ``redis_pool`` (never builds its own
+    client). Any import/connection error degrades silently to ``None`` so the
+    in-process path is used — the shared store is best-effort, never required.
+    """
+    try:
+        from litellm_llmrouter.redis_pool import get_async_redis_client
+
+        return await get_async_redis_client()
+    except Exception:
+        return None
+
+
+def _serialize_entry(identity: OIDCIdentity, expires_at: float) -> str:
+    """Serialize an ``(identity, expires_at)`` tuple to a JSON string for Redis.
+
+    The raw api-key / token is NEVER part of the payload (the Redis key is the
+    SHA-256 hash supplied by the caller), so this is safe to store and never logs
+    a secret.
+    """
+    return json.dumps({"identity": identity.model_dump(), "expires_at": expires_at})
+
+
+def _deserialize_entry(data: str) -> Optional[tuple[OIDCIdentity, float]]:
+    """Rebuild an ``(identity, expires_at)`` tuple from a Redis JSON string.
+
+    Returns ``None`` on any malformed payload so a corrupt Redis entry degrades
+    to a cache miss rather than raising.
+    """
+    try:
+        obj = json.loads(data)
+        identity = OIDCIdentity(**obj["identity"])
+        return identity, float(obj["expires_at"])
+    except Exception:
+        return None
+
+
+async def _shared_set(
+    local: _BoundedTTLDict,
+    prefix: str,
+    key_hash: str,
+    identity: OIDCIdentity,
+    expires_at: float,
+    *,
+    ttl_seconds: int,
+) -> None:
+    """Write an entry to the in-process dict and, when Redis is available, mirror
+    it to Redis under ``prefix + key_hash`` with a bounded TTL.
+
+    ``ttl_seconds`` bounds the Redis entry (exchanged keys/identities are
+    short-lived); a non-positive TTL skips the Redis write entirely (the entry is
+    already expired). Redis failures are swallowed — the local write always
+    succeeds, preserving byte-stable behaviour when Redis is absent.
+    """
+    local.set(key_hash, (identity, expires_at))
+
+    if ttl_seconds <= 0:
+        return
+    redis = await _get_shared_redis()
+    if redis is None:
+        return
+    try:
+        await redis.set(
+            prefix + key_hash,
+            _serialize_entry(identity, expires_at),
+            ex=int(ttl_seconds),
+        )
+    except Exception as exc:  # never let a Redis hiccup break auth
+        logger.debug("OIDC shared-store Redis SET failed: %s", exc)
+
+
+async def _shared_get(
+    local: _BoundedTTLDict,
+    prefix: str,
+    key_hash: str,
+) -> Optional[tuple[OIDCIdentity, float]]:
+    """Read an entry, checking the in-process dict first, then Redis.
+
+    On a local miss with a Redis hit the value is back-filled into the in-process
+    dict (cross-pod warm-up). Returns ``None`` when neither store has the entry.
+    Byte-stable when Redis is absent: only the local dict is consulted.
+    """
+    entry = local.get(key_hash)
+    if entry is not None:
+        return entry  # type: ignore[no-any-return]
+
+    redis = await _get_shared_redis()
+    if redis is None:
+        return None
+    try:
+        data = await redis.get(prefix + key_hash)
+    except Exception as exc:
+        logger.debug("OIDC shared-store Redis GET failed: %s", exc)
+        return None
+    if data is None:
+        return None
+    rebuilt = _deserialize_entry(data)
+    if rebuilt is None:
+        return None
+    # Back-fill the local cache so subsequent same-pod lookups are hot.
+    local.set(key_hash, rebuilt)
+    return rebuilt
+
+
+async def _shared_pop(local: _BoundedTTLDict, prefix: str, key_hash: str) -> None:
+    """Remove an entry from both the in-process dict and Redis (best-effort).
+
+    Used to evict an expired exchanged key. Redis failures are swallowed.
+    """
+    local.pop(key_hash)
+    redis = await _get_shared_redis()
+    if redis is None:
+        return
+    try:
+        await redis.delete(prefix + key_hash)
+    except Exception as exc:
+        logger.debug("OIDC shared-store Redis DELETE failed: %s", exc)
 
 
 def _generate_state() -> str:
@@ -1028,14 +1175,15 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
                 detail=f"ID token validation failed: {exc}",
             ) from exc
 
-        # Cache the identity
+        # Cache the identity (in-process + shared Redis when available)
         token_hash = _hash_token(id_token)
-        _identity_cache.set(
+        await _shared_set(
+            _identity_cache,
+            _REDIS_IDENTITY_KEY_PREFIX,
             token_hash,
-            (
-                identity,
-                time.monotonic() + config.session_ttl,
-            ),
+            identity,
+            time.monotonic() + config.session_ttl,
+            ttl_seconds=config.session_ttl,
         )
 
         logger.info(
@@ -1122,8 +1270,17 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
         api_key = f"sk-oidc-{secrets.token_urlsafe(32)}"
         key_hash = _hash_token(api_key)
 
-        # Store the key mapping
-        _exchanged_keys.set(key_hash, (identity, expires_at))
+        # Store the key mapping (in-process + shared Redis when available so the
+        # minted key is visible on every replica — RouteIQ-0716). The Redis TTL
+        # is bounded to the key's own remaining lifetime.
+        await _shared_set(
+            _exchanged_keys,
+            _REDIS_EXCHANGED_KEY_PREFIX,
+            key_hash,
+            identity,
+            expires_at,
+            ttl_seconds=expires_at - int(time.time()),
+        )
 
         alias = body.key_alias or f"oidc-{identity.user_id[:8]}"
 
@@ -1170,10 +1327,12 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
             )
         bearer_token = auth_header[7:]
 
-        # Check identity cache
+        # Check identity cache (in-process, then shared Redis when available)
         token_hash = _hash_token(bearer_token)
         _prune_expired_identities()
-        cached = _identity_cache.get(token_hash)
+        cached = await _shared_get(
+            _identity_cache, _REDIS_IDENTITY_KEY_PREFIX, token_hash
+        )
         if cached is not None:
             identity, _ = cached
             return JSONResponse(
@@ -1187,13 +1346,14 @@ def create_oidc_router(config: OIDCConfig) -> APIRouter:
         except OIDCAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-        # Cache the result
-        _identity_cache.set(
+        # Cache the result (in-process + shared Redis when available)
+        await _shared_set(
+            _identity_cache,
+            _REDIS_IDENTITY_KEY_PREFIX,
             token_hash,
-            (
-                identity,
-                time.monotonic() + config.session_ttl,
-            ),
+            identity,
+            time.monotonic() + config.session_ttl,
+            ttl_seconds=config.session_ttl,
         )
 
         return JSONResponse(
@@ -1236,18 +1396,24 @@ async def resolve_identity(request: Request) -> Optional[OIDCIdentity]:
     if _oidc_config is None or not _oidc_config.enabled:
         return None
 
-    # 1. Check for exchanged API key (custom header or Authorization)
+    # 1. Check for exchanged API key (custom header or Authorization).
+    #    Looks up the in-process map first, then the shared Redis store so a key
+    #    minted on another replica resolves here too (RouteIQ-0716).
     api_key = request.headers.get("x-api-key") or request.headers.get("X-Api-Key") or ""
     if api_key.startswith("sk-oidc-"):
         key_hash = _hash_token(api_key)
-        entry = _exchanged_keys.get(key_hash)
+        entry = await _shared_get(
+            _exchanged_keys, _REDIS_EXCHANGED_KEY_PREFIX, key_hash
+        )
         if entry is not None:
             identity, expires_at = entry
             if time.time() < expires_at:
                 return identity
             else:
-                # Expired — clean up
-                _exchanged_keys.pop(key_hash)
+                # Expired — clean up (both stores)
+                await _shared_pop(
+                    _exchanged_keys, _REDIS_EXCHANGED_KEY_PREFIX, key_hash
+                )
                 logger.debug(
                     "Expired OIDC-exchanged key removed for user %s", identity.user_id
                 )
@@ -1262,10 +1428,10 @@ async def resolve_identity(request: Request) -> Optional[OIDCIdentity]:
     if not bearer_token:
         return None
 
-    # Check identity cache
+    # Check identity cache (in-process, then shared Redis when available)
     token_hash = _hash_token(bearer_token)
     _prune_expired_identities()
-    cached = _identity_cache.get(token_hash)
+    cached = await _shared_get(_identity_cache, _REDIS_IDENTITY_KEY_PREFIX, token_hash)
     if cached is not None:
         identity, _ = cached
         return identity
@@ -1280,13 +1446,14 @@ async def resolve_identity(request: Request) -> Optional[OIDCIdentity]:
         logger.debug("OIDC identity resolution failed: %s", exc)
         return None
 
-    # Cache the result
-    _identity_cache.set(
+    # Cache the result (in-process + shared Redis when available)
+    await _shared_set(
+        _identity_cache,
+        _REDIS_IDENTITY_KEY_PREFIX,
         token_hash,
-        (
-            identity,
-            time.monotonic() + _oidc_config.session_ttl,
-        ),
+        identity,
+        time.monotonic() + _oidc_config.session_ttl,
+        ttl_seconds=_oidc_config.session_ttl,
     )
     return identity
 
