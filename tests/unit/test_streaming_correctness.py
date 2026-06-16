@@ -22,7 +22,7 @@ import hashlib
 import os
 import time
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 

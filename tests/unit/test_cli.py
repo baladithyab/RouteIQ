@@ -13,8 +13,6 @@ Tests cover:
 from __future__ import annotations
 
 import os
-import sys
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -241,7 +239,7 @@ class TestStartCommand:
     def test_start_workers_argument(self):
         """routeiq start --workers 4 should set ROUTEIQ_WORKERS env var."""
         with patch("sys.argv", ["routeiq", "start", "--workers", "4"]):
-            with patch("litellm_llmrouter.startup.main") as mock_startup:
+            with patch("litellm_llmrouter.startup.main"):
                 original = os.environ.get("ROUTEIQ_WORKERS")
                 try:
                     main()

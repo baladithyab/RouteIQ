@@ -30,7 +30,6 @@ from litellm_llmrouter.guardrail_policies import (
     GuardrailPhase,
     GuardrailPolicy,
     GuardrailPolicyEngine,
-    GuardrailResult,
     GuardrailType,
     HTTP_446_GUARDRAIL_DENIED,
     get_guardrail_policy_engine,

@@ -1,6 +1,5 @@
 """Unit tests for the evaluation feedback loop pipeline."""
 
-import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 

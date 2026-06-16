@@ -1,7 +1,6 @@
 """Unit tests for Router-R1 iterative reasoning router."""
 
 import asyncio
-from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

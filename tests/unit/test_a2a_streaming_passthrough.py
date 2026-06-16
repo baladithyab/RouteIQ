@@ -20,7 +20,7 @@ import asyncio
 import json
 import os
 from typing import Any, AsyncIterator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
