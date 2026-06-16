@@ -897,6 +897,17 @@ def create_gateway_app(
     # --- Admin UI static files (after routes so API routes take priority) ---
     _mount_admin_ui(app)
 
+    # --- Anthropic Messages bare-path surface (must precede the /v1 mount) ---
+    # Upstream LiteLLM registers the Anthropic Messages family only at the
+    # /v1-prefixed path, so mounting it under /v1 would expose it at
+    # /v1/v1/messages (404 for Anthropic SDK callers POSTing /v1/messages).
+    # Registering these explicit routes on the parent app BEFORE the /v1 mount
+    # makes them match first at the bare external /v1/messages path.
+    if mount_litellm:
+        from ..routes.messages import register_messages_routes
+
+        register_messages_routes(app)
+
     # --- Mount LiteLLM as sub-application ---
     if mount_litellm:
         try:
