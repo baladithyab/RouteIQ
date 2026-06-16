@@ -1,6 +1,9 @@
 version: '1'
 domains:
   aws-rearch: {}
+  container: {}
+  kumaraswamy-thompson: {}
+  testing: {}
 governance:
   max_entries: 100
   warn_entries: 150
