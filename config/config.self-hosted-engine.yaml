@@ -1,0 +1,130 @@
+# RouteIQ Gateway - Self-Hosted Inference Engine Configuration (C3b)
+# =============================================================================
+# Registers a FIRST self-hosted inference engine (vLLM Production Stack or
+# AIBrix, or a Dynamo serving group) as ONE LiteLLM deployment whose api_base
+# points at the engine's IN-CLUSTER gateway/frontend Service.
+#
+# Source of truth:
+#   docs/architecture/aws-rearchitecture/50-litellm-universal-surface.md  §4 (C3b)
+#   docs/architecture/aws-rearchitecture/51-multinode-large-model-serving.md §3.2
+#   Seeds: RouteIQ-91fe (C3b engine as ONE api_base), RouteIQ-28be (KVBM tiers)
+#
+# -----------------------------------------------------------------------------
+# THE TWO-LAYER ROUTING RULE (read before editing model_list)
+# -----------------------------------------------------------------------------
+# RouteIQ does Layer-1 model SELECTION: its Kumaraswamy-Thompson bandit + the 18
+# ML strategies pick WHICH model / api_base to call. The engine does Layer-2
+# replica SCHEDULING (KV-cache-aware routing, LoRA-aware autoscaling, KVBM cache
+# tiering) BELOW one api_base, opaque to RouteIQ. The two layers COMPOSE iff
+# RouteIQ targets exactly ONE api_base per model.
+#
+#   CRITICAL -- THE ONE CONFIG ERROR TO AVOID:
+#   Register the engine FRONTEND / gateway Service as ONE LiteLLM deployment.
+#   NEVER register individual workers / replicas / prefill+decode pods as
+#   separate model_list rows. Doing so collapses Layer-1 model-selection into
+#   Layer-2 replica-scheduling: RouteIQ would take cache-blind, topology-blind
+#   replica decisions that FIGHT the engine's own KV-aware Smart Router
+#   (vLLM Production Stack / AIBrix Router / Dynamo FlashIndexer).
+#   api_base = the engine's in-cluster Service, NEVER a pod IP / replica.
+#
+#   (It IS fine to have multiple model_list rows under one model_name when they
+#   are genuinely separate CAPACITY SOURCES -- e.g. this engine arm AND a
+#   Bedrock arm -- but never multiple rows pointing INSIDE one engine group.)
+# =============================================================================
+
+model_list:
+  # --- Arm: ONE self-hosted engine, registered as ONE api_base (C3b) ---------
+  # provider hosted_vllm consumes the engine's OpenAI-compatible /v1 endpoint
+  # directly via api_base with no translation shim. The engine's in-cluster
+  # gateway Service is the frontend -- the KV-aware router lives BELOW it.
+  #
+  # AIBrix:                http://aibrix-gateway.aibrix-system.svc.cluster.local:8000/v1
+  # vLLM Production Stack: http://<release>-router-service.<ns>.svc.cluster.local/v1
+  # Dynamo frontend:       http://dynamo-frontend.dynamo-system.svc.cluster.local:8000/v1
+  - model_name: oss-70b
+    litellm_params:
+      # model = hosted_vllm/<the model id the engine serves> (NOT a worker id).
+      model: hosted_vllm/meta-llama/Llama-3.1-70B-Instruct
+      # api_base = the engine FRONTEND Service (ONE per model). Never a replica.
+      api_base: http://aibrix-gateway.aibrix-system.svc.cluster.local:8000/v1
+      # hosted_vllm requires a non-empty api_key even though the in-cluster
+      # engine does not authenticate -- "fake-api-key" is the documented sentinel
+      # (reference/litellm/litellm/llms/hosted_vllm/chat/transformation.py).
+      api_key: fake-api-key
+
+  # --- Optional sibling capacity arm (DIFFERENT source, same alias is fine) ---
+  # A Bedrock arm under the SAME model_name is a legitimate second CAPACITY
+  # SOURCE (429 failover across self-hosted + managed). This is NOT the error
+  # above -- it is a distinct backend, not a replica inside the engine.
+  # - model_name: oss-70b
+  #   litellm_params:
+  #     model: bedrock/meta.llama3-1-70b-instruct-v1:0
+  #     aws_region_name: us-west-2
+
+# =============================================================================
+# Router Settings
+# =============================================================================
+router_settings:
+  # Start with simple-shuffle; switch to an llmrouter-* strategy once the engine
+  # arm has accumulated routing telemetry. The strategy picks the model_name
+  # group's surviving arm -- it never reaches inside the engine.
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  retry_after: 5
+  timeout: 600
+
+# =============================================================================
+# General Settings
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+# =============================================================================
+# DYNAMO KVBM REMOTE KV-CACHE TIERS (RouteIQ-28be) -- ENGINE-SIDE, NOT HERE
+# =============================================================================
+# KVBM (KV Block Manager) is Dynamo's write-through unified-memory layer that
+# offloads KV blocks down four tiers:
+#   G1 GPU HBM -> G2 CPU pinned DRAM -> G3 local NVMe -> G4 remote (S3/MinIO).
+# It is a LAYER-2-AND-BELOW concern that lives ENTIRELY inside the ONE api_base
+# above. RouteIQ config is UNCHANGED whether or not KVBM is enabled -- the
+# DYN_KVBM_* knobs are set as env on the ENGINE (Dynamo) deployment, never on
+# RouteIQ. They are documented here only so the layering is explicit.
+#
+# Two EFA-FREE shapes land AT C3b on the single-node engine (no cross-node
+# RDMA, so no EFA, no node group):
+#   (1) single-node aggregated  G1 -> G2 -> G3   (DynamoConnector, kv_role kv_both)
+#   (2) remote G4 object tier    S3 / MinIO       (DYN_KVBM_OBJECT_*, standard TCP)
+# The (3) disaggregated prefill/decode shape needs cross-node EFA -- OUT OF
+# SCOPE here (operator-gated, the C3-deep EFA seed).
+#
+# WRITE-THROUGH SIZING TRAP (the single most important KVBM rule):
+#   DYN_KVBM_CPU_CACHE_GB  >= GPU KV-cache size   (G2 >= G1)
+#   DYN_KVBM_DISK_CACHE_GB >= DYN_KVBM_CPU_CACHE_GB (G3 >= G2)
+# If a lower tier is smaller than the tier above it, KVBM churns -- it offloads
+# after every forward pass for NO benefit and can DEGRADE performance.
+#
+# Example DYN_KVBM_* env block for the ENGINE pod (illustrative -- set on the
+# DynamoGraphDeployment, NOT on RouteIQ; tier sizes are operator-sized to the
+# real GPU KV footprint, which needs the live GPU):
+#
+#   env:
+#     # (1) single-node aggregated G1->G2->G3
+#     - {name: DYN_KVBM_CPU_CACHE_GB,  value: "100"}   # G2 >= GPU KV size
+#     - {name: DYN_KVBM_DISK_CACHE_GB, value: "400"}   # G3 >= G2
+#     # (2) remote G4 object tier (EFA-free, standard TCP to S3/MinIO)
+#     - {name: DYN_KVBM_OBJECT_ENABLED,  value: "true"}
+#     - {name: DYN_KVBM_OBJECT_BUCKET,   value: "routeiq-kvbm-g4"}
+#     - {name: DYN_KVBM_OBJECT_REGION,   value: "us-west-2"}
+#     # - {name: DYN_KVBM_OBJECT_ENDPOINT, value: "https://minio.internal:9000"} # MinIO only
+#     # ObjectLockManager (conditional PUT If-None-Match:*) makes the G4 tier
+#     # multi-replica-safe -- shared system prompts / tool defs are computed once
+#     # and reused across replicas.
+#
+# The LIVE deploy (Dynamo operator + DynamoGraphDeployment CRD + etcd + NATS,
+# GPU node with the sized DRAM/NVMe, real S3 bucket + IAM) is OPERATOR-GATED and
+# out of scope for this RouteIQ-side config. See:
+#   docs/architecture/aws-rearchitecture/52-self-hosted-engine-kvbm.md
