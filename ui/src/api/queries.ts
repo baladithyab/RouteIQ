@@ -6,6 +6,8 @@ import type {
     GlobalStats,
     MyStats,
     ModelInfo,
+    ModelUpsertRequest,
+    ModelMutationResponse,
     RoutingConfig,
     UpdateRoutingConfig,
     Workspace,
@@ -50,11 +52,16 @@ export function useGlobalStats() {
     })
 }
 
-export function useUserStats() {
+// /me/stats is a USER-tier endpoint: it MUST be called with the end-user's
+// token (RouteIQ-f98a), not the admin key, so the gateway resolves the caller's
+// OWN identity. Gated on a held user token so it does not fire (and 401) before
+// the user logs in.
+export function useUserStats(enabled: boolean) {
     return useQuery<MyStats>({
         queryKey: ['user-stats'],
-        queryFn: () => apiClient.get<MyStats>('/api/v1/routeiq/me/stats'),
+        queryFn: () => apiClient.get<MyStats>('/api/v1/routeiq/me/stats', 'user'),
         refetchInterval: 15_000,
+        enabled,
     })
 }
 
@@ -63,6 +70,46 @@ export function useModels() {
         queryKey: ['models'],
         queryFn: () => apiClient.get<ModelInfo[]>('/api/v1/routeiq/models'),
         refetchInterval: 30_000,
+    })
+}
+
+// --- Model CRUD hooks (admin auth, RouteIQ-eb2d) ---
+
+export function useAddModel() {
+    const queryClient = useQueryClient()
+    return useMutation<ModelMutationResponse, Error, ModelUpsertRequest>({
+        mutationFn: (data) =>
+            apiClient.post<ModelMutationResponse>('/api/v1/routeiq/models', data),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['models'] })
+        },
+    })
+}
+
+export function useUpdateModel() {
+    const queryClient = useQueryClient()
+    return useMutation<ModelMutationResponse, Error, { modelName: string; data: ModelUpsertRequest }>({
+        mutationFn: ({ modelName, data }) =>
+            apiClient.put<ModelMutationResponse>(
+                `/api/v1/routeiq/models/${encodeURIComponent(modelName)}`,
+                data,
+            ),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['models'] })
+        },
+    })
+}
+
+export function useDeleteModel() {
+    const queryClient = useQueryClient()
+    return useMutation<ModelMutationResponse, Error, string>({
+        mutationFn: (modelName) =>
+            apiClient.delete<ModelMutationResponse>(
+                `/api/v1/routeiq/models/${encodeURIComponent(modelName)}`,
+            ),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['models'] })
+        },
     })
 }
 

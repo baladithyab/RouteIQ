@@ -1,4 +1,14 @@
-import { useGatewayStatus, useRoutingStats, useGlobalStats, useModels } from '../api/queries'
+import { useState } from 'react'
+import {
+  useGatewayStatus,
+  useRoutingStats,
+  useGlobalStats,
+  useModels,
+  useAddModel,
+  useUpdateModel,
+  useDeleteModel,
+} from '../api/queries'
+import type { ModelInfo } from '../api/types'
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -128,11 +138,96 @@ function DistTable({ label, distribution }: { label: string; distribution: Recor
   )
 }
 
+// --- Model CRUD form: drives the admin add/edit endpoints (RouteIQ-eb2d) ---
+function ModelForm({
+  initial,
+  onClose,
+}: {
+  initial: ModelInfo | null // null => add, non-null => edit
+  onClose: () => void
+}) {
+  const isEdit = initial !== null
+  const [modelName, setModelName] = useState(initial?.model_name ?? '')
+  const [modelId, setModelId] = useState(initial?.model_id ?? '')
+  const addModel = useAddModel()
+  const updateModel = useUpdateModel()
+  const pending = addModel.isPending || updateModel.isPending
+  const error = (addModel.error || updateModel.error) as Error | null
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const body = {
+      model_name: modelName.trim(),
+      litellm_params: { model: modelId.trim() },
+    }
+    if (isEdit && initial) {
+      updateModel.mutate(
+        { modelName: initial.model_name, data: body },
+        { onSuccess: onClose },
+      )
+    } else {
+      addModel.mutate(body, { onSuccess: onClose })
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="bg-gray-50 rounded-lg p-4 mb-4 space-y-3">
+      <h4 className="text-sm font-semibold text-gray-800">
+        {isEdit ? `Edit ${initial?.model_name}` : 'Add Model'}
+      </h4>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs text-gray-500 uppercase tracking-wide mb-1">
+            Model Name
+          </label>
+          <input
+            value={modelName}
+            onChange={(e) => setModelName(e.target.value)}
+            placeholder="claude-3-5-sonnet"
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 uppercase tracking-wide mb-1">
+            litellm_params.model
+          </label>
+          <input
+            value={modelId}
+            onChange={(e) => setModelId(e.target.value)}
+            placeholder="anthropic/claude-3-5-sonnet"
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono"
+          />
+        </div>
+      </div>
+      {error && <p className="text-red-600 text-xs">{error.message}</p>}
+      <div className="flex gap-2">
+        <button
+          type="submit"
+          disabled={pending || !modelName.trim() || !modelId.trim()}
+          className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-40"
+        >
+          {pending ? 'Saving…' : isEdit ? 'Save' : 'Add'}
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="px-4 py-2 rounded-lg bg-white border border-gray-300 text-gray-700 text-sm font-medium hover:bg-gray-50"
+        >
+          Cancel
+        </button>
+      </div>
+    </form>
+  )
+}
+
 export default function Dashboard() {
   const status = useGatewayStatus()
   const stats = useRoutingStats()
   const global = useGlobalStats()
   const models = useModels()
+  const deleteModel = useDeleteModel()
+  // null = form closed; 'new' = add form; a ModelInfo = edit that model.
+  const [editing, setEditing] = useState<ModelInfo | 'new' | null>(null)
 
   return (
     <div>
@@ -267,7 +362,7 @@ export default function Dashboard() {
 
       <div className="mb-6" />
 
-      {/* Model Overview - full width */}
+      {/* Model Overview - full width (with admin CRUD, RouteIQ-eb2d) */}
       <Card
         title="Model Overview"
         isLoading={models.isLoading}
@@ -275,6 +370,29 @@ export default function Dashboard() {
         error={models.error as Error}
         onRetry={() => models.refetch()}
       >
+        <div className="flex justify-end mb-3">
+          {editing === null && (
+            <button
+              type="button"
+              onClick={() => setEditing('new')}
+              className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700"
+            >
+              + Add Model
+            </button>
+          )}
+        </div>
+
+        {editing !== null && (
+          <ModelForm
+            initial={editing === 'new' ? null : editing}
+            onClose={() => setEditing(null)}
+          />
+        )}
+
+        {deleteModel.error && (
+          <p className="text-red-600 text-xs mb-3">{(deleteModel.error as Error).message}</p>
+        )}
+
         {models.data && models.data.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -284,6 +402,7 @@ export default function Dashboard() {
                   <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Provider</th>
                   <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Model ID</th>
                   <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Status</th>
+                  <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -293,6 +412,23 @@ export default function Dashboard() {
                     <td className="py-2.5 px-3 text-gray-600">{model.provider}</td>
                     <td className="py-2.5 px-3 text-gray-500 font-mono text-xs">{model.model_id}</td>
                     <td className="py-2.5 px-3"><StatusBadge status={model.status} /></td>
+                    <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                      <button
+                        type="button"
+                        onClick={() => setEditing(model)}
+                        className="text-blue-600 hover:text-blue-800 text-xs font-medium mr-3"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteModel.mutate(model.model_name)}
+                        disabled={deleteModel.isPending}
+                        className="text-red-600 hover:text-red-800 text-xs font-medium disabled:opacity-40"
+                      >
+                        Remove
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>

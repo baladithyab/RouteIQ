@@ -370,6 +370,216 @@ def reset_stats_accumulator() -> None:
 
 
 # =============================================================================
+# Cluster-wide shared stats store (RouteIQ-78fd)
+# =============================================================================
+#
+# The :class:`RoutingStatsAccumulator` above is PER-WORKER: each uvicorn worker
+# / replica keeps its own copy, so the admin Routing-stats panel only ever shows
+# the worker that served the scrape.  This store layers a Redis-backed
+# *cluster-wide* aggregate on top: every worker mirrors its decision counters
+# into shared Redis keys (write-through), and the admin ``/stats/global``
+# endpoint reads the SUM across all workers back out.
+#
+# Lower-risk-than-Prometheus design (per the seed): reuse the existing
+# ``redis_pool`` async client.  When Redis is unavailable the cluster snapshot
+# falls back to the in-memory per-worker snapshot, so the panel still renders
+# (degraded to one worker) rather than erroring.
+
+# Redis key namespace + TTL for the shared counters.  Counters are refreshed on
+# every write so an idle cluster eventually expires the keys (avoids unbounded
+# growth of per-strategy / per-model fields after a config change).
+_CLUSTER_STATS_PREFIX = "routeiq:stats:cluster"
+_CLUSTER_STATS_TTL_SECONDS = 7 * 24 * 3600  # 7 days; refreshed on every write
+
+
+def _cluster_stats_enabled() -> bool:
+    """Whether cluster-wide stats write-through is enabled (default ON).
+
+    Reads ``ROUTEIQ_CLUSTER_STATS_ENABLED`` (true/1/yes/on).  When OFF the
+    accumulator does NOT mirror to Redis and the global endpoint serves the
+    in-memory per-worker snapshot (the historical behaviour).  Never raises.
+    """
+    return os.getenv("ROUTEIQ_CLUSTER_STATS_ENABLED", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _k(*parts: str) -> str:
+    """Build a namespaced cluster-stats Redis key."""
+    return ":".join((_CLUSTER_STATS_PREFIX, *parts))
+
+
+async def mirror_decision_to_cluster(
+    *,
+    strategy: Optional[str] = None,
+    model: Optional[str] = None,
+    profile: Optional[str] = None,
+    key_id: Optional[str] = None,
+    centroid: bool = False,
+) -> bool:
+    """Write-through ONE routing decision into the shared cluster counters.
+
+    Mirrors the same dimensions the in-memory accumulator tracks into shared
+    Redis keys so every worker contributes to a single cluster-wide aggregate:
+
+      * ``<prefix>:totals``  -- a hash with ``total_decisions`` /
+        ``centroid_decisions`` fields,
+      * ``<prefix>:strategy`` / ``:profile`` / ``:model`` -- hashes of per-name
+        counts,
+      * ``<prefix>:keys``    -- a hash of per-key decision counts (for
+        ``tracked_keys`` / ``key_distribution``).
+
+    Uses a pipeline so the mirror is one network round-trip per decision and
+    every touched key gets its TTL refreshed.  Fully fail-open: returns
+    ``False`` (and never raises) when Redis is absent/disabled so the request
+    path is never broken by cluster bookkeeping.
+    """
+    if not _cluster_stats_enabled():
+        return False
+    try:
+        from litellm_llmrouter.redis_pool import get_async_redis_client
+
+        redis = await get_async_redis_client()
+        if redis is None:
+            return False
+
+        totals_key = _k("totals")
+        pipe = redis.pipeline()
+        pipe.hincrby(totals_key, "total_decisions", 1)
+        if centroid:
+            pipe.hincrby(totals_key, "centroid_decisions", 1)
+        pipe.expire(totals_key, _CLUSTER_STATS_TTL_SECONDS)
+
+        if strategy:
+            sk = _k("strategy")
+            pipe.hincrby(sk, strategy, 1)
+            pipe.expire(sk, _CLUSTER_STATS_TTL_SECONDS)
+        if profile:
+            pk = _k("profile")
+            pipe.hincrby(pk, profile, 1)
+            pipe.expire(pk, _CLUSTER_STATS_TTL_SECONDS)
+        if model:
+            mk = _k("model")
+            pipe.hincrby(mk, model, 1)
+            pipe.expire(mk, _CLUSTER_STATS_TTL_SECONDS)
+        if key_id:
+            kk = _k("keys")
+            pipe.hincrby(kk, key_id, 1)
+            pipe.expire(kk, _CLUSTER_STATS_TTL_SECONDS)
+
+        await pipe.execute()
+        return True
+    except Exception:  # pragma: no cover - cluster stats must never break routing
+        logger.debug("Failed to mirror decision to cluster store", exc_info=True)
+        return False
+
+
+def _coerce_int_hash(raw: Any) -> Dict[str, int]:
+    """Coerce a Redis HGETALL result into a ``{str: int}`` map.
+
+    Tolerates bytes keys/values (``decode_responses=False`` clients) and
+    non-numeric junk (skipped), so a malformed field never breaks the read.
+    """
+    out: Dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            name = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+            out[name] = int(v)
+        except Exception:
+            continue
+    return out
+
+
+async def cluster_global_snapshot() -> Dict[str, Any]:
+    """Return the CLUSTER-WIDE global aggregate, or the per-worker fallback.
+
+    Reads the shared Redis counters (summed across every worker that mirrored
+    into them) and shapes them into the SAME dict ``global_snapshot`` returns,
+    so the admin ``/stats/global`` endpoint is a drop-in.  Two fields cannot be
+    reconstructed cluster-wide from the counters and are taken from the local
+    accumulator as a best-effort overlay:
+
+      * ``profile_distribution`` is cluster-wide (mirrored), and
+      * ``average_latency_ms`` is LOCAL only (latency is a per-worker rolling
+        mean that does not sum), so it reflects the serving worker.
+
+    Fail-open: when cluster stats are disabled or Redis is unavailable this
+    returns the local :meth:`RoutingStatsAccumulator.global_snapshot` verbatim,
+    annotated with ``cluster_wide=False`` so the caller/UI can show scope.
+    """
+    local = get_stats_accumulator().global_snapshot()
+    local["cluster_wide"] = False
+
+    if not _cluster_stats_enabled():
+        return local
+
+    try:
+        from litellm_llmrouter.redis_pool import get_async_redis_client
+
+        redis = await get_async_redis_client()
+        if redis is None:
+            return local
+
+        totals = _coerce_int_hash(await redis.hgetall(_k("totals")))
+        strategy = _coerce_int_hash(await redis.hgetall(_k("strategy")))
+        profile = _coerce_int_hash(await redis.hgetall(_k("profile")))
+        model = _coerce_int_hash(await redis.hgetall(_k("model")))
+        keys = _coerce_int_hash(await redis.hgetall(_k("keys")))
+
+        total_decisions = totals.get("total_decisions", 0)
+        if total_decisions == 0 and not keys and not strategy:
+            # Nothing mirrored yet (fresh cluster / Redis flushed): the local
+            # snapshot is at least as informative.
+            return local
+
+        return {
+            "total_decisions": total_decisions,
+            "strategy_distribution": strategy,
+            "profile_distribution": profile,
+            "centroid_decisions": totals.get("centroid_decisions", 0),
+            # Latency does not aggregate via counters; surface the local mean.
+            "average_latency_ms": local["average_latency_ms"],
+            "model_distribution": model,
+            "key_distribution": keys,
+            "tracked_keys": len(keys),
+            "cluster_wide": True,
+        }
+    except Exception:  # pragma: no cover - cluster read must never break the panel
+        logger.debug("Failed to read cluster stats snapshot", exc_info=True)
+        return local
+
+
+async def reset_cluster_stats() -> bool:
+    """Delete all shared cluster-stats keys (for tests / operator reset).
+
+    Returns ``True`` when a delete was issued, ``False`` when Redis is
+    unavailable.  Fail-open: never raises.
+    """
+    try:
+        from litellm_llmrouter.redis_pool import get_async_redis_client
+
+        redis = await get_async_redis_client()
+        if redis is None:
+            return False
+        await redis.delete(
+            _k("totals"),
+            _k("strategy"),
+            _k("profile"),
+            _k("model"),
+            _k("keys"),
+        )
+        return True
+    except Exception:  # pragma: no cover
+        logger.debug("Failed to reset cluster stats", exc_info=True)
+        return False
+
+
+# =============================================================================
 # LLM API Path Registry
 # =============================================================================
 
@@ -1194,15 +1404,68 @@ def _record_decision_stats(
                 or metadata.get("_user")
             )
 
+        resolved_key = str(key_id) if key_id else None
         get_stats_accumulator().record_decision(
             strategy=strategy,
             model=model,
             profile=profile,
-            key_id=str(key_id) if key_id else None,
+            key_id=resolved_key,
             user_id=str(user_id) if user_id else None,
+        )
+
+        # Write-through to the cluster-wide shared store (RouteIQ-78fd) so every
+        # worker contributes to a single cross-replica aggregate.  Fire-and-forget
+        # on the running loop; a no-op when no loop / Redis is available.
+        _schedule_cluster_mirror(
+            strategy=strategy,
+            model=model,
+            profile=profile,
+            key_id=resolved_key,
+            centroid=strategy == _CENTROID_STRATEGY_NAME,
         )
     except Exception:  # pragma: no cover - stats must never break routing
         logger.debug("Failed to record decision stats", exc_info=True)
+
+
+def _schedule_cluster_mirror(
+    *,
+    strategy: Optional[str],
+    model: Optional[str],
+    profile: Optional[str],
+    key_id: Optional[str],
+    centroid: bool,
+) -> None:
+    """Fire-and-forget the async cluster mirror without blocking the caller.
+
+    ``_record_decision_stats`` runs on the sync callback path which MAY be
+    inside the request event loop (async callback) or on a plain thread (sync
+    callback).  When a running loop is present we schedule the coroutine as a
+    task; otherwise we drop the mirror (the local accumulator already recorded
+    it, and the next loop-bound decision will refresh the shared keys).  Never
+    raises -- cluster bookkeeping must never break routing.
+    """
+    if not _cluster_stats_enabled():
+        return
+    try:
+        import asyncio
+
+        coro = mirror_decision_to_cluster(
+            strategy=strategy,
+            model=model,
+            profile=profile,
+            key_id=key_id,
+            centroid=centroid,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop on this thread: close the coroutine to avoid a
+            # "coroutine was never awaited" warning and skip the mirror.
+            coro.close()
+            return
+        loop.create_task(coro)
+    except Exception:  # pragma: no cover - mirror scheduling must never raise
+        logger.debug("Failed to schedule cluster mirror", exc_info=True)
 
 
 def _extract_response_content(response_obj: Any) -> str:

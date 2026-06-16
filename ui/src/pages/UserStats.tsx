@@ -1,5 +1,15 @@
 import type React from 'react'
+import { useEffect, useState } from 'react'
 import { useUserStats, useGlobalStats } from '../api/queries'
+import {
+    fetchUiConfig,
+    beginLogin,
+    captureTokenFromRedirect,
+    isUserAuthenticated,
+    logoutUser,
+    setUserToken,
+    type UiConfig,
+} from '../api/auth'
 
 function Card({ title, children, isLoading, isError, error, onRetry }: {
   title: string
@@ -53,9 +63,94 @@ function fmtUsd(value: number | null): string {
   return value === null ? '-' : `$${value.toFixed(2)}`
 }
 
+// --- Login: obtain a USER token via the gateway-advertised OIDC flow ---
+// (RouteIQ-f98a). Falls back to a token-entry field when SSO is not configured
+// so the user-tier path is still exercisable. Both channels feed the SAME
+// apiClient user-token store that /me/stats reads.
+function UserLogin({ onAuthenticated }: { onAuthenticated: () => void }) {
+  const [uiConfig, setUiConfig] = useState<UiConfig | null>(null)
+  const [configError, setConfigError] = useState<string | null>(null)
+  const [manualToken, setManualToken] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    fetchUiConfig()
+      .then((cfg) => {
+        if (!cancelled) setUiConfig(cfg)
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setConfigError(err.message)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const ssoEnabled = !!uiConfig?.oidc.enabled && !!uiConfig?.oidc.login_url
+
+  const handleManualSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const token = manualToken.trim()
+    if (!token) return
+    setUserToken(token)
+    onAuthenticated()
+  }
+
+  return (
+    <Card title="Sign in to view your usage">
+      <div className="space-y-4">
+        <p className="text-sm text-gray-600">
+          Your usage is scoped to your own identity. Sign in with your account
+          to view it &mdash; the admin key is not used here.
+        </p>
+
+        {ssoEnabled && uiConfig?.oidc.login_url && (
+          <button
+            type="button"
+            onClick={() => beginLogin(uiConfig.oidc.login_url as string)}
+            className="inline-flex items-center px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700"
+          >
+            Sign in with SSO
+          </button>
+        )}
+
+        {!ssoEnabled && (
+          <p className="text-xs text-amber-600">
+            {configError
+              ? `Could not load login config: ${configError}`
+              : 'SSO is not configured on this gateway. Enter a user token to continue.'}
+          </p>
+        )}
+
+        <form onSubmit={handleManualSubmit} className="space-y-2">
+          <label className="block text-xs text-gray-500 uppercase tracking-wide">
+            User token
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="password"
+              value={manualToken}
+              onChange={(e) => setManualToken(e.target.value)}
+              placeholder="sk-oidc-..."
+              className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono"
+            />
+            <button
+              type="submit"
+              disabled={!manualToken.trim()}
+              className="px-4 py-2 rounded-lg bg-gray-900 text-white text-sm font-medium hover:bg-gray-700 disabled:opacity-40"
+            >
+              Continue
+            </button>
+          </div>
+        </form>
+      </div>
+    </Card>
+  )
+}
+
 // --- My Stats: caller's own scope (GET /me/stats, user auth, own-scope only) ---
-function MyStatsSection() {
-  const me = useUserStats()
+function MyStatsSection({ onLogout }: { onLogout: () => void }) {
+  const me = useUserStats(true)
 
   return (
     <Card
@@ -115,6 +210,16 @@ function MyStatsSection() {
           ) : (
             <p className="text-gray-500 text-sm">No routing decisions yet</p>
           )}
+
+          <div className="mt-6 pt-4 border-t border-gray-100">
+            <button
+              type="button"
+              onClick={onLogout}
+              className="text-sm text-gray-500 hover:text-gray-800 font-medium"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       )}
     </Card>
@@ -140,9 +245,25 @@ function PerKeySection() {
     >
       {global.data && (
         <div>
-          <p className="text-xs text-gray-500 mb-4">
-            Org-wide rollup across {global.data.tracked_keys.toLocaleString()} tracked
-            {global.data.tracked_keys === 1 ? ' key' : ' keys'}.
+          <p className="text-xs text-gray-500 mb-4 flex items-center gap-2 flex-wrap">
+            <span>
+              Org-wide rollup across {global.data.tracked_keys.toLocaleString()} tracked
+              {global.data.tracked_keys === 1 ? ' key' : ' keys'}.
+            </span>
+            <span
+              className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                global.data.cluster_wide
+                  ? 'bg-green-100 text-green-700'
+                  : 'bg-amber-100 text-amber-700'
+              }`}
+              title={
+                global.data.cluster_wide
+                  ? 'Aggregated across all replicas via the shared store'
+                  : 'Shared store unavailable — showing the single serving worker'
+              }
+            >
+              {global.data.cluster_wide ? 'cluster-wide' : 'per-worker'}
+            </span>
           </p>
           {entries.length > 0 ? (
             <div className="overflow-x-auto">
@@ -177,11 +298,28 @@ function PerKeySection() {
 }
 
 export default function UserStats() {
+  // On mount, capture any user_token the gateway callback appended to the URL
+  // (OIDC round-trip return), then reflect the held-token state.
+  const [authed, setAuthed] = useState<boolean>(() => {
+    captureTokenFromRedirect()
+    return isUserAuthenticated()
+  })
+
+  const handleAuthenticated = () => setAuthed(true)
+  const handleLogout = () => {
+    logoutUser()
+    setAuthed(false)
+  }
+
   return (
     <div>
       <h2 className="text-2xl font-bold text-gray-900 mb-6">User Stats</h2>
       <div className="space-y-6">
-        <MyStatsSection />
+        {authed ? (
+          <MyStatsSection onLogout={handleLogout} />
+        ) : (
+          <UserLogin onAuthenticated={handleAuthenticated} />
+        )}
         <PerKeySection />
       </div>
     </div>

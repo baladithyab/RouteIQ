@@ -29,6 +29,9 @@ export interface GlobalStats {
     centroid_decisions: number
     average_latency_ms: number
     tracked_keys: number
+    // True when the figures are the cross-replica aggregate (RouteIQ-78fd);
+    // false when they fall back to the single serving worker.
+    cluster_wide: boolean
 }
 
 // Caller-scoped usage from GET /api/v1/routeiq/me/stats (user auth, own-scope only)
@@ -48,6 +51,20 @@ export interface ModelInfo {
     provider: string
     model_id: string
     status: 'active' | 'degraded' | 'unavailable'
+}
+
+// Request body for POST/PUT /api/v1/routeiq/models (admin auth, RouteIQ-eb2d)
+export interface ModelUpsertRequest {
+    model_name: string
+    litellm_params: Record<string, unknown>
+    model_info?: Record<string, unknown> | null
+}
+
+// Result of a model CRUD mutation
+export interface ModelMutationResponse {
+    model_name: string
+    action: 'added' | 'updated' | 'removed'
+    model_count: number
 }
 
 // Routing config from GET /api/v1/routeiq/routing/config
