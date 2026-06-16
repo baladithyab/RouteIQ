@@ -142,21 +142,52 @@ This is the architectural fork (refined). Restated as a support matrix:
 **P6e-GB200 UltraServer** (arm64 Grace, up to 28.8 Tbps). These are the families that
 both expose EFA NICs *and* have the local NVMe that the KVBM G3 disk tier (Part 2) wants.
 
-## 1.2 Tensor / pipeline parallel across nodes — LWS / JobSet + EFA + capacity
+## 1.2 Tensor / pipeline parallel across nodes — Grove + KAI (gang) + EFA + capacity
 
-**[VERIFIED, framework existence] / [SPECULATIVE, our exact wiring]** A model too large
-for one node is served by **one logical replica that spans several nodes**. The K8s
-primitive for "a group of pods that must be co-scheduled and addressed as one unit" is a
-**gang**: either **LeaderWorkerSet (LWS)** or **JobSet**. The leader runs the
-rank-0 / coordinator role and the workers run the remaining tensor/pipeline-parallel
-ranks; all of them sit on the EFA node group and request `vpc.amazonaws.com/efa`.
+**[VERIFIED — researched 2026-06-16, cited below]** A model too large for one node is served
+by **one logical replica that spans several nodes**. The K8s primitive for "a group of pods
+that must be co-scheduled and addressed as one unit" is a **gang**. There are two real
+options for Dynamo multi-node, and **NVIDIA's recommended/default is Grove + KAI** (the
+Dynamo operator selects Grove when present and hard-errors on a multinode deploy if neither
+Grove nor LWS is available):
+
+- **Option 1 — RECOMMENDED: NVIDIA Grove (PodCliqueSet) enforced by the KAI Scheduler.**
+  Grove (`github.com/ai-dynamo/grove`, `grove.io/v1alpha1`) is a *hierarchical* gang API:
+  `PodCliqueSet` (the whole serving system; each replica is one gang) → `PodCliqueScalingGroup`
+  (a set of cliques that scale together in a fixed ratio — e.g. 1 leader + N workers as one
+  multi-node instance) → `PodClique` (one role: prefill / decode / router, each with its own
+  `minAvailable`) → `PodGang` (the auto-generated scheduler-interface CR). This models
+  **disaggregated prefill/decode at *different* scale ratios** with a *service-level*
+  `minAvailable` so the scheduler only admits a functionally-complete end-to-end pipeline —
+  the exact problem flat gang scheduling can't express. **KAI Scheduler**
+  (`github.com/NVIDIA/KAI-Scheduler`, NVIDIA's open-sourced ex-Run:ai scheduler, CNCF Sandbox)
+  is the scheduler that *enforces* Grove's PodGang: it has a `GroveGrouper` plugin that turns
+  the PodGang into its `PodGroup` (MinMember + MinSubGroup) and applies the topology
+  constraints. KAI is a **secondary scheduler, opt-in per pod** (`schedulerName: kai-scheduler`
+  + `kai.scheduler/queue`) that **coexists** with the default kube-scheduler. The Dynamo DGD
+  exposes Grove via `topologyConstraint` (`packDomain: rack|block`, NOT `host`, for multinode)
+  + `cliqueStartupType`/`startsAfter` for role startup ordering, so you never touch Grove
+  internals. Pin **KAI ≥ v0.13.0** (topology-aware scheduling) + **Grove ≥ v0.1.0-alpha.6**
+  per the Dynamo 1.0.x compatibility matrix.
+- **Option 2 — FALLBACK: LeaderWorkerSet (LWS ≥ 0.8) + Volcano.** Set
+  `nvidia.com/enable-grove: "false"` on the DGD. LWS is the sig-apps multi-node primitive
+  (leader + workers, `LeaderFirst`/`Parallel` startup); Volcano is the CNCF batch scheduler
+  that provides the PodGroup gang underneath (LWS sets
+  `gangSchedulingManagement.schedulerProvider=volcano`). Mature + widely adopted, but it
+  models leader+workers, not multi-role disaggregated ratios as cleanly as Grove. Keep this
+  as the escape hatch since Grove (alpha) + KAI (sandbox) are both early-2025-stage.
+
+> **CORRECTION (prior drafts said "Grove-Volcano" / "LWS/JobSet"):** there is **no NVIDIA
+> "Grove-Volcano" pairing** — Volcano pairs with **LWS**, and KAI pairs with **Grove**.
+> JobSet is a more general multi-job primitive, not the Dynamo multinode path. Skip **Kueue**
+> here (it's an admission/queueing layer, not a placement scheduler — KAI already has
+> hierarchical queues).
 
 The recommended cross-node setup, assembled from the verified pieces above:
 
-1. **Gang scheduler** — LWS (or JobSet) so the multi-node replica comes up all-or-nothing
-   (a half-provisioned tensor-parallel group is useless). **[SPECULATIVE]** LWS is the
-   common choice for multi-node vLLM/Dynamo on EKS; we have not pinned the exact CRD in
-   our cluster.
+1. **Gang scheduler** — Grove (PodCliqueSet) + KAI so the multi-node replica comes up
+   all-or-nothing at the *service* level (a half-provisioned tensor-parallel group, or a
+   prefill-only / decode-only pipeline, is useless). LWS + Volcano is the documented fallback.
 2. **EFA fabric** — the §1.1 node-group + device-plugin + LIBFABRIC stack.
 3. **Instances** — p5 / p6 family (EFA NICs + local NVMe); the **P6e-GB200 UltraServer**
    for the very top end (28.8 Tbps EFA, NVLink-domain across the rack).
@@ -200,13 +231,43 @@ group only adds DRA-native topology-aware placement + EFA device sharing.
   EFA↔GPU affinity. Choose this when placement affinity / EFA device sharing measurably
   matters at scale.
 - Either way, **taint the GPU/EFA nodes** so only the multi-node serving pods land there;
-  the gang scheduler (LWS/JobSet, or Dynamo's Grove/Volcano) tolerates the taint.
+  the gang scheduler (Grove+KAI, or the LWS+Volcano fallback) tolerates the taint, and KAI
+  is given **dedicated node pools** so it doesn't contend with the default kube-scheduler.
 
 **[SPECULATIVE]** This "two node sources in one cluster" shape (Auto Mode for everything +
 a managed EFA node group for the disaggregation tier) is the lowest-disruption way to add
 C3-deep, but we have not built the CDK construct for it. It is the natural extension of the
 C3a NodeRoleName-reuse pattern, just targeting a managed node group instead of a Karpenter
 NodePool.
+
+### 1.3.1 Gang-scheduler ↔ substrate interaction (the real C3-deep decision)
+
+**[VERIFIED — researched 2026-06-16]** Grove+KAI *run* on EKS (KAI is a per-pod secondary
+scheduler; "EKS Auto Mode: usable after installing the GPU Operator with the device plugin
+disabled via the `nvidia.com/gpu.deploy.device-plugin: "false"` node label"). But two
+substrate facts push the **best EFA-topology story toward Karpenter/AL2023 (Shape 2-ish), not
+Auto Mode**:
+
+1. **EFA-DRA + DRA + per-device EFA config are NOT supported on EKS Auto Mode or Karpenter**
+   (AWS EKS docs). On Auto Mode you get the **EFA device plugin** (`vpc.amazonaws.com/efa`
+   extended resource) only — and **automatic GPU↔EFA topology alignment requires AL2023
+   accelerated AMIs, which Auto Mode does NOT use (it uses Bottlerocket)**. So Auto Mode gives
+   you *functional* multi-node EFA RDMA but **not** automatic topology-aligned placement; you
+   lean on Grove `topologyConstraint: packDomain: rack|block` + node labels + (Auto-Mode
+   per-device EFA config is "coming soon").
+2. **Karpenter is not gang-aware** (open `kubernetes-sigs/karpenter#2030`): it simulates
+   kube-scheduler to provision and doesn't understand KAI's pod-group filtering, so it can
+   scale the wrong mix or split a gang across pools. Mitigate with **dedicated KAI node pools**
+   + per-workload inter-pod affinity; KAI's `NodeScaleAdjuster` treats Karpenter's nominated
+   node as a *preference*. KAI's **spread** can also clash with Karpenter **bin-pack/
+   consolidation** — separate preemptible vs non-preemptible workloads.
+
+**Decision recorded:** for the C3-deep EFA RDMA tier, prefer **Karpenter + EKS-optimized
+AL2023 accelerated AMIs (self-managed or managed node groups) with dedicated KAI node pools**
+over Auto Mode/Bottlerocket, because Auto Mode cannot do EFA-DRA / automatic GPU↔EFA topology
+alignment today. Revisit when Auto Mode ships per-device EFA config + EFA-DRA support. The
+single-node C3a/C3b path stays on Auto Mode; only the multi-node-EFA serving group needs the
+AL2023/Karpenter node source.
 
 ## 1.4 Decision tree — how many nodes does this model need?
 
@@ -238,7 +299,7 @@ NodePool.
               ┌────────▼─────────┐        │ C3-DEEP: multi-node + EFA   │
               │ multi-node,      │        │ managed/self-managed node   │
               │ NO EFA           │        │ group + GPU Operator + EFA  │
-              │ (Karpenter MAY   │        │ device plugin + LWS/JobSet  │
+              │ (Karpenter MAY   │        │ device plugin + Grove+KAI   │
               │ still work; NIXL │        │ + p5/p6/UltraServer + NIXL  │
               │ on TCP — accept  │        │ LIBFABRIC backend           │
               │ the ~100x hit    │        │ + KVBM disagg (Part 2)      │
@@ -453,7 +514,7 @@ its tail into the scale-gated **C3-deep** rung. The full ladder:
 | C2 | Gov-ban / non-routable arm | n/a (app) | No | seed `RouteIQ-badb` |
 | **C3a** | Close GPU NodePool gap | Karpenter NodePool (Auto Mode) | No | seed `RouteIQ-acdc` |
 | **C3b** | First engine, **single-node**, ONE `api_base` (+ **single-node KVBM offload + S3 G4** — EFA-free) | C3a NodePool | No | seed `RouteIQ-91fe` |
-| **C3-deep** *(this doc)* | **Multi-node very-large-model serving + Dynamo disaggregation + cross-node KVBM** | **managed/self-managed node group + GPU Operator + EFA device plugin + LWS/JobSet** | **Yes** | **NEW — two seeds filed below** |
+| **C3-deep** *(this doc)* | **Multi-node very-large-model serving + Dynamo disaggregation + cross-node KVBM** | **AL2023/Karpenter (or managed/self-managed node group) + GPU Operator + EFA device plugin + Grove+KAI (LWS+Volcano fallback)** | **Yes** | **NEW — two seeds filed below** |
 
 ## 4.2 The C3-deep phased plan (ordered, cheapest first)
 
@@ -468,10 +529,12 @@ build is last and only-if-needed**:
 2. **(at C3b, EFA-free) Add the G4 S3/MinIO cold tier** when there is cross-replica reuse
    (shared system prompts, agentic workloads). `DYN_KVBM_OBJECT_*` + a bucket;
    `ObjectLockManager` makes it multi-replica-safe. Still no EFA.
-3. **(C3-deep, the gate) Stand up the multi-node-EFA node group** (Part 1): managed/
-   self-managed EFA-enabled GPU node group + GPU Operator + AWS EFA device plugin +
-   LWS/JobSet gang scheduling + p5/p6/UltraServer + the **LIBFABRIC backend** (verify it —
-   the silent ~100× trap). This is the highest-effort, scale-gated step.
+3. **(C3-deep, the gate) Stand up the multi-node-EFA node source** (Part 1, §1.3.1): prefer
+   **Karpenter + AL2023 accelerated AMIs** (or a managed/self-managed EFA-enabled GPU node
+   group) + GPU Operator + AWS EFA device plugin + **Grove+KAI gang scheduling** (LWS+Volcano
+   fallback) + p5/p6/UltraServer + the **LIBFABRIC backend** (verify it — the silent ~100×
+   trap). NOT Auto Mode for this tier (no EFA-DRA / no auto GPU↔EFA topology on Bottlerocket).
+   This is the highest-effort, scale-gated step.
 4. **(C3-deep) Deploy the very-large model as a Dynamo `DynamoGraphDeployment`** with
    disaggregated prefill/decode (`disagg_kvbm.yaml` shape: `PdConnector` =
    `DynamoConnector` + `NixlConnector`) **on top of** step 3's fabric, and register the
@@ -510,9 +573,11 @@ RouteIQ's Kumaraswamy-Thompson bandit keeps doing **Layer-1 model selection** un
 registers the whole group as **ONE arm** (the one config error to avoid: never register
 individual workers/replicas). The cross-node fabric is **AWS EFA** — the only RDMA fabric
 on AWS — and the verdict is sharp: the **EFA-DRA driver is not supported on
-Karpenter/Auto Mode**, so the multi-node-EFA tier needs **managed/self-managed node groups
-+ GPU Operator + AWS EFA device plugin + LWS/JobSet + p5/p6/UltraServer**, with NIXL forced
-onto the **LIBFABRIC backend** (the silent ~98s-vs-~1s TTFT trap). KVBM's single-node
+Karpenter/Auto Mode** (and Auto Mode's Bottlerocket gives no auto GPU↔EFA topology), so the
+multi-node-EFA tier prefers **Karpenter + AL2023 accelerated AMIs (or managed/self-managed
+node groups) + GPU Operator + AWS EFA device plugin + Grove+KAI gang scheduling (LWS+Volcano
+fallback) + p5/p6/UltraServer**, with NIXL forced onto the **LIBFABRIC backend** (the silent
+~98s-vs-~1s TTFT trap). KVBM's single-node
 offload and S3 G4 cold tier are **EFA-free** wins that ride C3b; only **disaggregated
 prefill/decode** requires the Part-1 EFA setup — same plumbing, one investment. This is the
 **C3-deep** rung beyond the C3a/C3b common path in

@@ -255,12 +255,47 @@ NodePool + device-plugin manifests** described below.
    It advertises `vpc.amazonaws.com/efa` as an extended resource pods request.
 
 3. **Taint the EFA nodes** so only the multi-node serving pods land there; the
-   gang scheduler (LWS / JobSet, or Dynamo's Grove/Volcano) tolerates the taint.
+   gang scheduler tolerates the taint, and **KAI gets dedicated node pools** so it
+   doesn't contend with the default kube-scheduler.
+
+### 2.1.1 Gang scheduler — Grove + KAI (recommended) vs LWS + Volcano (fallback)
+
+NVIDIA's **default/recommended** Dynamo-multinode gang stack is **Grove + KAI** — the
+Dynamo operator selects Grove when present and hard-errors on a multinode deploy if
+**neither** Grove nor LWS is installed:
+
+- **Option 1 (recommended):** **NVIDIA Grove** (`PodCliqueSet` → `PodCliqueScalingGroup`
+  → `PodClique` → auto-generated `PodGang`) describes the whole disaggregated system and
+  enforces gang completeness at the *service* level (≥1 complete prefill instance AND ≥1
+  complete decode instance) while letting prefill/decode scale at **different ratios**.
+  **KAI Scheduler** enforces the PodGang (its `GroveGrouper` plugin → KAI `PodGroup`
+  MinMember/MinSubGroup). KAI is a **secondary scheduler, opt-in per pod**
+  (`schedulerName: kai-scheduler` + `kai.scheduler/queue`) that coexists with
+  kube-scheduler. On the DGD, set topology via `topologyConstraint`
+  (`packDomain: rack|block`, not `host`) + startup order via
+  `cliqueStartupType`/`startsAfter`. **Pin KAI ≥ v0.13.0** (topology-aware scheduling) +
+  **Grove ≥ v0.1.0-alpha.6** per the Dynamo 1.0.x compatibility matrix. Install on EKS
+  Auto Mode after installing the GPU Operator with the device plugin disabled via the
+  `nvidia.com/gpu.deploy.device-plugin: "false"` node label.
+- **Option 2 (fallback):** set `nvidia.com/enable-grove: "false"` on the DGD and use
+  **LeaderWorkerSet (LWS ≥ 0.8) + Volcano** (LWS sets
+  `gangSchedulingManagement.schedulerProvider=volcano`). Mature/widely-adopted; models
+  leader+workers rather than multi-role disaggregated ratios.
+
+> Both Grove (alpha) and KAI (CNCF Sandbox) are early-stage; **Karpenter is not gang-aware**
+> (`kubernetes-sigs/karpenter#2030`) so it can split a gang across pools — mitigate with the
+> dedicated KAI node pools above + per-workload inter-pod affinity. Do **not** add Kueue here
+> (it's admission/queueing, not placement; KAI has hierarchical queues natively).
+
+> **EFA-topology substrate note:** EFA-DRA + per-device EFA config are **not supported on
+> EKS Auto Mode** (Bottlerocket), and automatic GPU↔EFA topology alignment needs **AL2023
+> accelerated AMIs**. For the multi-node-EFA tier prefer **Karpenter + AL2023 (or managed
+> node groups)** over Auto Mode; the single-node C3a/C3b path stays on Auto Mode.
 
 ### 2.2 Pod spec + container requirements (the non-negotiables)
 
-The multi-node replica is one **gang** (LeaderWorkerSet or JobSet) co-scheduled
-all-or-nothing. Each pod **must**:
+The multi-node replica is one **gang** (Grove `PodCliqueSet`, or the LWS fallback)
+co-scheduled all-or-nothing. Each pod **must**:
 
 - request `vpc.amazonaws.com/efa`;
 - set `hugepages-2Mi: 5120Mi`;

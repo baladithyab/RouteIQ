@@ -704,8 +704,10 @@ class EksClusterConstruct(Construct):
           * ``hostIPC: true`` + a large ``/dev/shm``.
 
         This is a hand-rolled scaffold (no live cluster touched) so the cred-free
-        synth is byte-deterministic. The LIVE gang-schedule (LWS/JobSet on the EFA
-        NodePool) + the NIXL=LIBFABRIC probe are operator-gated.
+        synth is byte-deterministic. The LIVE gang-schedule (NVIDIA Grove + KAI
+        Scheduler -- NVIDIA's recommended Dynamo-multinode path; LWS+Volcano is the
+        fallback) on the EFA NodePool + the NIXL=LIBFABRIC probe are operator-gated.
+        See docs/operations/universal-surface-and-deferred-runbook.md §2.1.1.
         """
         return (
             "# RouteIQ EFA device-plugin install + gang-pod EFA contract (RouteIQ-2f97).\n"
@@ -720,7 +722,8 @@ class EksClusterConstruct(Construct):
             f"#     --namespace {_EFA_DEVICE_PLUGIN_NAMESPACE} \\\n"
             '#     --set nodeSelector."routeiq\\.ai/nodepool"=efa\n'
             "#\n"
-            "# A multi-node gang pod (LWS / JobSet) on the EFA NodePool MUST set:\n"
+            "# A multi-node gang pod (Grove PodClique / KAI; LWS+Volcano fallback) on the\n"
+            "# EFA NodePool MUST set:\n"
             "#   resources.limits:\n"
             "#     vpc.amazonaws.com/efa: 1        # the EFA NIC (the device plugin)\n"
             "#     nvidia.com/gpu: 8\n"
@@ -756,8 +759,8 @@ class EksClusterConstruct(Construct):
 
         CRED-FREE / OPERATOR-GATED SPLIT: the CDK/manifest authored here is
         cred-free + byte-stable-when-off + test-covered. The LIVE half - p5/p6 GPU
-        hardware, the multi-node gang schedule (LWS/JobSet), and the
-        NIXL=LIBFABRIC-not-UCX runtime probe - is operator-gated (it needs real
+        hardware, the multi-node gang schedule (Grove + KAI, recommended; LWS+Volcano
+        fallback), and the NIXL=LIBFABRIC-not-UCX runtime probe - is operator-gated (it needs real
         hardware + a live cluster and cannot be expressed in CDK).
         """
         self.efa_node_pool_manifest_value = self.efa_node_pool_manifest()

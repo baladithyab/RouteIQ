@@ -17,8 +17,9 @@ rendered manifest requests ``vpc.amazonaws.com/efa`` on the EFA-capable p5/p6
 families.
 
 CRED-FREE / OPERATOR-GATED SPLIT: the manifest authored here is cred-free. The
-LIVE half - p5/p6 GPU hardware, the multi-node gang schedule (LWS/JobSet), and the
-NIXL=LIBFABRIC-not-UCX runtime probe - is operator-gated.
+LIVE half - p5/p6 GPU hardware, the multi-node gang schedule (NVIDIA Grove + KAI
+Scheduler, recommended; LWS+Volcano fallback), and the NIXL=LIBFABRIC-not-UCX
+runtime probe - is operator-gated.
 
 Synthesised offline via the shared ``make_stack`` / ``template_for`` helpers
 (dummy env account ``123456789012`` / ``us-west-2``), credential-free.
