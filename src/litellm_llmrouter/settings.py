@@ -1191,9 +1191,17 @@ class KumaraswamyThompsonSettings(BaseModel):
     """Kumaraswamy-Thompson online-bandit routing strategy configuration.
 
     The core bandit runs with the in-memory backend and NO external deps:
-    ``InMemoryPosteriorBackend`` is the ONLY backend that exists.
+    ``InMemoryPosteriorBackend`` is the byte-stable DEFAULT backend.
 
-    RESERVED / not yet wired (no consumer): the ``backend``, ``durable`` and
+    DURABLE (RouteIQ-95a8): set ``backend='file'`` to select the cred-free,
+    pure-stdlib ``FilePosteriorBackend`` — it mirrors the in-memory semantics but
+    persists posteriors to ``state_path`` via an atomic ``json.dump`` +
+    ``os.replace`` (the governance-store pattern) so a worker restart RESUMES
+    convergence instead of starting cold.  Persistence is debounced off the hot
+    path; the prior posteriors are loaded at startup.  The default stays
+    ``memory`` for byte-stable behavior.
+
+    RESERVED / not yet wired (no consumer): the ``durable`` and
     ``cost_reward_alpha`` fields below have ZERO readers.
     ``register_kumaraswamy_thompson_strategy`` never reads them, and the durable
     Redis (hot) / Aurora (durable) posterior backends they would select are NOT
@@ -1201,7 +1209,8 @@ class KumaraswamyThompsonSettings(BaseModel):
     the module docstring in ``kumaraswamy_thompson.py`` documents the same).
 
     Env vars: ``ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED``,
-    ``ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND``, etc. (``__`` nested delimiter).
+    ``ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND``,
+    ``ROUTEIQ_KUMARASWAMY_THOMPSON__STATE_PATH``, etc. (``__`` nested delimiter).
     """
 
     enabled: bool = Field(
@@ -1211,11 +1220,40 @@ class KumaraswamyThompsonSettings(BaseModel):
     backend: str = Field(
         "memory",
         description=(
-            "RESERVED / not yet wired (no consumer): hot posterior backend "
-            "(memory | redis).  Only the in-memory backend exists; the durable "
-            "Redis posterior backend is NOT built and "
-            "``register_kumaraswamy_thompson_strategy`` never reads this field "
-            "(RouteIQ-4654).  Retained for env-var forward-compat."
+            "Posterior backend (memory | file).  ``memory`` (default) is the "
+            "byte-stable per-worker ``InMemoryPosteriorBackend``.  ``file`` "
+            "selects the cred-free DURABLE ``FilePosteriorBackend`` which "
+            "persists posteriors to ``state_path`` (atomic json.dump + "
+            "os.replace) and reloads them at startup so a restart resumes "
+            "convergence (RouteIQ-95a8).  The durable Redis/Aurora backends "
+            "remain NOT built (RouteIQ-4654)."
+        ),
+    )
+    state_path: str = Field(
+        "",
+        description=(
+            "Filesystem path for the DURABLE ``file`` backend's posterior "
+            "snapshot (RouteIQ-95a8).  Only consulted when ``backend='file'``; "
+            "empty disables persistence (the file backend then behaves like the "
+            "in-memory one).  Env: "
+            "``ROUTEIQ_KUMARASWAMY_THOMPSON__STATE_PATH``."
+        ),
+    )
+    flush_interval_seconds: float = Field(
+        5.0,
+        ge=0.0,
+        description=(
+            "DURABLE ``file`` backend (RouteIQ-95a8): max seconds between debounced "
+            "persists.  0 disables the time-based flush (count-based only)."
+        ),
+    )
+    flush_dirty_threshold: int = Field(
+        32,
+        ge=1,
+        description=(
+            "DURABLE ``file`` backend (RouteIQ-95a8): persist after this many "
+            "posterior mutations accumulate (off-hot-path debounce).  1 = "
+            "write-through."
         ),
     )
     durable: str = Field(

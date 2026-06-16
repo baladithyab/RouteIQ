@@ -780,6 +780,18 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.warning("Drain manager error during shutdown: %s", exc)
 
+    # 1b. Flush durable bandit posteriors (RouteIQ-95a8 DEFECT-2). After drain no
+    #     more updates arrive, so persist the debounced tail (up to
+    #     dirty_threshold-1 updates) the FilePosteriorBackend has not yet flushed
+    #     — otherwise a clean shutdown loses them and convergence-across-restarts
+    #     regresses. Best-effort / fail-open; a no-op for the memory backend.
+    try:
+        from ..kumaraswamy_thompson import flush_posteriors_on_shutdown
+
+        flush_posteriors_on_shutdown()
+    except Exception as exc:
+        logger.warning("KTS posterior flush at shutdown skipped/failed: %s", exc)
+
     # 2. Plugin shutdown (stops middleware interception first)
     await _run_plugin_shutdown(app)
 

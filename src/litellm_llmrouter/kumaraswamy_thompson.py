@@ -25,13 +25,19 @@ Key facts:
   arm's exploration. The default ``kumaraswamy_quantile`` uses
   ``-math.expm1(math.log1p(-u)/b)`` which stays positive. ``_q_naive`` is kept
   ONLY as a reference for the divergence unit test.
-- **In-memory backend is the ONLY backend.** ``InMemoryPosteriorBackend`` is the
-  sole concrete implementation; the core bandit + every unit test run with NO
-  external deps. Durable backends (Redis hot / Aurora durable) are NOT yet built
-  — the ``backend`` / ``durable`` settings fields are reserved placeholders for
-  the planned live substrate (P1/P2) and currently have NO consumer
-  (``register_kumaraswamy_thompson_strategy`` does not read them). Do not assume
-  a non-memory store is available.
+- **In-memory backend is the DEFAULT backend.** ``InMemoryPosteriorBackend`` is
+  the byte-stable default; the core bandit + every unit test run with NO external
+  deps. ``FilePosteriorBackend`` (RouteIQ-95a8) is the cred-free DURABLE backend:
+  it mirrors the in-memory semantics but persists posteriors to a JSON file via
+  an atomic ``json.dump`` + ``os.replace`` (the governance-store pattern) so a
+  worker restart RESUMES convergence instead of starting cold. It LOADS prior
+  posteriors at construction and persists on ``update`` (debounced — see the
+  ``flush_interval``/``dirty_threshold`` knobs — never fsync per update on the
+  hot path). Backend selection is wired through the ``backend`` settings field
+  (``memory`` | ``file``); the default stays ``memory`` for byte-stable behavior.
+  Durable Redis (hot) / Aurora (durable) backends are still NOT built — the
+  ``durable`` settings field remains a reserved placeholder (P2). The bandit is
+  numpy-free; ``FilePosteriorBackend`` is likewise pure stdlib.
 - Determinism: the RNG is threaded as a ``random.Random`` *object*, never the
   global ``random`` module — seeded for tests/replay, no global-state pollution.
 
@@ -41,8 +47,10 @@ test arm set in this module.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -546,6 +554,170 @@ class InMemoryPosteriorBackend:
             self._store = new_store
 
 
+class FilePosteriorBackend(InMemoryPosteriorBackend):
+    """DURABLE file-backed backend (RouteIQ-95a8) — cred-free, pure stdlib.
+
+    The in-memory backend is per-worker and volatile: posteriors are lost on
+    restart, never shared, and in an HA fleet the bandit never truly converges
+    because each replica relearns from its uniform prior. This backend fixes the
+    *durability* gap for the cred-free default deploy (Redis hot / Aurora durable
+    remain a later seed): it keeps the exact in-memory semantics (it subclasses
+    :class:`InMemoryPosteriorBackend`) but mirrors the live store to a JSON file
+    so a fresh process resumes from the persisted posteriors.
+
+    Atomicity: persistence mirrors ``governance_store`` — ``json.dump`` to a
+    sibling ``*.tmp`` in the SAME directory then ``os.replace`` (an atomic rename
+    on POSIX/NTFS). A crash mid-write leaves the prior complete file intact; a
+    reader never sees a half-written file. An ``os.fsync`` is issued before the
+    replace so the bytes are on disk before the rename is durable.
+
+    Hot-path cost: persistence is DEBOUNCED — :meth:`update` / :meth:`decay`
+    increment a dirty counter and only flush when either ``dirty_threshold``
+    mutations have accumulated OR ``flush_interval`` seconds have elapsed since
+    the last flush. The default knobs (32 updates / 5 s) keep the steady-state
+    cost at ~1 serialize per 32 requests instead of per request. Set
+    ``dirty_threshold=1`` for write-through (used by the durability unit test).
+    The graceful-shutdown drain path calls :meth:`flush` (via
+    :func:`flush_posteriors_on_shutdown`) to force a final persist of the
+    debounced tail so a clean stop does not lose up to ``dirty_threshold - 1``
+    updates (RouteIQ-95a8 DEFECT-2).
+
+    Thread-safety: inherits the parent ``RLock``; the flush serializes under the
+    same lock so the snapshot is internally consistent.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        flush_interval: float = 5.0,
+        dirty_threshold: int = 32,
+    ) -> None:
+        super().__init__()
+        self._path = path
+        self._flush_interval = max(0.0, float(flush_interval))
+        self._dirty_threshold = max(1, int(dirty_threshold))
+        self._dirty = 0
+        self._last_flush = 0.0
+        # LOAD prior posteriors at construction so a restart resumes convergence.
+        self._load_from_disk()
+
+    # -- persistence internals ----------------------------------------------
+
+    def _load_from_disk(self) -> None:
+        """Hydrate from the on-disk snapshot if present (no-op when absent)."""
+        if not self._path or not os.path.exists(self._path):
+            return
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            # A corrupt/partial file must not crash startup — log and start cold.
+            logger.warning(
+                "FilePosteriorBackend: failed to load %s, starting cold: %s",
+                self._path,
+                exc,
+            )
+            return
+        # hydrate() acquires the lock and replaces the store atomically.
+        self.hydrate(data if isinstance(data, dict) else {})
+
+    def _atomic_write(self, data: Dict[str, Any]) -> None:
+        """Serialize ``data`` to ``self._path`` atomically (tmp + os.replace).
+
+        Mirrors the governance-store durable pattern. Writes to a uniquely-named
+        temp file in the SAME directory (so ``os.replace`` is an atomic rename on
+        the same filesystem), fsyncs, then replaces. Best-effort — a write error
+        is logged, never raised (durability is an optimization, not a hard dep on
+        the hot path).
+        """
+        if not self._path:
+            return
+        directory = os.path.dirname(os.path.abspath(self._path)) or "."
+        tmp_path = f"{self._path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._path)
+        except OSError as exc:
+            logger.warning(
+                "FilePosteriorBackend: failed to persist %s: %s", self._path, exc
+            )
+            # Best-effort cleanup of a stranded temp file.
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def flush(self) -> None:
+        """Force-persist the current posteriors regardless of the debounce state.
+
+        Wired into the graceful-shutdown drain path via
+        :func:`flush_posteriors_on_shutdown` (called from ``_routeiq_lifespan``)
+        so the debounced tail (up to ``dirty_threshold - 1`` updates) is persisted
+        on a clean stop instead of being lost (RouteIQ-95a8 DEFECT-2).
+        """
+        with self._lock:
+            data = self.snapshot()
+            self._dirty = 0
+            self._last_flush = time.time()
+        # Write OUTSIDE the lock-built snapshot copy is already detached; serialize
+        # under the lock-released phase to avoid holding the lock during disk I/O.
+        self._atomic_write(data)
+
+    def _maybe_flush(self) -> None:
+        """Persist iff the dirty count or the time-since-flush crossed a bound."""
+        now = time.time()
+        with self._lock:
+            self._dirty += 1
+            due = self._dirty >= self._dirty_threshold or (
+                self._flush_interval > 0.0
+                and (now - self._last_flush) >= self._flush_interval
+            )
+            if not due:
+                return
+            data = self.snapshot()
+            self._dirty = 0
+            self._last_flush = now
+        self._atomic_write(data)
+
+    # -- mutating ops: persist (debounced) after the in-memory update --------
+
+    def update(self, bucket: str, model: str, reward: float) -> None:
+        """Apply the conjugate update in memory, then debounced-persist."""
+        super().update(bucket, model, reward)
+        self._maybe_flush()
+
+    def decay(
+        self,
+        bucket: str,
+        model: str,
+        gamma: float,
+        days: float,
+        prior: Tuple[float, float],
+    ) -> None:
+        """Decay in memory, then debounced-persist (a no-op decay does not dirty)."""
+        if days <= 0 or gamma >= 1.0:
+            return
+        super().decay(bucket, model, gamma, days, prior)
+        self._maybe_flush()
+
+    def hydrate(self, data: Dict[str, Any]) -> None:
+        """Replace state from a snapshot dict and persist the new state."""
+        super().hydrate(data)
+        # Persist the hydrated state so a load_artifact swap is durable too. Reset
+        # the debounce clock; this is an explicit full-state replacement.
+        with self._lock:
+            self._dirty = 0
+            self._last_flush = time.time()
+            snap = self.snapshot()
+        self._atomic_write(snap)
+
+
 # ---------------------------------------------------------------------------
 # The strategy
 # ---------------------------------------------------------------------------
@@ -958,6 +1130,70 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
 # ---------------------------------------------------------------------------
 
 
+def build_posterior_backend(kts: Any) -> PosteriorBackend:
+    """Construct the posterior backend selected by the settings ``backend`` field.
+
+    ``memory`` (default, or any unknown value) -> :class:`InMemoryPosteriorBackend`
+    (byte-stable, per-worker, volatile). ``file`` -> :class:`FilePosteriorBackend`
+    (cred-free DURABLE; persists to ``state_path`` and reloads at startup so a
+    restart resumes convergence — RouteIQ-95a8). A ``file`` selection with an
+    empty ``state_path`` degrades gracefully to a non-persisting file backend
+    (logged), so a misconfig never crashes startup.
+    """
+    backend_kind = str(getattr(kts, "backend", "memory") or "memory").lower()
+    if backend_kind != "file":
+        return InMemoryPosteriorBackend()
+
+    state_path = str(getattr(kts, "state_path", "") or "")
+    if not state_path:
+        logger.warning(
+            "KTS backend='file' but state_path is empty; persistence disabled "
+            "(posteriors will not survive restart). Set "
+            "ROUTEIQ_KUMARASWAMY_THOMPSON__STATE_PATH to enable durability."
+        )
+    return FilePosteriorBackend(
+        state_path,
+        flush_interval=float(getattr(kts, "flush_interval_seconds", 5.0)),
+        dirty_threshold=int(getattr(kts, "flush_dirty_threshold", 32)),
+    )
+
+
+def flush_posteriors_on_shutdown() -> bool:
+    """Force-persist the active KTS strategy's posteriors at graceful shutdown.
+
+    DEFECT-2 fix (RouteIQ-95a8): :meth:`FilePosteriorBackend.flush` is documented
+    as "call explicitly at drain", but without a live caller a clean shutdown
+    loses up to ``dirty_threshold - 1`` (default 31) tail updates — undercutting
+    the seed's convergence-across-restarts goal. This wires the drain hook.
+
+    It resolves the active strategy from the routing registry the SAME way
+    :func:`register_kumaraswamy_thompson_strategy` registered it, and if that
+    strategy's backend is a :class:`FilePosteriorBackend`, calls its
+    :meth:`~FilePosteriorBackend.flush`. Best-effort and fail-open: any error
+    (no registry, strategy absent, non-file backend, flush failure) is logged
+    and swallowed so shutdown never blocks on durability.
+
+    Returns:
+        True if a FilePosteriorBackend was found and flushed, else False.
+    """
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        strategy = get_routing_registry().get(STRATEGY_NAME)
+        if strategy is None:
+            return False
+        backend = getattr(strategy, "_backend", None)
+        flush = getattr(backend, "flush", None)
+        if isinstance(backend, FilePosteriorBackend) and callable(flush):
+            flush()
+            logger.info("Flushed Kumaraswamy-Thompson posteriors to disk at shutdown")
+            return True
+        return False
+    except Exception as exc:  # pragma: no cover - defensive, must never block drain
+        logger.warning("KTS posterior flush-on-shutdown failed: %s", exc)
+        return False
+
+
 def register_kumaraswamy_thompson_strategy() -> bool:
     """Register the bandit in the routing registry (gated by settings).
 
@@ -979,7 +1215,13 @@ def register_kumaraswamy_thompson_strategy() -> bool:
 
         from litellm_llmrouter.strategy_registry import get_routing_registry
 
+        # Select the posterior backend (RouteIQ-95a8). 'memory' (default) stays
+        # byte-stable; 'file' wires the cred-free DURABLE backend so a restart
+        # resumes convergence. Unknown values fall back to memory.
+        backend = build_posterior_backend(kts)
+
         strategy = KumaraswamyThompsonStrategy(
+            backend=backend,
             seed=getattr(kts, "seed", None),
             w_quality=getattr(kts, "w_quality", 0.5),
             w_cost=getattr(kts, "w_cost", 0.4),

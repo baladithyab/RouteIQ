@@ -12,16 +12,22 @@ Every test runs with the in-memory backend and NO Redis/Aurora/env dependency.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from litellm_llmrouter.kumaraswamy_thompson import (
     STRATEGY_NAME,
     STRATEGY_VERSION,
+    FilePosteriorBackend,
     InMemoryPosteriorBackend,
     KumaraswamyThompsonStrategy,
     Posterior,
+    PosteriorBackend,
     _q_naive,
+    build_posterior_backend,
     fit_kumaraswamy_moments,
+    flush_posteriors_on_shutdown,
     kumaraswamy_cdf,
     kumaraswamy_mean_var,
     kumaraswamy_quantile,
@@ -462,6 +468,243 @@ def test_export_load_artifact_round_trip(tmp_path):
     ref = ArtifactRef(path=str(path), payload=artifact)
     assert s2.load_artifact(ref) is True
     assert s2._backend.get("g", "bedrock/a").alpha == pytest.approx(2.0)
+
+
+# ===========================================================================
+# 9b. RouteIQ-95a8 — DURABLE file-backed posterior backend
+# ===========================================================================
+#
+# The in-memory backend is per-worker and volatile: posteriors are lost on
+# restart, never shared, and never converge in HA. FilePosteriorBackend mirrors
+# the in-memory semantics but persists to a JSON file (atomic json.dump +
+# os.replace, the governance-store pattern) and loads at construction so a fresh
+# process resumes from the persisted posteriors. Pure stdlib, cred-free.
+
+
+def test_file_backend_implements_posterior_protocol(tmp_path):
+    # Durability is opt-in but must satisfy the EXACT storage contract.
+    backend = FilePosteriorBackend(str(tmp_path / "post.json"))
+    assert isinstance(backend, PosteriorBackend)
+    assert isinstance(backend, InMemoryPosteriorBackend)  # shares semantics
+
+
+def test_file_backend_update_then_persist_then_reload(tmp_path):
+    # THE acceptance test: update -> persist -> a FRESH instance load()s the
+    # same alpha/beta (restart resumes convergence instead of starting cold).
+    path = str(tmp_path / "posteriors.json")
+    b1 = FilePosteriorBackend(path, dirty_threshold=1)  # write-through
+    b1.update("bucket-A", "bedrock/a", 1.0)
+    b1.update("bucket-A", "bedrock/a", 0.0)
+    b1.update("bucket-A", "bedrock/b", 1.0)
+    assert os.path.exists(path)
+
+    # Fresh process: a NEW backend hydrates from disk at construction.
+    b2 = FilePosteriorBackend(path, dirty_threshold=1)
+    pa = b2.get("bucket-A", "bedrock/a")
+    pb = b2.get("bucket-A", "bedrock/b")
+    assert pa.alpha == pytest.approx(2.0)  # 1.0 prior + 1.0 reward
+    assert pa.beta == pytest.approx(2.0)  # 1.0 prior + (1 - 0) reward
+    assert pb.alpha == pytest.approx(2.0)
+    assert pb.beta == pytest.approx(1.0)
+
+
+def test_file_backend_debounce_holds_then_flushes(tmp_path):
+    # With a count threshold and the time-flush disabled, updates below the
+    # threshold do NOT persist; crossing it does. Keeps the hot path cheap.
+    path = str(tmp_path / "post.json")
+    b = FilePosteriorBackend(path, flush_interval=0.0, dirty_threshold=3)
+    b.update("g", "m", 1.0)
+    b.update("g", "m", 1.0)
+    assert not os.path.exists(path)  # below threshold -> not yet persisted
+    b.update("g", "m", 1.0)  # third update crosses the threshold
+    assert os.path.exists(path)
+
+
+def test_file_backend_explicit_flush_forces_persist(tmp_path):
+    # flush() persists regardless of the debounce state (drain hook contract).
+    path = str(tmp_path / "post.json")
+    b = FilePosteriorBackend(path, flush_interval=0.0, dirty_threshold=1000)
+    b.update("g", "m", 1.0)
+    assert not os.path.exists(path)  # debounce not yet due
+    b.flush()
+    assert os.path.exists(path)
+    b2 = FilePosteriorBackend(path, dirty_threshold=1)
+    assert b2.get("g", "m").alpha == pytest.approx(2.0)
+
+
+def test_file_backend_atomic_write_no_tmp_left_behind(tmp_path):
+    # The atomic tmp + os.replace pattern must not strand a *.tmp sibling.
+    path = str(tmp_path / "post.json")
+    b = FilePosteriorBackend(path, dirty_threshold=1)
+    b.update("g", "m", 1.0)
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_file_backend_corrupt_file_starts_cold_no_crash(tmp_path):
+    # A corrupt/partial snapshot must not crash startup — start cold instead.
+    path = tmp_path / "post.json"
+    path.write_text("{ this is not valid json")
+    b = FilePosteriorBackend(str(path), dirty_threshold=1)
+    # Cold start: get() lazily creates a fresh Beta(1,1) posterior.
+    post = b.get("g", "m")
+    assert post.alpha == pytest.approx(1.0)
+    assert post.beta == pytest.approx(1.0)
+
+
+def test_file_backend_empty_path_disables_persistence_no_crash():
+    # backend='file' with an empty path must degrade to non-persisting, no I/O.
+    b = FilePosteriorBackend("", dirty_threshold=1)
+    b.update("g", "m", 1.0)  # must not raise even though there is no path
+    assert b.get("g", "m").alpha == pytest.approx(2.0)
+
+
+def test_file_backend_decay_noop_does_not_persist(tmp_path):
+    # A no-op decay (gamma>=1) must not dirty/persist (mirrors in-memory no-op).
+    path = str(tmp_path / "post.json")
+    b = FilePosteriorBackend(path, flush_interval=0.0, dirty_threshold=2)
+    b.update("g", "m", 1.0)  # dirty=1, below threshold
+    b.decay("g", "m", gamma=1.0, days=100.0, prior=(1.0, 1.0))  # no-op
+    assert not os.path.exists(path)  # decay did not advance the dirty counter
+
+
+def test_select_memory_backend_is_default(tmp_path):
+    # build_posterior_backend honors the settings field; 'memory' (default) and
+    # unknown values yield the byte-stable in-memory backend.
+    class _Cfg:
+        backend = "memory"
+        state_path = ""
+        flush_interval_seconds = 5.0
+        flush_dirty_threshold = 32
+
+    b = build_posterior_backend(_Cfg())
+    assert isinstance(b, InMemoryPosteriorBackend)
+    assert not isinstance(b, FilePosteriorBackend)
+
+    _Cfg.backend = "redis-not-built"  # unknown -> safe memory fallback
+    assert not isinstance(build_posterior_backend(_Cfg()), FilePosteriorBackend)
+
+
+def test_select_file_backend_when_settings_say_file(tmp_path):
+    class _Cfg:
+        backend = "file"
+        state_path = str(tmp_path / "post.json")
+        flush_interval_seconds = 0.0
+        flush_dirty_threshold = 1
+
+    b = build_posterior_backend(_Cfg())
+    assert isinstance(b, FilePosteriorBackend)
+    b.update("g", "m", 1.0)
+    assert os.path.exists(_Cfg.state_path)
+
+
+def test_registration_file_backend_durable_round_trip(tmp_path, monkeypatch):
+    # End-to-end through settings: backend='file' wires a durable backend, and
+    # a re-registration with the same state_path resumes the prior posteriors.
+    path = str(tmp_path / "kts_posteriors.json")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED", "true")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND", "file")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__STATE_PATH", path)
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__FLUSH_DIRTY_THRESHOLD", "1")
+    from litellm_llmrouter.settings import get_settings, reset_settings
+
+    reset_settings()
+    assert register_kumaraswamy_thompson_strategy() is True
+    strat = get_routing_registry().get(STRATEGY_NAME)
+    assert isinstance(strat, KumaraswamyThompsonStrategy)
+    assert isinstance(strat._backend, FilePosteriorBackend)
+    strat.update("bedrock/a", 1.0, bucket="g")
+    assert os.path.exists(path)
+
+    # Simulate a restart: a brand-new strategy built from the same settings must
+    # resume from the persisted posteriors (this is the convergence-in-HA fix).
+    reset_settings()
+    backend2 = build_posterior_backend(get_settings().kumaraswamy_thompson)
+    assert isinstance(backend2, FilePosteriorBackend)
+    assert backend2.get("g", "bedrock/a").alpha == pytest.approx(2.0)
+
+
+def test_default_backend_setting_is_memory_byte_stable():
+    # The shipped default MUST remain 'memory' (byte-stable backward-compat).
+    from litellm_llmrouter.settings import get_settings, reset_settings
+
+    reset_settings()
+    assert get_settings().kumaraswamy_thompson.backend == "memory"
+
+
+# ===========================================================================
+# 9b. RouteIQ-95a8 DEFECT-2 — flush-on-shutdown persists the debounced tail
+# ===========================================================================
+#
+# Without a live flush() caller, a clean shutdown loses up to
+# (dirty_threshold - 1) tail updates that the debounce has not yet persisted.
+# flush_posteriors_on_shutdown() (wired into _routeiq_lifespan's drain path)
+# resolves the active KTS strategy from the routing registry and flushes its
+# FilePosteriorBackend so a restart resumes from those tail updates.
+
+
+def test_flush_on_shutdown_persists_pending_debounced_updates(tmp_path, monkeypatch):
+    # THE defect-2 acceptance test: with the DEFAULT dirty_threshold (32), apply
+    # N < threshold updates so the debounce has NOT yet persisted them, then
+    # invoke the shutdown hook -> the on-disk file reflects the pending updates.
+    path = str(tmp_path / "kts_posteriors.json")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED", "true")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND", "file")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__STATE_PATH", path)
+    # Disable the time-based flush so ONLY the count debounce (default 32) gates
+    # persistence — proving the tail would be lost without an explicit flush.
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__FLUSH_INTERVAL_SECONDS", "0")
+    from litellm_llmrouter.settings import reset_settings
+
+    reset_settings()
+    assert register_kumaraswamy_thompson_strategy() is True
+    strat = get_routing_registry().get(STRATEGY_NAME)
+    assert isinstance(strat, KumaraswamyThompsonStrategy)
+    assert isinstance(strat._backend, FilePosteriorBackend)
+
+    # 3 updates (< default dirty_threshold of 32) — NOT yet persisted.
+    strat.update("bedrock/a", 1.0, bucket="g")
+    strat.update("bedrock/a", 1.0, bucket="g")
+    strat.update("bedrock/a", 0.0, bucket="g")
+    assert not os.path.exists(path)  # debounce holds the tail in memory
+
+    # Capture the live in-memory posterior the debounce is withholding from disk;
+    # it must differ from the cold Beta(1,1) prior so the test proves real data
+    # would have been lost without the flush.
+    live = strat._backend.get("g", "bedrock/a")
+    assert (live.alpha, live.beta) != (1.0, 1.0)
+
+    # The drain hook forces the final persist.
+    assert flush_posteriors_on_shutdown() is True
+    assert os.path.exists(path)
+
+    # A fresh process resumes from the flushed tail (the convergence-across-
+    # restarts contract): the on-disk posterior equals the live one pre-shutdown.
+    b2 = FilePosteriorBackend(path, dirty_threshold=1)
+    post = b2.get("g", "bedrock/a")
+    assert post.alpha == pytest.approx(live.alpha)
+    assert post.beta == pytest.approx(live.beta)
+
+
+def test_flush_on_shutdown_noop_for_memory_backend(monkeypatch):
+    # Memory backend has no flush; the hook must be a safe fail-open no-op.
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED", "true")
+    monkeypatch.setenv("ROUTEIQ_KUMARASWAMY_THOMPSON__BACKEND", "memory")
+    from litellm_llmrouter.settings import reset_settings
+
+    reset_settings()
+    assert register_kumaraswamy_thompson_strategy() is True
+    strat = get_routing_registry().get(STRATEGY_NAME)
+    assert isinstance(strat._backend, InMemoryPosteriorBackend)
+    assert not isinstance(strat._backend, FilePosteriorBackend)
+    # No file backend -> nothing to flush, returns False, must not raise.
+    assert flush_posteriors_on_shutdown() is False
+
+
+def test_flush_on_shutdown_noop_when_strategy_not_registered():
+    # No KTS strategy in the registry -> fail-open no-op (e.g. KTS disabled).
+    assert get_routing_registry().get(STRATEGY_NAME) is None
+    assert flush_posteriors_on_shutdown() is False
 
 
 # ===========================================================================

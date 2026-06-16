@@ -1048,13 +1048,17 @@ class TestGovernanceSpendTrackingAlias:
 
 
 class TestKumaraswamyThompsonReservedFields:
-    """RouteIQ-4654: backend / durable / cost_reward_alpha have ZERO consumers.
+    """RouteIQ-4654 / RouteIQ-95a8: ``durable`` / ``cost_reward_alpha`` have ZERO
+    consumers.
 
     ``register_kumaraswamy_thompson_strategy`` never reads them and the durable
-    Redis/Aurora posterior backends are not built.  The fields are RESERVED (env
-    forward-compat) and their docstrings must say so.  These tests pin the
-    defaults (so the env-var compat surface is unchanged) and assert the
-    'RESERVED / not yet wired' marking is present.
+    Redis/Aurora posterior backends are not built.  Those fields remain RESERVED
+    (env forward-compat) and their docstrings must say so.  ``backend`` was
+    REPURPOSED by RouteIQ-95a8 from a reserved placeholder into a LIVE consumer
+    (``build_posterior_backend`` reads it to select memory|file), so it is NO
+    LONGER asserted as reserved here.  These tests pin the defaults (so the
+    env-var compat surface is unchanged) and assert the 'RESERVED / not yet
+    wired' marking is present on the still-reserved fields only.
     """
 
     def test_reserved_field_defaults(self):
@@ -1074,13 +1078,27 @@ class TestKumaraswamyThompsonReservedFields:
         assert s.kumaraswamy_thompson.cost_reward_alpha == 0.7
 
     def test_reserved_marking_in_descriptions(self):
+        # backend is now a LIVE consumer (RouteIQ-95a8: memory|file selection) so
+        # it is intentionally NOT in this set; only the still-reserved fields are.
         fields = KumaraswamyThompsonSettings.model_fields
-        for name in ("backend", "durable", "cost_reward_alpha"):
+        for name in ("durable", "cost_reward_alpha"):
             desc = fields[name].description or ""
             assert "RESERVED" in desc, f"{name} missing RESERVED marking"
             assert "no consumer" in desc, f"{name} missing 'no consumer'"
 
+    def test_backend_field_is_not_marked_reserved(self):
+        # Guard against a regression that re-marks the now-live backend field as
+        # RESERVED / no-consumer (RouteIQ-95a8 wired it to build_posterior_backend).
+        desc = KumaraswamyThompsonSettings.model_fields["backend"].description or ""
+        assert "RESERVED" not in desc
+        assert "no consumer" not in desc
+
     def test_reserved_marking_in_class_docstring(self):
+        # The docstring must still mark the STILL-reserved fields, and must NOT
+        # enumerate ``backend`` among them (it now has a consumer).
         doc = KumaraswamyThompsonSettings.__doc__ or ""
         assert "RESERVED" in doc
         assert "no consumer" in doc
+        # ``durable`` and ``cost_reward_alpha`` are the reserved set.
+        assert "durable" in doc
+        assert "cost_reward_alpha" in doc
