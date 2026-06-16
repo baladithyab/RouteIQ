@@ -306,3 +306,56 @@ def test_fable5_boundary_drop_keeps_lookalike_arm():
     banned = _dep("grp", "bedrock/global.anthropic.claude_fable_5", "d2")
     out = drop_gov_banned([lookalike, banned])
     assert out == [lookalike]
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-9fce — version-glue separators ``:`` / ``@`` / ``#`` tokenize correctly
+# ---------------------------------------------------------------------------
+#
+# Version-tagged spellings glue the version onto the family with ``:`` / ``@`` /
+# ``#`` (``claude-fable-5:v1``, ``claude-fable-5@1``).  Before the fix the split
+# set was ``[/._- ]`` only, so the terminal token fused (``5:v1``) and the clean
+# ``(fable, 5)`` run was MISSED -> the banned model routed.
+
+
+def test_fable5_version_glued_colon_at_hash_banned():
+    """``:`` / ``@`` / ``#`` version-glued Fable 5 spellings ARE banned (9fce)."""
+    reset_settings()
+    get_settings()  # zero operator config -> relies on the always-on family ban
+    version_glued = [
+        "claude-fable-5:v1",
+        "claude-fable-5@1",
+        "claude-fable-5#latest",
+        "bedrock/global.anthropic.claude-fable-5:v1",
+        "anthropic/claude-fable-5@2025",
+    ]
+    for arm in version_glued:
+        assert is_gov_banned(_dep("grp", arm, "d")), arm
+        # And via the group name (model_name) too.
+        assert is_gov_banned(_dep(arm, "bedrock/safe-arm", "d")), arm
+
+
+def test_fable50_version_glued_lookalike_not_banned():
+    """The regression guard: ``claude-fable-5:v1`` IS banned while a version-
+    glued look-alike ``claude-fable-50`` is still NOT (token ``50`` != ``5``)."""
+    reset_settings()
+    get_settings()
+    assert is_gov_banned(_dep("grp", "claude-fable-5:v1", "d"))
+    not_banned = [
+        "claude-fable-50",
+        "claude-fable-50:v1",
+        "claude-fable-50@1",
+        "claude-fable-500#latest",
+    ]
+    for arm in not_banned:
+        assert not is_gov_banned(_dep("grp", arm, "d")), arm
+
+
+def test_fable5_version_glued_drop_keeps_lookalike():
+    """drop_gov_banned removes a ``:``-glued fable-5 arm, keeps the ``50`` one."""
+    reset_settings()
+    get_settings()
+    lookalike = _dep("grp", "claude-fable-50:v1", "d1")
+    banned = _dep("grp", "claude-fable-5:v1", "d2")
+    out = drop_gov_banned([lookalike, banned])
+    assert out == [lookalike]

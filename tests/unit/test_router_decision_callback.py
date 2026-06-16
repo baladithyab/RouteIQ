@@ -624,3 +624,26 @@ class TestGovernanceSpendTrackingGate:
             os.environ, {"LLMROUTER_GOVERNANCE_SPEND_TRACKING": "on"}, clear=False
         ):
             assert _governance_spend_tracking_enabled() is True
+
+    def test_flag_is_boot_time_not_per_request(self, monkeypatch):
+        """RouteIQ-9fce: the flag is resolved at BOOT via the cached Settings
+        (ADR-0013), NOT per request.
+
+        Flipping the env var mid-process does NOT change the answer until
+        ``reset_settings()`` rebuilds Settings.  This pins the documented
+        behavior (flip + restart in prod, or reset_settings in tests).
+        """
+        # Boot with the flag ON (default) and cache the Settings instance.
+        monkeypatch.delenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", raising=False)
+        reset_settings()
+        get_settings()
+        assert _governance_spend_tracking_enabled() is True
+
+        # Flip the env to OFF *without* resetting -> still ON (boot-cached).
+        monkeypatch.setenv("LLMROUTER_GOVERNANCE_SPEND_TRACKING", "false")
+        assert _governance_spend_tracking_enabled() is True
+
+        # Only after reset_settings() does the new value take effect.
+        reset_settings()
+        get_settings()
+        assert _governance_spend_tracking_enabled() is False

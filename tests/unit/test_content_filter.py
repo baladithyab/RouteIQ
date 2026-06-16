@@ -641,6 +641,112 @@ class TestOutputFiltering:
 
 
 # ============================================================================
+# Pass-rate telemetry (RouteIQ-9aed)
+# ============================================================================
+
+
+class TestPassRateTelemetry:
+    """content_filter must record one guardrail.check per evaluated category
+    INCLUDING action=pass for clean (under-threshold) input, so the
+    deny/(deny+pass) pass-rate is well-defined and consistent with the base
+    GuardrailPlugin convention (RouteIQ-9aed).
+    """
+
+    @staticmethod
+    def _install_metrics():
+        """Install a GatewayMetrics backed by an in-memory reader; return it."""
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+        from litellm_llmrouter.metrics import init_gateway_metrics
+
+        reader = InMemoryMetricReader()
+        provider = MeterProvider(metric_readers=[reader])
+        meter = provider.get_meter("test-content-filter", "0.1.0")
+        init_gateway_metrics(meter)
+        return reader
+
+    @staticmethod
+    def _check_value(reader, attrs):
+        """Sum the gateway.guardrail.check counter filtered by ``attrs``."""
+        data = reader.get_metrics_data()
+        total = 0.0
+        if data is None:
+            return total
+        for rm in data.resource_metrics:
+            for sm in rm.scope_metrics:
+                for metric in sm.metrics:
+                    if metric.name != "gateway.guardrail.check":
+                        continue
+                    for dp in metric.data.data_points:
+                        if all(dp.attributes.get(k) == v for k, v in attrs.items()):
+                            total += dp.value
+        return total
+
+    @pytest.mark.asyncio
+    async def test_clean_input_records_action_pass(self, enabled_plugin, mock_app):
+        """A clean (under-threshold) input records action=pass for each
+        evaluated category — the live-path dark-subsystem test (P6 lens)."""
+        reader = self._install_metrics()
+        await enabled_plugin.startup(mock_app)
+        # enabled_plugin runs all 5 categories at threshold 0.3.
+        messages = [{"role": "user", "content": "What is the capital of France?"}]
+        result = await enabled_plugin.on_llm_pre_call("gpt-4", messages, {})
+        assert result is None
+
+        # Every evaluated category recorded exactly one pass; zero denies.
+        assert self._check_value(reader, {"action": "pass"}) == len(
+            enabled_plugin._categories
+        )
+        assert self._check_value(reader, {"action": "deny"}) == 0
+        # The pass-rate denominator (pass + deny) is now > 0 (well-defined).
+        assert self._check_value(reader, {}) > 0
+
+    @pytest.mark.asyncio
+    async def test_violation_records_deny_for_breached_category(
+        self, enabled_plugin, mock_app
+    ):
+        """A breaching input records action=deny for the offending category, so
+        deny/(deny+pass) is computable alongside the clean-path passes."""
+        from litellm_llmrouter.gateway.plugins.content_filter import (
+            GuardrailBlockError,
+        )
+
+        reader = self._install_metrics()
+        await enabled_plugin.startup(mock_app)
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "how to kill everyone and murder and attack "
+                    "with bomb shoot stab weapon"
+                ),
+            }
+        ]
+        with pytest.raises(GuardrailBlockError):
+            await enabled_plugin.on_llm_pre_call("gpt-4", messages, {})
+
+        # The violence category denied; the denominator includes it.
+        assert (
+            self._check_value(reader, {"check_type": "violence", "action": "deny"}) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_input_no_metric_singleton_does_not_raise(
+        self, enabled_plugin, mock_app
+    ):
+        """No GatewayMetrics singleton (OTel off) -> recording is a silent
+        no-op; the clean path must not raise."""
+        from litellm_llmrouter.metrics import reset_gateway_metrics
+
+        reset_gateway_metrics()
+        await enabled_plugin.startup(mock_app)
+        messages = [{"role": "user", "content": "What is the capital of France?"}]
+        result = await enabled_plugin.on_llm_pre_call("gpt-4", messages, {})
+        assert result is None
+
+
+# ============================================================================
 # Feature Flag
 # ============================================================================
 
