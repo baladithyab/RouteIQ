@@ -47,6 +47,7 @@ import os
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -1467,3 +1468,430 @@ def get_strategy_comparison() -> Dict[str, Any]:
         "ab_enabled": status.get("ab_enabled", False),
         "ab_weights": status.get("ab_weights", {}),
     }
+
+
+# ===========================================================================
+# MLOps: quality-gated champion/challenger promotion + rollback (RouteIQ-2a1c)
+# ===========================================================================
+
+
+class PromotionAction(str, Enum):
+    """Outcome of one promoter evaluation."""
+
+    PROMOTE = "promote"
+    """Challenger beat the champion by the margin; it was activated."""
+
+    ROLLBACK = "rollback"
+    """A previously-promoted challenger regressed; the champion was restored."""
+
+    HOLD = "hold"
+    """No change (challenger not clearly better, or already-good state)."""
+
+
+@dataclass
+class PromotionDecision:
+    """Result of a champion/challenger promotion evaluation."""
+
+    action: PromotionAction = PromotionAction.HOLD
+    champion: Optional[str] = None
+    challenger: Optional[str] = None
+    champion_quality: Optional[float] = None
+    challenger_quality: Optional[float] = None
+    applied: bool = False
+    """True iff ``registry.set_active`` was actually called."""
+    reason: str = ""
+
+
+class ChampionChallengerPromoter:
+    """Quality-gated automated champion/challenger promotion + rollback.
+
+    Builds on the EXISTING registry A/B + hot-swap (``set_active``) and the eval
+    loop's aggregated quality (``{strategy/model: quality}`` on the
+    ``ModelQualityTracker`` ``[0, 1]`` scale). When the challenger beats the
+    champion by ``margin`` over a window of at least ``min_samples`` quality
+    samples, the challenger is PROMOTED via ``registry.set_active``. If a
+    freshly-promoted challenger then REGRESSES below the prior champion by the
+    same margin, it is ROLLED BACK to the champion.
+
+    STRATEGY-AGNOSTIC: champion/challenger are registry strategy NAMES; the
+    quality signal is keyed by those same names (the eval loop can aggregate by
+    strategy as well as by model). Insufficient samples => HOLD (never promote
+    on noise). Settings-gated, default OFF.
+
+    The promoter never mutates the registry unless ``apply=True`` is passed to
+    :meth:`evaluate` (so it can be dry-run/inspected). It tracks whether the
+    current active strategy was promoted by it, to scope rollbacks correctly.
+    """
+
+    def __init__(
+        self,
+        *,
+        champion: str,
+        challenger: str,
+        margin: float = 0.05,
+        min_samples: int = 20,
+        registry: Optional[RoutingStrategyRegistry] = None,
+    ) -> None:
+        self._champion = champion
+        self._challenger = challenger
+        self._margin = margin
+        self._min_samples = min_samples
+        self._registry = registry
+        self._lock = threading.RLock()
+        # Whether THIS promoter promoted the challenger to active (rollback scope).
+        self._challenger_promoted = False
+
+    def _get_registry(self) -> RoutingStrategyRegistry:
+        return self._registry or get_routing_registry()
+
+    @property
+    def champion(self) -> str:
+        with self._lock:
+            return self._champion
+
+    @property
+    def challenger(self) -> str:
+        with self._lock:
+            return self._challenger
+
+    @property
+    def challenger_is_active(self) -> bool:
+        """True if this promoter has promoted the challenger to active."""
+        with self._lock:
+            return self._challenger_promoted
+
+    def evaluate(
+        self,
+        quality_by_strategy: Dict[str, float],
+        sample_counts: Optional[Dict[str, int]] = None,
+        *,
+        apply: bool = True,
+    ) -> PromotionDecision:
+        """Decide promote / rollback / hold and (optionally) apply it.
+
+        Args:
+            quality_by_strategy: ``{strategy_name: quality}`` aggregate in
+                ``[0, 1]`` (champion & challenger keyed by registry name).
+            sample_counts: Optional ``{strategy_name: n_samples}``. When
+                provided, BOTH champion and challenger must have at least
+                ``min_samples`` or the decision is HOLD (insufficient data).
+            apply: When True, a PROMOTE/ROLLBACK calls ``registry.set_active``.
+
+        Returns:
+            A :class:`PromotionDecision`.
+        """
+        with self._lock:
+            champ = self._champion
+            chall = self._challenger
+            champ_q = quality_by_strategy.get(champ)
+            chall_q = quality_by_strategy.get(chall)
+
+            decision = PromotionDecision(
+                champion=champ,
+                challenger=chall,
+                champion_quality=champ_q,
+                challenger_quality=chall_q,
+            )
+
+            # Both must have a quality signal.
+            if champ_q is None or chall_q is None:
+                decision.action = PromotionAction.HOLD
+                decision.reason = "missing_quality_signal"
+                self._record_metric(decision.action)
+                return decision
+
+            # Sample-window gate: insufficient samples => HOLD.
+            if sample_counts is not None:
+                champ_n = sample_counts.get(champ, 0)
+                chall_n = sample_counts.get(chall, 0)
+                if champ_n < self._min_samples or chall_n < self._min_samples:
+                    decision.action = PromotionAction.HOLD
+                    decision.reason = (
+                        f"insufficient_samples(champ={champ_n},chall={chall_n},"
+                        f"min={self._min_samples})"
+                    )
+                    self._record_metric(decision.action)
+                    return decision
+
+            if not self._challenger_promoted:
+                # Challenger is NOT active yet: promote if it beats champion by margin.
+                if chall_q - champ_q >= self._margin:
+                    decision.action = PromotionAction.PROMOTE
+                    decision.reason = f"challenger_lead={chall_q - champ_q:.4f}>=margin"
+                    if apply:
+                        applied = self._get_registry().set_active(chall)
+                        decision.applied = applied
+                        if applied:
+                            self._challenger_promoted = True
+                else:
+                    decision.action = PromotionAction.HOLD
+                    decision.reason = "challenger_not_better_by_margin"
+            else:
+                # Challenger IS active: roll back if it regresses below champion
+                # by the margin.
+                if champ_q - chall_q >= self._margin:
+                    decision.action = PromotionAction.ROLLBACK
+                    decision.reason = (
+                        f"challenger_regression={champ_q - chall_q:.4f}>=margin"
+                    )
+                    if apply:
+                        applied = self._get_registry().set_active(champ)
+                        decision.applied = applied
+                        if applied:
+                            self._challenger_promoted = False
+                else:
+                    decision.action = PromotionAction.HOLD
+                    decision.reason = "challenger_still_acceptable"
+
+            self._record_metric(decision.action)
+            return decision
+
+    @staticmethod
+    def _record_metric(action: PromotionAction) -> None:
+        """Best-effort promotion-action metric (telemetry never raises)."""
+        try:
+            from litellm_llmrouter.metrics import get_gateway_metrics
+
+            m = get_gateway_metrics()
+            if m is not None:
+                m.record_promotion_action(action.value)
+        except Exception:  # pragma: no cover - telemetry must not break flow
+            pass
+
+
+# ===========================================================================
+# MLOps: shadow / mirror (silent canary) traffic to a candidate (RouteIQ-4fd1)
+# ===========================================================================
+
+
+@dataclass
+class ShadowRecord:
+    """One offline shadow-comparison record (PII-safe).
+
+    Captures what the candidate WOULD have selected vs what was actually served,
+    for offline comparison. No raw user content is retained.
+    """
+
+    served_model: Optional[str]
+    candidate_model: Optional[str]
+    candidate_strategy: str
+    agreed: bool
+    timestamp: float = field(default_factory=time.time)
+    candidate_error: Optional[str] = None
+
+
+class ShadowMirror:
+    """Mirror a sampled fraction of decisions to a candidate strategy.
+
+    The candidate's selection is computed SILENTLY (it never affects the served
+    response) and recorded for offline comparison. Sampling is honored exactly:
+    with ``sample_rate=0.0`` nothing is mirrored. Settings-gated, default OFF.
+
+    The mirror computes the candidate decision by running the candidate
+    strategy's ``select_deployment(context)`` against the SAME routing context
+    that produced the served decision -- so it is an apples-to-apples
+    counterfactual with zero user impact.
+    """
+
+    def __init__(
+        self,
+        *,
+        candidate_strategy: str,
+        sample_rate: float = 0.0,
+        max_records: int = 1000,
+        registry: Optional[RoutingStrategyRegistry] = None,
+        rng: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self._candidate_name = candidate_strategy
+        self._sample_rate = sample_rate
+        self._registry = registry
+        self._records: deque = deque(maxlen=max_records)
+        self._lock = threading.RLock()
+        self._total_seen = 0
+        self._total_mirrored = 0
+        # Injectable RNG for deterministic tests (defaults to random.random).
+        if rng is None:
+            import random
+
+            rng = random.random
+        self._rng = rng
+
+    def _get_registry(self) -> RoutingStrategyRegistry:
+        return self._registry or get_routing_registry()
+
+    def should_mirror(self) -> bool:
+        """Probabilistic sampling gate (honors ``sample_rate`` exactly)."""
+        if self._sample_rate <= 0.0:
+            return False
+        if self._sample_rate >= 1.0:
+            return True
+        return self._rng() < self._sample_rate
+
+    def mirror(
+        self,
+        context: "RoutingContext",
+        served_result: "RoutingResult",
+    ) -> Optional[ShadowRecord]:
+        """Maybe compute + record the candidate's counterfactual decision.
+
+        Returns the recorded :class:`ShadowRecord` if this decision was sampled
+        and the candidate ran, else None. NEVER mutates ``served_result`` -- the
+        served decision is untouched.
+        """
+        with self._lock:
+            self._total_seen += 1
+        if not self.should_mirror():
+            return None
+
+        candidate = self._get_registry().get(self._candidate_name)
+        if candidate is None:
+            logger.debug(
+                "ShadowMirror: candidate strategy %r not registered",
+                self._candidate_name,
+            )
+            return None
+
+        served_model = (
+            served_result.deployment.get("litellm_params", {}).get("model")
+            if served_result.deployment
+            else None
+        )
+
+        candidate_model: Optional[str] = None
+        candidate_error: Optional[str] = None
+        try:
+            candidate_deployment = candidate.select_deployment(context)
+            if candidate_deployment:
+                candidate_model = candidate_deployment.get("litellm_params", {}).get(
+                    "model"
+                )
+        except Exception as e:  # candidate failure must not affect serving
+            candidate_error = str(e)
+            logger.debug("ShadowMirror: candidate evaluation failed: %s", e)
+
+        record = ShadowRecord(
+            served_model=served_model,
+            candidate_model=candidate_model,
+            candidate_strategy=self._candidate_name,
+            agreed=(candidate_model is not None and candidate_model == served_model),
+            candidate_error=candidate_error,
+        )
+        with self._lock:
+            self._records.append(record)
+            self._total_mirrored += 1
+        return record
+
+    def get_records(self, limit: int = 100) -> List[ShadowRecord]:
+        """Recent shadow comparison records (most recent first)."""
+        with self._lock:
+            return list(self._records)[-limit:][::-1]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Aggregate shadow-comparison stats (PII-safe)."""
+        with self._lock:
+            records = list(self._records)
+            agreements = sum(1 for r in records if r.agreed)
+            errors = sum(1 for r in records if r.candidate_error)
+            return {
+                "candidate_strategy": self._candidate_name,
+                "sample_rate": self._sample_rate,
+                "total_seen": self._total_seen,
+                "total_mirrored": self._total_mirrored,
+                "records_retained": len(records),
+                "agreement_count": agreements,
+                "agreement_rate": (agreements / len(records)) if records else None,
+                "candidate_error_count": errors,
+            }
+
+
+# ---------------------------------------------------------------------------
+# MLOps singletons (promoter + shadow mirror), settings-gated default-off
+# ---------------------------------------------------------------------------
+
+_promoter_instance: Optional[ChampionChallengerPromoter] = None
+_shadow_instance: Optional[ShadowMirror] = None
+_mlops_lock = threading.RLock()
+
+
+def get_champion_challenger_promoter() -> Optional[ChampionChallengerPromoter]:
+    """Get the promoter singleton, or None when disabled.
+
+    Returns None unless ``settings.mlops.promotion.enabled`` is true AND both a
+    champion (the active strategy) and a challenger are resolvable. The
+    challenger name is read from ``LLMROUTER_MLOPS_CHALLENGER`` env / settings;
+    the champion defaults to the registry's current active strategy.
+    """
+    global _promoter_instance
+    with _mlops_lock:
+        if _promoter_instance is not None:
+            return _promoter_instance
+        cfg = _promotion_settings()
+        if cfg is None or not cfg.enabled:
+            return None
+        registry = get_routing_registry()
+        champion = registry.get_active()
+        challenger = _mlops_challenger_name()
+        if not champion or not challenger or champion == challenger:
+            return None
+        _promoter_instance = ChampionChallengerPromoter(
+            champion=champion,
+            challenger=challenger,
+            margin=cfg.margin,
+            min_samples=cfg.min_samples,
+            registry=registry,
+        )
+        return _promoter_instance
+
+
+def get_shadow_mirror() -> Optional[ShadowMirror]:
+    """Get the shadow-mirror singleton, or None when disabled.
+
+    Returns None unless ``settings.mlops.shadow.enabled`` is true and a
+    non-empty ``candidate_strategy`` is configured.
+    """
+    global _shadow_instance
+    with _mlops_lock:
+        if _shadow_instance is not None:
+            return _shadow_instance
+        cfg = _shadow_settings()
+        if cfg is None or not cfg.enabled or not cfg.candidate_strategy:
+            return None
+        _shadow_instance = ShadowMirror(
+            candidate_strategy=cfg.candidate_strategy,
+            sample_rate=cfg.sample_rate,
+            max_records=cfg.max_records,
+        )
+        return _shadow_instance
+
+
+def reset_mlops_singletons() -> None:
+    """Reset the promoter + shadow-mirror singletons (for tests)."""
+    global _promoter_instance, _shadow_instance
+    with _mlops_lock:
+        _promoter_instance = None
+        _shadow_instance = None
+
+
+def _promotion_settings():  # type: ignore[no-untyped-def]
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        mlops = getattr(get_settings(), "mlops", None)
+        return getattr(mlops, "promotion", None) if mlops is not None else None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _shadow_settings():  # type: ignore[no-untyped-def]
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        mlops = getattr(get_settings(), "mlops", None)
+        return getattr(mlops, "shadow", None) if mlops is not None else None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _mlops_challenger_name() -> str:
+    """Resolve the challenger strategy name (env override, else empty)."""
+    return os.getenv("LLMROUTER_MLOPS_CHALLENGER", "").strip()

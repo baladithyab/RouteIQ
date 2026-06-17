@@ -42,6 +42,7 @@ __all__ = [
     "ModelQualityTracker",
     "get_eval_pipeline",
     "reset_eval_pipeline",
+    "wire_mlops_loop",
 ]
 
 logger = logging.getLogger("litellm_llmrouter.eval_pipeline")
@@ -662,3 +663,119 @@ def reset_eval_pipeline() -> None:
             _pipeline._task.cancel()
         _pipeline._running = False
     _pipeline = None
+
+
+# ============================================================================
+# MLOps closed-loop wiring (Cluster H) — drift detector + promoter feedback
+# ============================================================================
+
+
+def _mlops_aggregate_feedback(model_qualities: Dict[str, float]) -> None:
+    """Feed the eval-loop AGGREGATE to the MLOps drift detector + promoter.
+
+    This is the callback signature ``EvalPipeline`` invokes its feedback
+    callbacks with (``{model/strategy: quality}`` on the ``[0, 1]`` scale). It
+    fans the aggregate to:
+
+    - the DRIFT detector (``observe_aggregate`` records the mean as one
+      current-quality observation, then ``evaluate`` emits drift signals); and
+    - the champion/challenger PROMOTER (``evaluate`` applies a quality-gated
+      promotion/rollback).
+
+    Both consumers are settings-gated and return None when disabled, so this is
+    a byte-stable no-op until an operator opts in. It NEVER raises -- a feedback
+    callback failure must not break the eval loop.
+    """
+    if not model_qualities:
+        return
+
+    # Drift detection (RouteIQ-6dce).
+    try:
+        from litellm_llmrouter.mlops.drift import get_drift_detector
+
+        detector = get_drift_detector()
+        if detector is not None:
+            detector.observe_aggregate(model_qualities)
+            detector.evaluate()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("MLOps drift evaluation failed: %s", e)
+
+    # Champion/challenger promotion (RouteIQ-2a1c).
+    try:
+        from litellm_llmrouter.strategy_registry import (
+            get_champion_challenger_promoter,
+        )
+
+        promoter = get_champion_challenger_promoter()
+        if promoter is not None:
+            # Resolve per-strategy sample counts from the pipeline tracker when
+            # available so the promoter's min-sample gate is honored.
+            counts: Optional[Dict[str, int]] = None
+            pipeline = _pipeline
+            if pipeline is not None:
+                counts = pipeline.tracker.get_sample_counts()
+            promoter.evaluate(model_qualities, counts)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("MLOps promotion evaluation failed: %s", e)
+
+
+def wire_mlops_loop(
+    *,
+    eval_pipeline: Optional["EvalPipeline"] = None,
+    force: bool = False,
+) -> bool:
+    """Subscribe the MLOps drift+promotion callback into the eval-pipeline
+    FEEDBACK arm.
+
+    Closes the Cluster-H loop on top of the EXISTING eval loop: each
+    ``push_feedback()`` aggregate reaches the drift detector and the
+    champion/challenger promoter. Wiring is idempotent and never raises.
+
+    Gated on ANY of the ``settings.mlops`` sub-loops being enabled (drift,
+    promotion, or shadow). Pass ``force=True`` to bypass the gate (tests).
+
+    Returns:
+        True if the callback was newly subscribed into a live eval pipeline;
+        False otherwise (gate off, pipeline disabled, or already wired).
+    """
+    if not force and not _any_mlops_enabled():
+        return False
+
+    pipeline = eval_pipeline
+    if pipeline is None:
+        try:
+            pipeline = get_eval_pipeline()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("MLOps: eval pipeline unavailable: %s", e)
+            pipeline = None
+    if pipeline is None:
+        return False
+
+    add_cb = getattr(pipeline, "add_feedback_callback", None)
+    if not callable(add_cb):
+        return False
+    try:
+        added = add_cb(_mlops_aggregate_feedback)
+        if added:
+            logger.info("MLOps: subscribed drift+promotion callback to eval loop")
+        return bool(added)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("MLOps: loop wiring failed: %s", e)
+        return False
+
+
+def _any_mlops_enabled() -> bool:
+    """True if any ``settings.mlops`` sub-loop is enabled."""
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        mlops = getattr(get_settings(), "mlops", None)
+        if mlops is None:
+            return False
+        return bool(
+            getattr(getattr(mlops, "drift", None), "enabled", False)
+            or getattr(getattr(mlops, "promotion", None), "enabled", False)
+            or getattr(getattr(mlops, "shadow", None), "enabled", False)
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False

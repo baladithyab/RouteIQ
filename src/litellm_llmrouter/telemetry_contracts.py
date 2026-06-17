@@ -1079,6 +1079,46 @@ METRIC_CATALOG: tuple[MetricSpec, ...] = (
         ("verdict",),
         description="Evaluation samples scored by verdict (pass/fail)",
     ),
+    # --- MLOps drift + promotion instruments (Cluster H) ---
+    _spec(
+        "gateway.mlops.input_drift.score",
+        MetricType.UP_DOWN_COUNTER,
+        "1",
+        (),
+        description=(
+            "Current input-distribution drift score (population stability "
+            "index) vs the captured baseline"
+        ),
+    ),
+    _spec(
+        "gateway.mlops.quality_regression.delta",
+        MetricType.UP_DOWN_COUNTER,
+        "1",
+        (),
+        description=(
+            "Current routing-quality regression (baseline - current aggregated "
+            "quality, in [0,1]); positive means quality dropped"
+        ),
+    ),
+    _spec(
+        "gateway.mlops.drift.signal",
+        MetricType.COUNTER,
+        "{signal}",
+        ("kind",),
+        description=(
+            "MLOps drift signals fired by kind (input_drift / quality_regression)"
+        ),
+    ),
+    _spec(
+        "gateway.mlops.promotion",
+        MetricType.COUNTER,
+        "{action}",
+        ("action",),
+        description=(
+            "Champion/challenger promotion-loop actions by action "
+            "(promote / rollback / hold)"
+        ),
+    ),
     # --- Cost-aware routing histogram (strategies.py, lazily created) ---
     _spec(
         "routeiq.routing.cost_per_1k_tokens",

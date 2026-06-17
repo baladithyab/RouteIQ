@@ -363,6 +363,56 @@ class GatewayMetrics:
             unit="{sample}",
         )
 
+        # =================================================================
+        # MLOps Drift Instruments (Cluster H, RouteIQ-6dce)
+        # =================================================================
+        #
+        # Gauge-like UpDownCounters for the drift detector. Because this
+        # codebase's no-op OTel adapter does not implement observable gauges,
+        # we model each gauge with an UpDownCounter delta: the detector tracks
+        # the last-emitted value per key and pushes the signed delta so a
+        # Prometheus/CloudWatch query reads the live value. Labels are coarse
+        # (signal kind only) -- never request ids or raw user text.
+
+        self.mlops_input_drift_score: UpDownCounter = meter.create_up_down_counter(
+            name="gateway.mlops.input_drift.score",
+            description=(
+                "Current input-distribution drift score (population stability "
+                "index) vs the captured baseline"
+            ),
+            unit="1",
+        )
+
+        self.mlops_quality_regression: UpDownCounter = meter.create_up_down_counter(
+            name="gateway.mlops.quality_regression.delta",
+            description=(
+                "Current routing-quality regression (baseline - current "
+                "aggregated quality, in [0,1]); positive means quality dropped"
+            ),
+            unit="1",
+        )
+
+        self.mlops_drift_signal: Counter = meter.create_counter(
+            name="gateway.mlops.drift.signal",
+            description=(
+                "MLOps drift signals fired by kind (input_drift / quality_regression)"
+            ),
+            unit="{signal}",
+        )
+
+        # =================================================================
+        # MLOps Promotion Instruments (Cluster H, RouteIQ-2a1c)
+        # =================================================================
+
+        self.mlops_promotion: Counter = meter.create_counter(
+            name="gateway.mlops.promotion",
+            description=(
+                "Champion/challenger promotion-loop actions by action "
+                "(promote / rollback / hold)"
+            ),
+            unit="{action}",
+        )
+
         logger.info("GatewayMetrics: all instruments created")
 
     # Aliases for backward compatibility
@@ -532,6 +582,41 @@ class GatewayMetrics:
             verdict: ``pass`` or ``fail``.
         """
         self.eval_sample.add(1, {"verdict": verdict})
+
+    # ----- MLOps drift / promotion record helpers (Cluster H) -----
+
+    def set_input_drift_score(self, current: float, previous: float = 0.0) -> None:
+        """Set the input-drift score gauge.
+
+        Modeled as an UpDownCounter delta (``current - previous``) because the
+        no-op OTel adapter lacks an observable gauge. Callers track the
+        last-emitted value and pass it as ``previous``.
+        """
+        delta = current - previous
+        if delta:
+            self.mlops_input_drift_score.add(delta)
+
+    def set_quality_regression(self, current: float, previous: float = 0.0) -> None:
+        """Set the routing-quality-regression gauge (delta-modeled)."""
+        delta = current - previous
+        if delta:
+            self.mlops_quality_regression.add(delta)
+
+    def record_drift_signal(self, kind: str) -> None:
+        """Record a fired drift signal.
+
+        Args:
+            kind: ``input_drift`` or ``quality_regression``.
+        """
+        self.mlops_drift_signal.add(1, {"kind": kind})
+
+    def record_promotion_action(self, action: str) -> None:
+        """Record a champion/challenger promotion-loop action.
+
+        Args:
+            action: ``promote`` / ``rollback`` / ``hold``.
+        """
+        self.mlops_promotion.add(1, {"action": action})
 
 
 # =============================================================================
