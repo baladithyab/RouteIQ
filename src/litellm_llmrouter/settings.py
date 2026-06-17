@@ -57,6 +57,28 @@ class RoutingProfile(str, Enum):
     REASONING = "reasoning"
 
 
+class BedrockSynthesisMode(str, Enum):
+    """How Bedrock auto-discovery folds discovered arms into ``model_list``.
+
+    - ``distinct``        — one distinct ``model_name`` per discovered arm (the
+                            byte-stable historical default; the operator-authored
+                            list is only extended, never collapsed).
+    - ``auto_group``      — every discovered serverless arm (across ALL providers
+                            and tiers) collapses onto ONE shared ``model_name``
+                            (``auto_group_name``) so a single routing group fans
+                            out over the whole Bedrock surface.
+    - ``logical_groups``  — one group PER LOGICAL model (e.g.
+                            ``anthropic.claude-sonnet-4``) fanned across its
+                            global/geo/regional/mantle arms; better observability
+                            than ``auto_group`` (which collapses everything to one
+                            name) while still letting the bandit cascade per group.
+    """
+
+    DISTINCT = "distinct"
+    AUTO_GROUP = "auto_group"
+    LOGICAL_GROUPS = "logical_groups"
+
+
 class PolicyFailMode(str, Enum):
     """Policy engine behaviour when evaluation fails."""
 
@@ -809,6 +831,112 @@ class RegionRoutingSettings(BaseModel):
             "carry an explicit residency flag are hard-constrained; an "
             "unflagged region is a soft preference (in-region first, full-set "
             "fallback)."
+        ),
+    )
+
+
+class CapabilityRoutingSettings(BaseModel):
+    """INTELLIGENCE-FIRST capability-tier floor (RouteIQ-8e37).
+
+    Makes the RL router pick the most CAPABLE model for the task, not the
+    cheapest, by enforcing a per-request capability-tier FLOOR as a PRE-SCORING
+    candidate filter on the SAME ``filter_routable_candidates`` seam every
+    RouteIQ strategy already calls (the region filter — RouteIQ-60cc — is the
+    precedent). It composes with gov-ban + cooldown + region and benefits EVERY
+    strategy (default / ML / bandit / centroid / FALLBACK) with no new strategy
+    subclass and no per-path edit.
+
+    Each model carries an ordered capability TIER — ``fast`` < ``advanced`` <
+    ``expert`` (see :attr:`tier_order`). The request DIFFICULTY (resolved from
+    the warm centroid complexity classifier + reasoning markers — never a cold
+    model load on the hot path) maps to a REQUIRED minimum tier: a simple task
+    accepts any tier; a complex / reasoning task requires ``expert``. When
+    gating is :attr:`enabled` and the request needs ``>=`` a tier, models BELOW
+    that tier are DROPPED from the candidate set BEFORE scoring, so a reasoning
+    task NEVER scores a sub-tier model — even in fallback / exploration.
+
+    Tiers are CONFIG-DRIVEN: :attr:`model_tiers` overrides the per-family
+    defaults (:data:`litellm_llmrouter.centroid_routing.MODEL_CAPABILITY_TIERS`).
+    An UNKNOWN model defaults to :attr:`default_tier` (``advanced``, a safe
+    MIDDLE tier) so it is never WRONGLY excluded by a tier floor.
+
+    Capability is a PREFERENCE floor, not a hard residency deny: in the default
+    SOFT mode, if the floor would EMPTY the candidate set (no capable model
+    available) it DEGRADES GRACEFULLY — logs and falls back to the full set
+    rather than returning None / 500. Set :attr:`strict` to fail-closed-to-empty
+    instead (the strategy then yields None / triggers a fallback).
+
+    Env vars (``__`` nested delimiter):
+    ``ROUTEIQ_CAPABILITY_ROUTING__ENABLED``,
+    ``ROUTEIQ_CAPABILITY_ROUTING__STRICT``,
+    ``ROUTEIQ_CAPABILITY_ROUTING__DEFAULT_TIER``,
+    ``ROUTEIQ_CAPABILITY_ROUTING__MODEL_TIERS`` (JSON map),
+    ``ROUTEIQ_CAPABILITY_ROUTING__COMPLEX_MIN_TIER``,
+    ``ROUTEIQ_CAPABILITY_ROUTING__SIMPLE_MIN_TIER``.
+
+    Default OFF / identity: when :attr:`enabled` is False the filter is a
+    byte-stable no-op (returns the input list object unchanged).
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable the per-request capability-tier FLOOR candidate pre-filter "
+            "(intelligence-first routing). Default off -> identity (byte-stable "
+            "no-op)."
+        ),
+    )
+    strict: bool = Field(
+        False,
+        description=(
+            "When True, the capability floor is HARD: if no candidate meets the "
+            "required tier the set is EMPTIED (strategy yields None / fallback). "
+            "When False (default) the floor DEGRADES GRACEFULLY — it logs and "
+            "returns the full set rather than emptying it (capability is a "
+            "PREFERENCE floor, not a residency deny; never 500 on an empty set)."
+        ),
+    )
+    tier_order: List[str] = Field(
+        default_factory=lambda: ["fast", "advanced", "expert"],
+        description=(
+            "Ordered capability tiers from least to most capable. A model's tier "
+            "is compared by its INDEX here; a required tier of ``expert`` drops "
+            "every model whose tier index is below ``expert``'s. Operators may "
+            "extend / reorder this for custom fleets."
+        ),
+    )
+    default_tier: str = Field(
+        "advanced",
+        description=(
+            "Tier assigned to a model with NO known / configured tier. A SAFE "
+            "MIDDLE tier (``advanced``) so an unknown model is never WRONGLY "
+            "excluded by a tier floor (it clears a ``fast``/``advanced`` floor "
+            "and is only dropped by an ``expert`` floor)."
+        ),
+    )
+    model_tiers: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Operator override map of model id (or family substring) -> tier "
+            'name (e.g. {"my-custom-7b": "fast", "my-frontier": "expert"}). '
+            "Checked BEFORE the per-family defaults so an operator can pin any "
+            "model's tier. A tier value not in ``tier_order`` falls back to "
+            "``default_tier``."
+        ),
+    )
+    complex_min_tier: str = Field(
+        "expert",
+        description=(
+            "Required MINIMUM tier for a COMPLEX / reasoning-difficulty request "
+            "(centroid 'complex' tier OR reasoning markers detected). Default "
+            "``expert`` — a hard-reasoning task never scores a sub-expert model."
+        ),
+    )
+    simple_min_tier: str = Field(
+        "fast",
+        description=(
+            "Required MINIMUM tier for a SIMPLE-difficulty request. Default "
+            "``fast`` — a simple task accepts ANY tier (the lowest floor)."
         ),
     )
 
@@ -1683,6 +1811,23 @@ class KumaraswamyThompsonSettings(BaseModel):
             "field (RouteIQ-4654).  Retained for env-var forward-compat."
         ),
     )
+    reward_profile: str = Field(
+        "balanced",
+        description=(
+            "INTELLIGENCE-FIRST reward profile (RouteIQ-8e37). A one-flag switch "
+            "for the bandit's reward weights:\n"
+            "  - ``balanced`` (DEFAULT, byte-stable): the explicit "
+            "``w_quality`` / ``w_cost`` / ``w_latency`` below (0.5 / 0.4 / 0.1).\n"
+            "  - ``intelligence_first`` (RECOMMENDED for the Claude-Code recipe): "
+            "weight quality ~1.0, cost ~0, latency ~0 — within the capable tier "
+            "the bandit LEARNS per-bucket which model is actually best from the "
+            "LLM-judge (Opus vs MiniMax vs Kimi vs DeepSeek), not the cheapest.\n"
+            "  - ``cost_aware``: weight cost more heavily (0.2 / 0.7 / 0.1).\n"
+            "Any non-default profile OVERRIDES the explicit ``w_*`` weights; "
+            "``balanced`` leaves them untouched so existing configs are unchanged. "
+            "Env: ``ROUTEIQ_KUMARASWAMY_THOMPSON__REWARD_PROFILE``."
+        ),
+    )
     w_quality: float = Field(
         0.5,
         ge=0.0,
@@ -1701,6 +1846,24 @@ class KumaraswamyThompsonSettings(BaseModel):
         le=1.0,
         description="Reward weight on latency (faster => higher).",
     )
+
+    def resolved_reward_weights(self) -> tuple[float, float, float]:
+        """Resolve ``(w_quality, w_cost, w_latency)`` for the active profile.
+
+        ``balanced`` (default) returns the explicit ``w_quality`` / ``w_cost`` /
+        ``w_latency`` UNCHANGED (byte-stable). ``intelligence_first`` and
+        ``cost_aware`` are one-flag presets that OVERRIDE those weights. An
+        unknown profile falls back to the explicit weights (treated as balanced)
+        so a typo never silently zeroes a weight.
+        """
+        profile = (self.reward_profile or "balanced").strip().lower()
+        if profile == "intelligence_first":
+            return (1.0, 0.0, 0.0)
+        if profile == "cost_aware":
+            return (0.2, 0.7, 0.1)
+        # balanced (default) or unknown -> the explicit per-weight fields.
+        return (self.w_quality, self.w_cost, self.w_latency)
+
     cost_reward_alpha: float = Field(
         0.5,
         ge=0.0,
@@ -2270,6 +2433,38 @@ class BedrockDiscoverySettings(BaseModel):
             "``ROUTEIQ_BEDROCK_DISCOVERY__INCLUDE_MARKETPLACE_ENDPOINTS``."
         ),
     )
+    synthesis_mode: BedrockSynthesisMode = Field(
+        BedrockSynthesisMode.DISTINCT,
+        description=(
+            "RouteIQ-77e8: how discovered arms fold into ``model_list``. "
+            "``distinct`` (default, byte-stable) keeps one ``model_name`` per "
+            "arm; ``auto_group`` collapses every arm onto the single "
+            "``auto_group_name`` group; ``logical_groups`` emits one group per "
+            "LOGICAL model (e.g. ``anthropic.claude-sonnet-4``) fanned across its "
+            "global/geo/regional/mantle arms (better observability than "
+            "``auto_group``). When set this SUPERSEDES the legacy ``auto_group`` "
+            "bool; ``auto_group=True`` with the default ``synthesis_mode`` is "
+            "still honoured for back-compat (it maps to ``auto_group``). Env: "
+            "``ROUTEIQ_BEDROCK_DISCOVERY__SYNTHESIS_MODE``."
+        ),
+    )
+    full_bedrock_coverage: bool = Field(
+        False,
+        description=(
+            "RouteIQ-77e8: rolled-up FULL-COVERAGE switch. When True, RouteIQ "
+            "routes across the ENTIRE Bedrock + Bedrock-Marketplace (mantle) "
+            "surface as one operator action -- it implies ``enabled=True``, "
+            "``include_marketplace_endpoints=True``, and "
+            "``synthesis_mode=logical_groups`` (unless ``synthesis_mode`` was set "
+            "explicitly to a non-default value, which wins), with the "
+            "global>geo>regional profile preference already on by default "
+            "(``residency_constraint=False``). So the operator flips ONE flag "
+            "instead of four to get intelligence-first routing over every "
+            "serverless FM + registered marketplace endpoint in every source "
+            "region. Default OFF -- byte-stable: nothing changes until enabled. "
+            "Env: ``ROUTEIQ_BEDROCK_DISCOVERY__FULL_BEDROCK_COVERAGE``."
+        ),
+    )
     drift_metric_enabled: bool = Field(
         False,
         description=(
@@ -2310,6 +2505,47 @@ class BedrockDiscoverySettings(BaseModel):
         if isinstance(v, str):
             return [r.strip() for r in v.split(",") if r.strip()]
         return v
+
+    # ------------------------------------------------------------------
+    # Effective-setting resolution (RouteIQ-77e8 full-coverage rollup)
+    # ------------------------------------------------------------------
+    # These compute the EFFECTIVE values a scan should use after applying the
+    # ``full_bedrock_coverage`` rollup, WITHOUT mutating the stored fields (so
+    # the persisted config stays exactly what the operator wrote). They are the
+    # single source of truth for the rollup -- both ``merge_bedrock_discovered_models``
+    # and any other caller resolve through them.
+
+    @property
+    def effective_enabled(self) -> bool:
+        """Discovery runs when explicitly enabled OR full-coverage is on."""
+        return bool(self.enabled or self.full_bedrock_coverage)
+
+    @property
+    def effective_include_marketplace_endpoints(self) -> bool:
+        """Full-coverage forces marketplace/mantle endpoints into the scan."""
+        return bool(self.include_marketplace_endpoints or self.full_bedrock_coverage)
+
+    @property
+    def effective_synthesis_mode(self) -> "BedrockSynthesisMode":
+        """Resolve the synthesis mode after rollup + legacy ``auto_group`` map.
+
+        Precedence (highest first):
+          1. An explicit non-default ``synthesis_mode`` (operator chose it) wins
+             outright -- even under full-coverage.
+          2. ``full_bedrock_coverage`` -> ``logical_groups`` (one group per
+             logical model, the recommended full-coverage shape).
+          3. Legacy ``auto_group=True`` -> ``auto_group`` (back-compat: the old
+             bool still means "collapse onto one group" when ``synthesis_mode``
+             was left at its ``distinct`` default).
+          4. Otherwise the stored ``synthesis_mode`` (``distinct`` default).
+        """
+        if self.synthesis_mode is not BedrockSynthesisMode.DISTINCT:
+            return self.synthesis_mode
+        if self.full_bedrock_coverage:
+            return BedrockSynthesisMode.LOGICAL_GROUPS
+        if self.auto_group:
+            return BedrockSynthesisMode.AUTO_GROUP
+        return BedrockSynthesisMode.DISTINCT
 
 
 class BedrockRequestLeversSettings(BaseModel):
@@ -2955,6 +3191,13 @@ class GatewaySettings(BaseSettings):
         description=(
             "Per-request region-aware / data-residency candidate-filter settings "
             "(default off / identity)."
+        ),
+    )
+    capability_routing: CapabilityRoutingSettings = Field(
+        default_factory=CapabilityRoutingSettings,  # type: ignore[arg-type]
+        description=(
+            "Intelligence-first capability-tier floor candidate-filter settings "
+            "(RouteIQ-8e37; default off / identity)."
         ),
     )
     linucb: LinUCBSettings = Field(

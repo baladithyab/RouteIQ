@@ -1222,12 +1222,25 @@ def register_kumaraswamy_thompson_strategy() -> bool:
         # resumes convergence. Unknown values fall back to memory.
         backend = build_posterior_backend(kts)
 
+        # RouteIQ-8e37: resolve the reward weights through the reward_profile
+        # one-flag switch. ``balanced`` (default) returns the explicit
+        # w_quality/w_cost/w_latency UNCHANGED (byte-stable); ``intelligence_first``
+        # overrides them to quality~1.0/cost~0/latency~0 so the bandit learns the
+        # most CAPABLE model per bucket from the LLM-judge, not the cheapest.
+        resolver = getattr(kts, "resolved_reward_weights", None)
+        if callable(resolver):
+            w_quality, w_cost, w_latency = resolver()
+        else:  # pragma: no cover - forward-compat for a plain object
+            w_quality = getattr(kts, "w_quality", 0.5)
+            w_cost = getattr(kts, "w_cost", 0.4)
+            w_latency = getattr(kts, "w_latency", 0.1)
+
         strategy = KumaraswamyThompsonStrategy(
             backend=backend,
             seed=getattr(kts, "seed", None),
-            w_quality=getattr(kts, "w_quality", 0.5),
-            w_cost=getattr(kts, "w_cost", 0.4),
-            w_latency=getattr(kts, "w_latency", 0.1),
+            w_quality=w_quality,
+            w_cost=w_cost,
+            w_latency=w_latency,
             decay_gamma=getattr(kts, "decay_gamma", 0.99),
             cold_start_kappa=getattr(kts, "cold_start_kappa", 5.0),
             moment_fit=getattr(kts, "moment_fit", False),

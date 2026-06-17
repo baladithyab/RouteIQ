@@ -149,6 +149,19 @@ def _get_sentence_transformer(model_name: str, device: str = "cpu"):
 # Default embedding model matching the training pipeline
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Intelligence-first reward profile (RouteIQ-8e37).
+#
+# The RECOMMENDED Kumaraswamy-Thompson reward profile for the Claude-Code recipe:
+# weight response QUALITY ~1.0 and cost / latency ~0, so that WITHIN the
+# capability-tier floor (see ``candidate_filter.drop_below_capability_tier``) the
+# bandit learns per-bucket which model is ACTUALLY best from the LLM-judge
+# (Opus vs MiniMax vs Kimi vs DeepSeek gets LEARNED), instead of converging on
+# the cheapest arm. Set via ``settings.kumaraswamy_thompson.reward_profile =
+# "intelligence_first"`` (a one-flag switch resolved by
+# ``KumaraswamyThompsonSettings.resolved_reward_weights``). The DEFAULT profile
+# stays ``"balanced"`` (0.5 / 0.4 / 0.1) so existing configs are byte-stable.
+INTELLIGENCE_FIRST_REWARD_PROFILE = "intelligence_first"
+
 # Security: Pickle loading is disabled by default to prevent RCE
 # Set LLMROUTER_ALLOW_PICKLE_MODELS=true to enable in trusted environments
 ALLOW_PICKLE_MODELS = (

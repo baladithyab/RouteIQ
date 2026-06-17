@@ -407,27 +407,183 @@ def drop_out_of_region(
     return candidates  # soft: availability over locality
 
 
+# ---------------------------------------------------------------------------
+# Capability-tier floor (RouteIQ-8e37, intelligence-first routing)
+# ---------------------------------------------------------------------------
+#
+# Makes the RL router pick the most CAPABLE model for the task, not the cheapest,
+# by enforcing a per-request capability-tier FLOOR at the SAME pre-scoring seam
+# as gov-ban + cooldown + region. Each model carries an ordered tier (``fast`` <
+# ``advanced`` < ``expert``); the request difficulty (warm centroid classifier +
+# reasoning markers) maps to a REQUIRED minimum tier. A request that needs
+# ``>=`` a tier DROPS sub-tier models BEFORE scoring, so a reasoning task NEVER
+# scores a sub-tier model — even in fallback / exploration.
+#
+# UNLIKE region/residency, capability is a PREFERENCE floor, not a hard deny:
+# in the default SOFT mode an empty floor result DEGRADES GRACEFULLY (logs +
+# returns the full set) rather than emptying the set / 500ing. ``strict`` mode
+# fails closed-to-empty (the strategy then yields None / triggers a fallback).
+#
+# Default OFF / identity: when ``settings.capability_routing.enabled`` is False,
+# or no context is supplied, the filter is a byte-stable no-op.
+
+
+def _capability_settings() -> Any:
+    """Return ``get_settings().capability_routing`` or ``None`` (fail-open)."""
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().capability_routing
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("capability_routing settings lookup failed (fail-open): %s", exc)
+        return None
+
+
+def _required_min_tier(difficulty: str, settings: Any) -> str:
+    """Map request ``difficulty`` -> the required MINIMUM capability tier.
+
+    ``complex`` (centroid complex tier OR reasoning markers) -> the configured
+    ``complex_min_tier`` (default ``expert``). Anything else (``simple``) -> the
+    configured ``simple_min_tier`` (default ``fast`` — the lowest floor, so a
+    simple task accepts any tier).
+    """
+    if difficulty == "complex":
+        return str(getattr(settings, "complex_min_tier", "expert") or "expert")
+    return str(getattr(settings, "simple_min_tier", "fast") or "fast")
+
+
+def _tier_rank(tier: str, tier_order: List[str]) -> int:
+    """Index of ``tier`` in ``tier_order``; an unknown tier ranks at the bottom.
+
+    An unknown tier returning ``-1`` means it is treated as BELOW every known
+    tier — but the only producer of tiers (``get_model_tier``) maps unknown
+    models to the safe ``default_tier`` (a known tier), so a candidate never
+    reaches here with an unknown tier in practice.
+    """
+    try:
+        return tier_order.index(tier)
+    except ValueError:
+        return -1
+
+
+def drop_below_capability_tier(
+    context: Any, candidates: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """RouteIQ-8e37: per-request capability-tier FLOOR pre-filter.
+
+    Default OFF / identity: returns the input list OBJECT unchanged when the
+    feature is disabled or the context is absent (byte-stable — no allocation,
+    no reordering).
+
+    When ENABLED, resolves the request difficulty (warm centroid classifier +
+    reasoning markers — never a cold load) -> a required minimum tier, then DROPS
+    every candidate whose tier ranks BELOW it. Behaviour when the floor empties
+    the set:
+
+      - SOFT (default): DEGRADE GRACEFULLY — log + return the ORIGINAL list
+        object unchanged (capability is a preference floor; never 500 on empty).
+      - STRICT: return ``[]`` (the strategy yields None / triggers a fallback).
+
+    Byte-stable when every candidate already meets the floor (same membership AND
+    order) -> returns the original object.
+    """
+    if context is None:
+        return candidates
+    settings = _capability_settings()
+    if settings is None or not getattr(settings, "enabled", False):
+        return candidates
+    if not candidates:
+        return candidates
+
+    try:
+        from litellm_llmrouter.centroid_routing import (
+            get_model_tier,
+            resolve_request_difficulty,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("capability tier deps unavailable (fail-open): %s", exc)
+        return candidates
+
+    difficulty = resolve_request_difficulty(context)
+    required = _required_min_tier(difficulty, settings)
+    tier_order = list(
+        getattr(settings, "tier_order", None) or ["fast", "advanced", "expert"]
+    )
+    required_rank = _tier_rank(required, tier_order)
+    # A required tier that is the LOWEST in the order (e.g. simple->fast) can
+    # never drop anything -> byte-stable no-op without per-candidate work.
+    if required_rank <= 0:
+        return candidates
+
+    model_tiers = dict(getattr(settings, "model_tiers", None) or {})
+    default_tier = str(getattr(settings, "default_tier", "advanced") or "advanced")
+
+    def _arm_name(dep: Dict[str, Any]) -> str:
+        return str(
+            (dep.get("litellm_params") or {}).get("model", "")
+            or dep.get("model_name", "")
+        )
+
+    capable = [
+        d
+        for d in candidates
+        if _tier_rank(
+            get_model_tier(_arm_name(d), model_tiers, default_tier), tier_order
+        )
+        >= required_rank
+    ]
+
+    if capable:
+        # Byte-stable when EVERY candidate already meets the floor.
+        if len(capable) == len(candidates):
+            return candidates
+        return capable
+
+    # No candidate meets the floor.
+    if getattr(settings, "strict", False):
+        logger.info(
+            "capability floor (strict): no candidate meets tier >= %r for a "
+            "%s request -> emptying set (None / fallback)",
+            required,
+            difficulty,
+        )
+        return []
+    logger.info(
+        "capability floor (soft): no candidate meets tier >= %r for a %s "
+        "request -> degrading to full set (availability over capability)",
+        required,
+        difficulty,
+    )
+    return candidates
+
+
 def filter_routable_candidates(
     router: Any,
     candidates: List[Dict[str, Any]],
     context: Any = None,
 ) -> List[Dict[str, Any]]:
-    """Compose the pre-scoring filters: gov-ban (hard), cooldown (soft), region.
+    """Compose the pre-scoring filters: gov-ban, cooldown, capability, region.
 
     Order (locked): gov-ban FIRST (a banned arm is never re-added), then cooldown
-    (fail-open), then the per-request region filter (RouteIQ-60cc). Region runs
-    LAST because hard residency is a request-scoped constraint, not a fleet-health
-    one -- it must apply to whatever availability-filtered set remains, and its
-    fail-closed empty result is the correct terminal outcome (a residency
-    violation must not be re-added).
+    (fail-open), then the per-request capability-tier FLOOR (RouteIQ-8e37), then
+    the per-request region filter (RouteIQ-60cc).
 
-    ``context`` is OPTIONAL: when ``None`` (the legacy call shape) the region
-    filter no-ops, so every existing caller is byte-stable. When supplied AND
-    ``settings.region_routing.enabled`` is True, the region filter activates.
+    Capability runs BEFORE region so that the intelligence floor narrows to the
+    capable set first; region (hard residency) then applies its request-scoped
+    constraint LAST, since its fail-closed empty result is the correct terminal
+    outcome (a residency violation must not be re-added). The capability floor's
+    SOFT degrade re-adds only from its OWN already-(gov-ban+cooldown)-filtered
+    input, so it can never re-introduce a banned / cooled-down arm; a STRICT
+    empty likewise flows through region unchanged.
+
+    ``context`` is OPTIONAL: when ``None`` (the legacy call shape) BOTH the
+    capability and region filters no-op, so every existing caller is byte-stable.
+    When supplied AND the respective feature is enabled, that filter activates.
 
     Byte-stable no-op when ``banned_models`` is empty, nothing is cooled down,
-    and (region disabled OR no per-request region token) -- returns the original
-    list object.
+    and (capability disabled OR no tier floor applies) and (region disabled OR no
+    per-request region token) -- returns the original list object.
     """
     routable = drop_cooled_down(router, drop_gov_banned(candidates))
+    routable = drop_below_capability_tier(context, routable)
     return drop_out_of_region(context, routable)

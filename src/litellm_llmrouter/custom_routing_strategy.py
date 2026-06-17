@@ -279,6 +279,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         result = await self._route_via_personalized(
             model=model,
             request_kwargs=request_kwargs,
+            messages=messages,
         )
         if result is not None:
             return result
@@ -292,8 +293,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         if result is not None:
             return result
 
-        # 6. Fallback to first available deployment
-        return self._fallback_deployment(model, request_kwargs)
+        # 6. Fallback to first available deployment (RouteIQ-8e37: thread messages
+        #    so the capability-tier floor applies on the terminal fallback too).
+        return self._fallback_deployment(model, request_kwargs, messages)
 
     def get_available_deployment(
         self,
@@ -371,8 +373,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         if result is not None:
             return result
 
-        # 5. Fallback to first available deployment
-        return self._fallback_deployment(model, request_kwargs)
+        # 5. Fallback to first available deployment (RouteIQ-8e37: thread messages
+        #    so the capability-tier floor applies on the terminal fallback too).
+        return self._fallback_deployment(model, request_kwargs, messages)
 
     # ------------------------------------------------------------------
     # Internal: Gov-ban chokepoint (RouteIQ-a073)
@@ -622,8 +625,12 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         query = self._extract_query(messages, input)
 
         # Get model list and deployment map (RouteIQ-60cc: pass request_kwargs so
-        # the per-request region / data-residency pre-filter activates here).
-        model_list, healthy_deployments = self._get_model_list(model, request_kwargs)
+        # the per-request region / data-residency pre-filter activates here;
+        # RouteIQ-8e37: pass messages so the capability-tier floor resolves the
+        # request difficulty on the ML path).
+        model_list, healthy_deployments = self._get_model_list(
+            model, request_kwargs, messages
+        )
 
         if not model_list:
             model_list = [model]
@@ -824,6 +831,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         self,
         model: str,
         request_kwargs: Optional[Dict] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[Dict]:
         """Re-rank candidate deployments using learned user preferences.
 
@@ -835,6 +843,8 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         Args:
             model: The requested model group name.
             request_kwargs: Request keyword arguments (may contain user_id).
+            messages: Chat messages, threaded so the capability-tier floor
+                (RouteIQ-8e37) can resolve the request difficulty on this path.
 
         Returns:
             Selected deployment dict, or None if personalized routing is
@@ -854,9 +864,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 return None
 
             # Get candidate models from healthy deployments (RouteIQ-60cc:
-            # pass request_kwargs so region / residency is honoured here too).
+            # pass request_kwargs so region / residency is honoured here too;
+            # RouteIQ-8e37: pass messages so the capability-tier floor applies).
             model_list, healthy_deployments = self._get_model_list(
-                model, request_kwargs
+                model, request_kwargs, messages
             )
             if not model_list or len(model_list) < 2:
                 # No point re-ranking with 0 or 1 candidates
@@ -973,18 +984,22 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
     # ------------------------------------------------------------------
 
     def _get_model_list(
-        self, model: str, request_kwargs: Optional[Dict] = None
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
     ) -> tuple:
         """
         Get available deployments from the Router.
 
         Prefers ``healthy_deployments`` over ``model_list`` for freshness.
 
-        ``request_kwargs`` is OPTIONAL: when supplied, a minimal
-        :class:`RoutingContext` is built from it so the per-request region /
-        data-residency pre-filter (RouteIQ-60cc) activates on the ML
-        (``LLMRouterStrategyFamily``) path. When ``None`` the region filter
-        no-ops (byte-stable for callers that have no request context).
+        ``request_kwargs`` / ``messages`` are OPTIONAL: when supplied, a minimal
+        :class:`RoutingContext` is built so the per-request region /
+        data-residency pre-filter (RouteIQ-60cc) AND the capability-tier FLOOR
+        (RouteIQ-8e37) activate on the ML (``LLMRouterStrategyFamily``) path.
+        ``messages`` feed the capability floor's difficulty resolution. When both
+        are absent both filters no-op (byte-stable for callers with no context).
 
         Returns:
             Tuple of (model_name_list, healthy_deployments_list)
@@ -1002,9 +1017,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
 
         # RouteIQ-60cc: build a minimal region-signal context from request_kwargs
         # so a HARD data-residency request never leaks out-of-region on the ML
-        # path. ``context=None`` (no request_kwargs) keeps the legacy byte-stable
-        # behaviour (region filter no-ops).
-        context = self._region_context(model, request_kwargs)
+        # path. RouteIQ-8e37: ``messages`` are threaded too so the capability-tier
+        # floor can resolve the request difficulty here. ``context=None`` (no
+        # request_kwargs AND no messages) keeps the legacy byte-stable behaviour.
+        context = self._region_context(model, request_kwargs, messages)
 
         group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
         routable = filter_routable_candidates(
@@ -1020,9 +1036,12 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         return model_list, healthy_deployments
 
     def _region_context(
-        self, model: str, request_kwargs: Optional[Dict]
+        self,
+        model: str,
+        request_kwargs: Optional[Dict],
+        messages: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[Any]:
-        """Build a minimal region-signal context for the region pre-filter.
+        """Build a minimal context for the per-request candidate pre-filters.
 
         RouteIQ-60cc: the ML (``LLMRouterStrategyFamily``) path operates on a
         bare model name, not a ``RoutingContext``, so the region / data-residency
@@ -1031,23 +1050,30 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         ``request_kwargs`` / ``metadata`` are exactly the sources
         ``candidate_filter._ctx_sources`` scans.
 
-        Returns ``None`` when ``request_kwargs`` is absent (no region signal) so
-        the region filter no-ops and the legacy candidate set is byte-stable.
+        RouteIQ-8e37: ``messages`` are also threaded so the capability-tier FLOOR
+        filter can resolve the request DIFFICULTY (reasoning markers + warm
+        centroid tier) on the same ML / fallback paths — without the prompt the
+        floor could not tell a simple request from a hard reasoning one.
+
+        Returns ``None`` when there is NO signal at all (no ``request_kwargs`` AND
+        no ``messages``) so both filters no-op and the legacy candidate set is
+        byte-stable.
         """
-        if not request_kwargs:
+        if not request_kwargs and not messages:
             return None
         try:
             from litellm_llmrouter.strategy_registry import RoutingContext
 
-            metadata = request_kwargs.get("metadata")
+            metadata = (request_kwargs or {}).get("metadata")
             return RoutingContext(
                 router=self._router,
                 model=model,
+                messages=messages,
                 request_kwargs=request_kwargs,
                 metadata=metadata if isinstance(metadata, dict) else {},
             )
         except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("region context build failed (region filter no-op): %s", exc)
+            logger.debug("filter context build failed (filters no-op): %s", exc)
             return None
 
     @staticmethod
@@ -1141,7 +1167,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         return self._pipeline
 
     def _fallback_deployment(
-        self, model: str, request_kwargs: Optional[Dict] = None
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[Dict]:
         """Return first routable deployment for the given model group.
 
@@ -1151,9 +1180,11 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         RouteIQ-60cc: this terminal fallback is the LAST deployment-selection
         seam, so it MUST honour per-request region/data-residency too — a
         hard-residency request that reaches the fallback must not leak
-        out-of-region. ``request_kwargs`` is threaded so the region filter sees
-        the same header/metadata signal; ``None`` => region filter no-ops
-        (byte-stable).
+        out-of-region. RouteIQ-8e37: the capability-tier FLOOR is threaded here
+        too — a HARD reasoning request must never fall back to a sub-tier model
+        (in STRICT mode the set empties; in SOFT mode it degrades to the full
+        set). ``request_kwargs`` + ``messages`` carry the same signal the other
+        paths use; both absent => filters no-op (byte-stable).
         """
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
@@ -1161,7 +1192,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             self._router, "healthy_deployments", self._router.model_list
         )
         group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
-        context = self._region_context(model, request_kwargs)
+        context = self._region_context(model, request_kwargs, messages)
         for deployment in filter_routable_candidates(
             self._router, group_matched, context=context
         ):

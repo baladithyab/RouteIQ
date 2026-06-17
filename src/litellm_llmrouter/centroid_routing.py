@@ -280,6 +280,184 @@ MODEL_CAPABILITIES: Dict[str, Set[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Capability TIER ladder (RouteIQ-8e37, intelligence-first routing)
+# ---------------------------------------------------------------------------
+#
+# An ordered capability TIER per model — ``fast`` < ``advanced`` < ``expert`` —
+# orthogonal to the capability-SET above (vision / function_calling / ...). The
+# tier expresses raw model INTELLIGENCE so the capability-floor pre-filter
+# (``candidate_filter.drop_below_capability_tier``) can DROP sub-tier models for
+# a hard / reasoning request BEFORE scoring. Defaults below cover known families;
+# operators override per-model via ``settings.capability_routing.model_tiers``,
+# and an UNKNOWN model resolves to the safe MIDDLE ``default_tier`` (``advanced``)
+# so it is never WRONGLY excluded. The ``reasoning`` capability already lives in
+# :data:`MODEL_CAPABILITIES`; the tier here is the COMPLEMENTARY raw-intelligence
+# axis (a reasoning-required request needs an ``expert`` tier, not merely the
+# ``reasoning`` capability flag).
+MODEL_CAPABILITY_TIERS: Dict[str, str] = {
+    # --- expert: frontier reasoning / flagship models ---
+    "claude-opus-4-6-20250918": "expert",
+    "claude-3-opus-20240229": "expert",
+    "claude-3-7-sonnet": "expert",
+    "claude-sonnet-4-5-20250929": "expert",
+    "claude-sonnet-4-20250514": "expert",
+    "gpt-5": "expert",
+    "gpt-5.2": "expert",
+    "gpt-5.4": "expert",
+    "o1": "expert",
+    "o1-mini": "expert",
+    "o3-mini": "expert",
+    "o4-mini": "expert",
+    "deepseek-reasoner": "expert",
+    "deepseek-r1": "expert",
+    "minimax-m1": "expert",
+    "kimi-k2": "expert",
+    "gemini-2.5-pro-preview-05-06": "expert",
+    "gemini-1.5-pro": "expert",
+    # --- advanced: capable mid-tier general models ---
+    "gpt-4o": "advanced",
+    "gpt-4-turbo": "advanced",
+    "gpt-4.1": "advanced",
+    "gpt-5-mini": "advanced",
+    "claude-3-5-sonnet-20241022": "advanced",
+    "deepseek-chat": "advanced",
+    "gemini-3-flash-preview": "advanced",
+    # --- fast: small / cheap / low-latency models ---
+    "gpt-4o-mini": "fast",
+    "gpt-4.1-mini": "fast",
+    "gpt-4.1-nano": "fast",
+    "claude-3-5-haiku-20241022": "fast",
+    "claude-haiku-4-5-20251001": "fast",
+    "nova-lite": "fast",
+    "nova-micro": "fast",
+    "gemini-2.0-flash": "fast",
+}
+
+# Difficulty -> the request needs AT LEAST this much capability. A SIMPLE request
+# accepts any tier (the lowest floor); a COMPLEX / reasoning request requires the
+# expert floor. These are the DEFAULTS; the actual required tier is read from
+# ``settings.capability_routing.{simple,complex}_min_tier`` so an operator can
+# loosen / tighten the mapping without code changes.
+_DEFAULT_SIMPLE_MIN_TIER = "fast"
+_DEFAULT_COMPLEX_MIN_TIER = "expert"
+
+
+def get_model_tier(model_name: str, model_tiers: Dict[str, str], default: str) -> str:
+    """Resolve a model's capability TIER (config-overridable, fuzzy, safe default).
+
+    Resolution order (first hit wins):
+
+    1. Operator override ``model_tiers`` — exact, then substring (either
+       direction), so a family token (e.g. ``"claude-opus"``) pins every
+       region/version-prefixed arm.
+    2. The built-in :data:`MODEL_CAPABILITY_TIERS` defaults — exact, then
+       substring.
+    3. ``default`` (the safe MIDDLE tier) for an UNKNOWN model, so it is never
+       WRONGLY excluded by a tier floor.
+    """
+    name = str(model_name or "")
+    # 1. Operator overrides (highest precedence).
+    if model_tiers:
+        tier = model_tiers.get(name)
+        if tier:
+            return str(tier)
+        for key, val in model_tiers.items():
+            if key and (key in name or name in key):
+                return str(val)
+    # 2. Built-in family defaults.
+    tier = MODEL_CAPABILITY_TIERS.get(name)
+    if tier:
+        return tier
+    for key, val in MODEL_CAPABILITY_TIERS.items():
+        if key in name or name in key:
+            return val
+    # 3. Unknown -> safe middle tier (never wrongly excluded).
+    return default
+
+
+def resolve_request_difficulty(context: Any) -> str:
+    """Resolve request DIFFICULTY as ``"simple"`` or ``"complex"`` (hot-path safe).
+
+    Combines two signals, biasing toward ``complex`` (it is safer to over-serve):
+
+    - The centroid complexity classifier's tier — used ONLY when the centroid
+      model is ALREADY warm-loaded (mirrors ``KumaraswamyThompsonStrategy._bucket``:
+      NEVER trigger a cold sentence-transformer load on the routing hot path).
+    - The :class:`ReasoningDetector` regex markers — pure-regex, always cheap, so
+      it runs unconditionally. Any reasoning hit forces ``complex``.
+
+    Returns ``"complex"`` if either signal fires, else ``"simple"``. Never
+    raises and never blocks — any error falls back to ``"simple"`` (the most
+    permissive floor, so a difficulty-resolution glitch can never wrongly EMPTY
+    the candidate set).
+    """
+    try:
+        text, system_message = _difficulty_text(context)
+        if not text and not system_message:
+            return "simple"
+
+        # 1. Reasoning markers (pure regex, always safe to run).
+        reasoning = ReasoningDetector.detect(text, system_message)
+        if reasoning.is_reasoning:
+            return "complex"
+
+        # 2. Centroid tier — ONLY if already warm (no cold load on hot path).
+        strategy = get_centroid_strategy()
+        classifier = getattr(strategy, "_classifier", None)
+        if classifier is not None and getattr(classifier, "_loaded", False):
+            result = classifier.classify(text or system_message)
+            tier = getattr(result, "tier", None)
+            if tier == "complex":
+                return "complex"
+        return "simple"
+    except Exception:  # pragma: no cover - defensive, must never block routing
+        return "simple"
+
+
+def _difficulty_text(context: Any) -> Tuple[str, str]:
+    """Best-effort ``(user_text, system_message)`` extraction for difficulty.
+
+    Reads ``context.messages`` (last user message + system message), falling
+    back to ``context.input`` / ``request_kwargs['messages']``. Tolerant of a
+    minimal context shape (the region filter builds a lightweight one), so it
+    never assumes more than the ``messages`` / ``input`` / ``request_kwargs``
+    attributes exist.
+    """
+    messages = getattr(context, "messages", None)
+    if not messages:
+        rk = getattr(context, "request_kwargs", None)
+        if isinstance(rk, dict):
+            messages = rk.get("messages")
+    if not messages:
+        inp = getattr(context, "input", None)
+        if isinstance(inp, str) and inp:
+            return inp, ""
+        return "", ""
+
+    system_message = ""
+    last_user = ""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            content = " ".join(parts)
+        if not isinstance(content, str):
+            content = str(content) if content else ""
+        if role in ("system", "developer"):
+            system_message = content
+        elif role == "user":
+            last_user = content
+    return last_user, system_message
+
+
 def detect_required_capabilities(request_data: Dict[str, Any]) -> Set[str]:
     """Detect what capabilities a request requires based on its content.
 
