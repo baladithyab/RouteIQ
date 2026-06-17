@@ -2117,6 +2117,53 @@ class HASettings(BaseModel):
     )
 
 
+class EngineMetricsSettings(BaseModel):
+    """Self-hosted-engine ``/metrics`` scrape configuration (default OFF).
+
+    Drives :mod:`litellm_llmrouter.engine_metrics`, the credless scraper that
+    GETs a self-hosted inference engine's Prometheus ``/metrics`` (vLLM, vLLM
+    Production Stack, AIBrix, llm-d -- all serve the ``vllm:*`` family) and
+    parses the queue-depth / KV-cache-pressure gauges
+    (``vllm:num_requests_waiting``, ``vllm:kv_cache_usage_perc`` /
+    ``vllm:gpu_cache_usage_perc``, ...). Those signals feed a *future*
+    KV/queue-aware Layer-1 router or an autoscaler-into-the-engine.
+
+    LAYERING: this reads the engine *frontend's* aggregate ``/metrics`` so
+    Layer-1 can decide whether to send more load to this engine arm; it never
+    scrapes individual worker pods (that would collapse the two-layer model --
+    see ``docs/architecture/aws-rearchitecture/51-multinode-large-model-serving.md``
+    Part 3).
+
+    Default DISABLED (opt-in): with ``enabled=False`` the scraper is a byte-stable
+    no-op -- importing the module does no I/O, and ``scrape()`` returns an empty
+    ``reachable=False`` snapshot without touching the network. Live scraping is
+    therefore operator-gated.
+
+    Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix):
+    ``ROUTEIQ_ENGINE_METRICS__ENABLED``,
+    ``ROUTEIQ_ENGINE_METRICS__SCRAPE_TIMEOUT``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable the self-hosted-engine /metrics scrape. Default OFF -- the "
+            "scraper no-ops and does zero network I/O until an operator opts in "
+            "(live scrape is operator-gated)."
+        ),
+    )
+    scrape_timeout: float = Field(
+        2.0,
+        ge=0.1,
+        le=30.0,
+        description=(
+            "Per-scrape HTTP GET timeout in seconds. An engine that does not "
+            "answer within this budget yields an empty (reachable=False) "
+            "snapshot, never an exception."
+        ),
+    )
+
+
 # ============================================================================
 # Custom env source -- comma-separated coercion for documented list fields
 # ============================================================================
@@ -2500,6 +2547,13 @@ class GatewaySettings(BaseSettings):
         description=(
             "MLOps closed-loop settings: quality-gated promotion, drift "
             "detection, and shadow/mirror canary (all default off)."
+        ),
+    )
+    engine_metrics: EngineMetricsSettings = Field(
+        default_factory=EngineMetricsSettings,  # type: ignore[arg-type]
+        description=(
+            "Self-hosted-engine /metrics scrape settings (vLLM / Production "
+            "Stack / AIBrix / llm-d queue-depth + KV-cache gauges; default off)."
         ),
     )
 

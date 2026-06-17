@@ -7,7 +7,9 @@
 # Source of truth:
 #   docs/architecture/aws-rearchitecture/50-litellm-universal-surface.md  §4 (C3b)
 #   docs/architecture/aws-rearchitecture/51-multinode-large-model-serving.md §3.2
-#   Seeds: RouteIQ-91fe (C3b engine as ONE api_base), RouteIQ-28be (KVBM tiers)
+#   docs/architecture/aws-rearchitecture/53-self-hosted-serving-engines.md (engine deep-dive)
+#   Seeds: RouteIQ-91fe (C3b engine as ONE api_base), RouteIQ-28be (KVBM tiers),
+#          RouteIQ-7f7d (engine coverage: Prod Stack/AIBrix/llm-d), RouteIQ-ffaa (metrics)
 #
 # -----------------------------------------------------------------------------
 # THE TWO-LAYER ROUTING RULE (read before editing model_list)
@@ -51,6 +53,34 @@ model_list:
       # engine does not authenticate -- "fake-api-key" is the documented sentinel
       # (reference/litellm/litellm/llms/hosted_vllm/chat/transformation.py).
       api_key: fake-api-key
+
+  # ===========================================================================
+  # CRED-FREE ENGINE ARMS -- pick ONE per model (commented; uncomment + set the
+  # real in-cluster Service DNS to go live). The arm above is AIBrix; these are
+  # the other two vLLM-native control planes. The engine CHOICE is operational /
+  # platform / maturity, NOT API-compatibility -- all expose OpenAI /v1 and are
+  # registered IDENTICALLY (one hosted_vllm row, api_base = the gateway Service).
+  # Deep coverage (pick-when / k8s gang scheduling / RouteIQ integration):
+  #   docs/architecture/aws-rearchitecture/53-self-hosted-serving-engines.md
+  # ---------------------------------------------------------------------------
+  # --- Arm: vLLM PRODUCTION STACK (smallest step up; Helm + KEDA; LWS for ----
+  #     multi-node; KV-cache-aware FastAPI router; no gateway CRDs) -----------
+  # - model_name: oss-70b
+  #   litellm_params:
+  #     model: hosted_vllm/meta-llama/Llama-3.1-70B-Instruct
+  #     # api_base = the Production-Stack ROUTER Service (not a serving pod).
+  #     api_base: http://vllm-router-service.vllm-system.svc.cluster.local/v1
+  #     api_key: fake-api-key
+  #
+  # --- Arm: llm-d (Gateway API Inference Extension; EPP scheduler; LWS for ---
+  #     multi-node; pick ONLY if standardizing on GAIE -- it STRICTLY requires
+  #     Gateway API + InferencePool CRDs + a Gateway provider) ----------------
+  # - model_name: oss-70b
+  #   litellm_params:
+  #     model: hosted_vllm/meta-llama/Llama-3.1-70B-Instruct
+  #     # api_base = the llm-d GAIE Gateway Service (EPP sits behind it).
+  #     api_base: http://llm-d-gateway.llm-d.svc.cluster.local/v1
+  #     api_key: fake-api-key
 
   # --- Optional sibling capacity arm (DIFFERENT source, same alias is fine) ---
   # A Bedrock arm under the SAME model_name is a legitimate second CAPACITY

@@ -106,6 +106,10 @@ def _reset_all_singletons():
 
     reset_service_discovery()
 
+    from litellm_llmrouter.engine_metrics import reset_engine_metrics_scraper
+
+    reset_engine_metrics_scraper()
+
     from litellm_llmrouter.settings import reset_settings
 
     reset_settings()
