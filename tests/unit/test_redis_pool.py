@@ -963,3 +963,127 @@ class TestIamTokenTtlSingleSource:
             # One second past the threshold -> stale.
             clock["t"] += 1.0
             assert rp._iam_token_is_stale() is True
+
+
+# =============================================================================
+# Redis Cluster mode (RouteIQ-5d8f)
+# =============================================================================
+#
+# Cluster mode is gated on settings.redis.cluster_mode (ROUTEIQ_REDIS__CLUSTER_MODE),
+# DEFAULT false. When on, get_async/sync_redis_client build a RedisCluster client
+# instead of a single-endpoint Redis; the ElastiCache IAM-auth (SigV4) splice
+# applies verbatim. redis / redis.asyncio ARE importable in the dev env so the
+# client classes are patched directly (mirrors the existing factory tests).
+
+
+class TestRedisClusterMode:
+    """cluster_mode=true builds a RedisCluster; default builds single-endpoint Redis."""
+
+    async def test_async_cluster_client_when_cluster_mode_on(self):
+        """get_async_redis_client builds a RedisCluster when cluster_mode is on."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {
+            "REDIS_HOST": "cluster-cfg.example.com",
+            "REDIS_PORT": "6379",
+            "REDIS_SSL": "true",
+            "ROUTEIQ_REDIS__CLUSTER_MODE": "true",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            with (
+                patch("redis.asyncio.RedisCluster") as mock_cluster,
+                patch("redis.asyncio.Redis") as mock_single,
+            ):
+                mock_cluster.return_value = MagicMock()
+                client = await rp.get_async_redis_client()
+
+                assert client is not None
+                mock_cluster.assert_called_once()
+                mock_single.assert_not_called()
+                kwargs = mock_cluster.call_args.kwargs
+                assert kwargs["host"] == "cluster-cfg.example.com"
+                assert kwargs["port"] == 6379
+                assert kwargs["ssl"] is True
+                # Cluster mode is db 0 only -> no db kwarg passed.
+                assert "db" not in kwargs
+
+    async def test_async_single_endpoint_when_cluster_mode_off(self):
+        """Default (cluster_mode off) builds a single-endpoint Redis, not a cluster."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {
+            "REDIS_HOST": "single.example.com",
+            "REDIS_PORT": "6379",
+            # ROUTEIQ_REDIS__CLUSTER_MODE unset -> default OFF
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            with (
+                patch("redis.asyncio.RedisCluster") as mock_cluster,
+                patch("redis.asyncio.Redis") as mock_single,
+            ):
+                mock_single.return_value = MagicMock()
+                client = await rp.get_async_redis_client()
+
+                assert client is not None
+                mock_single.assert_called_once()
+                mock_cluster.assert_not_called()
+                # The single-endpoint path keeps the db kwarg (byte-stable).
+                assert "db" in mock_single.call_args.kwargs
+
+    def test_sync_cluster_client_when_cluster_mode_on(self):
+        """get_sync_redis_client builds a RedisCluster when cluster_mode is on."""
+        import litellm_llmrouter.redis_pool as rp
+
+        env = {
+            "REDIS_HOST": "cluster-cfg.example.com",
+            "REDIS_PORT": "6379",
+            "ROUTEIQ_REDIS__CLUSTER_MODE": "true",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            with (
+                patch("redis.RedisCluster") as mock_cluster,
+                patch("redis.Redis") as mock_single,
+            ):
+                mock_cluster.return_value = MagicMock()
+                client = rp.get_sync_redis_client()
+
+                assert client is not None
+                mock_cluster.assert_called_once()
+                mock_single.assert_not_called()
+
+    async def test_cluster_mode_honors_iam_auth_splice(self, monkeypatch):
+        """Cluster mode still mints + presents username + token-as-password (ADR-0029)."""
+        import litellm_llmrouter.redis_pool as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_mint_elasticache_token",
+            lambda user, cache_name, region: _FAKE_SIGNED_TOKEN,
+        )
+        env = {
+            "REDIS_HOST": _SERVERLESS_HOST,
+            "REDIS_SSL": "true",
+            "REDIS_USERNAME": _FAKE_CACHE_USER,
+            "ROUTEIQ_REDIS_IAM_AUTH": "true",
+            "ROUTEIQ_REDIS__CLUSTER_MODE": "true",
+            "AWS_REGION": "us-east-1",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            reset_settings()
+            with patch("redis.asyncio.RedisCluster") as mock_cluster:
+                mock_cluster.return_value = MagicMock()
+                await rp.get_async_redis_client()
+
+                kwargs = mock_cluster.call_args.kwargs
+                assert kwargs["username"] == _FAKE_CACHE_USER
+                assert kwargs["password"] == _FAKE_SIGNED_TOKEN
+
+    def test_cluster_mode_enabled_helper_fail_soft(self):
+        """_cluster_mode_enabled returns False when settings cannot be read."""
+        import litellm_llmrouter.redis_pool as rp
+
+        with patch.object(rp, "get_settings", side_effect=RuntimeError("boom")):
+            assert rp._cluster_mode_enabled() is False

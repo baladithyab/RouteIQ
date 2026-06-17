@@ -1088,3 +1088,132 @@ class TestRunMigrationsBootFailLoud:
         )
         # No raise: generic errors keep the soft-degrade behaviour.
         await run_migrations()
+
+
+# =============================================================================
+# Reader / replica endpoint routing (RouteIQ-65ed)
+# =============================================================================
+#
+# get_read_db_pool() builds a SEPARATE pool against settings.postgres.reader_host
+# (Aurora reader endpoint / RDS Proxy read endpoint) for read-only queries, and
+# falls back to the writer pool when reader_host is empty (byte-stable default).
+# asyncpg is mocked via sys.modules (the in-function `import asyncpg`); _mint_db_token
+# is stubbed so boto3 is never imported. The pool singletons are reset by the global
+# autouse conftest fixture (reset_database_singletons -> reset_db_pool) + reset_settings.
+
+from litellm_llmrouter.database import (  # noqa: E402
+    _swap_url_host,
+    get_read_db_pool,
+)
+
+_READER_HOST = "db-ro.cluster-ro-xyz.us-east-1.rds.amazonaws.com"
+
+
+class TestSwapUrlHost:
+    def test_swaps_host_preserving_user_port_db(self):
+        """_swap_url_host replaces only the host, keeping userinfo/port/path/query."""
+        new = _swap_url_host(_RDS_URL, _READER_HOST)
+        assert _READER_HOST in new
+        # writer host gone, reader host present
+        assert "db.cluster-xyz.us-east-1.rds.amazonaws.com" not in new
+        # user, port, db, query preserved
+        assert "routeiq@" in new
+        assert ":5432/" in new
+        assert "/litellm" in new
+        assert "sslmode=require" in new
+
+
+class TestGetReadDbPool:
+    async def test_reads_fall_back_to_writer_when_no_reader(self, monkeypatch):
+        """reader_host empty (default) -> get_read_db_pool returns the WRITER pool."""
+        mock_asyncpg = _mock_asyncpg()
+        env = {"DATABASE_URL": _RDS_URL}  # ROUTEIQ_POSTGRES__READER_HOST unset
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                writer = await get_db_pool()
+                reader = await get_read_db_pool()
+
+        # Same object: reads share the writer pool when no reader configured.
+        assert reader is writer
+        # Only ONE pool ever built (the writer); no separate reader pool.
+        assert mock_asyncpg.create_pool.await_count == 1
+
+    async def test_reader_pool_built_against_reader_host_when_configured(
+        self, monkeypatch
+    ):
+        """reader_host set -> a SEPARATE pool is built against the reader endpoint."""
+        # Distinct mock pool per create_pool call so the writer/reader identity
+        # check is meaningful (the default _mock_asyncpg returns one shared object).
+        mock_asyncpg = _mock_asyncpg()
+        mock_asyncpg.create_pool = AsyncMock(
+            side_effect=[MagicMock(name="writer-pool"), MagicMock(name="reader-pool")]
+        )
+        env = {
+            "DATABASE_URL": _RDS_URL,
+            "ROUTEIQ_POSTGRES__READER_HOST": _READER_HOST,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                writer = await get_db_pool()
+                reader = await get_read_db_pool()
+
+        # Distinct pool objects: the reader is its own pool.
+        assert reader is not writer
+        assert mock_asyncpg.create_pool.await_count == 2
+        # The reader pool's URL (first positional arg of the 2nd create_pool call)
+        # targets the reader host, not the writer host.
+        reader_call = mock_asyncpg.create_pool.await_args_list[1]
+        reader_url = reader_call.args[0]
+        assert _READER_HOST in reader_url
+        assert "db.cluster-xyz.us-east-1.rds.amazonaws.com" not in reader_url
+
+    async def test_reader_pool_is_singleton(self, monkeypatch):
+        """The reader pool is cached: a second call returns the same pool."""
+        mock_asyncpg = _mock_asyncpg()
+        env = {
+            "DATABASE_URL": _RDS_URL,
+            "ROUTEIQ_POSTGRES__READER_HOST": _READER_HOST,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                r1 = await get_read_db_pool()
+                r2 = await get_read_db_pool()
+
+        assert r1 is r2
+        # Exactly one reader pool built (no writer was requested here).
+        assert mock_asyncpg.create_pool.await_count == 1
+
+    async def test_reader_honors_iam_auth_callable_password(self, monkeypatch):
+        """The reader pool also mints the rds-db:connect token (callable password)."""
+        import litellm_llmrouter.database as db_mod
+
+        monkeypatch.setattr(db_mod, "_mint_db_token", lambda **kw: _FAKE_DB_TOKEN)
+        mock_asyncpg = _mock_asyncpg()
+        env = {
+            "DATABASE_URL": _RDS_URL,
+            "ROUTEIQ_POSTGRES__READER_HOST": _READER_HOST,
+            "ROUTEIQ_DB_IAM_AUTH": "true",
+            "AWS_REGION": "us-east-1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with patch.dict(sys.modules, {"asyncpg": mock_asyncpg}):
+                await get_read_db_pool()
+
+        kwargs = mock_asyncpg.create_pool.call_args.kwargs
+        pw = kwargs["password"]
+        assert callable(pw)
+        assert pw() == _FAKE_DB_TOKEN
+
+    async def test_reader_host_helper_fail_soft(self, monkeypatch):
+        """_reader_host returns None when settings cannot be read."""
+        import litellm_llmrouter.database as db_mod
+        from litellm_llmrouter import settings as settings_mod
+
+        monkeypatch.setattr(
+            settings_mod, "get_settings", lambda: (_ for _ in ()).throw(RuntimeError())
+        )
+        assert db_mod._reader_host() is None

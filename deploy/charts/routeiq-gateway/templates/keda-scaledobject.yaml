@@ -1,0 +1,60 @@
+{{- /*
+  RouteIQ-9c4c: KEDA event-driven autoscaling.
+
+  Renders a KEDA ScaledObject scaling the gateway Deployment on a LOAD signal
+  (the backpressure in-flight gauge / RPS via the Prometheus adapter, or a
+  CloudWatch metric via the AWS adapter) -- not just CPU/mem. DEFAULT OFF
+  (autoscaling.keda.enabled=false) so the CPU/mem HorizontalPodAutoscaler
+  (hpa.yaml) stays the default and the default render is byte-stable.
+
+  MUTUALLY EXCLUSIVE with the chart HPA: when this is on, hpa.yaml emits nothing
+  (it gates on `not .Values.autoscaling.keda.enabled`), because KEDA creates and
+  owns its OWN HPA for the same Deployment and two HPAs would fight.
+
+  OPERATOR CONCERN (not provisioned here): KEDA must be installed
+  (keda-operator + keda-operator-metrics-apiserver) and the metrics backend the
+  trigger reads (a Prometheus reachable at serverAddress, or CloudWatch +
+  pod-role grants) must exist. See values.yaml autoscaling.keda for details.
+*/ -}}
+{{- if .Values.autoscaling.keda.enabled }}
+{{- $keda := .Values.autoscaling.keda }}
+{{- $trigger := $keda.trigger }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "routeiq-gateway.fullname" . }}
+  pollingInterval: {{ $keda.pollingInterval | default 30 }}
+  cooldownPeriod: {{ $keda.cooldownPeriod | default 300 }}
+  minReplicaCount: {{ $keda.minReplicaCount | default .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ $keda.maxReplicaCount | default .Values.autoscaling.maxReplicas }}
+  triggers:
+    {{- if eq $trigger.type "cloudwatch" }}
+    - type: aws-cloudwatch
+      metadata:
+        awsRegion: {{ $trigger.awsRegion | quote }}
+        namespace: {{ $trigger.namespace | quote }}
+        metricName: {{ $trigger.metricName | quote }}
+        targetMetricValue: {{ $trigger.threshold | quote }}
+      {{- if $trigger.authenticationRef }}
+      authenticationRef:
+        name: {{ $trigger.authenticationRef }}
+      {{- end }}
+    {{- else }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ $trigger.serverAddress | quote }}
+        query: {{ $trigger.query | quote }}
+        threshold: {{ $trigger.threshold | quote }}
+      {{- if $trigger.authenticationRef }}
+      authenticationRef:
+        name: {{ $trigger.authenticationRef }}
+      {{- end }}
+    {{- end }}
+{{- end }}
