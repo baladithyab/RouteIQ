@@ -1,6 +1,12 @@
 import type React from 'react'
 import { useEffect, useState } from 'react'
-import { useUserStats, useGlobalStats } from '../api/queries'
+import {
+    useUserStats,
+    useGlobalStats,
+    useMyKeys,
+    useCreateMyKey,
+    useRevokeMyKey,
+} from '../api/queries'
 import {
     fetchUiConfig,
     beginLogin,
@@ -226,6 +232,151 @@ function MyStatsSection({ onLogout }: { onLogout: () => void }) {
   )
 }
 
+// --- Self-service keys: caller's OWN keys (user auth, own-scope, RouteIQ-3215) ---
+function MyKeysSection() {
+  const keys = useMyKeys(true)
+  const createKey = useCreateMyKey()
+  const revokeKey = useRevokeMyKey()
+  const [name, setName] = useState('')
+  const [budget, setBudget] = useState('')
+  // The secret is shown ONCE, right after creation -- never recoverable later.
+  const [newSecret, setNewSecret] = useState<string | null>(null)
+
+  const handleCreate = (e: React.FormEvent) => {
+    e.preventDefault()
+    const max_budget_usd = budget.trim() ? Number(budget) : null
+    createKey.mutate(
+      { name: name.trim() || null, max_budget_usd },
+      {
+        onSuccess: (created) => {
+          setNewSecret(created.key ?? null)
+          setName('')
+          setBudget('')
+        },
+      },
+    )
+  }
+
+  return (
+    <Card
+      title="My API Keys"
+      isLoading={keys.isLoading}
+      isError={keys.isError}
+      error={keys.error as Error}
+      onRetry={() => keys.refetch()}
+    >
+      <div className="space-y-5">
+        <p className="text-sm text-gray-600">
+          Create and revoke API keys scoped to your own identity. You can only
+          see and manage your own keys.
+        </p>
+
+        {newSecret && (
+          <div className="rounded-lg border border-green-200 bg-green-50 p-3">
+            <p className="text-xs text-green-700 font-medium mb-1">
+              New key created. Copy it now &mdash; it will not be shown again.
+            </p>
+            <code className="block text-xs font-mono break-all text-green-900">
+              {newSecret}
+            </code>
+            <button
+              type="button"
+              onClick={() => setNewSecret(null)}
+              className="mt-2 text-xs text-green-700 hover:text-green-900 font-medium"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        <form onSubmit={handleCreate} className="flex flex-wrap items-end gap-2">
+          <div className="flex-1 min-w-[8rem]">
+            <label className="block text-xs text-gray-500 uppercase tracking-wide mb-1">
+              Name
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="my-app"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+          <div className="w-32">
+            <label className="block text-xs text-gray-500 uppercase tracking-wide mb-1">
+              Max budget ($)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              placeholder="optional"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={createKey.isPending}
+            className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-40"
+          >
+            {createKey.isPending ? 'Creating…' : 'Create key'}
+          </button>
+        </form>
+
+        {createKey.isError && (
+          <p className="text-sm text-red-600">
+            {(createKey.error as Error)?.message || 'Failed to create key'}
+          </p>
+        )}
+
+        {keys.data && (
+          keys.data.keys.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-200">
+                    <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Name</th>
+                    <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Key ID</th>
+                    <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Budget</th>
+                    <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {keys.data.keys.map((k) => (
+                    <tr key={k.key_id} className="border-b border-gray-50 hover:bg-gray-50">
+                      <td className="py-2.5 px-3 text-gray-900">{k.name || '—'}</td>
+                      <td className="py-2.5 px-3 font-mono text-xs text-gray-500 break-all">
+                        {k.masked || `${k.key_id.slice(0, 14)}…`}
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-gray-700">
+                        {fmtUsd(k.max_budget_usd)}
+                      </td>
+                      <td className="py-2.5 px-3 text-right">
+                        <button
+                          type="button"
+                          onClick={() => revokeKey.mutate(k.key_id)}
+                          disabled={revokeKey.isPending}
+                          className="text-xs text-red-600 hover:text-red-800 font-medium disabled:opacity-40"
+                        >
+                          Revoke
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-gray-500 text-sm">No keys yet. Create one above.</p>
+          )
+        )}
+      </div>
+    </Card>
+  )
+}
+
 // --- Per-Key breakdown: admin rollup (GET /stats/global) ---
 function PerKeySection() {
   const global = useGlobalStats()
@@ -316,7 +467,10 @@ export default function UserStats() {
       <h2 className="text-2xl font-bold text-gray-900 mb-6">User Stats</h2>
       <div className="space-y-6">
         {authed ? (
-          <MyStatsSection onLogout={handleLogout} />
+          <>
+            <MyStatsSection onLogout={handleLogout} />
+            <MyKeysSection />
+          </>
         ) : (
           <UserLogin onAuthenticated={handleAuthenticated} />
         )}
