@@ -7,6 +7,7 @@ import Guardrails from './pages/Guardrails'
 import Prompts from './pages/Prompts'
 import Observability from './pages/Observability'
 import UserStats from './pages/UserStats'
+import AiHub from './pages/AiHub'
 
 export default function App() {
   return (
@@ -14,6 +15,7 @@ export default function App() {
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Dashboard />} />
+          <Route path="ai-hub" element={<AiHub />} />
           <Route path="routing" element={<RoutingConfig />} />
           <Route path="governance" element={<Governance />} />
           <Route path="guardrails" element={<Guardrails />} />

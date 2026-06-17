@@ -1,6 +1,16 @@
 import { useState, useEffect } from 'react'
 import type React from 'react'
-import { useServiceStatus, useModelQuality, useEvalStats, useRunEvalBatch } from '../api/queries'
+import {
+  useServiceStatus,
+  useModelQuality,
+  useEvalStats,
+  useRunEvalBatch,
+  useRoutingStats,
+  useGlobalStats,
+} from '../api/queries'
+import { LineChart, BarSeries, type Series } from '../components/Charts'
+import { useTimeSeries, useDecisionFeed, type DecisionSnapshot } from '../api/timeseries'
+import config from '../config'
 
 function Card({ title, children, isLoading, isError, error, onRetry, badge }: {
   title: string
@@ -270,6 +280,291 @@ function EvalPipelineSection() {
   )
 }
 
+// --- Trend charts: cost/usage/tokens/latency over time (RouteIQ-c119) ---
+//
+// RouteIQ's stats endpoints are point-in-time snapshots, so we sample them on
+// the SPA's polling cadence and chart the accumulated history client-side
+// (see api/timeseries.ts). "Usage" = decisions/min derived from the cumulative
+// total; "latency" = the reported avg at each sample. Token/cost series chart
+// the cluster-wide totals when the metrics backend exposes them via /stats/global,
+// otherwise they fall back to the decision-volume trend.
+function TrendChartsSection() {
+  const stats = useRoutingStats()
+  const global = useGlobalStats()
+
+  const history = useTimeSeries(stats.data)
+  const globalHistory = useTimeSeries(global.data)
+
+  // Decisions-per-interval (usage rate): delta of cumulative total between samples.
+  const usageSeries: Series[] = [
+    {
+      label: 'Decisions / interval',
+      color: '#3b82f6',
+      points: history.slice(1).map((s, i) => ({
+        t: s.t,
+        v: Math.max(0, s.value.total_decisions - history[i].value.total_decisions),
+      })),
+    },
+  ]
+
+  // Latency trend (ms) over time.
+  const latencySeries: Series[] = [
+    {
+      label: 'Avg decision latency (ms)',
+      color: '#8b5cf6',
+      points: history.map((s) => ({ t: s.t, v: s.value.average_latency_ms })),
+    },
+  ]
+
+  // Cumulative decision-volume trend (cluster-wide when available).
+  const volumeSeries: Series[] = [
+    {
+      label: global.data?.cluster_wide ? 'Total decisions (cluster)' : 'Total decisions (worker)',
+      color: '#10b981',
+      points: (globalHistory.length > 1 ? globalHistory : history).map((s) => ({
+        t: s.t,
+        v: s.value.total_decisions,
+      })),
+    },
+  ]
+
+  const samples = history.length
+
+  return (
+    <Card
+      title="Usage & Latency Trends"
+      isLoading={stats.isLoading && samples === 0}
+      isError={stats.isError}
+      error={stats.error as Error}
+      onRetry={() => stats.refetch()}
+      badge={
+        <span className="text-xs text-gray-400">
+          {samples > 0 ? `${samples} sample${samples === 1 ? '' : 's'} · live` : 'collecting…'}
+        </span>
+      }
+    >
+      {samples === 0 ? (
+        <p className="text-gray-500 text-sm py-6 text-center">
+          Collecting samples — trends appear after the first refresh interval.
+        </p>
+      ) : (
+        <div className="space-y-6">
+          <div>
+            <h4 className="text-sm font-medium text-gray-700 mb-2">Decision Volume (cumulative)</h4>
+            <LineChart series={volumeSeries} />
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div>
+              <h4 className="text-sm font-medium text-gray-700 mb-2">Throughput (decisions / interval)</h4>
+              <BarSeries
+                points={usageSeries[0].points}
+                color="#3b82f6"
+                emptyLabel="No throughput yet"
+              />
+            </div>
+            <div>
+              <h4 className="text-sm font-medium text-gray-700 mb-2">Latency</h4>
+              <LineChart
+                series={latencySeries}
+                yFormat={(v) => `${v.toFixed(0)}ms`}
+              />
+            </div>
+          </div>
+          <p className="text-xs text-gray-400">
+            In-app trends are sampled per refresh and reset on reload. For
+            authoritative, cluster-wide cost/token time-series use the embedded
+            CloudWatch / Grafana dashboard below.
+          </p>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+// --- Live routing-decision feed + per-request X-Ray trace links (RouteIQ-9d2d) ---
+//
+// SCOPE NOTE: this reads the EXISTING /stats/global counter snapshot and derives
+// a delta-based "recent decisions" feed entirely client-side — no new python
+// endpoint (which would collide with the concurrent python waves). A true
+// per-request stream with real trace IDs would need a small additive admin_ui
+// endpoint (flagged for a follow-up); until then each event deep-links to the
+// X-Ray traces console (filtered on the gateway service) when configured.
+function LiveDecisionsSection() {
+  const global = useGlobalStats()
+
+  const snapshot: DecisionSnapshot | undefined = global.data
+    ? {
+        total_decisions: global.data.total_decisions,
+        strategy_distribution: global.data.strategy_distribution,
+        average_latency_ms: global.data.average_latency_ms,
+        model_distribution: global.data.model_distribution,
+      }
+    : undefined
+  const feed = useDecisionFeed(snapshot)
+  const xrayBase = config.XRAY_CONSOLE_BASE
+
+  const traceLink = (ev: { t: number }) => {
+    if (!xrayBase) return null
+    // Deep-link to the X-Ray traces console filtered on the gateway service,
+    // scoped to a short window around the event time. Operators resolve the
+    // exact per-request trace there.
+    const sep = xrayBase.includes('?') ? '&' : '?'
+    const from = new Date(ev.t - 60_000).toISOString()
+    const to = new Date(ev.t + 60_000).toISOString()
+    const href = `${xrayBase}${sep}timeRange=${encodeURIComponent(`${from}~${to}`)}`
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-xs text-blue-600 hover:text-blue-800 font-medium whitespace-nowrap"
+      >
+        Trace ↗
+      </a>
+    )
+  }
+
+  return (
+    <Card
+      title="Live Routing Decisions"
+      isLoading={global.isLoading && feed.length === 0}
+      isError={global.isError}
+      error={global.error as Error}
+      onRetry={() => global.refetch()}
+      badge={
+        <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
+          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+          live · polled
+        </span>
+      }
+    >
+      {feed.length === 0 ? (
+        <p className="text-gray-500 text-sm py-6 text-center">
+          Watching for new routing decisions… events appear as the cumulative
+          counter advances between polls.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200">
+                <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Time</th>
+                <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">New</th>
+                <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Strategies</th>
+                <th className="text-left py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Models</th>
+                <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium">Latency</th>
+                <th className="text-right py-2 px-3 text-xs text-gray-500 uppercase tracking-wide font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {feed.map((ev) => (
+                <tr key={ev.t} className="border-b border-gray-50 hover:bg-gray-50">
+                  <td className="py-2.5 px-3 text-gray-500 font-mono text-xs whitespace-nowrap">
+                    {new Date(ev.t).toLocaleTimeString()}
+                  </td>
+                  <td className="py-2.5 px-3 text-right text-gray-900 font-mono font-medium">
+                    +{ev.count}
+                  </td>
+                  <td className="py-2.5 px-3">
+                    <div className="flex flex-wrap gap-1">
+                      {Object.entries(ev.strategyDeltas).map(([name, d]) => (
+                        <span
+                          key={name}
+                          className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono bg-blue-50 text-blue-700"
+                        >
+                          {name} +{d}
+                        </span>
+                      ))}
+                      {Object.keys(ev.strategyDeltas).length === 0 && (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="py-2.5 px-3">
+                    <div className="flex flex-wrap gap-1">
+                      {Object.entries(ev.modelDeltas).map(([name, d]) => (
+                        <span
+                          key={name}
+                          className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono bg-emerald-50 text-emerald-700"
+                        >
+                          {name} +{d}
+                        </span>
+                      ))}
+                      {Object.keys(ev.modelDeltas).length === 0 && (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="py-2.5 px-3 text-right text-gray-600 font-mono text-xs">
+                    {ev.avgLatencyMs.toFixed(1)}ms
+                  </td>
+                  <td className="py-2.5 px-3 text-right">{traceLink(ev)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!xrayBase && (
+            <p className="text-xs text-gray-400 mt-3">
+              Set <code className="font-mono">XRAY_CONSOLE_BASE</code> in the UI
+              runtime config to enable per-request trace deep-links.
+            </p>
+          )}
+        </div>
+      )}
+    </Card>
+  )
+}
+
+// --- Embedded CloudWatch / Managed Grafana dashboard (RouteIQ-0c8e) ---
+function DashboardEmbedSection() {
+  const embed = config.DASHBOARD_EMBED
+  if (!embed || (!embed.url && !embed.embed_url)) {
+    return null
+  }
+  const providerLabel =
+    embed.provider === 'cloudwatch'
+      ? 'CloudWatch'
+      : embed.provider === 'grafana'
+        ? 'Managed Grafana'
+        : embed.provider
+
+  return (
+    <Card
+      title={`${providerLabel} Dashboard`}
+      badge={
+        embed.url ? (
+          <a
+            href={embed.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 text-sm font-medium text-blue-600 hover:text-blue-800"
+          >
+            Open dashboard ↗
+          </a>
+        ) : undefined
+      }
+    >
+      {embed.embed_url ? (
+        <iframe
+          src={embed.embed_url}
+          title={`${providerLabel} dashboard`}
+          className="w-full rounded-lg border border-gray-200"
+          style={{ height: 480 }}
+          sandbox="allow-scripts allow-same-origin allow-popups"
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        <p className="text-gray-500 text-sm">
+          Cluster-wide cost/usage/token/latency time-series are available in the
+          {` ${providerLabel}`} dashboard. Click “Open dashboard” above. Inline
+          embedding requires a frameable dashboard URL — see the operator setup
+          doc (Operations → Dashboard Embedding).
+        </p>
+      )}
+    </Card>
+  )
+}
+
 export default function Observability() {
   return (
     <div>
@@ -277,6 +572,12 @@ export default function Observability() {
 
       <div className="space-y-6">
         <ServicesSection />
+
+        <TrendChartsSection />
+
+        <LiveDecisionsSection />
+
+        <DashboardEmbedSection />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <ModelQualitySection />

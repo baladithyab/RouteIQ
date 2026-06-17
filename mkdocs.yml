@@ -34,41 +34,44 @@ theme:
 nav:
   - Home: index.md
   - Getting Started:
-    - Quick Start: getting-started/quickstart.md
-    - Installation: getting-started/installation.md
-    - Configuration: getting-started/configuration.md
+      - Quick Start: getting-started/quickstart.md
+      - Installation: getting-started/installation.md
+      - Configuration: getting-started/configuration.md
   - Features:
-    - Intelligent Routing: features/routing.md
-    - MCP Gateway: features/mcp-gateway.md
-    - A2A Protocol: features/a2a-gateway.md
-    - Skills Gateway: features/skills-gateway.md
-    - Context Optimization: features/context-optimizer.md
-    - Prompt Management: features/prompt-management.md
-    - Plugin System: plugins.md
+      - Intelligent Routing: features/routing.md
+      - MCP Gateway: features/mcp-gateway.md
+      - A2A Protocol: features/a2a-gateway.md
+      - Skills Gateway: features/skills-gateway.md
+      - Context Optimization: features/context-optimizer.md
+      - Prompt Management: features/prompt-management.md
+      - Plugin System: plugins.md
   - Governance:
-    - Overview: governance/overview.md
-    - Workspaces: governance/workspaces.md
-    - Usage Policies: governance/usage-policies.md
-    - Guardrails: governance/guardrails.md
-    - Identity (OIDC/SSO): governance/identity.md
+      - Overview: governance/overview.md
+      - Workspaces: governance/workspaces.md
+      - Usage Policies: governance/usage-policies.md
+      - Guardrails: governance/guardrails.md
+      - Identity (OIDC/SSO): governance/identity.md
   - Operations:
-    - Deployment: operations/deployment.md
-    - Observability: operations/observability.md
-    - Helm Chart: operations/helm.md
-    - Docker: operations/docker.md
-    - Security: operations/security.md
-    - MLOps Training: mlops-training.md
-    - AWS Production Guide: aws-production-guide.md
+      - Deployment: operations/deployment.md
+      - Observability: operations/observability.md
+      - Dashboard Embedding: operations/dashboard-embedding.md
+      - Claude Code Routing: operations/claude-code-routing.md
+      - Bedrock Cross-Region Fallbacks: operations/bedrock-fallbacks.md
+      - Helm Chart: operations/helm.md
+      - Docker: operations/docker.md
+      - Security: operations/security.md
+      - MLOps Training: mlops-training.md
+      - AWS Production Guide: aws-production-guide.md
   - Architecture:
-    - Overview: architecture/overview.md
-    - ADRs: architecture/adrs.md
+      - Overview: architecture/overview.md
+      - ADRs: architecture/adrs.md
   - API Reference:
-    - Gateway API: api/gateway.md
-    - Governance API: api/governance.md
-    - Routing API: api/routing.md
+      - Gateway API: api/gateway.md
+      - Governance API: api/governance.md
+      - Routing API: api/routing.md
   - Tutorials:
-    - HA Quickstart: tutorials/ha-quickstart.md
-    - Observability Quickstart: tutorials/observability-quickstart.md
+      - HA Quickstart: tutorials/ha-quickstart.md
+      - Observability Quickstart: tutorials/observability-quickstart.md
   - Contributing: contributing.md
 
 markdown_extensions:
@@ -82,7 +85,7 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.highlight:
-      anchor_liners: true
+      anchor_linenums: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - tables

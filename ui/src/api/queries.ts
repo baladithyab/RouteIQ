@@ -27,6 +27,10 @@ import type {
     PromptDefinition,
     CreatePromptRequest,
     UpdatePromptABTestRequest,
+    McpServer,
+    McpServerList,
+    A2aAgent,
+    A2aAgentList,
 } from './types'
 
 // --- Existing hooks ---
@@ -366,5 +370,31 @@ export function useUpdatePromptABTest() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['prompts'] })
         },
+    })
+}
+
+// --- AI-Hub catalog hooks (RouteIQ-06cf) ---
+// These GET endpoints 404 when the MCP / A2A gateways are disabled, so we do not
+// retry (a 404 is a stable "feature off", not a transient failure).
+
+export function useMcpServers() {
+    return useQuery<McpServer[]>({
+        queryKey: ['mcp-servers'],
+        queryFn: () =>
+            apiClient
+                .get<McpServerList>('/llmrouter/mcp/servers')
+                .then((r) => r.servers ?? []),
+        refetchInterval: 30_000,
+        retry: false,
+    })
+}
+
+export function useA2aAgents() {
+    return useQuery<A2aAgent[]>({
+        queryKey: ['a2a-agents'],
+        queryFn: () =>
+            apiClient.get<A2aAgentList>('/a2a/agents').then((r) => r.agents ?? []),
+        refetchInterval: 30_000,
+        retry: false,
     })
 }

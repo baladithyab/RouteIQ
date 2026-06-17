@@ -51,6 +51,9 @@
 | Document | Description |
 |----------|-------------|
 | [Observability Guide](observability.md) | OpenTelemetry traces, metrics, and logs configuration |
+| [Dashboard Embedding](operations/dashboard-embedding.md) | Embed CloudWatch GenAI / Managed Grafana dashboards in the admin UI |
+| [Claude Code Routing](operations/claude-code-routing.md) | Point Claude Code at RouteIQ for mixed-Bedrock cost routing |
+| [Bedrock Cross-Region Fallbacks](operations/bedrock-fallbacks.md) | Cross-region / context-window / content-policy failover recipe |
 | [Security Guide](security.md) | Authentication, RBAC, SSRF protection, and secret management |
 | [MLOps Training Pipeline](mlops-training.md) | Closed-loop MLOps: telemetry extraction, model training, deployment |
 | [Streaming Verification](streaming-verification.md) | SSE streaming correctness and performance verification report |

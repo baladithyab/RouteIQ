@@ -281,3 +281,31 @@ export interface UpdatePromptABTestRequest {
     enabled: boolean
     weights: Record<number, number>
 }
+
+// --- AI-Hub catalog types (RouteIQ-06cf) ---
+
+// MCP server entry from GET /llmrouter/mcp/servers
+export interface McpServer {
+    server_id: string
+    name: string
+    url: string
+    transport: string
+    tools: string[]
+    resources: string[]
+}
+
+export interface McpServerList {
+    servers: McpServer[]
+}
+
+// A2A agent entry from GET /a2a/agents
+export interface A2aAgent {
+    agent_id: string
+    agent_name: string
+    description: string
+    url: string
+}
+
+export interface A2aAgentList {
+    agents: A2aAgent[]
+}

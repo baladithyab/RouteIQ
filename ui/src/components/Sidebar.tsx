@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom'
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: '\u{1F4CA}' },
+  { to: '/ai-hub', label: 'AI Hub', icon: '\u{1F9E9}' },
   { to: '/routing', label: 'Routing Config', icon: '\u{1F500}' },
   { to: '/governance', label: 'Governance', icon: '\u{1F3DB}' },
   { to: '/guardrails', label: 'Guardrails', icon: '\u{1F6E1}' },
