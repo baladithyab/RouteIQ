@@ -96,7 +96,7 @@ def _record_mcp_invocation_metric(result: str) -> None:
     any recording error is swallowed.
 
     Args:
-        result: ``success`` or ``error``.
+        result: ``success``, ``error``, or ``access_denied``.
     """
     try:
         from litellm_llmrouter.metrics import get_gateway_metrics
@@ -106,6 +106,21 @@ def _record_mcp_invocation_metric(result: str) -> None:
             m.record_mcp_tool_invocation(result)
     except Exception:  # pragma: no cover - telemetry must not break flow
         pass
+
+
+def _server_requires_access_group(server: "MCPServer") -> list[str]:
+    """Return the access groups a server is gated behind (empty == unrestricted).
+
+    Access-group membership lives in ``server.metadata['access_groups']`` (the
+    same field the discovery/registry listing filter reads). A server with no
+    such key, or an empty list, is unrestricted (open by default).
+    """
+    groups = server.metadata.get("access_groups")
+    if not groups:
+        return []
+    if isinstance(groups, str):
+        return [g.strip() for g in groups.split(",") if g.strip()]
+    return [str(g) for g in groups if str(g).strip()]
 
 
 class MCPTransport(str, Enum):
@@ -285,6 +300,12 @@ class MCPGateway:
                 self._ha_sync_enabled = REDIS_AVAILABLE
                 self._sync_interval = 5.0
 
+        # RouteIQ-2fa1: per-key/per-tool MCP access-group enforcement on the LIVE
+        # invocation path. Resolved from the typed MCPSettings (no dedicated bare
+        # env var). Default OFF => byte-stable: access_groups metadata stays
+        # advisory (registry-listing filter only) until an operator opts in.
+        self._access_group_enforcement = self._resolve_access_group_enforcement()
+
         # HA sync via Redis (optional)
         self._redis_client: Any = None
         self._last_sync_time = 0.0
@@ -319,6 +340,25 @@ class MCPGateway:
     def is_db_persistence_enabled(self) -> bool:
         """Check whether DB-backed registry persistence is active."""
         return bool(self._db_persistence_enabled)
+
+    @staticmethod
+    def _resolve_access_group_enforcement() -> bool:
+        """Whether per-key/per-tool MCP access groups are enforced at invoke.
+
+        Reads ``MCPSettings.access_group_enforcement`` (env
+        ``ROUTEIQ_MCP__ACCESS_GROUP_ENFORCEMENT``). Defaults to False (advisory)
+        so the prior behaviour is byte-stable.
+        """
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            return bool(get_settings().mcp.access_group_enforcement)
+        except Exception:
+            return False
+
+    def is_access_group_enforcement_enabled(self) -> bool:
+        """Check whether access-group enforcement is active on the invoke path."""
+        return bool(self._access_group_enforcement)
 
     @staticmethod
     def _schedule_db_op(coro: Any) -> None:
@@ -1047,6 +1087,8 @@ class MCPGateway:
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        *,
+        caller_access_groups: list[str] | None = None,
     ) -> MCPToolResult:
         """
         Invoke an MCP tool.
@@ -1054,10 +1096,19 @@ class MCPGateway:
         Security:
         - Remote tool invocation is DISABLED by default. Enable via LLMROUTER_ENABLE_MCP_TOOL_INVOCATION=true.
         - Server URLs are validated against SSRF attacks before making requests.
+        - When access-group enforcement is enabled (RouteIQ-2fa1,
+          ``ROUTEIQ_MCP__ACCESS_GROUP_ENFORCEMENT=true``), a tool whose backing
+          server declares ``metadata['access_groups']`` is only invokable by a
+          caller presenting at least one matching group via
+          ``caller_access_groups`` -- a non-member call is REJECTED here, on the
+          terminal invocation path, before any outbound MCP call.
 
         Args:
             tool_name: Name of the tool to invoke
             arguments: Arguments to pass to the tool
+            caller_access_groups: The access groups the calling key/identity
+                belongs to (used only when enforcement is enabled). ``None`` or
+                empty means the caller belongs to no access group.
 
         Returns:
             Result of the tool invocation
@@ -1074,10 +1125,72 @@ class MCPGateway:
                 tool_name=tool_name,
             )
 
+        # RouteIQ-2fa1: per-key/per-tool access-group enforcement on the LIVE
+        # invocation path. Runs on EVERY invocation (incl. the terminal path),
+        # AFTER the enabled gate but BEFORE any outbound MCP call. Default OFF.
+        denial = self._check_access_group(tool_name, caller_access_groups)
+        if denial is not None:
+            _record_mcp_invocation_metric("access_denied")
+            return denial
+
         result = await self._invoke_tool_impl(tool_name, arguments)
         # Telemetry: record the invocation outcome (no-op when OTel is off).
         _record_mcp_invocation_metric("success" if result.success else "error")
         return result
+
+    def _check_access_group(
+        self,
+        tool_name: str,
+        caller_access_groups: list[str] | None,
+    ) -> MCPToolResult | None:
+        """Enforce per-key/per-tool access groups (RouteIQ-2fa1).
+
+        Returns an ``access_denied`` :class:`MCPToolResult` when the call must be
+        rejected, or ``None`` when the call is permitted to proceed.
+
+        Enforcement is a no-op (returns ``None``) when:
+        * enforcement is disabled (``access_group_enforcement=False``, default); or
+        * the tool's backing server declares no ``access_groups`` (unrestricted /
+          open by default).
+
+        Otherwise the caller must present at least one access group that the
+        server is gated behind; an empty/None ``caller_access_groups`` is rejected.
+        """
+        if not self._access_group_enforcement:
+            return None
+
+        server = self.find_server_for_tool(tool_name)
+        if server is None:
+            # Unknown tool: let _invoke_tool_impl emit the canonical not-found
+            # error (do not leak access-group state for non-existent tools).
+            return None
+
+        required = _server_requires_access_group(server)
+        if not required:
+            # Server is unrestricted -- open by default even under enforcement.
+            return None
+
+        caller = {g for g in (caller_access_groups or []) if g}
+        if caller & set(required):
+            return None
+
+        verbose_proxy_logger.warning(
+            "MCP: access denied invoking tool '%s' on server '%s': caller groups "
+            "%s do not intersect required %s",
+            tool_name,
+            server.server_id,
+            sorted(caller),
+            sorted(required),
+        )
+        return MCPToolResult(
+            success=False,
+            error=(
+                f"access_denied: tool '{tool_name}' requires one of access "
+                f"groups {sorted(required)}; caller is not a member"
+            ),
+            tool_name=tool_name,
+            server_id=server.server_id,
+        )
 
     async def _invoke_tool_impl(
         self,

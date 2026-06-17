@@ -170,6 +170,26 @@ class DiscoveredModel:
         return None
 
 
+@dataclass
+class MarketplaceEndpoint:
+    """An Amazon Bedrock Marketplace / mantle custom-deployment endpoint.
+
+    Surfaced by ``ListMarketplaceModelEndpoints`` (RouteIQ-7105). ``endpoint_arn``
+    is the operator-owned, invocable endpoint ARN (``bedrock/<endpointArn>``);
+    ``model_source`` is the Marketplace model ARN it deploys. Only ``REGISTERED``
+    endpoints are routable -- an ``INCOMPATIBLE_ENDPOINT`` is skipped.
+    """
+
+    endpoint_arn: str
+    model_source: str
+    region: str
+    status: str = "REGISTERED"
+
+    @property
+    def is_routable(self) -> bool:
+        return (self.status or "").upper() == "REGISTERED"
+
+
 @dataclass(frozen=True)
 class ModelSelection:
     """The chosen serverless invocation path for one (model, region)."""
@@ -384,6 +404,95 @@ def to_litellm_entry(
     return entry
 
 
+def _marketplace_model_name(endpoint: MarketplaceEndpoint) -> str:
+    """Derive a stable ``model_name`` for a marketplace endpoint arm.
+
+    Uses the last ARN segment (the endpoint name) prefixed with ``marketplace.``
+    so the synthesized name is human-recognisable and collision-resistant. Falls
+    back to the full ARN when it has no ``/`` segment.
+    """
+    tail = endpoint.endpoint_arn.rsplit("/", 1)[-1] or endpoint.endpoint_arn
+    return f"marketplace.{tail}"
+
+
+def marketplace_to_litellm_entry(
+    endpoint: MarketplaceEndpoint,
+    *,
+    model_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Map a :class:`MarketplaceEndpoint` into a LiteLLM ``model_list`` entry.
+
+    The endpoint ARN is invocable directly -- it is inlined into
+    ``litellm_params.model`` as ``bedrock/<endpointArn>`` (the ``bedrock/``
+    prefix is preserved, mirroring :func:`to_litellm_entry`) with
+    ``aws_region_name`` set. ``model_info`` records the marketplace model source
+    and an ``arm_id`` so telemetry can attribute the arm.
+    """
+    name = model_name or _marketplace_model_name(endpoint)
+    return {
+        "model_name": name,
+        "litellm_params": {
+            "model": f"bedrock/{endpoint.endpoint_arn}",
+            "aws_region_name": endpoint.region,
+        },
+        "model_info": {
+            "arm_id": f"{endpoint.region}/{endpoint.endpoint_arn}",
+            "marketplace_model_source": endpoint.model_source,
+            "tier": "marketplace",
+        },
+    }
+
+
+def _list_marketplace_endpoints(client: Any) -> list[dict[str, Any]]:
+    """Page through ``ListMarketplaceModelEndpoints`` (RouteIQ-7105).
+
+    Returns the raw ``marketplaceModelEndpoints`` summaries. Defensive: when the
+    boto3 client predates the API (no ``list_marketplace_model_endpoints``
+    attribute) returns an empty list so the FM scan is unaffected.
+    """
+    fn = getattr(client, "list_marketplace_model_endpoints", None)
+    if fn is None:
+        return []
+    endpoints: list[dict[str, Any]] = []
+    next_token: Optional[str] = None
+    while True:
+        kwargs: dict[str, Any] = {}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = fn(**kwargs)
+        endpoints.extend(resp.get("marketplaceModelEndpoints", []) or [])
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+    return endpoints
+
+
+def discover_marketplace_endpoints(
+    client: Any, region: str
+) -> list[MarketplaceEndpoint]:
+    """Enumerate Marketplace / mantle custom-deployment endpoints in a region.
+
+    Joins ``ListMarketplaceModelEndpoints`` summaries into
+    :class:`MarketplaceEndpoint` records, dropping any with an empty
+    ``endpointArn``. Non-``REGISTERED`` endpoints are kept here (the routable
+    filter is applied at mapping time) so callers can inspect drift/status.
+    """
+    out: list[MarketplaceEndpoint] = []
+    for s in _list_marketplace_endpoints(client):
+        arn = s.get("endpointArn") or ""
+        if not arn:
+            continue
+        out.append(
+            MarketplaceEndpoint(
+                endpoint_arn=arn,
+                model_source=s.get("modelSourceIdentifier") or "",
+                region=region,
+                status=s.get("status") or "REGISTERED",
+            )
+        )
+    return out
+
+
 # ============================================================================
 # Core scan
 # ============================================================================
@@ -460,6 +569,11 @@ def discover_region(
 
     ``client`` is a ``boto3.client("bedrock")`` (control plane). All API calls
     are read-only.
+
+    Marketplace / mantle custom-deployment endpoints (RouteIQ-7105) are scanned
+    separately via :func:`discover_marketplace_endpoints` (called by the
+    orchestrator under its own flag), not here, so the serverless-FM path stays
+    byte-stable.
     """
     fm_resp = client.list_foundation_models()
     summaries = fm_resp.get("modelSummaries", []) or []
@@ -625,9 +739,36 @@ class DiscoveryResult:
 
     models: list[DiscoveredModel] = field(default_factory=list)
     region_errors: dict[str, str] = field(default_factory=dict)
+    #: Marketplace / mantle custom-deployment endpoints (RouteIQ-7105).
+    marketplace_endpoints: list[MarketplaceEndpoint] = field(default_factory=list)
 
     def providers(self) -> set[str]:
         return {m.provider_name for m in self.models}
+
+    def _marketplace_entries(
+        self, *, group_name: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Map every ROUTABLE marketplace endpoint to a model_list entry.
+
+        ``group_name`` (when set, the auto-group case) collapses each endpoint
+        arm under the shared group name; otherwise each endpoint keeps its own
+        ``marketplace.<name>`` model_name. Non-``REGISTERED`` endpoints are
+        skipped. Dedups identical (region, endpoint) arms discovered twice.
+        """
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for ep in self.marketplace_endpoints:
+            if not ep.is_routable:
+                logger.debug(
+                    "skipping non-routable marketplace endpoint %s", ep.endpoint_arn
+                )
+                continue
+            arm_id = f"{ep.region}/{ep.endpoint_arn}"
+            if arm_id in seen:
+                continue
+            seen.add(arm_id)
+            entries.append(marketplace_to_litellm_entry(ep, model_name=group_name))
+        return entries
 
     def to_litellm_model_list(
         self,
@@ -667,6 +808,9 @@ class DiscoveryResult:
                 logger.debug("skipping %s: %s", m.model_id, exc)
                 continue
             entries.append(to_litellm_entry(sel, register_cost=register_cost))
+        # Marketplace / mantle endpoints (RouteIQ-7105): each keeps its own
+        # distinct ``marketplace.<name>`` model_name in the non-auto-group case.
+        entries.extend(self._marketplace_entries())
         return entries
 
     def to_auto_group_model_list(
@@ -723,6 +867,15 @@ class DiscoveryResult:
             info["provider"] = sel.provider_name
             info["tier"] = sel.tier.value
             entries.append(entry)
+        # Marketplace / mantle endpoints (RouteIQ-7105) join the SAME group as
+        # additional arms when auto-grouping, so the bandit can cascade across
+        # FM + custom-deployment arms alike. Dedup is internal to the helper.
+        for mp_entry in self._marketplace_entries(group_name=group_name):
+            arm_id = mp_entry["model_info"]["arm_id"]
+            if arm_id in seen_arms:
+                continue
+            seen_arms.add(arm_id)
+            entries.append(mp_entry)
         return entries
 
 
@@ -757,6 +910,7 @@ def discover_models(
         )
         return DiscoveryResult()
 
+    include_marketplace = getattr(settings, "include_marketplace_endpoints", False)
     factory = client_factory or _bedrock_control_client
     result = DiscoveryResult()
     for region in regions:
@@ -766,10 +920,172 @@ def discover_models(
                 client, region, check_availability=settings.check_availability
             )
             result.models.extend(models)
+            # Marketplace / mantle custom-deployment endpoints (RouteIQ-7105),
+            # opt-in. Failure here must not drop the FM models already collected
+            # for this region, so it is guarded independently.
+            if include_marketplace:
+                try:
+                    result.marketplace_endpoints.extend(
+                        discover_marketplace_endpoints(client, region)
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "marketplace endpoint scan failed for region %s: %s",
+                        region,
+                        exc,
+                    )
         except Exception as exc:  # try/except per region (spec #5)
             logger.warning("bedrock discovery failed for region %s: %s", region, exc)
             result.region_errors[region] = str(exc)
     return result
+
+
+# ============================================================================
+# Catalogue drift detection (RouteIQ-9a42)
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class CatalogueDrift:
+    """Diff of the DISCOVERED catalogue (models_available) vs CONFIGURED.
+
+    ``available`` is the set of invocation ids the scan found Bedrock offers;
+    ``configured`` is the set of bedrock invocation ids in the live model_list.
+    ``missing`` = available − configured (offered but NOT routed: under-served);
+    ``extra`` = configured − available (routed but NOT offered: stale/dangling).
+    """
+
+    available: frozenset[str]
+    configured: frozenset[str]
+
+    @property
+    def missing(self) -> frozenset[str]:
+        return self.available - self.configured
+
+    @property
+    def extra(self) -> frozenset[str]:
+        return self.configured - self.available
+
+    @property
+    def drift_count(self) -> int:
+        return len(self.missing) + len(self.extra)
+
+    @property
+    def has_drift(self) -> bool:
+        return self.drift_count > 0
+
+
+def _invocation_id_from_litellm_model(model: str) -> Optional[str]:
+    """Extract the bedrock invocation id from a ``litellm_params.model`` string.
+
+    Strips the ``bedrock/`` provider prefix and an optional ``converse/`` route
+    so the id lines up with what the discovery selection produces. Returns None
+    for a non-bedrock model string (it is not part of the Bedrock catalogue).
+    """
+    if not model or not model.startswith("bedrock/"):
+        return None
+    rest = model[len("bedrock/") :]
+    if rest.startswith("converse/"):
+        rest = rest[len("converse/") :]
+    return rest or None
+
+
+def compute_catalogue_drift(
+    result: "DiscoveryResult",
+    configured_model_list: Iterable[dict[str, Any]],
+    *,
+    residency_constraint: bool = False,
+) -> CatalogueDrift:
+    """Compute model-catalogue drift (RouteIQ-9a42).
+
+    ``models_available`` is derived from the discovery ``result`` (the serverless
+    invocation ids the scan selected, plus routable marketplace endpoint ARNs);
+    ``models_configured`` is the set of bedrock invocation ids parsed out of the
+    live ``configured_model_list`` (non-bedrock arms are ignored -- they are not
+    part of the Bedrock catalogue).
+    """
+    available: set[str] = set()
+    for m in result.models:
+        try:
+            sel = select_invocation_path(m, residency_constraint=residency_constraint)
+        except NoServerlessPathInRegion:
+            continue
+        available.add(sel.invocation_id)
+    for ep in result.marketplace_endpoints:
+        if ep.is_routable:
+            available.add(ep.endpoint_arn)
+
+    configured: set[str] = set()
+    for entry in configured_model_list or []:
+        params = entry.get("litellm_params") or {}
+        inv = _invocation_id_from_litellm_model(params.get("model", ""))
+        if inv is not None:
+            configured.add(inv)
+
+    return CatalogueDrift(
+        available=frozenset(available), configured=frozenset(configured)
+    )
+
+
+#: Lazily-created OTel counter for catalogue-drift signals (RouteIQ-9a42). Kept
+#: module-local so this control-plane module owns its own instrument without a
+#: cross-cluster edit to ``metrics.py``. Reset via :func:`reset_drift_metric`.
+_drift_counter: Any = None
+
+
+def _get_drift_counter() -> Any:
+    """Return (lazily creating) the catalogue-drift OTel counter, or None.
+
+    Uses the shared OTel meter from :mod:`observability`. Returns None when OTel
+    is unavailable so :func:`record_catalogue_drift_metric` is a clean no-op.
+    """
+    global _drift_counter
+    if _drift_counter is not None:
+        return _drift_counter
+    try:
+        from litellm_llmrouter.observability import get_meter
+
+        meter = get_meter()
+        if meter is None:
+            return None
+        _drift_counter = meter.create_counter(
+            name="gateway.bedrock.catalogue_drift",
+            description=(
+                "Bedrock model-catalogue drift: discovered models_available vs "
+                "model_list models_configured, labelled by direction "
+                "(missing=offered-not-routed / extra=routed-not-offered)"
+            ),
+            unit="{model}",
+        )
+        return _drift_counter
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        return None
+
+
+def reset_drift_metric() -> None:
+    """Drop the cached drift counter (test hygiene)."""
+    global _drift_counter
+    _drift_counter = None
+
+
+def record_catalogue_drift_metric(drift: "CatalogueDrift") -> None:
+    """Emit the catalogue-drift metric (best-effort, RouteIQ-9a42).
+
+    Records the live drift count on the ``gateway.bedrock.catalogue_drift``
+    counter, split by direction (``missing`` / ``extra``), so a CloudWatch alarm
+    (or any Prometheus query) can fire on a non-zero deployed-vs-offered gap.
+    Telemetry must never raise: a missing meter (OTel disabled) is a no-op.
+    """
+    try:
+        counter = _get_drift_counter()
+        if counter is None:
+            return
+        if drift.missing:
+            counter.add(len(drift.missing), {"direction": "missing"})
+        if drift.extra:
+            counter.add(len(drift.extra), {"direction": "extra"})
+    except Exception:  # pragma: no cover - telemetry must not break flow
+        pass
 
 
 # ============================================================================

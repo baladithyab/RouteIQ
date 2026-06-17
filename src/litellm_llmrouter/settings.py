@@ -984,6 +984,21 @@ class MCPSettings(BaseModel):
         description="Interval (seconds) for HA registry sync.",
     )
     oauth_enabled: bool = Field(False, description="Enable OAuth for MCP.")
+    access_group_enforcement: bool = Field(
+        False,
+        description=(
+            "RouteIQ-2fa1: enforce per-key/per-tool MCP access groups on the LIVE "
+            "invocation path. When True, invoking a tool whose backing server "
+            "declares ``metadata['access_groups']`` requires the caller to present "
+            "at least one matching access group; a non-member call is REJECTED at "
+            "``invoke_tool`` (the terminal path, before any outbound MCP call). "
+            "When False (default) the access-group metadata is purely advisory "
+            "(used only by the discovery/registry listing filter) -- byte-stable. "
+            "Servers with NO ``access_groups`` configured are unrestricted on "
+            "either setting (open by default). Env: "
+            "``ROUTEIQ_MCP__ACCESS_GROUP_ENFORCEMENT``."
+        ),
+    )
 
 
 class A2ASettings(BaseModel):
@@ -1917,13 +1932,162 @@ class MLOpsShadowSettings(BaseModel):
     )
 
 
-class MLOpsSettings(BaseModel):
-    """MLOps closed-loop configuration (Cluster H).
+class MLOpsFailureCaptureSettings(BaseModel):
+    """Low-rate capture from the eval COLLECT FAILURE/timeout path (RouteIQ-d365).
 
-    Bundles the three MLOps sub-loops that keep routing strategies optimal:
+    The eval COLLECT arm only samples SUCCESS responses, so AGGREGATE/FEEDBACK
+    never sees which models/strategies are error-prone.  When enabled, a
+    parallel, clearly-labeled, low-rate capture fires on the FAILURE path
+    (``async_log_failure_event``) so the loop can downweight error-prone
+    models/strategies.
+
+    Captured failure samples are tagged (``outcome="failure"`` +
+    ``error_type``) so AGGREGATE never confuses them with successful responses.
+    Default OFF and sampled at a LOW rate so a failure storm cannot flood the
+    eval queue.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable low-rate capture of FAILURE/timeout-path eval samples.",
+    )
+    sample_rate: float = Field(
+        0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of failure events to capture (kept LOW so a failure storm "
+            "does not flood the eval queue)."
+        ),
+    )
+
+
+class MLOpsUpstreamRouterSettings(BaseModel):
+    """Delegate routing to an upstream LiteLLM adaptive/quality/auto router
+    (RouteIQ-8539).
+
+    Upstream LiteLLM ships its OWN online-bandit / quality-feedback routing
+    modes (``litellm.router_strategy.adaptive_router`` /
+    ``quality_router`` / ``auto_router``), each configured per-deployment via the
+    ``auto_router/...`` model prefix and holding an in-memory
+    ``AdaptiveRouterUpdateQueue``.  This block lets RouteIQ DELEGATE to one of
+    those modes (alongside the RouteIQ ML strategies) and FLUSH the chosen
+    router's update queue to the durable store on the MLOps cadence.
+
+    Default OFF: with ``enabled=False`` RouteIQ never touches the upstream
+    router registries, so this is a byte-stable no-op until an operator opts in.
+    The upstream router itself must additionally be configured in the LiteLLM
+    ``model_list`` (the ``auto_router/...`` deployment) -- this flag only wires
+    RouteIQ's delegation + queue-flush, it does not create the deployment.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Delegate to an upstream LiteLLM adaptive/quality/auto router and "
+            "flush its update queue to the durable store."
+        ),
+    )
+    mode: str = Field(
+        "adaptive",
+        description=(
+            "Which upstream router family to delegate to: 'adaptive' "
+            "(adaptive_router), 'quality' (quality_router), or 'auto' "
+            "(auto_router). Selects which of the LiteLLM Router's per-name "
+            "router dicts RouteIQ delegates to / flushes."
+        ),
+    )
+    router_name: str = Field(
+        "",
+        description=(
+            "Optional specific upstream router_name (the model_list deployment "
+            "name) to delegate to. Empty => the first registered router of the "
+            "selected mode."
+        ),
+    )
+    flush_queue: bool = Field(
+        True,
+        description=(
+            "On each MLOps feedback cadence, drain the selected upstream "
+            "router's AdaptiveRouterUpdateQueue (state + session) to the durable "
+            "store (the proxy prisma client). No-op when the mode has no queue "
+            "(auto/quality) or no durable client is available."
+        ),
+    )
+
+
+class MLOpsSageMakerSettings(BaseModel):
+    """SageMaker Model Registry + Experiments integration (RouteIQ-93e9).
+
+    Registers a trained routing-model artifact into a SageMaker Model Package
+    Group (with an approval status) and logs run metrics to SageMaker
+    Experiments.  Cred-free + mockable: the adapter takes an injected boto3
+    sagemaker client, so unit tests pass a mock and never touch AWS.
+
+    Default OFF: live SageMaker calls are operator-gated.  With
+    ``enabled=False`` the adapter's register/log methods short-circuit and never
+    construct a boto3 client.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable SageMaker Model Registry + Experiments integration. Live "
+            "SageMaker calls are operator-gated; default off."
+        ),
+    )
+    model_package_group_name: str = Field(
+        "routeiq-routing-models",
+        description="SageMaker Model Package Group the routing artifact registers into.",
+    )
+    approval_status: str = Field(
+        "PendingManualApproval",
+        description=(
+            "ModelApprovalStatus for the registered package "
+            "(PendingManualApproval | Approved | Rejected)."
+        ),
+    )
+    experiment_name: str = Field(
+        "routeiq-routing-eval",
+        description="SageMaker Experiment name run metrics are logged under.",
+    )
+    region: str = Field(
+        "",
+        description="AWS region for the boto3 sagemaker client (empty => default chain).",
+    )
+
+
+class MLOpsOfflineEvalSettings(BaseModel):
+    """Offline eval harness over a versioned golden dataset (RouteIQ-8d24).
+
+    Replays a versioned golden dataset (request -> expected-quality) through the
+    eval judge / a strategy and reports per-strategy quality OFFLINE -- no live
+    traffic.  Default OFF; the harness is also invokable directly (tests / a CLI
+    / a batch job) without flipping this flag.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable the offline eval harness (also directly invokable).",
+    )
+    golden_dataset_path: str = Field(
+        "",
+        description=(
+            "Path to the versioned golden dataset JSON. Empty => the bundled "
+            "default fixture under config/golden_eval/."
+        ),
+    )
+
+
+class MLOpsSettings(BaseModel):
+    """MLOps closed-loop configuration (Cluster H + Cluster M).
+
+    Bundles the MLOps sub-loops that keep routing strategies optimal:
     quality-gated champion/challenger promotion (RouteIQ-2a1c), drift detection
-    (RouteIQ-6dce), and shadow/mirror canary traffic (RouteIQ-4fd1).  All three
-    are independently settings-gated and DEFAULT OFF -- importing or wiring the
+    (RouteIQ-6dce), shadow/mirror canary traffic (RouteIQ-4fd1), upstream
+    LiteLLM router delegation (RouteIQ-8539), SageMaker registry/experiments
+    (RouteIQ-93e9), and the offline eval harness (RouteIQ-8d24).  All are
+    independently settings-gated and DEFAULT OFF -- importing or wiring the
     MLOps machinery changes nothing until an operator opts in.
 
     Builds on the EXISTING COLLECT/EVALUATE/AGGREGATE/FEEDBACK eval loop
@@ -1932,7 +2096,11 @@ class MLOpsSettings(BaseModel):
     Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix):
     ``ROUTEIQ_MLOPS__PROMOTION__ENABLED``,
     ``ROUTEIQ_MLOPS__DRIFT__ENABLED``,
-    ``ROUTEIQ_MLOPS__SHADOW__ENABLED``, etc.
+    ``ROUTEIQ_MLOPS__SHADOW__ENABLED``,
+    ``ROUTEIQ_MLOPS__UPSTREAM_ROUTER__ENABLED``,
+    ``ROUTEIQ_MLOPS__SAGEMAKER__ENABLED``,
+    ``ROUTEIQ_MLOPS__OFFLINE_EVAL__ENABLED``,
+    ``ROUTEIQ_MLOPS__FAILURE_CAPTURE__ENABLED``, etc.
     """
 
     promotion: MLOpsPromotionSettings = Field(
@@ -1946,6 +2114,22 @@ class MLOpsSettings(BaseModel):
     shadow: MLOpsShadowSettings = Field(
         default_factory=MLOpsShadowSettings,  # type: ignore[arg-type]
         description="Shadow/mirror (silent canary) traffic to candidate strategies.",
+    )
+    upstream_router: MLOpsUpstreamRouterSettings = Field(
+        default_factory=MLOpsUpstreamRouterSettings,  # type: ignore[arg-type]
+        description="Upstream LiteLLM adaptive/quality/auto router delegation.",
+    )
+    sagemaker: MLOpsSageMakerSettings = Field(
+        default_factory=MLOpsSageMakerSettings,  # type: ignore[arg-type]
+        description="SageMaker Model Registry + Experiments integration.",
+    )
+    offline_eval: MLOpsOfflineEvalSettings = Field(
+        default_factory=MLOpsOfflineEvalSettings,  # type: ignore[arg-type]
+        description="Offline eval harness over a versioned golden dataset.",
+    )
+    failure_capture: MLOpsFailureCaptureSettings = Field(
+        default_factory=MLOpsFailureCaptureSettings,  # type: ignore[arg-type]
+        description="Low-rate failure/timeout-path eval sample capture.",
     )
 
 
@@ -2047,6 +2231,31 @@ class BedrockDiscoverySettings(BaseModel):
             "``model`` at this value (or rewrite to it via the model-alias layer) "
             "to route through the mixed-Bedrock group. Env: "
             "``ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP_NAME``."
+        ),
+    )
+    include_marketplace_endpoints: bool = Field(
+        False,
+        description=(
+            "RouteIQ-7105: also enumerate Amazon Bedrock Marketplace / mantle "
+            "custom-deployment endpoints (``ListMarketplaceModelEndpoints``) and "
+            "register each REGISTERED endpoint ARN as a ``model_list`` arm "
+            "(``bedrock/<endpointArn>``). This extends the serverless-FM scan to "
+            "cover operator-deployed Marketplace models (the bedrock-mantle "
+            "PrivateLink custom endpoints). Default OFF -- byte-stable: the extra "
+            "control call is opt-in and adds no arms until enabled. Env: "
+            "``ROUTEIQ_BEDROCK_DISCOVERY__INCLUDE_MARKETPLACE_ENDPOINTS``."
+        ),
+    )
+    drift_metric_enabled: bool = Field(
+        False,
+        description=(
+            "RouteIQ-9a42: emit a model-catalogue DRIFT metric "
+            "(``gateway.bedrock.catalogue_drift``) measuring "
+            "models_available (discovered) vs models_configured (the live "
+            "model_list) so a CloudWatch alarm can fire when the deployed "
+            "catalogue drifts from what Bedrock actually offers. Default OFF -- "
+            "byte-stable: no metric is recorded until enabled. Env: "
+            "``ROUTEIQ_BEDROCK_DISCOVERY__DRIFT_METRIC_ENABLED``."
         ),
     )
 

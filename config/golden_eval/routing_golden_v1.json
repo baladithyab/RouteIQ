@@ -1,0 +1,61 @@
+{
+  "version": "1",
+  "name": "routeiq-routing-golden-v1",
+  "description": "Versioned golden/held-out dataset for the RouteIQ offline eval harness (RouteIQ-8d24). request -> expected-quality per strategy. Used to replay routing decisions offline (no live traffic) and detect per-strategy quality regressions before shipping. Bump version on any change.",
+  "cases": [
+    {
+      "case_id": "math-001",
+      "messages": [{"role": "user", "content": "What is 17 multiplied by 23?"}],
+      "strategy": "llmrouter-knn",
+      "model": "gpt-4o",
+      "tier": "complex",
+      "expected_quality": 0.92,
+      "response_content": "17 multiplied by 23 is 391."
+    },
+    {
+      "case_id": "math-002",
+      "messages": [{"role": "user", "content": "Solve for x: 3x + 7 = 22"}],
+      "strategy": "llmrouter-knn",
+      "model": "gpt-4o",
+      "tier": "complex",
+      "expected_quality": 0.90,
+      "response_content": "3x + 7 = 22, so 3x = 15, x = 5."
+    },
+    {
+      "case_id": "greeting-001",
+      "messages": [{"role": "user", "content": "Hi, how are you today?"}],
+      "strategy": "llmrouter-centroid",
+      "model": "gpt-4o-mini",
+      "tier": "simple",
+      "expected_quality": 0.85,
+      "response_content": "I'm doing well, thank you! How can I help you today?"
+    },
+    {
+      "case_id": "greeting-002",
+      "messages": [{"role": "user", "content": "Thanks, that was helpful."}],
+      "strategy": "llmrouter-centroid",
+      "model": "gpt-4o-mini",
+      "tier": "simple",
+      "expected_quality": 0.80,
+      "response_content": "You're welcome! Let me know if you need anything else."
+    },
+    {
+      "case_id": "reasoning-001",
+      "messages": [{"role": "user", "content": "Prove that the square root of 2 is irrational."}],
+      "strategy": "llmrouter-mlp",
+      "model": "o3-mini",
+      "tier": "reasoning",
+      "expected_quality": 0.95,
+      "response_content": "Assume sqrt(2) = a/b in lowest terms. Then 2 = a^2/b^2, so a^2 = 2 b^2, meaning a is even, a = 2k, then b is also even - contradiction."
+    },
+    {
+      "case_id": "reasoning-002",
+      "messages": [{"role": "user", "content": "Explain why a stack overflow happens in deep recursion."}],
+      "strategy": "llmrouter-mlp",
+      "model": "o3-mini",
+      "tier": "reasoning",
+      "expected_quality": 0.88,
+      "response_content": "Each recursive call pushes a frame onto the call stack; deep recursion exhausts the fixed stack region, raising a stack overflow."
+    }
+  ]
+}

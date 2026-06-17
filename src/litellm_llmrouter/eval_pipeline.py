@@ -50,6 +50,11 @@ logger = logging.getLogger("litellm_llmrouter.eval_pipeline")
 # Score at/above which an evaluated sample counts as a "pass" verdict.
 _EVAL_PASS_THRESHOLD = 0.5
 
+# Quality assigned to a FAILURE/timeout-path sample (RouteIQ-d365).  An error
+# response gets 0.0 quality (not sent to the judge) so AGGREGATE/FEEDBACK
+# downweights error-prone models/strategies.
+_FAILURE_SAMPLE_QUALITY = 0.0
+
 
 def _record_eval_sample_metric(verdict: str) -> None:
     """Emit the eval sample metric (best-effort).
@@ -104,6 +109,13 @@ class EvalSample:
     user_id: Optional[str] = None
     workspace_id: Optional[str] = None
     prompt_name: Optional[str] = None
+
+    # Outcome label (RouteIQ-d365).  "success" for the normal COLLECT arm;
+    # "failure" for samples captured from the FAILURE/timeout path so AGGREGATE
+    # never confuses an error with a graded response.  ``error_type`` carries the
+    # exception class name for failure samples (empty for success).
+    outcome: str = "success"
+    error_type: str = ""
 
     # Evaluation results (filled after evaluation)
     scores: Dict[str, float] = field(default_factory=dict)
@@ -410,10 +422,18 @@ class EvalPipeline:
             for _ in range(min(self._batch_size, len(self._pending_samples)))
         ]
 
-        results = await self._judge.evaluate_batch(batch)
+        # FAILURE-path samples (RouteIQ-d365) are NOT sent to the LLM judge --
+        # there is no graded response, and judging an error wastes a judge call.
+        # They are scored directly at ``_FAILURE_SAMPLE_QUALITY`` so AGGREGATE /
+        # FEEDBACK downweight error-prone models/strategies. Only success samples
+        # go to the judge.
+        judged_batch = [s for s in batch if s.outcome != "failure"]
+        failure_batch = [s for s in batch if s.outcome == "failure"]
+
+        results = await self._judge.evaluate_batch(judged_batch) if judged_batch else []
 
         evaluated = 0
-        for sample, scores in zip(batch, results):
+        for sample, scores in zip(judged_batch, results):
             if scores:
                 sample.scores = scores
                 sample.evaluated = True
@@ -428,6 +448,16 @@ class EvalPipeline:
                     "pass" if avg_score >= _EVAL_PASS_THRESHOLD else "fail"
                 )
                 evaluated += 1
+
+        for sample in failure_batch:
+            sample.scores = {"failure": _FAILURE_SAMPLE_QUALITY}
+            sample.evaluated = True
+            sample.evaluated_at = time.time()
+            self._tracker.record(
+                sample.model, _FAILURE_SAMPLE_QUALITY, strategy=sample.strategy
+            )
+            _record_eval_sample_metric("fail")
+            evaluated += 1
 
         self._total_evaluated += evaluated
 

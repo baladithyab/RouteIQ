@@ -161,6 +161,28 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
         # MagicMock factory so no live AWS / real boto3 is needed.
         self._client_factory = client_factory or _make_agentcore_client
 
+        # RouteIQ-60e7: AgentCore Memory + Identity integration, each gated
+        # default-OFF. Memory (managed agent/conversation state via
+        # CreateEvent/ListEvents) and Identity (agent OAuth2 token exchange via
+        # GetResourceOauth2Token) ride the SAME bedrock-agentcore data-plane
+        # client (SigV4-signed by botocore). The features are inert until an
+        # operator opts in -- no API is ever called from __init__.
+        self._memory_enabled = (
+            os.getenv(
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ENABLED", "false"
+            ).lower()
+            == "true"
+        )
+        self._memory_id = os.getenv(
+            "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ID", ""
+        ).strip()
+        self._identity_enabled = (
+            os.getenv(
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_IDENTITY_ENABLED", "false"
+            ).lower()
+            == "true"
+        )
+
         self._registered_server_ids: list[str] = []
         self._context: PluginContext | None = None
         self._tools_registered_counter: Any = None
@@ -443,6 +465,148 @@ class BedrockAgentCoreMCPPlugin(GatewayPlugin):
             self._invocations_counter.add(1, {"agent_id": agent_id, "region": region})
 
         return self._decode_invoke_response(response)
+
+    # =========================================================================
+    # AgentCore Memory (RouteIQ-60e7) — managed agent/conversation state.
+    # =========================================================================
+
+    def is_memory_enabled(self) -> bool:
+        """Whether AgentCore Memory is enabled (default OFF)."""
+        return bool(self._memory_enabled)
+
+    def is_identity_enabled(self) -> bool:
+        """Whether AgentCore Identity is enabled (default OFF)."""
+        return bool(self._identity_enabled)
+
+    def _resolve_memory_region(self) -> str:
+        region = self._region or _resolve_region(None)
+        if not region:
+            raise ValueError(
+                "No AWS region resolved for AgentCore Memory; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_REGION or AWS_REGION."
+            )
+        self._region = region
+        return region
+
+    async def memory_put_event(
+        self,
+        actor_id: str,
+        session_id: str,
+        payload: list[dict[str, Any]] | dict[str, Any],
+        *,
+        memory_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a conversation/agent-state event into AgentCore Memory.
+
+        Wraps the data-plane ``CreateEvent`` API on the SigV4-signing
+        ``bedrock-agentcore`` client (botocore signs automatically). ``payload``
+        is normalised to the ``payload=[...]`` list shape the API expects.
+
+        Gated: raises :class:`RuntimeError` when Memory is disabled, and
+        :class:`ValueError` when no ``memoryId`` is configured/supplied.
+        """
+        if not self._memory_enabled:
+            raise RuntimeError(
+                "AgentCore Memory is disabled; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ENABLED=true to enable."
+            )
+        mem_id = (memory_id or self._memory_id).strip()
+        if not mem_id:
+            raise ValueError(
+                "No AgentCore memoryId configured; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ID or pass memory_id."
+            )
+        region = self._resolve_memory_region()
+        endpoint = _agentcore_runtime_endpoint(region)
+        client = self._client_factory(region, endpoint)
+
+        events = payload if isinstance(payload, list) else [payload]
+        resp = client.create_event(
+            memoryId=mem_id,
+            actorId=actor_id,
+            sessionId=session_id,
+            payload=events,
+        )
+        return dict(resp) if isinstance(resp, dict) else {"response": resp}
+
+    async def memory_list_events(
+        self,
+        actor_id: str,
+        session_id: str,
+        *,
+        memory_id: str | None = None,
+        max_results: int | None = None,
+        include_payloads: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Read conversation/agent-state events back from AgentCore Memory.
+
+        Wraps the read-only ``ListEvents`` API. Returns the ``events`` list
+        (empty when none). Same gating contract as :meth:`memory_put_event`.
+        """
+        if not self._memory_enabled:
+            raise RuntimeError(
+                "AgentCore Memory is disabled; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ENABLED=true to enable."
+            )
+        mem_id = (memory_id or self._memory_id).strip()
+        if not mem_id:
+            raise ValueError(
+                "No AgentCore memoryId configured; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_MEMORY_ID or pass memory_id."
+            )
+        region = self._resolve_memory_region()
+        endpoint = _agentcore_runtime_endpoint(region)
+        client = self._client_factory(region, endpoint)
+
+        kwargs: dict[str, Any] = {
+            "memoryId": mem_id,
+            "actorId": actor_id,
+            "sessionId": session_id,
+            "includePayloads": include_payloads,
+        }
+        if max_results is not None:
+            kwargs["maxResults"] = max_results
+        resp = client.list_events(**kwargs)
+        return list(resp.get("events", []) or [])
+
+    # =========================================================================
+    # AgentCore Identity (RouteIQ-60e7) — agent OAuth2 token exchange.
+    # =========================================================================
+
+    async def identity_get_oauth2_token(
+        self,
+        workload_identity_token: str,
+        resource_credential_provider_name: str,
+        scopes: list[str],
+        *,
+        oauth2_flow: str = "M2M",
+    ) -> dict[str, Any]:
+        """Exchange a workload identity token for a resource OAuth2 token.
+
+        Wraps the ``GetResourceOauth2Token`` API on the SigV4-signing
+        ``bedrock-agentcore`` client. Returns the raw response
+        (``accessToken`` / ``authorizationUrl`` / ``sessionStatus`` /
+        ``sessionUri``). ``oauth2_flow`` is one of
+        ``M2M`` / ``USER_FEDERATION`` / ``ON_BEHALF_OF_TOKEN_EXCHANGE``.
+
+        Gated: raises :class:`RuntimeError` when Identity is disabled.
+        """
+        if not self._identity_enabled:
+            raise RuntimeError(
+                "AgentCore Identity is disabled; set "
+                "ROUTEIQ_PLUGIN_BEDROCK_AGENTCORE_IDENTITY_ENABLED=true to enable."
+            )
+        region = self._resolve_memory_region()
+        endpoint = _agentcore_runtime_endpoint(region)
+        client = self._client_factory(region, endpoint)
+
+        resp = client.get_resource_oauth2_token(
+            workloadIdentityToken=workload_identity_token,
+            resourceCredentialProviderName=resource_credential_provider_name,
+            scopes=list(scopes),
+            oauth2Flow=oauth2_flow,
+        )
+        return dict(resp) if isinstance(resp, dict) else {"response": resp}
 
     @staticmethod
     def _decode_invoke_response(response: dict[str, Any]) -> dict[str, Any]:

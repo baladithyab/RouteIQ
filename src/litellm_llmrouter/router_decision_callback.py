@@ -26,6 +26,7 @@ Environment Variables:
 
 import logging
 import os
+import random
 import threading
 import time
 from collections import OrderedDict
@@ -1279,8 +1280,19 @@ class RouterDecisionCallback:
         start_time: float,
         end_time: float,
     ) -> None:
-        """Async version of log_failure_event."""
+        """Async version of log_failure_event.
+
+        Also drives the eval FAILURE-path capture (RouteIQ-d365): a parallel,
+        clearly-labeled, low-rate capture from the error/timeout path so
+        AGGREGATE/FEEDBACK can downweight error-prone models/strategies. Gated
+        behind ``settings.mlops.failure_capture.enabled`` (default off) and
+        sampled at a LOW rate; safe no-op when disabled. Fully fail-open.
+        """
         self.log_failure_event(kwargs, response_obj, start_time, end_time)
+
+        # FAILURE-path eval capture (independent of the OTEL-gated _enabled flag,
+        # mirroring the success-path COLLECT/spend pattern).
+        _collect_failure_eval_sample(kwargs, start_time, end_time)
 
     async def async_post_call_success_hook(
         self,
@@ -1709,6 +1721,123 @@ def _collect_eval_sample(
         pipeline.collect(sample)
     except Exception:  # pragma: no cover - collection must never break routing
         logger.debug("Failed to collect eval sample", exc_info=True)
+
+
+def _failure_capture_settings() -> tuple[bool, float]:
+    """Resolve ``settings.mlops.failure_capture`` (enabled, sample_rate).
+
+    Returns ``(False, 0.0)`` on any read failure so a misconfig never silently
+    enables failure capture.  Settings-first per ADR-0013.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        mlops = getattr(get_settings(), "mlops", None)
+        fc = getattr(mlops, "failure_capture", None) if mlops is not None else None
+        if fc is None or not getattr(fc, "enabled", False):
+            return False, 0.0
+        return True, float(getattr(fc, "sample_rate", 0.0))
+    except Exception:  # pragma: no cover - defensive
+        return False, 0.0
+
+
+def _collect_failure_eval_sample(
+    kwargs: Dict[str, Any],
+    start_time: Any,
+    end_time: Any,
+) -> None:
+    """FAILURE arm: capture one error/timeout decision into the eval pipeline.
+
+    The success-only COLLECT arm leaves AGGREGATE/FEEDBACK blind to which
+    models/strategies are error-prone (RouteIQ-d365).  This captures a parallel,
+    clearly-labeled (``outcome="failure"`` + ``error_type``), LOW-rate sample
+    from the failure path so the loop can downweight error-prone targets.
+
+    Gating + safety contract:
+      * Independent gate ``settings.mlops.failure_capture.enabled`` (default off)
+        -- distinct from the eval pipeline's own success sample rate, so a
+        failure storm cannot ride the success rate.
+      * Sampled at the LOW ``failure_capture.sample_rate`` so a failure storm
+        cannot flood the eval queue.
+      * ``get_eval_pipeline()`` must be present (eval pipeline enabled), else
+        no-op -- the captured sample has nowhere to go otherwise.
+      * Fully fail-open: any error is swallowed so the failure path is never
+        broken by eval bookkeeping.
+
+    No response is captured (there is none on the failure path); the sample
+    carries the request + the error_type only.  PII discipline matches the
+    success arm.
+    """
+    try:
+        enabled, sample_rate = _failure_capture_settings()
+        if not enabled:
+            return
+        if sample_rate <= 0.0 or random.random() >= sample_rate:
+            return
+
+        from litellm_llmrouter.eval_pipeline import EvalSample, get_eval_pipeline
+
+        pipeline = get_eval_pipeline()
+        if pipeline is None:
+            return
+
+        metadata = kwargs.get("metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        model = kwargs.get("model", "") or ""
+        strategy = (
+            metadata.get("routing_strategy") or OVERRIDE_STRATEGY_NAME or "unknown"
+        )
+        tier = metadata.get("_routing_tier") or _resolve_tier_from_model(model)
+
+        exception = kwargs.get("exception", None)
+        error_type = type(exception).__name__ if exception is not None else "unknown"
+
+        messages = kwargs.get("messages", []) or []
+        if not isinstance(messages, list):
+            messages = []
+
+        # Caller scope (same precedence the success arm uses).
+        key_id: Optional[str] = None
+        user_id: Optional[str] = None
+        workspace_id: Optional[str] = None
+        gctx = metadata.get("_governance_ctx")
+        if isinstance(gctx, dict):
+            key_id = gctx.get("key_id")
+            workspace_id = gctx.get("workspace_id")
+        if not key_id:
+            key_id = metadata.get("user_api_key") or metadata.get("_key")
+        if not workspace_id:
+            workspace_id = metadata.get("workspace_id") or metadata.get("_workspace")
+        user_id = (
+            metadata.get("user_api_key_user_id")
+            or metadata.get("user_id")
+            or metadata.get("_user")
+        )
+
+        latency_ms = _compute_duration(start_time, end_time) * 1000.0
+
+        sample = EvalSample(
+            sample_id=str(
+                kwargs.get("litellm_call_id") or f"evalfail-{time.time()}-{id(kwargs)}"
+            ),
+            timestamp=time.time(),
+            model=str(model),
+            strategy=str(strategy),
+            tier=str(tier),
+            messages=messages,
+            response_content="",
+            latency_ms=float(latency_ms),
+            user_id=str(user_id) if user_id else None,
+            workspace_id=str(workspace_id) if workspace_id else None,
+            prompt_name=metadata.get("prompt_name"),
+            outcome="failure",
+            error_type=error_type,
+        )
+        pipeline.collect(sample)
+    except Exception:  # pragma: no cover - capture must never break the failure path
+        logger.debug("Failed to collect failure eval sample", exc_info=True)
 
 
 def _derive_spend_scope(metadata: Dict[str, Any]) -> tuple[str, str]:
