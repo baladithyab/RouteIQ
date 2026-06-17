@@ -98,6 +98,46 @@ class MyStatsResponse(BaseModel):
     max_budget_usd: float | None = None
 
 
+class CreateMyKeyRequest(BaseModel):
+    """Request body for self-service key creation (user-tier, own-scope).
+
+    A user supplies only descriptive fields; the OWNER is taken from the caller's
+    authenticated identity (never from the body), so a user can only ever mint a
+    key bound to themselves.  ``max_budget_usd`` / ``allowed_models`` let the user
+    self-constrain the key but never widen beyond their own governance.
+    """
+
+    name: str | None = None
+    max_budget_usd: float | None = None
+    allowed_models: list[str] = []
+
+
+class MyKeyResponse(BaseModel):
+    """A self-service API key the caller owns.
+
+    ``key`` (the plaintext secret) is returned ONLY at creation time and is
+    NOT recoverable afterward -- the gateway stores only a hash of it.  Every
+    other surface (list, revoke) addresses the key by its non-secret public
+    ``key_id`` and shows the ``masked`` preview, never the secret.
+    """
+
+    key_id: str  # non-secret public id (e.g. "kid_..."); safe to log / put in URLs
+    name: str | None = None
+    owner_id: str
+    created_at: str
+    max_budget_usd: float | None = None
+    allowed_models: list[str] = []
+    masked: str | None = None  # non-secret preview, e.g. "sk-rq-...ab12"
+    key: str | None = None  # plaintext secret, populated ONLY on create
+
+
+class MyKeyListResponse(BaseModel):
+    """List of the caller's OWN self-service keys (scope-isolated)."""
+
+    keys: list[MyKeyResponse]
+    count: int
+
+
 class ModelInfoResponse(BaseModel):
     """Model deployment information."""
 
@@ -748,6 +788,255 @@ async def get_my_stats(auth: Any = Depends(user_api_key_auth)):
         pass
 
     return response
+
+
+# =============================================================================
+# Self-Service Key Management (RouteIQ-3215) -- user-tier, scope-isolated
+# =============================================================================
+#
+# A logged-in user manages THEIR OWN API keys via the user-tier llmrouter_router
+# (Depends(user_api_key_auth)) -- admin auth is NOT required.  Ownership is taken
+# from the authenticated caller's identity (_resolve_caller_key_id), NEVER from
+# request input, so a user can only ever see / create / revoke keys bound to
+# themselves.  Keys are stored in the governance key store (KeyGovernance) with
+# the owner stamped into metadata["owner_id"]; the secret is returned only at
+# creation time.
+
+
+def _self_service_keys_enabled() -> bool:
+    """Whether the user-tier self-service key endpoints are exposed (RouteIQ-3215).
+
+    Legacy flat env var first, then the typed setting
+    (``settings.api_surfaces.self_service_keys_enabled``).  Defaults ON.
+    """
+    raw = os.getenv("ROUTEIQ_SELF_SERVICE_KEYS")
+    if raw is not None:
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().api_surfaces.self_service_keys_enabled
+    except Exception:
+        return True
+
+
+def _require_self_service_keys() -> None:
+    """Raise 404 when self-service key management is disabled."""
+    if not _self_service_keys_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "feature_disabled",
+                "message": (
+                    "Self-service key management is not enabled. "
+                    "Set ROUTEIQ_SELF_SERVICE_KEYS=true to enable."
+                ),
+            },
+        )
+
+
+def _key_owner_id(governance: Any) -> str | None:
+    """Extract the owner_id stamped into a KeyGovernance's metadata."""
+    metadata = getattr(governance, "metadata", None) or {}
+    owner = metadata.get("owner_id")
+    return str(owner) if owner else None
+
+
+def _mask_secret(secret: str) -> str:
+    """Render a non-secret preview of a plaintext key (prefix + last-4).
+
+    Never reveals enough to reconstruct the secret -- safe for lists / logs.
+    """
+    last4 = secret[-4:] if len(secret) >= 4 else ""
+    return f"sk-rq-...{last4}"
+
+
+def _public_key_id(governance: Any) -> str:
+    """The non-secret public id a caller addresses a key by (list / revoke).
+
+    Read from ``metadata.public_id``.  Falls back to the governance ``key_id``
+    only for legacy rows that predate the hashed-secret migration (those never
+    carried a public id); new keys always stamp one.
+    """
+    metadata = getattr(governance, "metadata", None) or {}
+    public_id = metadata.get("public_id")
+    return str(public_id) if public_id else str(getattr(governance, "key_id", ""))
+
+
+def _key_to_response(governance: Any, *, secret: str | None = None) -> MyKeyResponse:
+    """Project a KeyGovernance into the user-facing MyKeyResponse.
+
+    The response is keyed by the NON-SECRET public id; the plaintext ``secret``
+    is attached only when explicitly passed (creation only).  The stored
+    governance ``key_id`` (the raw api_key) is NEVER projected out.
+    """
+    metadata = getattr(governance, "metadata", None) or {}
+    return MyKeyResponse(
+        key_id=_public_key_id(governance),
+        name=metadata.get("name"),
+        owner_id=str(metadata.get("owner_id") or ""),
+        created_at=str(metadata.get("created_at") or ""),
+        max_budget_usd=getattr(governance, "max_budget_usd", None),
+        allowed_models=list(getattr(governance, "allowed_models", []) or []),
+        masked=str(metadata.get("masked") or "") or None,
+        key=secret,
+    )
+
+
+def _find_owned_key_by_public_id(
+    engine: Any, public_id: str, owner_id: str
+) -> Any | None:
+    """Resolve the caller's OWN KeyGovernance from its non-secret public id.
+
+    Returns ``None`` when no key with that public id is owned by ``owner_id``
+    (or when the caller is anonymous), so a caller can neither recover the
+    secret nor probe for another user's keys.
+    """
+    if owner_id == "anonymous":
+        return None
+    for kg in engine._key_governance.values():
+        if _public_key_id(kg) == public_id and _key_owner_id(kg) == owner_id:
+            return kg
+    return None
+
+
+@llmrouter_router.post(
+    "/api/v1/routeiq/me/keys", response_model=MyKeyResponse, status_code=201
+)
+async def create_my_key(
+    body: CreateMyKeyRequest,
+    auth: Any = Depends(user_api_key_auth),
+):
+    """Create a NEW API key owned by the authenticated caller (user-tier).
+
+    The owner is the caller's resolved identity -- never request input -- so the
+    key is always bound to the caller.  The plaintext secret is returned ONCE in
+    this response and is NOT recoverable later: the gateway stores only a SHA-256
+    hash plus a non-secret public id and masked preview.  Admin auth is not
+    required.
+    """
+    _require_self_service_keys()
+    import hashlib
+    import secrets
+    from datetime import datetime, timezone
+
+    owner_id = _resolve_caller_key_id(auth)
+    if owner_id == "anonymous":
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "unauthenticated",
+                "message": "A resolvable user identity is required to create keys.",
+            },
+        )
+
+    from litellm_llmrouter.governance import (
+        KeyGovernance,
+        get_governance_engine,
+        save_governance_state,
+    )
+    from litellm_llmrouter.governance_store import get_governance_store
+
+    # The generated secret IS the key_id the governance engine keys on (the raw
+    # api_key), matching the spend-scope derivation contract -- but the secret is
+    # NEVER projected back out.  Callers address the key by its non-secret
+    # public id, and only a hash + masked preview are retained for display.
+    secret = f"sk-rq-{secrets.token_urlsafe(24)}"
+    public_id = f"kid_{secrets.token_urlsafe(12)}"
+    secret_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    governance = KeyGovernance(
+        key_id=secret,
+        max_budget_usd=body.max_budget_usd,
+        allowed_models=list(body.allowed_models or []),
+        metadata={
+            "owner_id": owner_id,
+            "name": body.name,
+            "created_at": created_at,
+            "self_service": True,
+            "public_id": public_id,
+            "masked": _mask_secret(secret),
+            "secret_hash": secret_hash,
+        },
+    )
+
+    engine = get_governance_engine()
+    engine.register_key_governance(governance)
+    save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.upsert_key(engine.get_key_governance(secret))
+
+    # Return the plaintext secret ONCE (creation only); the public id is what the
+    # caller uses to list / revoke afterward.
+    return _key_to_response(engine.get_key_governance(secret), secret=secret)
+
+
+@llmrouter_router.get("/api/v1/routeiq/me/keys", response_model=MyKeyListResponse)
+async def list_my_keys(auth: Any = Depends(user_api_key_auth)):
+    """List the caller's OWN self-service keys (scope-isolated, user-tier).
+
+    Returns ONLY keys whose ``metadata.owner_id`` equals the caller's resolved
+    identity -- a user can never enumerate another user's keys.  Secrets are
+    never returned by the list path.
+    """
+    _require_self_service_keys()
+    owner_id = _resolve_caller_key_id(auth)
+
+    from litellm_llmrouter.governance import get_governance_engine
+
+    engine = get_governance_engine()
+    owned = [
+        _key_to_response(kg)
+        for kg in engine._key_governance.values()
+        if _key_owner_id(kg) == owner_id and owner_id != "anonymous"
+    ]
+    return MyKeyListResponse(keys=owned, count=len(owned))
+
+
+@llmrouter_router.delete("/api/v1/routeiq/me/keys/{key_id}")
+async def revoke_my_key(key_id: str, auth: Any = Depends(user_api_key_auth)):
+    """Revoke one of the caller's OWN keys by its NON-SECRET public id.
+
+    ``key_id`` here is the public id (``kid_...``), never the plaintext secret,
+    so the secret never lands in the request URL / access logs.  A user can
+    revoke ONLY a key they own; a key owned by someone else (or one that does
+    not exist) returns 404 -- never an ownership-leaking 403 -- so a user
+    cannot probe for the existence of another user's keys.
+    """
+    _require_self_service_keys()
+    owner_id = _resolve_caller_key_id(auth)
+
+    from litellm_llmrouter.governance import (
+        get_governance_engine,
+        save_governance_state,
+    )
+    from litellm_llmrouter.governance_store import get_governance_store
+
+    engine = get_governance_engine()
+    governance = _find_owned_key_by_public_id(engine, key_id, owner_id)
+
+    # Scope isolation: a non-owned (or missing) key is indistinguishable (404).
+    if governance is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "key_not_found",
+                "message": f"No key '{key_id}' owned by the caller.",
+            },
+        )
+
+    # Delete by the raw governance key (the api_key) internally -- it is resolved
+    # from the public id and is never echoed back to the caller.
+    raw_key = governance.key_id
+    engine.delete_key_governance(raw_key)
+    save_governance_state(engine)
+    store = get_governance_store()
+    if store.enabled:
+        await store.delete_key(raw_key)
+
+    return {"deleted": True, "key_id": key_id}
 
 
 @admin_router.get("/api/v1/routeiq/stats/global", response_model=GlobalStatsResponse)

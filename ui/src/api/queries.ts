@@ -5,6 +5,9 @@ import type {
     RoutingStats,
     GlobalStats,
     MyStats,
+    MyKey,
+    MyKeyList,
+    CreateMyKeyRequest,
     ModelInfo,
     ModelUpsertRequest,
     ModelMutationResponse,
@@ -62,6 +65,43 @@ export function useUserStats(enabled: boolean) {
         queryFn: () => apiClient.get<MyStats>('/api/v1/routeiq/me/stats', 'user'),
         refetchInterval: 15_000,
         enabled,
+    })
+}
+
+// --- Self-service key hooks (USER-tier, scope-isolated, RouteIQ-3215) ---
+// These hit the user tier with the end-user token (not the admin key) so the
+// gateway scopes every operation to the caller's OWN identity.
+
+export function useMyKeys(enabled: boolean) {
+    return useQuery<MyKeyList>({
+        queryKey: ['my-keys'],
+        queryFn: () => apiClient.get<MyKeyList>('/api/v1/routeiq/me/keys', 'user'),
+        enabled,
+    })
+}
+
+export function useCreateMyKey() {
+    const queryClient = useQueryClient()
+    return useMutation<MyKey, Error, CreateMyKeyRequest>({
+        mutationFn: (data) =>
+            apiClient.post<MyKey>('/api/v1/routeiq/me/keys', data, 'user'),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['my-keys'] })
+        },
+    })
+}
+
+export function useRevokeMyKey() {
+    const queryClient = useQueryClient()
+    return useMutation<{ deleted: boolean; key_id: string }, Error, string>({
+        mutationFn: (keyId) =>
+            apiClient.delete<{ deleted: boolean; key_id: string }>(
+                `/api/v1/routeiq/me/keys/${encodeURIComponent(keyId)}`,
+                'user',
+            ),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['my-keys'] })
+        },
     })
 }
 

@@ -45,6 +45,31 @@ export interface MyStats {
     max_budget_usd: number | null
 }
 
+// Self-service key (RouteIQ-3215). `key_id` is the NON-SECRET public id used
+// for display / revoke; `masked` is a non-secret preview. `key` (the plaintext
+// secret) is present ONLY on the create response and is never recoverable after.
+export interface MyKey {
+    key_id: string
+    name: string | null
+    owner_id: string
+    created_at: string
+    max_budget_usd: number | null
+    allowed_models: string[]
+    masked?: string | null
+    key?: string | null
+}
+
+export interface MyKeyList {
+    keys: MyKey[]
+    count: number
+}
+
+export interface CreateMyKeyRequest {
+    name?: string | null
+    max_budget_usd?: number | null
+    allowed_models?: string[]
+}
+
 // Model info from GET /api/v1/routeiq/models
 export interface ModelInfo {
     model_name: string

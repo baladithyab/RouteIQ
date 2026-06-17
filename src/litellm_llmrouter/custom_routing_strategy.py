@@ -256,6 +256,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 model=model,
                 messages=messages,
                 input=input,
+                request_kwargs=request_kwargs,
             )
             if result is not None:
                 return result
@@ -280,7 +281,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             return result
 
         # 6. Fallback to first available deployment
-        return self._fallback_deployment(model)
+        return self._fallback_deployment(model, request_kwargs)
 
     def get_available_deployment(
         self,
@@ -342,6 +343,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 model=model,
                 messages=messages,
                 input=input,
+                request_kwargs=request_kwargs,
             )
             if result is not None:
                 return result
@@ -358,7 +360,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             return result
 
         # 5. Fallback to first available deployment
-        return self._fallback_deployment(model)
+        return self._fallback_deployment(model, request_kwargs)
 
     # ------------------------------------------------------------------
     # Internal: Gov-ban chokepoint (RouteIQ-a073)
@@ -585,6 +587,7 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         model: str,
         messages: Optional[List[Dict[str, str]]] = None,
         input: Optional[Union[str, List]] = None,
+        request_kwargs: Optional[Dict] = None,
     ) -> Optional[Dict]:
         """
         Route directly using ``LLMRouterStrategyFamily``.
@@ -606,8 +609,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         # Extract query
         query = self._extract_query(messages, input)
 
-        # Get model list and deployment map
-        model_list, healthy_deployments = self._get_model_list(model)
+        # Get model list and deployment map (RouteIQ-60cc: pass request_kwargs so
+        # the per-request region / data-residency pre-filter activates here).
+        model_list, healthy_deployments = self._get_model_list(model, request_kwargs)
 
         if not model_list:
             model_list = [model]
@@ -722,8 +726,11 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             if not user_id:
                 return None
 
-            # Get candidate models from healthy deployments
-            model_list, healthy_deployments = self._get_model_list(model)
+            # Get candidate models from healthy deployments (RouteIQ-60cc:
+            # pass request_kwargs so region / residency is honoured here too).
+            model_list, healthy_deployments = self._get_model_list(
+                model, request_kwargs
+            )
             if not model_list or len(model_list) < 2:
                 # No point re-ranking with 0 or 1 candidates
                 return None
@@ -838,11 +845,19 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
     # Internal: Helper methods
     # ------------------------------------------------------------------
 
-    def _get_model_list(self, model: str) -> tuple:
+    def _get_model_list(
+        self, model: str, request_kwargs: Optional[Dict] = None
+    ) -> tuple:
         """
         Get available deployments from the Router.
 
         Prefers ``healthy_deployments`` over ``model_list`` for freshness.
+
+        ``request_kwargs`` is OPTIONAL: when supplied, a minimal
+        :class:`RoutingContext` is built from it so the per-request region /
+        data-residency pre-filter (RouteIQ-60cc) activates on the ML
+        (``LLMRouterStrategyFamily``) path. When ``None`` the region filter
+        no-ops (byte-stable for callers that have no request context).
 
         Returns:
             Tuple of (model_name_list, healthy_deployments_list)
@@ -858,8 +873,16 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         # subset BEFORE returning the candidate set the strategy scores.
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
+        # RouteIQ-60cc: build a minimal region-signal context from request_kwargs
+        # so a HARD data-residency request never leaks out-of-region on the ML
+        # path. ``context=None`` (no request_kwargs) keeps the legacy byte-stable
+        # behaviour (region filter no-ops).
+        context = self._region_context(model, request_kwargs)
+
         group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
-        routable = filter_routable_candidates(self._router, group_matched)
+        routable = filter_routable_candidates(
+            self._router, group_matched, context=context
+        )
 
         model_list: List[str] = []
         for deployment in routable:
@@ -868,6 +891,37 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 model_list.append(litellm_model)
 
         return model_list, healthy_deployments
+
+    def _region_context(
+        self, model: str, request_kwargs: Optional[Dict]
+    ) -> Optional[Any]:
+        """Build a minimal region-signal context for the region pre-filter.
+
+        RouteIQ-60cc: the ML (``LLMRouterStrategyFamily``) path operates on a
+        bare model name, not a ``RoutingContext``, so the region / data-residency
+        signal in ``request_kwargs`` (header + metadata) was previously dropped.
+        This wraps ``request_kwargs`` in a lightweight ``RoutingContext`` whose
+        ``request_kwargs`` / ``metadata`` are exactly the sources
+        ``candidate_filter._ctx_sources`` scans.
+
+        Returns ``None`` when ``request_kwargs`` is absent (no region signal) so
+        the region filter no-ops and the legacy candidate set is byte-stable.
+        """
+        if not request_kwargs:
+            return None
+        try:
+            from litellm_llmrouter.strategy_registry import RoutingContext
+
+            metadata = request_kwargs.get("metadata")
+            return RoutingContext(
+                router=self._router,
+                model=model,
+                request_kwargs=request_kwargs,
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("region context build failed (region filter no-op): %s", exc)
+            return None
 
     @staticmethod
     def _extract_query(
@@ -959,11 +1013,20 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
                 self._pipeline_initialized = True  # Don't retry
         return self._pipeline
 
-    def _fallback_deployment(self, model: str) -> Optional[Dict]:
+    def _fallback_deployment(
+        self, model: str, request_kwargs: Optional[Dict] = None
+    ) -> Optional[Dict]:
         """Return first routable deployment for the given model group.
 
         RouteIQ-99e8 / RouteIQ-badb: never fall back to a cooled-down or
         gov-banned arm (the fallback path also bypasses LiteLLM's pipeline).
+
+        RouteIQ-60cc: this terminal fallback is the LAST deployment-selection
+        seam, so it MUST honour per-request region/data-residency too — a
+        hard-residency request that reaches the fallback must not leak
+        out-of-region. ``request_kwargs`` is threaded so the region filter sees
+        the same header/metadata signal; ``None`` => region filter no-ops
+        (byte-stable).
         """
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
@@ -971,7 +1034,10 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             self._router, "healthy_deployments", self._router.model_list
         )
         group_matched = [d for d in healthy_deployments if d.get("model_name") == model]
-        for deployment in filter_routable_candidates(self._router, group_matched):
+        context = self._region_context(model, request_kwargs)
+        for deployment in filter_routable_candidates(
+            self._router, group_matched, context=context
+        ):
             return deployment
         return None
 

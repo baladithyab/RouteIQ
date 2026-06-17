@@ -939,7 +939,9 @@ class KumaraswamyThompsonStrategy(RoutingStrategy):
         # RouteIQ-99e8 (cooldown) + RouteIQ-badb (gov-ban): remove cooled-down /
         # gov-banned arms BEFORE scoring, so a cooled-down/unhealthy or banned
         # arm is never scored or selected (proactive, not retried-after-failure).
-        cands = filter_routable_candidates(context.router, cands)
+        # RouteIQ-60cc: pass context too so the per-request region / data-residency
+        # pre-filter activates on the bandit path (HARD residency never leaks).
+        cands = filter_routable_candidates(context.router, cands, context=context)
         cands = self._drop_open_breakers(cands)
         if not cands:
             return None
@@ -1494,7 +1496,9 @@ class LinUCBRoutingStrategy(RoutingStrategy):
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
         cands = self._candidates(context)
-        cands = filter_routable_candidates(context.router, cands)
+        # RouteIQ-60cc: pass context so the per-request region / data-residency
+        # pre-filter activates on the LinUCB path too (HARD residency never leaks).
+        cands = filter_routable_candidates(context.router, cands, context=context)
         if not cands:
             return None
 

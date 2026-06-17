@@ -140,6 +140,29 @@ CREATE TABLE IF NOT EXISTS governance_spend (
 CREATE INDEX IF NOT EXISTS idx_gov_spend_scope ON governance_spend(scope);
 CREATE INDEX IF NOT EXISTS idx_gov_spend_period ON governance_spend(period_start);
 
+-- Durable per-model spend rollup (the chargeback breakdown system-of-record).
+-- The scope-level governance_spend table has no model dimension, so this side
+-- table carries the (model x scope x period) cost/token aggregate the spend
+-- report renders as per-model breakdowns.  Same epoch-aligned period_start as
+-- governance_spend so the two tables roll up on the same bucket boundaries.
+CREATE TABLE IF NOT EXISTS governance_spend_model (
+    model            VARCHAR(255) NOT NULL,
+    scope            VARCHAR(255) NOT NULL DEFAULT 'global',
+    scope_type       VARCHAR(20)  NOT NULL DEFAULT 'global',
+    period_start     TIMESTAMP WITH TIME ZONE NOT NULL,
+    period           VARCHAR(20)  NOT NULL DEFAULT 'monthly',
+    spend_usd        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    request_count    BIGINT NOT NULL DEFAULT 0,
+    input_tokens     BIGINT NOT NULL DEFAULT 0,
+    output_tokens    BIGINT NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (model, scope, period, period_start)
+);
+CREATE INDEX IF NOT EXISTS idx_gov_spend_model_model
+    ON governance_spend_model(model);
+CREATE INDEX IF NOT EXISTS idx_gov_spend_model_period
+    ON governance_spend_model(period_start);
+
 -- Guardrail policy definitions (mirror of GuardrailPolicy, the 14-check engine).
 -- The full model is stored as JSONB ``payload`` (nested enums) + indexed scalars.
 CREATE TABLE IF NOT EXISTS guardrail_policies (
@@ -776,6 +799,168 @@ class GovernanceStore:
         if rows:
             return float(rows[0]["spend_usd"])
         return 0.0
+
+    async def record_model_spend(
+        self,
+        model: str,
+        scope: str,
+        scope_type: str,
+        period: str,
+        period_start: datetime,
+        *,
+        cost: float = 0.0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        requests: int = 1,
+    ) -> None:
+        """Atomically accumulate per-model spend for the chargeback breakdown.
+
+        The companion of :meth:`record_spend` carrying the model dimension the
+        scope-level table lacks.  No-op when disabled.  ``ON CONFLICT DO UPDATE``
+        keeps the accumulation atomic (no read-modify-write race).
+        """
+        if not self.enabled:
+            return
+        await self._execute(
+            """
+            INSERT INTO governance_spend_model (
+                model, scope, scope_type, period_start, period,
+                spend_usd, request_count, input_tokens, output_tokens, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+            ON CONFLICT (model, scope, period, period_start) DO UPDATE SET
+                spend_usd = governance_spend_model.spend_usd + EXCLUDED.spend_usd,
+                request_count = governance_spend_model.request_count
+                    + EXCLUDED.request_count,
+                input_tokens = governance_spend_model.input_tokens
+                    + EXCLUDED.input_tokens,
+                output_tokens = governance_spend_model.output_tokens
+                    + EXCLUDED.output_tokens,
+                updated_at = NOW()
+            """,
+            model,
+            scope,
+            scope_type,
+            period_start,
+            period,
+            float(cost or 0.0),
+            int(requests or 0),
+            int(input_tokens or 0),
+            int(output_tokens or 0),
+        )
+
+    async def aggregate_spend_report(self, *, since: datetime | None = None) -> dict:
+        """Aggregate the durable spend ledger into a chargeback report.
+
+        Returns real totals plus per-scope (key/team/workspace) and per-model
+        breakdowns and daily rollups, computed entirely in SQL from the
+        ``governance_spend`` / ``governance_spend_model`` rollup tables.  An
+        empty (zero) report when disabled or when no spend has been recorded --
+        the caller (``get_spend_report``) renders it either way.
+
+        Args:
+            since: Optional lower bound on ``period_start`` -- when provided only
+                buckets at/after this instant are summed.
+        """
+        empty = {
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_requests": 0,
+            "by_scope": [],
+            "by_model": [],
+            "daily": [],
+        }
+        if not self.enabled:
+            return empty
+
+        # -- Totals + per-scope breakdown (from the scope-level ledger). --------
+        scope_where = "WHERE period_start >= $1" if since is not None else ""
+        scope_args: tuple = (since,) if since is not None else ()
+        scope_rows = await self._fetch(
+            f"""
+            SELECT scope, scope_type,
+                   COALESCE(SUM(spend_usd), 0)     AS spend_usd,
+                   COALESCE(SUM(request_count), 0) AS request_count,
+                   COALESCE(SUM(total_tokens), 0)  AS total_tokens
+            FROM governance_spend
+            {scope_where}
+            GROUP BY scope, scope_type
+            ORDER BY spend_usd DESC
+            """,
+            *scope_args,
+        )
+
+        # -- Per-model breakdown (from the model-level ledger). ----------------
+        model_where = "WHERE period_start >= $1" if since is not None else ""
+        model_rows = await self._fetch(
+            f"""
+            SELECT model,
+                   COALESCE(SUM(spend_usd), 0)     AS spend_usd,
+                   COALESCE(SUM(request_count), 0) AS request_count,
+                   COALESCE(SUM(input_tokens), 0)  AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens
+            FROM governance_spend_model
+            {model_where}
+            GROUP BY model
+            ORDER BY spend_usd DESC
+            """,
+            *scope_args,
+        )
+
+        # -- Daily rollup (calendar-day truncation of the bucket period_start). -
+        daily_rows = await self._fetch(
+            f"""
+            SELECT date_trunc('day', period_start) AS day,
+                   COALESCE(SUM(spend_usd), 0)     AS spend_usd,
+                   COALESCE(SUM(request_count), 0) AS request_count
+            FROM governance_spend
+            {scope_where}
+            GROUP BY day
+            ORDER BY day
+            """,
+            *scope_args,
+        )
+
+        by_scope = [
+            {
+                "scope": r["scope"],
+                "scope_type": r["scope_type"],
+                "spend_usd": float(r["spend_usd"]),
+                "request_count": int(r["request_count"]),
+                "total_tokens": int(r["total_tokens"]),
+            }
+            for r in scope_rows
+        ]
+        by_model = [
+            {
+                "model": r["model"],
+                "spend_usd": float(r["spend_usd"]),
+                "request_count": int(r["request_count"]),
+                "input_tokens": int(r["input_tokens"]),
+                "output_tokens": int(r["output_tokens"]),
+            }
+            for r in model_rows
+        ]
+        daily = [
+            {
+                "date": r["day"].date().isoformat()
+                if hasattr(r["day"], "date")
+                else str(r["day"]),
+                "spend_usd": float(r["spend_usd"]),
+                "request_count": int(r["request_count"]),
+            }
+            for r in daily_rows
+        ]
+
+        return {
+            "total_cost_usd": round(sum(s["spend_usd"] for s in by_scope), 6),
+            "total_input_tokens": sum(m["input_tokens"] for m in by_model),
+            "total_output_tokens": sum(m["output_tokens"] for m in by_model),
+            "total_requests": sum(s["request_count"] for s in by_scope),
+            "by_scope": by_scope,
+            "by_model": by_model,
+            "daily": daily,
+        }
 
 
 # =============================================================================

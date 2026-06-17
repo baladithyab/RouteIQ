@@ -238,13 +238,196 @@ def drop_gov_banned(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [d for d in candidates if not is_gov_banned(d)]
 
 
-def filter_routable_candidates(
-    router: Any, candidates: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Compose both pre-scoring filters: gov-ban (hard) then cooldown (soft).
+# ---------------------------------------------------------------------------
+# Region-aware / data-residency pre-filter (RouteIQ-60cc)
+# ---------------------------------------------------------------------------
+#
+# Bedrock cross-region inference profiles are already used STATICALLY (each
+# ``model_list`` arm pins ``litellm_params.aws_region_name``). This filter adds a
+# PER-REQUEST region preference + a HARD residency constraint on top, run at the
+# SAME pre-scoring seam as gov-ban + cooldown so it benefits EVERY RouteIQ
+# strategy without a new strategy subclass.
+#
+# Semantics (settings.region_routing, default OFF -> identity):
+#   - UNCONSTRAINED request: PREFER in-region; fall back to the FULL set when no
+#     in-region arm exists (availability over locality -- a soft preference).
+#   - CONSTRAINED (hard residency) request: NEVER route out-of-region; if no
+#     in-region arm exists the set is EMPTIED so the strategy returns None /
+#     fall back triggers -- a residency violation must never silently leak.
+#
+# A candidate's region is read from ``litellm_params.aws_region_name``. The
+# request region token is normalized through ``region_map`` (token -> concrete
+# AWS regions); a token absent from the map matches the candidate region
+# verbatim (so an exact-region token works with zero map config).
 
-    Gov-ban runs FIRST (a banned arm is never re-added), then cooldown
-    (fail-open). Byte-stable no-op when both ``banned_models`` is empty and
-    nothing is cooled down -- returns the original list object.
+# Source keys (besides the configured header) carrying an explicit region token.
+_REGION_KEYS: tuple[str, ...] = ("region", "residency_region", "aws_region")
+# Truthy keys (in the SAME source as the region) marking a HARD residency need.
+_RESIDENCY_FLAG_KEYS: tuple[str, ...] = ("residency", "data_residency", "hard_region")
+_TRUTHY: frozenset[str] = frozenset({"true", "1", "yes", "on"})
+
+
+def _region_settings() -> Any:
+    """Return ``get_settings().region_routing`` or ``None`` (fail-open) on error."""
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().region_routing
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("region_routing settings lookup failed (fail-open): %s", exc)
+        return None
+
+
+def _ctx_sources(context: Any) -> List[Dict[str, Any]]:
+    """Ordered context dicts to read region signals from (request_kwargs first).
+
+    Mirrors ``TagRegexUserAgentRoutingStrategy._sources`` so the region signal is
+    read from the same places (request_kwargs, then metadata).
     """
-    return drop_cooled_down(router, drop_gov_banned(candidates))
+    sources: List[Dict[str, Any]] = []
+    rk = getattr(context, "request_kwargs", None)
+    if isinstance(rk, dict):
+        sources.append(rk)
+    md = getattr(context, "metadata", None)
+    if isinstance(md, dict):
+        sources.append(md)
+    return sources
+
+
+def _header_value(source: Dict[str, Any], header: str) -> str:
+    """Case-insensitive header lookup inside a context source's ``headers`` dict."""
+    headers = source.get("headers")
+    if not isinstance(headers, dict):
+        return ""
+    needle = header.lower()
+    for key, value in headers.items():
+        if str(key).lower() == needle and value:
+            return str(value)
+    return ""
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in _TRUTHY
+
+
+def resolve_request_region(context: Any, settings: Any) -> tuple[str, bool]:
+    """Resolve ``(region_token, is_hard_residency)`` for the request.
+
+    FIRST match wins, in order: the configured header, then a ``region`` /
+    ``residency_region`` / ``aws_region`` key, scanning request_kwargs before
+    metadata. The constraint is HARD when EITHER the matched source carries a
+    truthy residency flag OR ``settings.hard_residency_default`` is True.
+
+    Returns ``("", False)`` when no region token is present (a request with no
+    region preference -- the filter then no-ops for it).
+    """
+    header = getattr(settings, "region_header", "") or ""
+    hard_default = bool(getattr(settings, "hard_residency_default", False))
+
+    for source in _ctx_sources(context):
+        # 1. Header (configured name, case-insensitive).
+        if header:
+            token = _header_value(source, header)
+            if token:
+                hard = hard_default or any(
+                    _is_truthy(source.get(k)) for k in _RESIDENCY_FLAG_KEYS
+                )
+                return token.strip().lower(), hard
+        # 2. Explicit region key in the source.
+        for key in _REGION_KEYS:
+            raw = source.get(key)
+            if raw:
+                hard = hard_default or any(
+                    _is_truthy(source.get(k)) for k in _RESIDENCY_FLAG_KEYS
+                )
+                return str(raw).strip().lower(), hard
+    return "", False
+
+
+def _allowed_regions(token: str, settings: Any) -> set[str]:
+    """Concrete AWS regions that satisfy ``token`` (normalized, lowercased).
+
+    Uses ``region_map[token]`` when present; otherwise the token itself
+    (verbatim match against the candidate ``aws_region_name``).
+    """
+    region_map = getattr(settings, "region_map", None) or {}
+    mapped = region_map.get(token)
+    if mapped:
+        return {str(r).strip().lower() for r in mapped if str(r).strip()}
+    return {token} if token else set()
+
+
+def _candidate_region(deployment: Dict[str, Any]) -> str:
+    """The candidate's AWS region (normalized) from ``litellm_params.aws_region_name``."""
+    params = deployment.get("litellm_params") or {}
+    return str(params.get("aws_region_name", "") or "").strip().lower()
+
+
+def drop_out_of_region(
+    context: Any, candidates: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """RouteIQ-60cc: per-request region-aware / data-residency pre-filter.
+
+    Default OFF / identity: returns the input list OBJECT unchanged when the
+    feature is disabled, the context is absent, or the request carries no region
+    token (byte-stable -- no allocation, no reordering).
+
+    When a region token IS present:
+      - HARD residency: keep ONLY in-region candidates; if none, return ``[]``
+        (the strategy returns None / falls back -- never an out-of-region leak).
+      - SOFT preference: keep in-region candidates; if none, return the ORIGINAL
+        list object unchanged (availability over locality).
+    """
+    if context is None:
+        return candidates
+    settings = _region_settings()
+    if settings is None or not getattr(settings, "enabled", False):
+        return candidates
+
+    token, hard = resolve_request_region(context, settings)
+    if not token:
+        return candidates  # no region preference on this request -> no-op
+
+    allowed = _allowed_regions(token, settings)
+    if not allowed:
+        return candidates  # token resolved to nothing -> no-op (fail-open)
+
+    in_region = [d for d in candidates if _candidate_region(d) in allowed]
+    if in_region:
+        # Byte-stable when ALL candidates are already in-region (same membership
+        # AND order) -> return the original object so downstream stays identical.
+        if len(in_region) == len(candidates):
+            return candidates
+        return in_region
+    # No in-region candidate.
+    if hard:
+        return []  # residency fail-closed: never route out-of-region
+    return candidates  # soft: availability over locality
+
+
+def filter_routable_candidates(
+    router: Any,
+    candidates: List[Dict[str, Any]],
+    context: Any = None,
+) -> List[Dict[str, Any]]:
+    """Compose the pre-scoring filters: gov-ban (hard), cooldown (soft), region.
+
+    Order (locked): gov-ban FIRST (a banned arm is never re-added), then cooldown
+    (fail-open), then the per-request region filter (RouteIQ-60cc). Region runs
+    LAST because hard residency is a request-scoped constraint, not a fleet-health
+    one -- it must apply to whatever availability-filtered set remains, and its
+    fail-closed empty result is the correct terminal outcome (a residency
+    violation must not be re-added).
+
+    ``context`` is OPTIONAL: when ``None`` (the legacy call shape) the region
+    filter no-ops, so every existing caller is byte-stable. When supplied AND
+    ``settings.region_routing.enabled`` is True, the region filter activates.
+
+    Byte-stable no-op when ``banned_models`` is empty, nothing is cooled down,
+    and (region disabled OR no per-request region token) -- returns the original
+    list object.
+    """
+    routable = drop_cooled_down(router, drop_gov_banned(candidates))
+    return drop_out_of_region(context, routable)

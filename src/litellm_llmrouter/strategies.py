@@ -2949,7 +2949,7 @@ class CostAwareRoutingStrategy(RoutingStrategy):
 
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        return filter_routable_candidates(router, group_matched, context)
 
     def _get_available_candidates(self, candidates: List[Dict]) -> List[Dict]:
         """Filter out candidates whose provider circuit breaker is open.
@@ -3330,7 +3330,7 @@ class CostCascadeRoutingStrategy(RoutingStrategy):
 
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        return filter_routable_candidates(router, group_matched, context)
 
     def _ordered_ladder(self, candidates: List[Dict]) -> List[Tuple[Dict, float]]:
         """Order candidates cheapest -> strongest (by ascending cost).
@@ -3663,7 +3663,7 @@ class SemanticIntentRoutingStrategy(RoutingStrategy):
 
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        return filter_routable_candidates(router, group_matched, context)
 
     def _match_group(self, intent: str, candidates: List[Dict]) -> Optional[Dict]:
         """Return the candidate whose model best matches the intent's group.
@@ -3822,7 +3822,7 @@ class TagRegexUserAgentRoutingStrategy(RoutingStrategy):
 
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        return filter_routable_candidates(router, group_matched, context)
 
     @staticmethod
     def _sources(context: RoutingContext) -> List[Dict]:
@@ -3992,7 +3992,7 @@ class _SignalAwareRoutingMixin:
         ]
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        return filter_routable_candidates(router, group_matched, context)
 
     @staticmethod
     def _arm_key(deployment: Dict) -> str:

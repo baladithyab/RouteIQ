@@ -104,6 +104,24 @@ def _use_plugin_strategy() -> bool:
     return True
 
 
+def _api_surface_bare_paths_enabled() -> bool:
+    """Whether to register the first-class bare-path API surfaces (RouteIQ-e48a).
+
+    Honours the legacy flat env var first, then the typed setting
+    (``settings.api_surfaces.bare_paths_enabled``).  Defaults ON so the surfaces
+    are documented + middleware-wrapped out of the box; a settings failure also
+    defaults ON (the registration is itself a graceful no-op when LiteLLM's
+    handlers are unavailable).
+    """
+    raw = os.getenv("ROUTEIQ_API_SURFACE_BARE_PATHS")
+    if raw is not None:
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    try:
+        return get_settings().api_surfaces.bare_paths_enabled
+    except Exception:
+        return True
+
+
 def _parse_cors_origins() -> list[str]:
     """Parse CORS origins into a list of allowed origins.
 
@@ -990,6 +1008,18 @@ def create_gateway_app(
         from ..routes.messages import register_messages_routes
 
         register_messages_routes(app)
+
+    # --- First-class API surfaces at the bare external path (RouteIQ-e48a) ---
+    # The OpenAI/Cohere-style families (Responses, rerank, RAG, batches,
+    # vector-store, audio, images) register their bare paths upstream, but the
+    # /v1 mount only exposes them under /v1/* (the bare /rerank etc. 404s for
+    # SDK callers).  Registering thin delegators on the parent app BEFORE the
+    # /v1 mount makes the documented bare paths first-class RouteIQ routes that
+    # get the full middleware stack.  Mirrors the Messages bare-path fix above.
+    if mount_litellm and _api_surface_bare_paths_enabled():
+        from ..routes.api_surfaces import register_api_surface_routes
+
+        register_api_surface_routes(app)
 
     # --- Mount LiteLLM as sub-application ---
     if mount_litellm:

@@ -257,26 +257,77 @@ async def config_status():
 # =============================================================================
 
 
+def _persisted_spend_enabled() -> bool:
+    """Whether to aggregate the spend report from the durable rollup (RouteIQ-67fe).
+
+    Honours the legacy flat env var first, then the typed setting
+    (``settings.api_surfaces.persisted_spend_enabled``).  Defaults ON; the
+    aggregation still degrades to the zero report automatically whenever the
+    governance store is disabled (no ``DATABASE_URL``).
+    """
+    import os
+
+    raw = os.getenv("ROUTEIQ_PERSISTED_SPEND")
+    if raw is not None:
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    try:
+        from ..settings import get_settings
+
+        return get_settings().api_surfaces.persisted_spend_enabled
+    except Exception:
+        return True
+
+
 @admin_router.get("/llmrouter/spend/report")
 async def get_spend_report(
     rbac_info: dict = Depends(requires_permission(PERMISSION_SYSTEM_CONFIG_RELOAD)),
 ):
     """
-    Get an aggregated spend report from LiteLLM's spend tracking.
+    Get an aggregated spend report.
 
-    Returns per-model token usage and cost estimates from the LiteLLM proxy's
-    internal accounting. Falls back gracefully if spend tracking is not configured.
+    When the durable governance store is enabled (``DATABASE_URL`` set), the
+    headline totals + per-key/team/workspace + per-model + daily breakdowns are
+    aggregated from the persisted ``governance_spend`` / ``governance_spend_model``
+    rollup tables (RouteIQ-67fe) -- the real chargeback system-of-record written
+    on every successful request.  When no DB is configured the report degrades to
+    the model-catalog view (``total_cost_usd`` is 0.0, ``persisted=False``), so
+    the endpoint is always safe to call.
 
     Requires admin auth.
     """
     report: dict = {
         "status": "ok",
         "spend_tracking_enabled": False,
+        "persisted": False,
         "models": [],
         "total_cost_usd": 0.0,
         "total_input_tokens": 0,
         "total_output_tokens": 0,
+        "total_requests": 0,
+        "by_scope": [],
+        "by_model": [],
+        "daily": [],
     }
+
+    # --- Durable spend aggregation (the real per-request chargeback rollup) ---
+    # Default in-memory/no-op when no DB: aggregate_spend_report returns a zero
+    # report and persisted stays False, preserving the legacy hard-0.0 contract.
+    try:
+        store = get_governance_store()
+        if store.enabled and _persisted_spend_enabled():
+            agg = await store.aggregate_spend_report()
+            report["persisted"] = True
+            report["spend_tracking_enabled"] = True
+            report["total_cost_usd"] = agg["total_cost_usd"]
+            report["total_input_tokens"] = agg["total_input_tokens"]
+            report["total_output_tokens"] = agg["total_output_tokens"]
+            report["total_requests"] = agg["total_requests"]
+            report["by_scope"] = agg["by_scope"]
+            report["by_model"] = agg["by_model"]
+            report["daily"] = agg["daily"]
+    except Exception as e:
+        # Fail-open: a durable-store outage must not break the report.
+        report["aggregation_error"] = str(e)
 
     try:
         from litellm.proxy.proxy_server import llm_router

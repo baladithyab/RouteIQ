@@ -718,6 +718,88 @@ class LatencyAwareSettings(BaseModel):
     )
 
 
+class RegionRoutingSettings(BaseModel):
+    """Per-request region-aware / data-residency candidate-filter configuration
+    (RouteIQ-60cc).
+
+    Bedrock cross-region inference profiles are already used STATICALLY (each
+    ``model_list`` arm pins ``litellm_params.aws_region_name`` / a geo-prefixed
+    inference profile). This block adds a PER-REQUEST region preference + a hard
+    residency constraint on top, applied as a PRE-SCORING candidate filter (the
+    same ``filter_routable_candidates`` seam every RouteIQ strategy already calls,
+    so it composes with gov-ban + cooldown and benefits EVERY strategy -- no new
+    strategy subclass needed).
+
+    The requested region is resolved per request, FIRST match wins:
+
+    1. The request **header** named by :attr:`region_header` (read
+       case-insensitively from ``request_kwargs['headers']`` /
+       ``metadata['headers']``) -- e.g. ``X-RouteIQ-Region: eu``.
+    2. An explicit ``region`` / ``residency_region`` key in
+       ``request_kwargs`` / ``metadata`` (e.g. a governance-workspace region the
+       auth layer stamped onto the request metadata).
+
+    A request is "constrained" (HARD residency) when EITHER the resolved value
+    came with a residency flag (``residency`` / ``data_residency`` truthy in the
+    same source) OR :attr:`hard_residency_default` is True. A constrained request
+    is NEVER routed out-of-region: if no in-region candidate exists the candidate
+    set is emptied (the strategy then returns ``None`` / triggers a fallback) --
+    a residency violation must never silently leak. An UNCONSTRAINED request
+    PREFERS in-region but falls back to the full set when no in-region arm exists.
+
+    A candidate's region is read from ``litellm_params.aws_region_name`` (the
+    field every Bedrock arm already sets), then normalized through
+    :attr:`region_map` so a request token (``"eu"``) can map to one or more
+    concrete AWS regions (``["eu-west-1", "eu-central-1"]``). When a request
+    token is absent from ``region_map`` it is matched verbatim (so an
+    ``aws_region_name``-equal request token works with zero map config).
+
+    Env vars (``__`` nested delimiter): ``ROUTEIQ_REGION_ROUTING__ENABLED``,
+    ``ROUTEIQ_REGION_ROUTING__REGION_HEADER``,
+    ``ROUTEIQ_REGION_ROUTING__REGION_MAP`` (JSON map),
+    ``ROUTEIQ_REGION_ROUTING__HARD_RESIDENCY_DEFAULT``.
+
+    Default OFF / identity: when ``enabled`` is False the filter is a byte-stable
+    no-op (returns the input list object unchanged).
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable the per-request region-aware / data-residency candidate "
+            "pre-filter. Default off -> identity (byte-stable no-op)."
+        ),
+    )
+    region_header: str = Field(
+        "X-RouteIQ-Region",
+        description=(
+            "Request header carrying the desired region/residency token (read "
+            "case-insensitively). Checked before the request_kwargs/metadata "
+            "region keys."
+        ),
+    )
+    region_map: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of request region TOKEN -> list of concrete AWS regions that "
+            'satisfy it (e.g. {"eu": ["eu-west-1", "eu-central-1"]}). A token '
+            "absent from the map is matched verbatim against the candidate "
+            "``aws_region_name``, so an exact-region token needs no map entry."
+        ),
+    )
+    hard_residency_default: bool = Field(
+        False,
+        description=(
+            "When True, EVERY region-constrained request is treated as a HARD "
+            "residency constraint (never routed out-of-region) even without a "
+            "per-request residency flag. When False (default) only requests that "
+            "carry an explicit residency flag are hard-constrained; an "
+            "unflagged region is a soft preference (in-region first, full-set "
+            "fallback)."
+        ),
+    )
+
+
 class SecuritySettings(BaseModel):
     """Security, auth, and access control configuration.
 
@@ -1386,6 +1468,51 @@ class CostTrackerSettings(BaseModel):
     enabled: bool = Field(
         True,
         description="Enable per-request LLM cost tracking.",
+    )
+
+
+class ApiSurfacesSettings(BaseModel):
+    """First-class API surfaces, persisted spend, and self-service keys
+    (RouteIQ cluster N: e48a / 67fe / 3215).
+
+    All flags DEFAULT to the byte-stable behaviour:
+
+    * ``bare_paths_enabled`` -- register the bare-path delegators (Responses,
+      rerank, RAG, batches, vector-store, audio, images) on the parent app so
+      they get RouteIQ middleware + documentation (default ON; a no-op when
+      LiteLLM is not mounted).
+    * ``persisted_spend_enabled`` -- aggregate the spend report from the durable
+      ``governance_spend`` rollup (default ON; degrades to the zero/no-op report
+      automatically when no ``DATABASE_URL`` is configured).
+    * ``self_service_keys_enabled`` -- expose the user-tier self-service key
+      endpoints (default ON; they are scope-isolated to the caller's identity).
+
+    Env vars: ``ROUTEIQ_API_SURFACES__BARE_PATHS_ENABLED``,
+    ``ROUTEIQ_API_SURFACES__PERSISTED_SPEND_ENABLED``,
+    ``ROUTEIQ_API_SURFACES__SELF_SERVICE_KEYS_ENABLED``.
+    """
+
+    bare_paths_enabled: bool = Field(
+        True,
+        description=(
+            "Register first-class bare-path API surface delegators so they get "
+            "RouteIQ middleware + OpenAPI documentation (no-op without the /v1 "
+            "LiteLLM mount)."
+        ),
+    )
+    persisted_spend_enabled: bool = Field(
+        True,
+        description=(
+            "Aggregate the spend report from the durable governance_spend "
+            "rollup (degrades to a zero report when no DATABASE_URL is set)."
+        ),
+    )
+    self_service_keys_enabled: bool = Field(
+        True,
+        description=(
+            "Expose user-tier self-service key endpoints (scope-isolated to the "
+            "caller's identity)."
+        ),
     )
 
 
@@ -2491,6 +2618,14 @@ class GatewaySettings(BaseSettings):
         default_factory=CostTrackerSettings,  # type: ignore[arg-type]
         description="Cost tracker plugin settings.",
     )
+    api_surfaces: ApiSurfacesSettings = Field(
+        default_factory=ApiSurfacesSettings,  # type: ignore[arg-type]
+        description=(
+            "First-class API surfaces, persisted spend, and self-service key "
+            "settings (cluster N: RouteIQ-e48a / 67fe / 3215; all default on / "
+            "byte-stable)."
+        ),
+    )
     skills_discovery: SkillsDiscoverySettings = Field(
         default_factory=SkillsDiscoverySettings,  # type: ignore[arg-type]
         description="Skills discovery plugin settings.",
@@ -2536,6 +2671,13 @@ class GatewaySettings(BaseSettings):
         default_factory=LatencyAwareSettings,  # type: ignore[arg-type]
         description=(
             "Latency-SLA / usage-based / least-busy routing strategy settings."
+        ),
+    )
+    region_routing: RegionRoutingSettings = Field(
+        default_factory=RegionRoutingSettings,  # type: ignore[arg-type]
+        description=(
+            "Per-request region-aware / data-residency candidate-filter settings "
+            "(default off / identity)."
         ),
     )
     linucb: LinUCBSettings = Field(

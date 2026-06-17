@@ -1719,7 +1719,10 @@ class CentroidRoutingStrategy:
 
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        return filter_routable_candidates(router, group_matched)
+        # RouteIQ-60cc: thread the request context so the per-request region /
+        # data-residency pre-filter activates on the centroid path (a HARD
+        # residency request must never leak out-of-region here either).
+        return filter_routable_candidates(router, group_matched, context=context)
 
     @staticmethod
     def _fallback_deployment(context: Any) -> Optional[Dict]:
@@ -1749,7 +1752,9 @@ class CentroidRoutingStrategy:
         # cooled-down arm (this path also bypasses LiteLLM's pipeline).
         from litellm_llmrouter.candidate_filter import filter_routable_candidates
 
-        candidates = filter_routable_candidates(router, group_matched)
+        # RouteIQ-60cc: even the centroid fallback honours the per-request region
+        # / data-residency constraint (HARD residency never picks out-of-region).
+        candidates = filter_routable_candidates(router, group_matched, context=context)
         if candidates:
             return random.choice(candidates)
         return None

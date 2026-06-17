@@ -486,7 +486,12 @@ class DefaultStrategy(RoutingStrategy):
         group_matched = [
             d for d in healthy_deployments if d.get("model_name") == context.model
         ]
-        for deployment in filter_routable_candidates(router, group_matched):
+        # RouteIQ-60cc: thread the request context so the per-request region /
+        # data-residency pre-filter activates on the DEFAULT strategy path (a
+        # HARD residency request must never leak out-of-region here either).
+        for deployment in filter_routable_candidates(
+            router, group_matched, context=context
+        ):
             litellm_model = deployment.get("litellm_params", {}).get("model", "")
             if litellm_model:
                 model_list.append(litellm_model)
