@@ -206,19 +206,51 @@ class ModelQualityTracker:
 
     def __init__(self, window_size: int = 100):
         self._scores: Dict[str, List[float]] = defaultdict(list)
+        # Per-STRATEGY sliding window, parallel to the per-model window above.
+        # The champion/challenger promoter (RouteIQ-2a1c) keys decisions by
+        # registry STRATEGY name, not model, so the model-keyed aggregate alone
+        # never reaches it. Tracking strategy quality here closes that gap
+        # (RouteIQ-fc5c part c) without changing the model-keyed behaviour.
+        self._strategy_scores: Dict[str, List[float]] = defaultdict(list)
         self._window_size = window_size
 
-    def record(self, model: str, score: float) -> None:
-        """Record an evaluation score for a model.
+    def record(self, model: str, score: float, strategy: Optional[str] = None) -> None:
+        """Record an evaluation score for a model (and optionally its strategy).
 
         Args:
             model: Model identifier (e.g. "gpt-4o", "claude-3-opus").
             score: Normalized quality score (0.0-1.0).
+            strategy: Routing strategy that produced this decision. When given,
+                the score is also recorded into the per-strategy window so the
+                champion/challenger promoter (which keys by strategy) sees real
+                quality. Optional/backward-compatible: omitting it preserves the
+                prior model-only behaviour.
         """
         scores = self._scores[model]
         scores.append(score)
         if len(scores) > self._window_size:
             scores.pop(0)
+
+        if strategy:
+            sscores = self._strategy_scores[strategy]
+            sscores.append(score)
+            if len(sscores) > self._window_size:
+                sscores.pop(0)
+
+    def get_strategy_quality(self, strategy: str) -> Optional[float]:
+        """Average quality score for a routing strategy, or None if no data."""
+        scores = self._strategy_scores.get(strategy)
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
+
+    def get_all_strategy_qualities(self) -> Dict[str, float]:
+        """Average quality per routing strategy (``{strategy: quality}``)."""
+        return {s: sum(v) / len(v) for s, v in self._strategy_scores.items() if v}
+
+    def get_strategy_sample_counts(self) -> Dict[str, int]:
+        """Number of evaluation samples per routing strategy."""
+        return {s: len(v) for s, v in self._strategy_scores.items() if v}
 
     def get_quality(self, model: str) -> Optional[float]:
         """Get average quality score for a model.
@@ -387,9 +419,11 @@ class EvalPipeline:
                 sample.evaluated = True
                 sample.evaluated_at = time.time()
 
-                # Record per-model quality
+                # Record per-model AND per-strategy quality. The per-strategy
+                # window (RouteIQ-fc5c) is what the champion/challenger promoter
+                # reads -- it keys by strategy, not model.
                 avg_score = sum(scores.values()) / len(scores) if scores else 0.5
-                self._tracker.record(sample.model, avg_score)
+                self._tracker.record(sample.model, avg_score, strategy=sample.strategy)
                 _record_eval_sample_metric(
                     "pass" if avg_score >= _EVAL_PASS_THRESHOLD else "fail"
                 )
@@ -708,13 +742,23 @@ def _mlops_aggregate_feedback(model_qualities: Dict[str, float]) -> None:
 
         promoter = get_champion_challenger_promoter()
         if promoter is not None:
-            # Resolve per-strategy sample counts from the pipeline tracker when
-            # available so the promoter's min-sample gate is honored.
+            # The promoter keys champion/challenger by STRATEGY name, so feed it
+            # the per-strategy quality aggregate (RouteIQ-fc5c part c) -- the
+            # model-keyed ``model_qualities`` dict the callback receives never
+            # contains a strategy key, so the promoter would otherwise always
+            # HOLD on missing data. Fall back to the model-keyed aggregate only
+            # when the pipeline / per-strategy data is unavailable.
+            quality_by_strategy: Dict[str, float] = model_qualities
             counts: Optional[Dict[str, int]] = None
             pipeline = _pipeline
             if pipeline is not None:
-                counts = pipeline.tracker.get_sample_counts()
-            promoter.evaluate(model_qualities, counts)
+                strat_q = pipeline.tracker.get_all_strategy_qualities()
+                if strat_q:
+                    quality_by_strategy = strat_q
+                    counts = pipeline.tracker.get_strategy_sample_counts()
+                else:
+                    counts = pipeline.tracker.get_sample_counts()
+            promoter.evaluate(quality_by_strategy, counts)
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("MLOps promotion evaluation failed: %s", e)
 

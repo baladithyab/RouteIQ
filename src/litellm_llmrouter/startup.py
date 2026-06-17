@@ -35,6 +35,10 @@ import logging
 import os
 import signal
 import sys
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from litellm_llmrouter.settings import BedrockDiscoverySettings
 
 # Ensure src is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -290,6 +294,119 @@ def install_plugin_routing_strategy(app):
         print("⚠️ Plugin routing strategy failed — fell back to legacy monkey-patch")
 
     return success
+
+
+def _discovery_is_leader() -> bool:
+    """Return True when this replica may run the (one-shot) discovery scan.
+
+    Mirrors the leader gate the config-sync subsystem uses (``config_sync._is_leader``):
+    when leader election is DISABLED (single-instance, the default, and every unit
+    test) every replica is the leader; when ENABLED only the elected leader scans so
+    N replicas don't all hammer the Bedrock control plane.  Fail-open: any error
+    resolving the election treats this replica as the leader.
+    """
+    try:
+        from litellm_llmrouter.leader_election import (
+            get_leader_election,
+            get_leader_election_config,
+        )
+
+        cfg = get_leader_election_config()
+        if not cfg.get("enabled"):
+            return True
+        election = get_leader_election()
+        if election is None:
+            return True
+        return bool(election.is_leader)
+    except Exception:  # pragma: no cover - defensive: never block boot
+        return True
+
+
+def merge_bedrock_discovered_models(
+    *,
+    settings: Optional["BedrockDiscoverySettings"] = None,
+    client_factory: Optional[Callable[[str], Any]] = None,
+) -> int:
+    """Run Bedrock auto-discovery and merge the result into the live model_list.
+
+    LEADER- and flag-gated wiring for the previously-dark
+    :func:`bedrock_discovery.discover_models` /
+    :meth:`DiscoveryResult.to_auto_group_model_list` (RouteIQ-c417).  Called from
+    the lifespan BEFORE :func:`install_plugin_routing_strategy` so the synthesized
+    arms are present when the routing strategy (e.g. the Kumaraswamy-Thompson
+    bandit) is installed on the Router.
+
+    Behaviour:
+
+    * **Disabled (default)** -> :func:`discover_models` returns an empty result and
+      this is a byte-stable no-op (the operator-authored model_list is untouched).
+    * **Non-leader replica** -> skips the scan entirely (a no-op) so only the leader
+      issues the control-plane calls.
+    * **enabled + auto_group** -> the discovered arms are collapsed into one
+      ``auto_group_name`` group and APPENDED to ``llm_router.model_list``; the
+      Router's deployment indices are rebuilt via ``set_model_list`` so the new
+      group is routable.
+    * **enabled + auto_group=False** -> the per-model entries are appended (each a
+      distinct ``model_name``).
+
+    ``client_factory`` (a ``region -> client`` callable) is injectable so tests stay
+    credential-free; production passes ``None`` and discovery builds a real
+    control-plane client.  Returns the number of entries merged (0 when disabled,
+    non-leader, or nothing discovered) and never raises.
+    """
+    try:
+        from litellm_llmrouter.bedrock_discovery import discover_models
+
+        if settings is None:
+            from litellm_llmrouter.settings import get_settings
+
+            settings = get_settings().bedrock_discovery
+
+        if not getattr(settings, "enabled", False):
+            return 0
+
+        if not _discovery_is_leader():
+            logger.debug("Bedrock discovery: not leader, skipping scan")
+            return 0
+
+        result = discover_models(settings=settings, client_factory=client_factory)
+        entries = result.to_litellm_model_list(
+            residency_constraint=getattr(settings, "residency_constraint", False),
+            register_cost=getattr(settings, "register_cost", True),
+            auto_group=getattr(settings, "auto_group", False),
+            auto_group_name=getattr(settings, "auto_group_name", "claude-auto"),
+        )
+        if not entries:
+            return 0
+
+        try:
+            from litellm.proxy.proxy_server import llm_router
+        except ImportError:
+            logger.warning(
+                "Bedrock discovery: llm_router unavailable; %d entries not merged",
+                len(entries),
+            )
+            return 0
+        if llm_router is None:
+            logger.warning(
+                "Bedrock discovery: Router not initialised; %d entries not merged",
+                len(entries),
+            )
+            return 0
+
+        existing = list(getattr(llm_router, "model_list", None) or [])
+        llm_router.set_model_list(existing + entries)
+        logger.info(
+            "Bedrock discovery: merged %d entries into model_list "
+            "(auto_group=%s, providers=%s)",
+            len(entries),
+            getattr(settings, "auto_group", False),
+            sorted(result.providers()),
+        )
+        return len(entries)
+    except Exception as exc:  # never block boot on discovery
+        logger.warning("Bedrock discovery merge skipped/failed: %s", exc)
+        return 0
 
 
 def start_config_sync_if_enabled():

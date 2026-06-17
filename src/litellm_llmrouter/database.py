@@ -653,11 +653,16 @@ class A2AAgentRepository:
             verbose_proxy_logger.error(f"A2A DB: Error persisting agent: {e}")
 
     async def _load_from_db(self, agent_id: str) -> A2AAgentDB | None:
-        """Load agent from PostgreSQL database."""
+        """Load agent from PostgreSQL database.
+
+        Read-only SELECT -> routed through the READER pool (RouteIQ-6972) so it
+        targets the Aurora reader endpoint when ``postgres.reader_host`` is set;
+        falls back to the writer pool when no reader is configured (byte-stable).
+        """
         try:
             import json
 
-            pool = await get_db_pool(self._db_url)
+            pool = await get_read_db_pool(self._db_url)
             if pool is None:
                 return None
             async with pool.acquire() as conn:
@@ -1244,11 +1249,16 @@ class MCPServerRepository:
             verbose_proxy_logger.error(f"MCP DB: Error persisting server: {e}")
 
     async def _load_from_db(self, server_id: str) -> MCPServerDB | None:
-        """Load server from PostgreSQL database."""
+        """Load server from PostgreSQL database.
+
+        Read-only SELECT -> routed through the READER pool (RouteIQ-6972) so it
+        targets the Aurora reader endpoint when ``postgres.reader_host`` is set;
+        falls back to the writer pool when no reader is configured (byte-stable).
+        """
         try:
             import json
 
-            pool = await get_db_pool(self._db_url)
+            pool = await get_read_db_pool(self._db_url)
             if pool is None:
                 return None
             async with pool.acquire() as conn:

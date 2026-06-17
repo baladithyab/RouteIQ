@@ -972,6 +972,13 @@ class RouterDecisionCallback:
         # scope, so the global stats + /me/stats endpoints read real aggregates.
         _record_decision_stats(model, strategy, metadata)
 
+        # Feed the MLOps hot-path observers (RouteIQ-fc5c part b): the drift
+        # detector's request-bucket window and the shadow/mirror candidate. Both
+        # are settings-gated singletons that return None when disabled, so this
+        # is a byte-stable no-op until an operator opts in. Cheap + fully
+        # fail-open: never breaks the routing/telemetry path.
+        _record_mlops_hot_path(model, strategy, messages, metadata)
+
         logger.debug(
             f"Emitted router telemetry: model={model}, strategy={strategy}, "
             f"candidates={candidates}, outcome={outcome}"
@@ -1425,6 +1432,95 @@ def _record_decision_stats(
         )
     except Exception:  # pragma: no cover - stats must never break routing
         logger.debug("Failed to record decision stats", exc_info=True)
+
+
+def _prompt_length_bucket(messages: Optional[List[Dict[str, Any]]]) -> str:
+    """Map a request to a LOW-cardinality prompt-length bucket label.
+
+    Never emits raw user text -- only a coarse size class -- so the drift
+    detector's bucket window stays PII-safe and bounded-cardinality.
+    """
+    try:
+        total = 0
+        for m in messages or []:
+            content = m.get("content") if isinstance(m, dict) else None
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):  # multimodal content parts
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total += len(part["text"])
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+    if total <= 0:
+        return "empty"
+    if total < 256:
+        return "xs"
+    if total < 1024:
+        return "s"
+    if total < 4096:
+        return "m"
+    if total < 16384:
+        return "l"
+    return "xl"
+
+
+def _record_mlops_hot_path(
+    model: str,
+    strategy: str,
+    messages: Optional[List[Dict[str, Any]]],
+    metadata: Dict[str, Any],
+) -> None:
+    """Feed the MLOps hot-path observers from one routing decision (RouteIQ-fc5c).
+
+    Wires two previously-dark mechanisms into the per-decision seam:
+
+    * :meth:`DriftDetector.record_request_bucket` -- records one coarse
+      request-bucket (the requested tier when present, else a prompt-length
+      bucket) into the drift detector's current window.
+    * :meth:`ShadowMirror.mirror` -- mirrors the decision to a candidate strategy
+      (computes its counterfactual choice silently, never affecting serving).
+
+    Both consumers are settings-gated singletons that return ``None`` when
+    disabled, so this is a byte-stable no-op until ``settings.mlops.drift`` /
+    ``settings.mlops.shadow`` are turned on. Fully fail-open: any error is
+    swallowed so MLOps bookkeeping never breaks the routing/telemetry path.
+    """
+    try:
+        from litellm_llmrouter.mlops.drift import get_drift_detector
+
+        detector = get_drift_detector()
+        if detector is not None:
+            tier = (
+                metadata.get("_routing_profile") if isinstance(metadata, dict) else None
+            )
+            bucket = str(tier) if tier else _prompt_length_bucket(messages)
+            detector.record_request_bucket(bucket)
+    except Exception:  # pragma: no cover - drift must never break routing
+        logger.debug("Failed to record drift bucket", exc_info=True)
+
+    try:
+        from litellm_llmrouter.strategy_registry import (
+            RoutingContext,
+            RoutingResult,
+            get_shadow_mirror,
+        )
+
+        mirror = get_shadow_mirror()
+        if mirror is not None:
+            context = RoutingContext(
+                router=None,
+                model=model,
+                messages=messages,
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+            served = RoutingResult(
+                deployment={"litellm_params": {"model": model}},
+                strategy_name=strategy,
+            )
+            mirror.mirror(context, served)
+    except Exception:  # pragma: no cover - shadow must never break routing
+        logger.debug("Failed to mirror shadow decision", exc_info=True)
 
 
 def _schedule_cluster_mirror(

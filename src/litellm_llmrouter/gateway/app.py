@@ -337,13 +337,38 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     # removed. These are now provided natively by LiteLLM.
 
 
+def _input_guardrail_policies_configured() -> bool:
+    """True if any input-phase guardrail policy is configured.
+
+    Used to decide whether the ``PluginCallbackBridge`` must be registered even
+    when there are no callback-capable plugins — the bridge hosts the input
+    guardrail deny seam, so skipping registration would silently bypass input
+    guardrails (fail-open). Fail-safe: any error resolving the engine returns
+    ``False`` (we only force registration when policies are positively present;
+    plugins still register on their own path).
+    """
+    try:
+        from litellm_llmrouter.guardrail_policies import (
+            GuardrailPhase,
+            get_guardrail_policy_engine,
+        )
+
+        engine = get_guardrail_policy_engine()
+        return bool(engine.list_policies(phase=GuardrailPhase.INPUT))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not determine input guardrail policy presence: %s", exc)
+        return False
+
+
 async def _run_plugin_startup(app: FastAPI) -> None:
     """
     Run plugin startup hooks, then wire middleware and callback bridges.
 
     After plugins are started, this function:
     1. Identifies plugins with on_request/on_response hooks → PluginMiddleware
-    2. Identifies plugins with on_llm_* hooks → PluginCallbackBridge
+    2. Identifies plugins with on_llm_* hooks → PluginCallbackBridge (a
+       litellm CustomLogger; request mutations ride its
+       async_pre_call_deployment_hook, not the logging hook -- RouteIQ-60e3)
 
     Args:
         app: The FastAPI application instance
@@ -383,12 +408,32 @@ async def _run_plugin_startup(app: FastAPI) -> None:
             f"Wired {len(middleware_plugins)} middleware plugins into PluginMiddleware"
         )
 
-    # Wire callback-capable plugins into LiteLLM via PluginCallbackBridge
+    # Wire callback-capable plugins into LiteLLM via PluginCallbackBridge.
+    #
+    # SECURITY: the bridge ALSO hosts the input-guardrail deny seam, which must
+    # run whenever guardrail policies are configured — even with zero
+    # callback-capable plugins. Registering only when callback_plugins is
+    # non-empty would silently bypass input guardrails for an operator whose
+    # only control-plane surface is guardrail policies (fail-open). So we force
+    # registration when guardrail policies may exist. Byte-stable when neither
+    # plugins nor guardrail policies are present (register_callback_bridge
+    # returns None without touching litellm.callbacks).
     callback_plugins = manager.get_callback_plugins()
-    if callback_plugins:
-        bridge = register_callback_bridge(callback_plugins)
+    guardrails_require_bridge = _input_guardrail_policies_configured()
+    if callback_plugins or guardrails_require_bridge:
+        bridge = register_callback_bridge(
+            callback_plugins, force=guardrails_require_bridge
+        )
         if bridge:
-            logger.info(f"Wired {len(callback_plugins)} callback plugins into LiteLLM")
+            if callback_plugins:
+                logger.info(
+                    f"Wired {len(callback_plugins)} callback plugins into LiteLLM"
+                )
+            if guardrails_require_bridge and not callback_plugins:
+                logger.info(
+                    "Wired PluginCallbackBridge into LiteLLM for input guardrail "
+                    "enforcement (no callback plugins; guardrail policies present)"
+                )
 
 
 async def _run_plugin_shutdown(app: FastAPI) -> None:
@@ -647,6 +692,20 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("LiteLLM initialization failed: %s", exc)
 
+    # 0a2. Bedrock auto-discovery -> merge synthesized arms into the live
+    #      model_list BEFORE the routing strategy is installed (RouteIQ-c417).
+    #      Leader- and flag-gated: default-off => byte-stable no-op (the
+    #      operator-authored model_list is untouched). Must run BEFORE the
+    #      strategy install so the discovered group is routable on first request.
+    try:
+        from ..startup import merge_bedrock_discovered_models
+
+        merged = merge_bedrock_discovered_models()
+        if merged:
+            logger.info("Bedrock discovery merged %d model_list entries", merged)
+    except Exception as exc:
+        logger.warning("Bedrock discovery merge skipped/failed (non-fatal): %s", exc)
+
     # 0b. Install RouteIQ plugin routing strategy on the LiteLLM Router
     if getattr(app.state, "use_plugin_strategy", True):
         try:
@@ -762,6 +821,20 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if eval_pipeline is not None:
             await eval_pipeline.start_background_loop()
             logger.info("Eval pipeline background loop started")
+
+            # 4b. Wire the MLOps closed loop (Cluster H, RouteIQ-fc5c) on top of
+            #     the running eval pipeline: subscribe the drift+promotion feedback
+            #     callback so each push_feedback() aggregate reaches the drift
+            #     detector and champion/challenger promoter. Gated on any
+            #     settings.mlops sub-loop being enabled -> byte-stable no-op when
+            #     all three are off (the default).
+            try:
+                from ..eval_pipeline import wire_mlops_loop
+
+                if wire_mlops_loop(eval_pipeline=eval_pipeline):
+                    logger.info("MLOps closed loop wired into eval pipeline")
+            except Exception as exc:
+                logger.warning("MLOps loop wiring skipped/failed: %s", exc)
     except ImportError:
         logger.debug("Eval pipeline module not available")
     except Exception as exc:

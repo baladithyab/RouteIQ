@@ -8,25 +8,50 @@ LiteLLM calls methods on objects in ``litellm.callbacks`` at various points
 in the LLM call lifecycle. This bridge translates those callbacks into
 GatewayPlugin hook invocations:
 
-    litellm.log_pre_api_call  →  plugin.on_llm_pre_call
-    litellm.log_success_event →  plugin.on_llm_success
-    litellm.log_failure_event →  plugin.on_llm_failure
+    CustomLogger.async_pre_call_deployment_hook →  plugin.on_llm_pre_call  (MUTATION)
+    litellm.log_success_event                   →  plugin.on_llm_success
+    litellm.log_failure_event                   →  plugin.on_llm_failure
 
-In addition to plugin hooks, the bridge integrates the guardrail policy
-engine (``guardrail_policies.py``) at two points:
+Request MUTATION seam (RouteIQ-60e3)
+------------------------------------
+Plugin request mutations (``on_llm_pre_call`` returning a kwargs override, or
+mutating ``messages`` in place) ride ``CustomLogger.async_pre_call_deployment_hook``
+— NOT the logging hook ``async_log_pre_api_call``. Two reasons, both verified
+against litellm 1.89.0 source:
 
-    async_log_pre_api_call    →  input guardrails  (deny/log/alert)
-    async_log_success_event   →  output guardrails (log/alert only)
+  1. ``async_log_pre_api_call`` is a *logging* hook. litellm dispatches it
+     only when the callback ``isinstance(callback, CustomLogger)``
+     (``litellm_logging.py`` ``pre_call``), and it fires AFTER the provider
+     request body is serialized. A duck-typed (non-CustomLogger) callback is
+     never dispatched, so mutation via that seam silently no-ops.
+  2. ``async_pre_call_deployment_hook`` (``custom_logger.py:264``) is the
+     documented seam to "modify the request AFTER a deployment is selected,
+     but BEFORE the request is sent". litellm calls it from the ``@client``
+     ``wrapper_async`` (``utils.py:1815``) on the live ``kwargs`` and REPLACES
+     ``kwargs`` with the returned dict before the completion call runs.
+
+Because that dispatch ALSO gates on ``isinstance(callback, CustomLogger)``
+(``utils.py:1274-1280``), this bridge subclasses ``CustomLogger`` so litellm
+actually invokes it.
+
+Guardrail integration
+----------------------
+The guardrail policy engine (``guardrail_policies.py``) is evaluated in the
+deployment hook (input guardrails: deny/log/alert) and in the success event
+(output guardrails: log/alert only). Plugin guardrails that block by raising
+``GuardrailBlockError`` propagate out of the deployment hook, failing the
+request before it reaches the provider.
 
 Registration:
     Called during plugin startup in app.py. The bridge is appended to
     ``litellm.callbacks`` alongside the existing RouterDecisionCallback.
 
 Design:
-    - Uses duck-typing (no CustomLogger subclass) for minimal coupling
+    - Subclasses ``litellm.integrations.custom_logger.CustomLogger`` so litellm
+      dispatches the mutation + logging hooks (the isinstance gate).
     - Plugin hook failures are caught and logged, never crash the LLM call
-    - Plugins are called in priority order
-    - Guardrail policy evaluation runs after plugin hooks (plugins may modify kwargs)
+      (except guardrail blocks, which intentionally propagate).
+    - Plugins are called in priority order.
 """
 
 from __future__ import annotations
@@ -41,13 +66,30 @@ from litellm_llmrouter.gateway.plugins.guardrails_base import GuardrailBlockErro
 logger = logging.getLogger(__name__)
 
 
-class PluginCallbackBridge:
-    """
-    LiteLLM callback that bridges to GatewayPlugin LLM lifecycle hooks.
+def _custom_logger_base() -> type:
+    """Resolve the litellm ``CustomLogger`` base class lazily.
 
-    Implements the LiteLLM callback interface via duck-typing (same pattern
-    as RouterDecisionCallback). Delegates to plugins that override
-    on_llm_pre_call, on_llm_success, or on_llm_failure.
+    Imported lazily (not at module import time) so this module has no import
+    side effects and stays importable when litellm is absent. Falls back to
+    ``object`` so the bridge remains usable (duck-typed) in environments
+    without litellm — e.g. isolated unit tests that exercise the hooks directly.
+    """
+    try:
+        from litellm.integrations.custom_logger import CustomLogger
+
+        return CustomLogger
+    except Exception:  # pragma: no cover - litellm always present in prod
+        return object
+
+
+class PluginCallbackBridge(_custom_logger_base()):  # type: ignore[misc]
+    """
+    LiteLLM ``CustomLogger`` that bridges to GatewayPlugin LLM lifecycle hooks.
+
+    Subclasses ``CustomLogger`` so litellm dispatches both the request-mutation
+    seam (``async_pre_call_deployment_hook``) and the logging seams, which both
+    gate on ``isinstance(callback, CustomLogger)``. Delegates to plugins that
+    override on_llm_pre_call, on_llm_success, or on_llm_failure.
     """
 
     def __init__(self, plugins: list[Any] | None = None) -> None:
@@ -56,6 +98,12 @@ class PluginCallbackBridge:
             plugins: List of GatewayPlugin instances with LLM lifecycle hooks.
                      Can be set later via set_plugins().
         """
+        # CustomLogger.__init__ may register the instance in litellm's
+        # in-memory logger list; call it when the base is the real CustomLogger.
+        try:
+            super().__init__()
+        except Exception:  # pragma: no cover - object.__init__ never raises
+            pass
         self._plugins: list[Any] = plugins or []
 
     def set_plugins(self, plugins: list[Any]) -> None:
@@ -103,30 +151,105 @@ class PluginCallbackBridge:
     # Async hooks (LiteLLM proxy calls these in the async path)
     # =========================================================================
 
-    async def async_log_pre_api_call(
+    async def async_pre_call_deployment_hook(
+        self, kwargs: dict[str, Any], call_type: Any
+    ) -> dict[str, Any] | None:
+        """Request-MUTATION seam (litellm ``CustomLogger`` hook).
+
+        Called by litellm from the ``@client`` ``wrapper_async`` after a
+        deployment is selected but BEFORE the request is sent
+        (``utils.py:1815``), on the live ``kwargs``. The returned dict REPLACES
+        ``kwargs`` for the completion call, so this is the correct seam for
+        plugin request mutations (cachePoint, requestMetadata, per-team
+        callbacks, guardrailConfig, context optimization).
+
+        Runs plugin ``on_llm_pre_call`` mutations first (only when plugins are
+        registered), then ALWAYS evaluates input guardrail policies. Guardrail
+        blocks (``GuardrailBlockError`` or ``HTTPException``) propagate to fail
+        the request before it is sent.
+
+        SECURITY: input guardrail evaluation is UNCONDITIONAL — it must run even
+        when no callback plugins are loaded, otherwise an operator with input
+        guardrail policies but zero callback-capable plugins would have input
+        guardrails silently bypassed (fail-open). ``_evaluate_input_guardrails``
+        has its own internal "are there policies?" check, so it is a cheap
+        no-op when no input policies are configured.
+
+        Returns the mutated ``kwargs`` so litellm picks up plugin mutations.
+        Returns ``None`` when there are no plugins (so the no-plugins path stays
+        byte-stable for litellm; guardrails, if any, still ran and either denied
+        the request or passed through without mutating ``kwargs``).
+        """
+        model = kwargs.get("model", "unknown")
+        # ``messages`` is the live list inside kwargs — passing it (not a copy)
+        # lets plugins like context_optimizer mutate it in place AND lets
+        # litellm see the change because we return kwargs below.
+        messages = kwargs.get("messages") or []
+
+        # Plugin mutations only run when plugins are registered.
+        if self._plugins:
+            await self._dispatch_pre_call_mutations(model, messages, kwargs)
+
+        # --- Input guardrail policy evaluation (authoritative deny seam) ---
+        # ALWAYS runs, regardless of self._plugins. Internal policy check makes
+        # this a cheap no-op when no input guardrail policies are configured.
+        await self._evaluate_input_guardrails(model, messages, kwargs)
+
+        # Preserve byte-stable behavior for the no-plugins path: only signal a
+        # kwargs replacement to litellm when plugins may have mutated it.
+        return kwargs if self._plugins else None
+
+    async def _dispatch_pre_call_mutations(
         self, model: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]
     ) -> None:
-        """Called before each LLM API call (async path).
+        """Run each plugin's ``on_llm_pre_call`` for request mutation.
 
-        Runs plugin hooks first, then evaluates input guardrail policies.
-        If any guardrail with action=DENY fails, raises HTTPException(446).
+        Dict returns are merged into ``kwargs``; ``messages`` may also be
+        mutated in place by a plugin. ``GuardrailBlockError`` propagates so a
+        blocking guardrail fails the request; other exceptions are isolated.
         """
-        # --- Plugin hooks ---
         for plugin in self._plugins:
             try:
                 result = await plugin.on_llm_pre_call(model, messages, kwargs)
                 if isinstance(result, dict):
-                    # Merge overrides into kwargs
+                    # Merge overrides into kwargs (in place — kwargs is the
+                    # object litellm will send / that we return upstream).
                     kwargs.update(result)
             except GuardrailBlockError:
                 raise  # Let guardrail blocks propagate as request failures
+            except HTTPException:
+                raise  # Guardrail-policy deny / explicit block propagates
             except Exception as e:
                 logger.error(
                     f"Plugin '{plugin.name}' on_llm_pre_call failed: {e}",
                     exc_info=True,
                 )
 
-        # --- Input guardrail policy evaluation ---
+    async def async_log_pre_api_call(
+        self, model: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]
+    ) -> None:
+        """LOGGING seam (async path).
+
+        Plugin request *mutations* ride ``async_pre_call_deployment_hook`` (the
+        correct pre-send seam). This logging hook fires AFTER the provider body
+        is serialized, so it is kept for backward compatibility and as the
+        observability dispatch point; it still calls ``on_llm_pre_call`` so
+        plugins that only inspect/log the request keep working. Mutations that
+        land here would be too late to reach the wire — callers needing to
+        mutate the request must rely on the deployment hook.
+
+        SECURITY: this seam ALSO evaluates input guardrail policies
+        unconditionally. It is the path the governance/guardrail contract tests
+        assert against, and — like the deployment hook — must fail-closed when
+        guardrail policies exist but no callback plugins are loaded. Guardrail
+        denies raise ``HTTPException`` here too. ``_evaluate_input_guardrails``
+        has its own internal "are there policies?" check, so it is a cheap
+        no-op when no input policies are configured.
+        """
+        if self._plugins:
+            await self._dispatch_pre_call_mutations(model, messages, kwargs)
+
+        # --- Input guardrail policy evaluation (unconditional, fail-closed) ---
         await self._evaluate_input_guardrails(model, messages, kwargs)
 
     async def async_log_success_event(
@@ -185,6 +308,34 @@ class PluginCallbackBridge:
     # Guardrail policy evaluation
     # =========================================================================
 
+    _INPUT_GUARDRAIL_SENTINEL = "_routeiq_input_guardrails_evaluated"
+
+    @classmethod
+    def _input_guardrails_already_evaluated(cls, kwargs: dict[str, Any]) -> bool:
+        """True if input guardrails ran for this request on the other seam.
+
+        The sentinel lives in ``kwargs['metadata']`` (mirroring the governance
+        ``_governance_ctx`` convention) so it never leaks into the top-level
+        completion kwargs litellm sends to the provider.
+        """
+        if not isinstance(kwargs, dict):
+            return False
+        metadata = kwargs.get("metadata")
+        return bool(
+            isinstance(metadata, dict) and metadata.get(cls._INPUT_GUARDRAIL_SENTINEL)
+        )
+
+    @classmethod
+    def _mark_input_guardrails_evaluated(cls, kwargs: dict[str, Any]) -> None:
+        """Record that input guardrails ran so the paired seam short-circuits."""
+        if not isinstance(kwargs, dict):
+            return
+        metadata = kwargs.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            kwargs["metadata"] = metadata
+        metadata[cls._INPUT_GUARDRAIL_SENTINEL] = True
+
     async def _evaluate_input_guardrails(
         self,
         model: str,
@@ -197,9 +348,28 @@ class PluginCallbackBridge:
         all input-phase guardrail policies.  If any policy with action=DENY
         fails, raises ``HTTPException(446)`` to block the request.
 
-        Fail-open: if the guardrail engine is unavailable or evaluation
-        raises an unexpected error, the request passes through.
+        Fail-open ONLY on infrastructure errors: if the guardrail engine is
+        unavailable or evaluation raises an unexpected error, the request passes
+        through. A configured DENY policy that matches is ALWAYS fail-closed
+        (raises ``HTTPException``), regardless of whether any callback plugins
+        are loaded.
+
+        De-duplication: this runs on two seams for the live request path
+        (``async_pre_call_deployment_hook`` then ``async_log_pre_api_call``).
+        The first invocation marks ``kwargs`` with a sentinel so the second
+        seam skips re-evaluation (avoids double latency / double warning logs)
+        without changing behavior — a DENY on the first seam already raised, and
+        a pass on the first seam guarantees a pass on the second. The contract
+        tests call a single seam with fresh ``kwargs`` (no sentinel), so they
+        always evaluate.
         """
+        # Skip if this exact request was already guardrail-evaluated on the
+        # other seam (deployment hook is authoritative for the live path).
+        # The sentinel lives in metadata (not top-level kwargs) to keep the
+        # completion kwargs byte-stable for litellm.
+        if self._input_guardrails_already_evaluated(kwargs):
+            return
+
         try:
             from litellm_llmrouter.guardrail_policies import (
                 get_guardrail_policy_engine,
@@ -209,9 +379,14 @@ class PluginCallbackBridge:
 
             engine = get_guardrail_policy_engine()
 
-            # Quick check: are there any enabled input policies?
+            # Quick check: are there any enabled input policies? Cheap no-op
+            # when none are configured (the common no-guardrail path).
             input_policies = engine.list_policies(phase=GuardrailPhase.INPUT)
             if not input_policies:
+                # No policies: nothing to dedupe. Do NOT mark kwargs — the
+                # paired seam will hit this same cheap check, and mutating
+                # kwargs here would inject a spurious ``metadata`` key and break
+                # byte-stability on the common no-guardrail path.
                 return
 
             # Resolve workspace_id from governance context (if governance ran)
@@ -269,6 +444,9 @@ class PluginCallbackBridge:
                     r.action.value,
                     r.latency_ms,
                 )
+
+            # Passed (no DENY): mark so the paired seam short-circuits.
+            self._mark_input_guardrails_evaluated(kwargs)
 
         except HTTPException:
             raise  # Propagate guardrail deny
@@ -412,19 +590,27 @@ def get_callback_bridge() -> PluginCallbackBridge | None:
     return _callback_bridge
 
 
-def register_callback_bridge(plugins: list[Any]) -> PluginCallbackBridge | None:
+def register_callback_bridge(
+    plugins: list[Any], *, force: bool = False
+) -> PluginCallbackBridge | None:
     """
     Register the plugin callback bridge with LiteLLM.
 
     Args:
         plugins: List of GatewayPlugin instances with LLM lifecycle hooks
+        force: Register the bridge even when ``plugins`` is empty. Required so
+            the input-guardrail deny seam runs when guardrail policies are
+            configured but no callback-capable plugins are loaded — otherwise
+            input guardrails would be silently bypassed (fail-open). The bridge
+            evaluates guardrail policies unconditionally on its pre-call seams.
 
     Returns:
-        The registered bridge, or None if no callback plugins or LiteLLM unavailable
+        The registered bridge, or None if (no plugins AND not forced) or
+        LiteLLM is unavailable.
     """
     global _callback_bridge
 
-    if not plugins:
+    if not plugins and not force:
         logger.debug("No callback-capable plugins, skipping bridge registration")
         return None
 

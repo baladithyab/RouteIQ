@@ -1940,6 +1940,98 @@ class BedrockDiscoverySettings(BaseModel):
         return v
 
 
+class BedrockRequestLeversSettings(BaseModel):
+    """Per-request Bedrock Converse levers (data plane), default-OFF.
+
+    Drives :class:`litellm_llmrouter.gateway.plugins.bedrock_request_levers
+    .BedrockRequestLeversPlugin`, which mutates the outbound request on the
+    correct litellm seam (``CustomLogger.async_pre_call_deployment_hook``) so
+    the mutations actually reach the Bedrock ``Converse`` call args.
+
+    Three independently-gated levers (each a byte-stable no-op when off):
+
+    - ``request_metadata`` (RouteIQ-294a): forward tenant identity
+      (workspace / key) as Bedrock ``requestMetadata`` tags for cost
+      attribution. Lands as the top-level ``requestMetadata`` completion kwarg,
+      which litellm's converse transform maps from ``non_default_params``.
+    - ``team_callbacks`` (RouteIQ-9cd8): set per-team logging sinks as the
+      TOP-LEVEL request kwargs ``callbacks`` / ``success_callback`` /
+      ``failure_callback`` (where litellm sources dynamic per-request
+      callbacks), NOT ``metadata[callbacks]`` (never read). The global
+      registration is unaffected.
+    - ``cache_point`` (RouteIQ-b9ee): drive Bedrock prompt-caching via
+      litellm's ``cache_control_injection_points`` mechanism (system-prefix
+      message injection + tool_config cachePoint), NOT a bare ``tools[]``
+      ``cachePoint`` entry (dropped by the converse transform).
+
+    Env vars (``__`` nested delimiter under ``ROUTEIQ_``):
+    ``ROUTEIQ_BEDROCK_LEVERS__REQUEST_METADATA``,
+    ``ROUTEIQ_BEDROCK_LEVERS__TEAM_CALLBACKS``,
+    ``ROUTEIQ_BEDROCK_LEVERS__CACHE_POINT``,
+    ``ROUTEIQ_BEDROCK_LEVERS__CACHE_SYSTEM``,
+    ``ROUTEIQ_BEDROCK_LEVERS__CACHE_TOOLS``,
+    ``ROUTEIQ_BEDROCK_LEVERS__METADATA_PREFIX``,
+    ``ROUTEIQ_BEDROCK_LEVERS__TEAM_CALLBACK_MAP`` (JSON
+    ``{"team-a": {"success_callback": ["s3"]}}``).
+    """
+
+    request_metadata: bool = Field(
+        False,
+        description=(
+            "RouteIQ-294a: forward tenant identity (workspace_id / key_id) as "
+            "Bedrock requestMetadata tags for cost attribution. Default OFF -- "
+            "byte-stable: no requestMetadata kwarg is added until enabled."
+        ),
+    )
+    metadata_prefix: str = Field(
+        "routeiq_",
+        description=(
+            "Key prefix for the injected requestMetadata tags (Bedrock keys must "
+            "match [a-zA-Z0-9 :_@$#=/+,.-]). Only used when request_metadata=True."
+        ),
+    )
+    team_callbacks: bool = Field(
+        False,
+        description=(
+            "RouteIQ-9cd8: set per-team logging sinks as TOP-LEVEL request kwargs "
+            "callbacks/success_callback/failure_callback (the seam litellm reads "
+            "dynamic per-request callbacks from). Default OFF; the global "
+            "registration is untouched."
+        ),
+    )
+    team_callback_map: dict[str, dict[str, list[str]]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of team_id -> {success_callback|failure_callback|callbacks: "
+            '[sink names]}. e.g. {"team-a": {"success_callback": ["s3"]}}. Only '
+            "applied when team_callbacks=True and the request resolves to a "
+            "mapped team."
+        ),
+    )
+    cache_point: bool = Field(
+        False,
+        description=(
+            "RouteIQ-b9ee: enable Bedrock prompt-caching cachePoint injection via "
+            "litellm cache_control_injection_points. Default OFF -- byte-stable."
+        ),
+    )
+    cache_system: bool = Field(
+        True,
+        description=(
+            "When cache_point=True, inject a system-prefix cachePoint (message "
+            "injection point, role=system). Default on."
+        ),
+    )
+    cache_tools: bool = Field(
+        True,
+        description=(
+            "When cache_point=True, inject a tool_config cachePoint so the tool "
+            "schema prefix is cached. Default on. Only takes effect when the "
+            "request carries tools."
+        ),
+    )
+
+
 class ModelAliasSettings(BaseModel):
     """Pre-routing model-name alias/rewrite map (RouteIQ-0dcb).
 
@@ -2367,6 +2459,13 @@ class GatewaySettings(BaseSettings):
     bedrock_discovery: BedrockDiscoverySettings = Field(
         default_factory=BedrockDiscoverySettings,  # type: ignore[arg-type]
         description="In-process Bedrock model auto-discovery settings (default off).",
+    )
+    bedrock_levers: BedrockRequestLeversSettings = Field(
+        default_factory=BedrockRequestLeversSettings,  # type: ignore[arg-type]
+        description=(
+            "Per-request Bedrock Converse levers (requestMetadata / team "
+            "callbacks / cachePoint) on the pre-call mutation seam (default off)."
+        ),
     )
     model_alias: ModelAliasSettings = Field(
         default_factory=ModelAliasSettings,  # type: ignore[arg-type]
