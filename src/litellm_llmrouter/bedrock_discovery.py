@@ -634,13 +634,29 @@ class DiscoveryResult:
         *,
         residency_constraint: bool = False,
         register_cost: bool = True,
+        auto_group: bool = False,
+        auto_group_name: str = "claude-auto",
     ) -> list[dict[str, Any]]:
         """Map every discovered model to a LiteLLM ``model_list`` entry.
 
         Models with no serverless path under the given residency constraint are
         skipped (logged at debug) rather than raising -- the orchestrator
         produces a best-effort list.
+
+        When ``auto_group`` is True the per-model ``model_name`` values are all
+        collapsed to the single ``auto_group_name`` so the entries form one
+        LiteLLM routing GROUP (multiple arms behind one alias). LiteLLM treats
+        every ``model_list`` row sharing a ``model_name`` as an arm of that
+        group, which the routing strategy (e.g. the Kumaraswamy-Thompson bandit)
+        then picks between. Default ``auto_group=False`` preserves the prior
+        byte-stable behavior (one distinct ``model_name`` per discovered arm).
         """
+        if auto_group:
+            return self.to_auto_group_model_list(
+                group_name=auto_group_name,
+                residency_constraint=residency_constraint,
+                register_cost=register_cost,
+            )
         entries: list[dict[str, Any]] = []
         for m in self.models:
             try:
@@ -651,6 +667,62 @@ class DiscoveryResult:
                 logger.debug("skipping %s: %s", m.model_id, exc)
                 continue
             entries.append(to_litellm_entry(sel, register_cost=register_cost))
+        return entries
+
+    def to_auto_group_model_list(
+        self,
+        *,
+        group_name: str = "claude-auto",
+        residency_constraint: bool = False,
+        register_cost: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Synthesize a SINGLE mixed-Bedrock routing group from discovery.
+
+        Every discovered serverless model that yields a callable invocation path
+        becomes one arm of a group all sharing ``model_name == group_name``
+        (default ``"claude-auto"``). The arms span every tier and provider the
+        scan found -- Claude, Nova, gpt-oss, and any future provider -- so a
+        routing strategy can pick the cheapest/best arm for each request.
+
+        This is the recipe behind the Claude-Code cost-routing use case: point
+        an Anthropic client's ``model`` at ``claude-auto`` and let the
+        Kumaraswamy-Thompson bandit (or any ``routing_strategy``) cascade across
+        the mixed Bedrock arms instead of pinning Opus.
+
+        Each arm carries a ``model_info`` ``arm_id`` (its distinct upstream id)
+        so operators and telemetry can still see which physical model an arm
+        maps to -- LiteLLM only requires ``model_name`` to be shared, not unique.
+
+        Models with no serverless path under ``residency_constraint`` are skipped
+        (logged at debug). Returns an empty list when no model yields a path
+        (e.g. discovery disabled / no models found) -- the caller then leaves the
+        operator-authored ``model_list`` untouched.
+        """
+        entries: list[dict[str, Any]] = []
+        seen_arms: set[str] = set()
+        for m in self.models:
+            try:
+                sel = select_invocation_path(
+                    m, residency_constraint=residency_constraint
+                )
+            except NoServerlessPathInRegion as exc:
+                logger.debug("skipping %s for auto-group: %s", m.model_id, exc)
+                continue
+            entry = to_litellm_entry(
+                sel, model_name=group_name, register_cost=register_cost
+            )
+            # arm_id makes each arm distinguishable in telemetry/inspection even
+            # though all arms share the group's model_name. Dedup identical arms
+            # discovered from multiple source regions (same invocation path).
+            arm_id = f"{sel.region}/{sel.invocation_id}"
+            if arm_id in seen_arms:
+                continue
+            seen_arms.add(arm_id)
+            info = entry.setdefault("model_info", {})
+            info["arm_id"] = arm_id
+            info["provider"] = sel.provider_name
+            info["tier"] = sel.tier.value
+            entries.append(entry)
         return entries
 
 

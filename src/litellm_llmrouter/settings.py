@@ -318,6 +318,24 @@ class OTelSettings(BaseModel):
             "(env: ROUTEIQ_OTEL__ERROR_LOG_ENABLED)."
         ),
     )
+    xray_enabled: bool = Field(
+        False,
+        description=(
+            "Emit AWS X-Ray-format trace IDs and propagate the "
+            "``X-Amzn-Trace-Id`` header (RouteIQ-3c0a). When True, a NEW OTel "
+            "TracerProvider is constructed with the AWS X-Ray ``id_generator`` "
+            "(so spans carry X-Ray-format trace IDs) and the AWS X-Ray "
+            "propagator is installed as the global text-map, giving CloudWatch "
+            "Transaction Search / X-Ray a single edge-to-Bedrock trace. Default "
+            "OFF so trace IDs stay W3C-format unless an operator opts in. "
+            "Requires the optional ``opentelemetry-sdk-extension-aws`` + "
+            "``opentelemetry-propagator-aws-xray`` packages (the ``otel`` "
+            "extra); their absence degrades to W3C with a warning (never breaks "
+            "boot). The X-Ray ID generator only applies when RouteIQ creates the "
+            "provider - it cannot retrofit an existing reused SDK provider "
+            "(env: ROUTEIQ_OTEL__XRAY_ENABLED)."
+        ),
+    )
 
     @field_validator("endpoint")
     @classmethod
@@ -1627,13 +1645,180 @@ class AdapterFrameworkSettings(BaseModel):
         description="Enable the pre-selection required-signals filter.",
     )
     mlops_feedback_loop: bool = Field(
-        False,
+        True,
         description=(
             "Wire the eval-pipeline FEEDBACK arm into the strategy-agnostic "
             "MLOps coordinator: discover continuous-train learning adapters "
             "from the registry and subscribe the coordinator to "
-            "EvalPipeline.feedback_callbacks. Default off."
+            "EvalPipeline.feedback_callbacks. "
+            "DECISION (RouteIQ-3b4d): default ON. The intelligent-routing use "
+            "case (Claude Code -> RouteIQ -> mixed-Bedrock auto-group) is only "
+            "worth it if the bandit LEARNS which arm is best automatically, so "
+            "the loop closes by default. It is a NO-OP unless (a) a continuous "
+            "learning strategy is registered (e.g. the Kumaraswamy-Thompson "
+            "bandit -- itself off by default) AND (b) the eval pipeline is "
+            "enabled; with both off this flag costs nothing. OPT-OUT: set "
+            "``ROUTEIQ_ADAPTER_FRAMEWORK__MLOPS_FEEDBACK_LOOP=false``. "
+            "JUDGE-COST NOTE: when the eval pipeline's LLM-as-judge evaluator is "
+            "enabled it makes one extra judge call per sampled decision -- size "
+            "the judge model / sample rate accordingly (see "
+            "docs/operations/claude-code-routing.md)."
         ),
+    )
+
+
+class MLOpsPromotionSettings(BaseModel):
+    """Quality-gated champion/challenger promotion + rollback (RouteIQ-2a1c).
+
+    Drives :class:`litellm_llmrouter.strategy_registry.ChampionChallengerPromoter`.
+    When enabled, the promoter compares the aggregated routing quality of a
+    designated *challenger* strategy/version against the current *champion* and
+    PROMOTES the challenger (``registry.set_active``) when it beats the champion
+    by ``margin`` over a window of at least ``min_samples`` evaluations.  If a
+    freshly promoted challenger later REGRESSES below the prior champion by the
+    same margin, it is ROLLED BACK to the champion.
+
+    The quality signal is the eval loop's ``{strategy: quality}`` aggregate
+    (``ModelQualityTracker`` scale, ``[0, 1]``).  Insufficient samples => no
+    action (never promote on noise).  Default OFF.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable quality-gated champion/challenger promotion + rollback.",
+    )
+    margin: float = Field(
+        0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum quality lead (challenger - champion, in [0,1]) required to "
+            "promote; the same drop below champion triggers a rollback."
+        ),
+    )
+    min_samples: int = Field(
+        20,
+        ge=1,
+        description=(
+            "Minimum aggregated quality samples for BOTH champion and challenger "
+            "before any promotion/rollback decision is made."
+        ),
+    )
+
+
+class MLOpsDriftSettings(BaseModel):
+    """Input drift + routing-quality-regression detection (RouteIQ-6dce).
+
+    Drives :class:`litellm_llmrouter.mlops.drift.DriftDetector`.  Detects (a)
+    INPUT DRIFT -- a shift in the request/bucket distribution vs a captured
+    baseline (population-stability-index over coarse buckets) -- and (b)
+    ROUTING-QUALITY REGRESSION -- the aggregated quality dropping below a
+    captured baseline by ``quality_regression_threshold``.  Drift signals are
+    emitted as OTel gauges via ``metrics.py`` so CloudWatch / Prometheus can
+    alarm.  Default OFF.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable input-drift + quality-regression detection.",
+    )
+    input_drift_threshold: float = Field(
+        0.2,
+        ge=0.0,
+        description=(
+            "Population-Stability-Index threshold above which the input "
+            "(bucket) distribution counts as drifted (PSI>=0.2 is the textbook "
+            "'moderate shift' line)."
+        ),
+    )
+    quality_regression_threshold: float = Field(
+        0.1,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Absolute aggregated-quality drop (baseline - current, in [0,1]) "
+            "above which a routing-quality regression signal fires."
+        ),
+    )
+    min_samples: int = Field(
+        30,
+        ge=1,
+        description=(
+            "Minimum observations in BOTH the baseline and current windows "
+            "before drift/regression is evaluated (avoids small-sample noise)."
+        ),
+    )
+    window_size: int = Field(
+        200,
+        ge=1,
+        description="Sliding-window size for the current bucket/quality samples.",
+    )
+
+
+class MLOpsShadowSettings(BaseModel):
+    """Shadow / mirror (silent canary) traffic to candidate strategies
+    (RouteIQ-4fd1).
+
+    Drives :class:`litellm_llmrouter.strategy_registry.ShadowMirror`.  Mirrors a
+    sampled fraction of routing decisions to a candidate strategy WITHOUT
+    affecting the served response: it computes what the candidate WOULD have
+    picked and records it for offline comparison.  No user impact.  Default OFF
+    with ``sample_rate=0.0``.
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Enable shadow/mirror evaluation of a candidate strategy.",
+    )
+    candidate_strategy: str = Field(
+        "",
+        description=(
+            "Registry name of the candidate strategy to shadow-evaluate. Empty "
+            "disables mirroring even when enabled."
+        ),
+    )
+    sample_rate: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of served decisions to mirror to the candidate.",
+    )
+    max_records: int = Field(
+        1000,
+        ge=1,
+        description="Bounded ring buffer of shadow comparison records to retain.",
+    )
+
+
+class MLOpsSettings(BaseModel):
+    """MLOps closed-loop configuration (Cluster H).
+
+    Bundles the three MLOps sub-loops that keep routing strategies optimal:
+    quality-gated champion/challenger promotion (RouteIQ-2a1c), drift detection
+    (RouteIQ-6dce), and shadow/mirror canary traffic (RouteIQ-4fd1).  All three
+    are independently settings-gated and DEFAULT OFF -- importing or wiring the
+    MLOps machinery changes nothing until an operator opts in.
+
+    Builds on the EXISTING COLLECT/EVALUATE/AGGREGATE/FEEDBACK eval loop
+    (``ModelQualityTracker`` / ``MLOpsCoordinator``); it does not duplicate it.
+
+    Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix):
+    ``ROUTEIQ_MLOPS__PROMOTION__ENABLED``,
+    ``ROUTEIQ_MLOPS__DRIFT__ENABLED``,
+    ``ROUTEIQ_MLOPS__SHADOW__ENABLED``, etc.
+    """
+
+    promotion: MLOpsPromotionSettings = Field(
+        default_factory=MLOpsPromotionSettings,  # type: ignore[arg-type]
+        description="Quality-gated champion/challenger promotion + rollback.",
+    )
+    drift: MLOpsDriftSettings = Field(
+        default_factory=MLOpsDriftSettings,  # type: ignore[arg-type]
+        description="Input-drift + routing-quality-regression detection.",
+    )
+    shadow: MLOpsShadowSettings = Field(
+        default_factory=MLOpsShadowSettings,  # type: ignore[arg-type]
+        description="Shadow/mirror (silent canary) traffic to candidate strategies.",
     )
 
 
@@ -1713,6 +1898,30 @@ class BedrockDiscoverySettings(BaseModel):
             "breaks provider detection -- issue #17286). Default on."
         ),
     )
+    auto_group: bool = Field(
+        False,
+        description=(
+            "Synthesize a SINGLE mixed-Bedrock routing GROUP from discovery: "
+            "every discovered serverless arm (Claude + Nova + gpt-oss + any "
+            "future provider) shares one ``model_name`` (``auto_group_name``) so "
+            "a routing strategy (e.g. the Kumaraswamy-Thompson bandit) cascades "
+            "across the arms instead of the caller pinning one tier. This powers "
+            "the Claude-Code cost-routing recipe (point ``model`` at the group "
+            "name). Default OFF -- byte-stable: when off the per-model distinct "
+            "``model_name`` mapping is unchanged. Env: "
+            "``ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP``."
+        ),
+    )
+    auto_group_name: str = Field(
+        "claude-auto",
+        description=(
+            "The shared ``model_name`` for the synthesized auto-group (only used "
+            "when ``auto_group=True``). Point an unmodified Anthropic client's "
+            "``model`` at this value (or rewrite to it via the model-alias layer) "
+            "to route through the mixed-Bedrock group. Env: "
+            "``ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP_NAME``."
+        ),
+    )
 
     @field_validator("source_regions", mode="before")
     @classmethod
@@ -1729,6 +1938,66 @@ class BedrockDiscoverySettings(BaseModel):
         if isinstance(v, str):
             return [r.strip() for r in v.split(",") if r.strip()]
         return v
+
+
+class ModelAliasSettings(BaseModel):
+    """Pre-routing model-name alias/rewrite map (RouteIQ-0dcb).
+
+    Claude Code (and any unmodified Anthropic SDK client) PINS a concrete model
+    id in the request body, e.g. ``claude-sonnet-4-20250514``. LiteLLM matches
+    ``model_list`` rows by EXACT ``model_name``, so a pinned id never lands on a
+    synthesized routing group such as ``claude-auto`` -- the request would 400 or
+    fall through to a single arm.
+
+    This layer rewrites the request ``model`` field BEFORE the request reaches
+    LiteLLM, at the RouteIQ app/route entry layer (a raw-ASGI middleware in
+    ``model_alias.py``, NOT the broken ``on_llm_pre_call`` mutation seam). Two
+    maps are applied in order:
+
+    * ``exact`` -- an exact ``{requested_id: target_group}`` lookup (fast path).
+    * ``regex`` -- ordered ``{pattern: target_group}`` rules; the FIRST full
+      ``re.fullmatch`` wins. Patterns are compiled once; an invalid pattern is
+      logged and skipped (fail-open -- a bad rule never blocks traffic).
+
+    Default ``enabled=False`` with empty maps => IDENTITY (no rewrite), so the
+    behavior is byte-stable until an operator opts in.
+
+    Env vars (``__`` nested delimiter under ``ROUTEIQ_``):
+    ``ROUTEIQ_MODEL_ALIAS__ENABLED``,
+    ``ROUTEIQ_MODEL_ALIAS__EXACT`` (JSON object),
+    ``ROUTEIQ_MODEL_ALIAS__REGEX`` (JSON object of ordered rules).
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable the pre-routing model-alias rewrite layer. Default OFF "
+            "(identity -- no rewrite). When on, the request ``model`` field is "
+            "rewritten via ``exact`` then ``regex`` before LiteLLM sees it, so an "
+            "unmodified Anthropic client pinning a concrete id is transparently "
+            "routed through a target group (e.g. ``claude-auto``)."
+        ),
+    )
+    exact: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Exact-match alias map ``{requested_model_id: target_group}``. "
+            "Applied first; a hit short-circuits the regex pass. Env "
+            "``ROUTEIQ_MODEL_ALIAS__EXACT`` takes a JSON object, e.g. "
+            '``{"claude-sonnet-4-20250514": "claude-auto"}``.'
+        ),
+    )
+    regex: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Ordered regex alias rules ``{pattern: target_group}``; the FIRST "
+            "rule whose pattern ``re.fullmatch`` matches the requested id wins. "
+            "Env ``ROUTEIQ_MODEL_ALIAS__REGEX`` takes a JSON object, e.g. "
+            '``{"^claude-.*$": "claude-auto"}``. Dict insertion order is the '
+            "evaluation order (Python 3.7+). An uncompilable pattern is logged "
+            "and skipped (fail-open)."
+        ),
+    )
 
 
 class HASettings(BaseModel):
@@ -2099,6 +2368,12 @@ class GatewaySettings(BaseSettings):
         default_factory=BedrockDiscoverySettings,  # type: ignore[arg-type]
         description="In-process Bedrock model auto-discovery settings (default off).",
     )
+    model_alias: ModelAliasSettings = Field(
+        default_factory=ModelAliasSettings,  # type: ignore[arg-type]
+        description=(
+            "Pre-routing model-name alias/rewrite map (default off / identity)."
+        ),
+    )
     cost_cascade: CostCascadeSettings = Field(
         default_factory=CostCascadeSettings,  # type: ignore[arg-type]
         description="Cost-aware speculative-cascade routing strategy settings.",
@@ -2120,6 +2395,13 @@ class GatewaySettings(BaseSettings):
     linucb: LinUCBSettings = Field(
         default_factory=LinUCBSettings,  # type: ignore[arg-type]
         description="LinUCB feature-vector contextual-bandit routing settings.",
+    )
+    mlops: MLOpsSettings = Field(
+        default_factory=MLOpsSettings,  # type: ignore[arg-type]
+        description=(
+            "MLOps closed-loop settings: quality-gated promotion, drift "
+            "detection, and shadow/mirror canary (all default off)."
+        ),
     )
 
     # ------------------------------------------------------------------

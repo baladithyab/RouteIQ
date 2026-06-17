@@ -186,7 +186,9 @@ def register_strategies():
         # Wire the strategy-agnostic MLOps FEEDBACK arm: discover continuous
         # learning adapters from the registry and subscribe the coordinator to
         # the eval pipeline's feedback callbacks. Gated by
-        # adapter_framework.mlops_feedback_loop (default off); never raises.
+        # adapter_framework.mlops_feedback_loop (default ON as of RouteIQ-3b4d,
+        # but a no-op unless a learning strategy + eval pipeline are both on);
+        # never raises.
         try:
             from litellm_llmrouter.adapters.mlops import wire_mlops_feedback_loop
 

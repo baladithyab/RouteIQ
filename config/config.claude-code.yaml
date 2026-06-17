@@ -1,0 +1,110 @@
+# RouteIQ -- Claude Code -> mixed-Bedrock cost-routing recipe (RouteIQ-a416)
+# =============================================================================
+# Goal: let Claude Code (or any Anthropic SDK client) talk to RouteIQ and have
+# RouteIQ route each request across a MIXED pool of serverless Bedrock models
+# (Claude + Nova + gpt-oss + ...), learning which arm is best with the
+# Kumaraswamy-Thompson online bandit -- so you escape paying Opus-only prices
+# for every turn.
+#
+# How a request flows:
+#   Claude Code  --(ANTHROPIC_BASE_URL=http://routeiq:4000)-->  RouteIQ
+#     1. model-alias layer rewrites the pinned id (claude-sonnet-4-...) to the
+#        "claude-auto" GROUP   [RouteIQ-0dcb, env-gated -- see the doc page]
+#     2. the Kumaraswamy-Thompson bandit picks the cheapest/best arm in the group
+#     3. the eval-judge -> bandit MLOps loop feeds quality back so it keeps learning
+#
+# Two ways to populate the "claude-auto" group:
+#   (A) AUTO-DISCOVERY (recommended on AWS): turn on Bedrock discovery + auto_group
+#       and RouteIQ assembles the group from whatever serverless models the
+#       account is entitled to -- no hand-maintained model_list. See the doc page
+#       for the env vars (ROUTEIQ_BEDROCK_DISCOVERY__ENABLED=true,
+#       ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP=true).
+#   (B) STATIC (this file): the explicit claude-auto arms below. Works without
+#       discovery; edit the modelIds for your region's entitlements.
+#
+# The companion env vars (bandit on, alias on, learning loop) live in the
+# operations doc: docs/operations/claude-code-routing.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model list -- the "claude-auto" GROUP: many arms, ONE model_name.
+# -----------------------------------------------------------------------------
+# LiteLLM treats every row sharing a model_name as an arm of that group; the
+# routing strategy (the bandit) picks between them. Mix tiers so the bandit can
+# trade cost vs quality. No api_key -- Bedrock auth uses the IAM instance/pod
+# identity. These are US cross-region inference-profile ids; swap the geo prefix
+# (eu./apac./...) for your region, or use option (A) auto-discovery instead.
+model_list:
+  # --- Cheap, fast arms (the bandit should prefer these for easy turns) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-3-5-haiku-20241022-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      arm_id: claude-3-5-haiku
+      tier: cheap
+
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/us.amazon.nova-lite-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      arm_id: nova-lite
+      tier: cheap
+
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/us.amazon.nova-pro-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      arm_id: nova-pro
+      tier: mid
+
+  # --- Mid arm: open-weight gpt-oss (no global profile -> regional id) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/openai.gpt-oss-120b-1:0
+      aws_region_name: us-west-2
+    model_info:
+      arm_id: gpt-oss-120b
+      tier: mid
+
+  # --- Strong arms (the bandit escalates here only when quality demands) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-sonnet-4-20250514-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      arm_id: claude-sonnet-4
+      tier: strong
+
+  - model_name: claude-auto
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-20250514-v1:0
+      aws_region_name: us-east-1
+    model_info:
+      arm_id: claude-opus-4
+      tier: premium
+
+router_settings:
+  # NOTE: RouteIQ installs its OWN CustomRoutingStrategyBase plugin and the
+  # Kumaraswamy-Thompson bandit rides the RouteIQ routing pipeline (selected via
+  # ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED=true +
+  # ROUTEIQ_ROUTING__ACTIVE_STRATEGY=routeiq-kumaraswamy-thompson -- see the doc
+  # page). This LiteLLM-level routing_strategy is only the fallback used before
+  # the plugin takes over deployment selection.
+  routing_strategy: simple-shuffle
+
+  # Cross-region / context-window resilience composes with the bandit: if the
+  # whole group attempt fails (Bedrock 429, context overflow) LiteLLM retries.
+  num_retries: 2
+  retry_after: 5
+  timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true  # Anthropic <-> Bedrock param differences are dropped, not fatal
+  success_callback: ["otel"]
+  failure_callback: ["otel"]

@@ -274,6 +274,16 @@ def _configure_middleware(app: FastAPI) -> None:
     if register_router_decision_middleware(app):
         logger.debug("Added RouterDecisionMiddleware")
 
+    # Model-alias rewrite middleware (RouteIQ-0dcb) - rewrites the request
+    # ``model`` field PRE-routing so an unmodified Anthropic client pinning a
+    # concrete id (e.g. claude-sonnet-4-...) is transparently routed through a
+    # target group (e.g. claude-auto + the bandit). No-op / not added when the
+    # alias layer is disabled or has no rules (default identity).
+    from ..model_alias import add_model_alias_middleware
+
+    if add_model_alias_middleware(app):
+        logger.info("Added ModelAliasMiddleware (pre-routing model rewrite)")
+
 
 def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     """

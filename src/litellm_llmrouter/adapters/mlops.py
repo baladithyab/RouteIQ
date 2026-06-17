@@ -271,9 +271,14 @@ def wire_mlops_feedback_loop(
     discovered from the routing registry (the bandit AND any other learning
     strategy). It does NOT couple the loop to the bandit.
 
-    Behind the ``adapter_framework.mlops_feedback_loop`` flag (default off).
-    Pass ``force=True`` to bypass the flag (used by tests). Idempotent and
-    never raises — a wiring failure must not block startup.
+    Behind the ``adapter_framework.mlops_feedback_loop`` flag (default ON as of
+    RouteIQ-3b4d — the intelligent-routing use case needs the bandit to learn
+    automatically; opt out with
+    ``ROUTEIQ_ADAPTER_FRAMEWORK__MLOPS_FEEDBACK_LOOP=false``). It is still a
+    no-op unless a continuous learning strategy is registered AND the eval
+    pipeline is enabled, so the default flag costs nothing on its own. Pass
+    ``force=True`` to bypass the flag (used by tests). Idempotent and never
+    raises — a wiring failure must not block startup.
 
     Steps:
       1. Discover learning adapters from the routing registry (continuous ones
