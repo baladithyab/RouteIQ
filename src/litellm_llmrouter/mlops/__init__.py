@@ -12,6 +12,10 @@ AGGREGATE / FEEDBACK eval loop:
   Experiments adapter (RouteIQ-93e9), cred-free + operator-gated.
 - :mod:`litellm_llmrouter.mlops.offline_eval` -- offline eval harness over a
   versioned golden dataset (RouteIQ-8d24), no live traffic.
+- :mod:`litellm_llmrouter.mlops.retraining` -- SageMaker scheduled-retraining
+  orchestration (RouteIQ-8a24): EventBridge cron/rate -> training job/pipeline
+  -> poll -> hand the S3 artifact to the registry adapter; cred-free +
+  operator-gated.
 
 Quality-gated champion/challenger promotion (RouteIQ-2a1c) and shadow/mirror
 canary traffic (RouteIQ-4fd1) live in
@@ -36,6 +40,15 @@ from litellm_llmrouter.mlops.offline_eval import (
     expected_quality_scorer,
     judge_scorer,
     load_golden_dataset,
+)
+from litellm_llmrouter.mlops.retraining import (
+    RetrainingPipelineAdapter,
+    RetrainingRunResult,
+    RetrainingStatusResult,
+    RetrainRegisterResult,
+    ScheduleResult,
+    get_retraining_adapter,
+    reset_retraining_adapter,
 )
 from litellm_llmrouter.mlops.sagemaker_registry import (
     ExperimentRunResult,
@@ -67,6 +80,14 @@ __all__ = [
     "ExperimentRunResult",
     "get_sagemaker_registry_adapter",
     "reset_sagemaker_registry_adapter",
+    # SageMaker scheduled retraining (RouteIQ-8a24)
+    "RetrainingPipelineAdapter",
+    "RetrainingRunResult",
+    "RetrainingStatusResult",
+    "RetrainRegisterResult",
+    "ScheduleResult",
+    "get_retraining_adapter",
+    "reset_retraining_adapter",
     # Offline eval harness (RouteIQ-8d24)
     "GoldenCase",
     "GoldenDataset",

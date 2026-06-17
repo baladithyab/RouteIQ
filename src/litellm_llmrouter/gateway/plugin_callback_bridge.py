@@ -193,11 +193,21 @@ class PluginCallbackBridge(_custom_logger_base()):  # type: ignore[misc]
         # --- Input guardrail policy evaluation (authoritative deny seam) ---
         # ALWAYS runs, regardless of self._plugins. Internal policy check makes
         # this a cheap no-op when no input guardrail policies are configured.
+        # MUST run before the (non-blocking) affinity injection so a DENY policy
+        # fails the request and never reaches the engine — affinity logic does
+        # NOT short-circuit this fail-closed seam.
         await self._evaluate_input_guardrails(model, messages, kwargs)
 
+        # --- Multinode engine-affinity passthrough (RouteIQ-bdd0 + 3316) ---
+        # Default-OFF + byte-stable: a no-op unless ROUTEIQ_MULTINODE_AFFINITY_ENABLED
+        # is set AND an affinity hint / disaggregation signal is present. Returns
+        # True only when it actually mutated kwargs, so we know to signal a kwargs
+        # replacement to litellm even on the no-plugins path.
+        affinity_mutated = await self._apply_engine_affinity(kwargs)
+
         # Preserve byte-stable behavior for the no-plugins path: only signal a
-        # kwargs replacement to litellm when plugins may have mutated it.
-        return kwargs if self._plugins else None
+        # kwargs replacement to litellm when plugins OR affinity mutated kwargs.
+        return kwargs if (self._plugins or affinity_mutated) else None
 
     async def _dispatch_pre_call_mutations(
         self, model: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]
@@ -274,6 +284,12 @@ class PluginCallbackBridge(_custom_logger_base()):  # type: ignore[misc]
                     exc_info=True,
                 )
 
+        # --- Multinode affinity recording (RouteIQ-bdd0) ---
+        # Default-OFF + best-effort: record the response_id -> deployment mapping
+        # so the NEXT turn (with previous_response_id) can be made sticky. No-op
+        # unless ROUTEIQ_MULTINODE_AFFINITY_ENABLED and a tracker is initialized.
+        await self._record_affinity(model, response_obj, kwargs)
+
         # --- Output guardrail policy evaluation ---
         await self._evaluate_output_guardrails(model, response_obj, kwargs)
 
@@ -303,6 +319,275 @@ class PluginCallbackBridge(_custom_logger_base()):  # type: ignore[misc]
                     f"Plugin '{plugin.name}' on_llm_failure failed: {e}",
                     exc_info=True,
                 )
+
+    # =========================================================================
+    # Multinode engine-affinity passthrough (RouteIQ-bdd0 + RouteIQ-3316)
+    # =========================================================================
+
+    #: Sentinel in ``kwargs['metadata']`` marking that affinity was already
+    #: applied for this request, so the deployment hook + logging hook (both of
+    #: which can fire for a CustomLogger) don't double-inject headers/params.
+    _AFFINITY_SENTINEL = "_routeiq_affinity_applied"
+
+    @classmethod
+    def _affinity_already_applied(cls, kwargs: dict[str, Any]) -> bool:
+        """True if affinity was already injected for this request (idempotency)."""
+        if not isinstance(kwargs, dict):
+            return False
+        metadata = kwargs.get("metadata")
+        return bool(isinstance(metadata, dict) and metadata.get(cls._AFFINITY_SENTINEL))
+
+    @classmethod
+    def _mark_affinity_applied(cls, kwargs: dict[str, Any]) -> None:
+        """Record that affinity ran so a paired seam / re-fire short-circuits."""
+        if not isinstance(kwargs, dict):
+            return
+        metadata = kwargs.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            kwargs["metadata"] = metadata
+        metadata[cls._AFFINITY_SENTINEL] = True
+
+    @staticmethod
+    def _request_metadata(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Merge top-level + litellm_params metadata into a single read-only view.
+
+        Affinity hints (conversation/session ids, a per-request disagg flag) may
+        ride either ``kwargs['metadata']`` or ``kwargs['litellm_params']['metadata']``
+        depending on the entry path. Reads only; never mutates either dict.
+        """
+        merged: dict[str, Any] = {}
+        lp = kwargs.get("litellm_params")
+        if isinstance(lp, dict):
+            lp_md = lp.get("metadata")
+            if isinstance(lp_md, dict):
+                merged.update(lp_md)
+        top_md = kwargs.get("metadata")
+        if isinstance(top_md, dict):
+            merged.update(top_md)
+        return merged
+
+    @classmethod
+    def _derive_affinity_key(cls, kwargs: dict[str, Any]) -> str | None:
+        """Derive a stable session/conversation affinity key from the request.
+
+        Tries, in priority order: the Responses-API ``previous_response_id``
+        (the next-turn stickiness signal recorded on the prior success), then a
+        conversation id, then a stable session id — checked at the top level of
+        ``kwargs`` and in the merged metadata view. Returns ``None`` when no
+        stable key is present (so a stateless request stays byte-stable).
+        """
+        metadata = cls._request_metadata(kwargs)
+
+        for source in (kwargs, metadata):
+            for field in (
+                "previous_response_id",
+                "conversation_id",
+                "session_id",
+                "litellm_session_id",
+            ):
+                value = source.get(field)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    @staticmethod
+    def _resolve_disagg_signals(
+        metadata: dict[str, Any],
+    ) -> tuple[bool, bool, dict[str, Any] | None]:
+        """Resolve disaggregation passthrough signals (RouteIQ-3316).
+
+        A per-request metadata flag (``do_remote_prefill`` / ``do_remote_decode``
+        / ``kv_transfer_params``) takes precedence; otherwise falls back to the
+        settings-level disagg defaults. RouteIQ makes NO disaggregation decision
+        — it only carries the signals. Returns ``(prefill, decode, params)`` with
+        only-truthy semantics so a non-disagg request resolves to all-falsy.
+        """
+        # Settings-level defaults (cheap; failure => no defaults).
+        default_prefill = False
+        default_decode = False
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            ma = get_settings().multinode_affinity
+            default_prefill = bool(ma.disagg_default_remote_prefill)
+            default_decode = bool(ma.disagg_default_remote_decode)
+        except Exception:  # pragma: no cover - settings always importable
+            pass
+
+        def _flag(name: str, default: bool) -> bool:
+            value = metadata.get(name)
+            if isinstance(value, bool):
+                return value
+            return default
+
+        prefill = _flag("do_remote_prefill", default_prefill)
+        decode = _flag("do_remote_decode", default_decode)
+
+        params = metadata.get("kv_transfer_params")
+        if not isinstance(params, dict) or not params:
+            params = None
+
+        return prefill, decode, params
+
+    async def _apply_engine_affinity(self, kwargs: dict[str, Any]) -> bool:
+        """Inject engine-affinity headers + disagg params into outbound kwargs.
+
+        Gated by ``ROUTEIQ_MULTINODE_AFFINITY_ENABLED`` (default OFF, byte-stable
+        no-op). When ON:
+
+          * Derives a session/conversation affinity key from the request and,
+            if a sticky deployment is known (via the conversation-affinity
+            tracker), injects ``x-worker-instance-id`` + ``x-routeiq-affinity-key``
+            headers so the engine front-end routes to the same decode worker
+            (RouteIQ-bdd0).
+          * Carries disaggregation-coordination signals (``do_remote_prefill`` /
+            ``do_remote_decode`` / ``kv_transfer_params``) through to the engine
+            when the request signals disagg intent (RouteIQ-3316).
+
+        NEVER clobbers a caller-supplied header/param (``apply_engine_affinity``
+        uses ``setdefault`` semantics). Idempotent: a metadata sentinel prevents
+        double-application across the deployment + logging seams.
+
+        Returns ``True`` only when it actually merged something into ``kwargs``.
+        """
+        try:
+            from litellm_llmrouter.engine_affinity import (
+                apply_engine_affinity,
+                multinode_affinity_enabled,
+            )
+
+            if not multinode_affinity_enabled():
+                return False
+            if self._affinity_already_applied(kwargs):
+                return False
+
+            affinity_key = self._derive_affinity_key(kwargs)
+
+            # Look up a sticky decode-worker hint for this affinity key.
+            worker_instance_id: str | None = None
+            if affinity_key:
+                try:
+                    from litellm_llmrouter.conversation_affinity import (
+                        get_affinity_tracker,
+                    )
+
+                    tracker = get_affinity_tracker()
+                    if tracker is not None:
+                        record = await tracker.get_affinity(affinity_key)
+                        if record is not None:
+                            # The recorded provider deployment is the sticky
+                            # decode-worker hint for the engine front-end.
+                            worker_instance_id = record.provider_deployment
+                except Exception as exc:  # tracker failure must never block
+                    logger.debug("Affinity tracker lookup skipped: %s", exc)
+
+            metadata = self._request_metadata(kwargs)
+            prefill, decode, kv_params = self._resolve_disagg_signals(metadata)
+
+            # Nothing to carry: no affinity key AND no disagg signal => no-op.
+            if not affinity_key and not (prefill or decode or kv_params):
+                return False
+
+            merged = apply_engine_affinity(
+                kwargs,
+                affinity_key=affinity_key,
+                worker_instance_id=worker_instance_id,
+                do_remote_prefill=prefill,
+                do_remote_decode=decode,
+                kv_transfer_params=kv_params,
+            )
+
+            # ``apply_engine_affinity`` returns a NEW dict; merge only the keys it
+            # added back into the LIVE kwargs (the object litellm sends), without
+            # clobbering anything already set. ``extra_headers`` is merged
+            # key-by-key so caller headers survive.
+            mutated = False
+            for key, value in merged.items():
+                if key == "extra_headers" and isinstance(value, dict):
+                    existing = kwargs.get("extra_headers")
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    before = dict(existing)
+                    for hk, hv in value.items():
+                        existing.setdefault(hk, hv)
+                    if existing != before or "extra_headers" not in kwargs:
+                        kwargs["extra_headers"] = existing
+                        if existing != before:
+                            mutated = True
+                elif key not in kwargs:
+                    kwargs[key] = value
+                    mutated = True
+
+            if mutated:
+                self._mark_affinity_applied(kwargs)
+            return mutated
+
+        except Exception as exc:  # affinity must never break the request
+            logger.debug("Engine-affinity passthrough skipped: %s", exc)
+            return False
+
+    async def _record_affinity(
+        self, model: str, response_obj: Any, kwargs: dict[str, Any]
+    ) -> None:
+        """Record the ``response_id -> deployment`` mapping for the next turn.
+
+        Gated by ``ROUTEIQ_MULTINODE_AFFINITY_ENABLED`` (default OFF). Best-effort:
+        extracts the response id from the response object and the selected
+        provider/deployment from kwargs, then awaits ``record_response`` so the
+        NEXT request carrying that id as ``previous_response_id`` can be made
+        sticky. Never raises into the success path.
+        """
+        try:
+            from litellm_llmrouter.engine_affinity import multinode_affinity_enabled
+
+            if not multinode_affinity_enabled():
+                return
+
+            from litellm_llmrouter.conversation_affinity import get_affinity_tracker
+
+            tracker = get_affinity_tracker()
+            if tracker is None:
+                return
+
+            response_id = self._extract_response_id(response_obj)
+            if not response_id:
+                return
+
+            provider_deployment = self._extract_selected_deployment(kwargs, model)
+            await tracker.record_response(response_id, provider_deployment, model)
+        except Exception as exc:  # recording must never break the success path
+            logger.debug("Affinity recording skipped: %s", exc)
+
+    @staticmethod
+    def _extract_response_id(response_obj: Any) -> str | None:
+        """Extract the response id from a LiteLLM response object.
+
+        Handles ModelResponse-like objects (``.id``) and dict responses
+        (``{"id": ...}``). Returns ``None`` when no id is present.
+        """
+        if response_obj is None:
+            return None
+        rid = getattr(response_obj, "id", None)
+        if rid is None and isinstance(response_obj, dict):
+            rid = response_obj.get("id")
+        if isinstance(rid, str) and rid:
+            return rid
+        return None
+
+    @staticmethod
+    def _extract_selected_deployment(kwargs: dict[str, Any], model: str) -> str:
+        """Resolve the selected provider/deployment string for the affinity record.
+
+        Prefers the concrete provider model in ``litellm_params['model']`` (e.g.
+        ``openai/gpt-4``); falls back to the public ``model`` alias.
+        """
+        lp = kwargs.get("litellm_params")
+        if isinstance(lp, dict):
+            provider_model = lp.get("model")
+            if isinstance(provider_model, str) and provider_model:
+                return provider_model
+        return model
 
     # =========================================================================
     # Guardrail policy evaluation

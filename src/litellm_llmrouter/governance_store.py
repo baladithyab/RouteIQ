@@ -229,8 +229,38 @@ def _org_columns(org: "OrgConfig") -> dict:
     }
 
 
+# Reserved key inside the ``governance_workspaces.metadata`` JSONB column under
+# which the per-workspace cross-account AWS fields are folded (RouteIQ-c6e9).
+# ``governance_workspaces`` has no aws_* columns, so the Aurora store previously
+# DROPPED ``aws_account_id`` / ``aws_role_arn`` / ``aws_region`` on round-trip.
+# Folding them into ``metadata`` (rather than an ALTER TABLE) keeps the migration
+# additive; they are popped back out to the top-level model fields on load so the
+# user-facing ``metadata`` dict round-trips unchanged.
+_WS_AWS_METADATA_KEY = "_routeiq_aws"
+
+
 def _workspace_columns(ws: "WorkspaceConfig") -> dict:
-    """Map a ``WorkspaceConfig`` to its ``governance_workspaces`` column dict."""
+    """Map a ``WorkspaceConfig`` to its ``governance_workspaces`` column dict.
+
+    The per-workspace cross-account AWS fields (``aws_account_id`` /
+    ``aws_role_arn`` / ``aws_region``) have no dedicated columns; they are folded
+    into the ``metadata`` JSONB under :data:`_WS_AWS_METADATA_KEY` on write and
+    restored to the top-level model fields on read (RouteIQ-c6e9) so the Aurora
+    round-trip no longer drops them. When all three are unset the metadata column
+    is byte-identical to the pre-fix output (no reserved key written).
+    """
+    metadata = dict(ws.metadata or {})
+    aws_fold = {
+        k: v
+        for k, v in (
+            ("aws_account_id", ws.aws_account_id),
+            ("aws_role_arn", ws.aws_role_arn),
+            ("aws_region", ws.aws_region),
+        )
+        if v is not None
+    }
+    if aws_fold:
+        metadata[_WS_AWS_METADATA_KEY] = aws_fold
     return {
         "workspace_id": ws.workspace_id,
         "name": ws.name,
@@ -244,8 +274,41 @@ def _workspace_columns(ws: "WorkspaceConfig") -> dict:
         "enforced_guardrails": json.dumps(ws.enforced_guardrails or []),
         "default_routing_profile": ws.default_routing_profile,
         "config_override_allowed": ws.config_override_allowed,
-        "metadata": json.dumps(ws.metadata or {}),
+        "metadata": json.dumps(metadata),
     }
+
+
+def _row_to_workspace(r: Any) -> "WorkspaceConfig":
+    """Reconstruct a ``WorkspaceConfig`` from a ``governance_workspaces`` row.
+
+    Pops the folded AWS fields out of the ``metadata`` JSONB (RouteIQ-c6e9) and
+    restores them to the top-level model fields, leaving the user-facing
+    ``metadata`` dict free of the reserved key.
+    """
+    from .governance import WorkspaceConfig
+
+    metadata = json.loads(r["metadata"]) if r["metadata"] else {}
+    aws_fold = metadata.pop(_WS_AWS_METADATA_KEY, None) or {}
+    return WorkspaceConfig(
+        workspace_id=r["workspace_id"],
+        name=r["name"],
+        org_id=r["org_id"],
+        allowed_models=json.loads(r["allowed_models"]) if r["allowed_models"] else [],
+        blocked_models=json.loads(r["blocked_models"]) if r["blocked_models"] else [],
+        max_budget_usd=r["max_budget_usd"],
+        budget_alert_threshold=r["budget_alert_threshold"],
+        max_rpm=r["max_rpm"],
+        max_tpm=r["max_tpm"],
+        enforced_guardrails=json.loads(r["enforced_guardrails"])
+        if r["enforced_guardrails"]
+        else [],
+        default_routing_profile=r["default_routing_profile"],
+        config_override_allowed=r["config_override_allowed"],
+        aws_account_id=aws_fold.get("aws_account_id"),
+        aws_role_arn=aws_fold.get("aws_role_arn"),
+        aws_region=aws_fold.get("aws_region"),
+        metadata=metadata,
+    )
 
 
 def _key_columns(kg: "KeyGovernance") -> dict:
@@ -467,35 +530,8 @@ class GovernanceStore:
     async def load_all_workspaces(self) -> list["WorkspaceConfig"]:
         if not self.enabled:
             return []
-        from .governance import WorkspaceConfig
-
         rows = await self._fetch("SELECT * FROM governance_workspaces")
-        out: list[WorkspaceConfig] = []
-        for r in rows:
-            out.append(
-                WorkspaceConfig(
-                    workspace_id=r["workspace_id"],
-                    name=r["name"],
-                    org_id=r["org_id"],
-                    allowed_models=json.loads(r["allowed_models"])
-                    if r["allowed_models"]
-                    else [],
-                    blocked_models=json.loads(r["blocked_models"])
-                    if r["blocked_models"]
-                    else [],
-                    max_budget_usd=r["max_budget_usd"],
-                    budget_alert_threshold=r["budget_alert_threshold"],
-                    max_rpm=r["max_rpm"],
-                    max_tpm=r["max_tpm"],
-                    enforced_guardrails=json.loads(r["enforced_guardrails"])
-                    if r["enforced_guardrails"]
-                    else [],
-                    default_routing_profile=r["default_routing_profile"],
-                    config_override_allowed=r["config_override_allowed"],
-                    metadata=json.loads(r["metadata"]) if r["metadata"] else {},
-                )
-            )
-        return out
+        return [_row_to_workspace(r) for r in rows]
 
     # -- Key ops ------------------------------------------------------------
 
@@ -1039,21 +1075,49 @@ def backfill_self_service_key_metadata(engine: Any) -> int:
 # Singleton
 # =============================================================================
 
-_governance_store: GovernanceStore | None = None
+_governance_store: GovernanceStore | Any | None = None
 
 
-def get_governance_store() -> GovernanceStore:
-    """Get the global governance store singleton."""
+def get_governance_store() -> GovernanceStore | Any:
+    """Get the global governance store singleton.
+
+    Backend selection (RouteIQ-a865): when ``ROUTEIQ_GOVERNANCE_BACKEND=dynamodb``
+    the single-table :class:`~litellm_llmrouter.governance_store_dynamodb.DynamoDBGovernanceStore`
+    is returned; otherwise (the default ``file`` backend) the Aurora-backed
+    :class:`GovernanceStore` is returned (byte-stable: a default deployment is
+    unchanged). Both stores expose the same CRUD + load surface, so the
+    app-lifespan hydration path is backend-agnostic. The DynamoDB store also
+    resets via its own ``reset_dynamodb_governance_store`` singleton, which
+    :func:`reset_governance_store` clears too.
+    """
     global _governance_store
     if _governance_store is None:
-        _governance_store = GovernanceStore()
+        from .governance_store_dynamodb import (
+            dynamodb_backend_enabled,
+            get_dynamodb_governance_store,
+        )
+
+        if dynamodb_backend_enabled():
+            _governance_store = get_dynamodb_governance_store()
+        else:
+            _governance_store = GovernanceStore()
     return _governance_store
 
 
 def reset_governance_store() -> None:
-    """Reset the governance store singleton (for testing)."""
+    """Reset the governance store singleton (for testing).
+
+    Also clears the DynamoDB store singleton so a backend switch between tests
+    does not leak a stale instance (RouteIQ-a865).
+    """
     global _governance_store
     _governance_store = None
+    try:
+        from .governance_store_dynamodb import reset_dynamodb_governance_store
+
+        reset_dynamodb_governance_store()
+    except Exception:  # pragma: no cover - defensive: never raise on reset
+        pass
 
 
 __all__ = [

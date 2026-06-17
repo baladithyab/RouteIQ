@@ -5,7 +5,9 @@
 
 This guide covers training, evaluating, and deploying custom LLMRouter routing models.
 
-> **Note:** The MLOps workflow in RouteIQ is currently **script-driven**. Training and deployment are triggered via external scripts or CI/CD pipelines, not by a background job running inside the gateway itself.
+> **Note:** Manual MLflow-based training (below) remains the local-dev path. For
+> **scheduled, operator-gated retraining on AWS SageMaker**, see
+> [Scheduled Retraining Loop](#scheduled-retraining-loop-sagemaker--eventbridge).
 
 ## Quick Start
 
@@ -79,7 +81,7 @@ Starting with RouteIQ v1.0, routing decisions emit a **versioned telemetry event
 
 The routing decision event is emitted as an OpenTelemetry span event with a single JSON payload attribute.
 
-**Event Name:** `routeiq.router_decision.v1`  
+**Event Name:** `routeiq.router_decision.v1`
 **Payload Key:** `routeiq.router_decision.payload`
 
 #### Schema Definition
@@ -89,14 +91,14 @@ The routing decision event is emitted as an OpenTelemetry span event with a sing
   "contract_version": "v1",
   "contract_name": "routeiq.router_decision.v1",
   "event_id": "uuid-string",
-  
+
   "trace_id": "32-hex-char-trace-id",
   "span_id": "16-hex-char-span-id",
   "parent_span_id": "16-hex-char-parent-id | null",
-  
+
   "timestamp_utc": "2024-01-15T10:30:00.000Z",
   "timestamp_unix_ms": 1705315800000,
-  
+
   "input": {
     "requested_model": "gpt-4 | null",
     "query_length": 150,
@@ -104,10 +106,10 @@ The routing decision event is emitted as an OpenTelemetry span event with a sing
     "team_id": "team-id | null",
     "request_metadata": {}
   },
-  
+
   "strategy_name": "llmrouter-knn",
   "strategy_version": "1.0.0 | null",
-  
+
   "candidate_deployments": [
     {
       "model_name": "gpt-4",
@@ -122,17 +124,17 @@ The routing decision event is emitted as an OpenTelemetry span event with a sing
       "available": true
     }
   ],
-  
+
   "selected_deployment": "gpt-4",
   "selection_reason": "highest_score",
-  
+
   "timings": {
     "total_ms": 15.5,
     "strategy_ms": 10.2,
     "embedding_ms": 3.1,
     "candidate_filter_ms": 2.2
   },
-  
+
   "outcome": {
     "status": "success | failure | fallback | no_candidates | timeout | error",
     "error_message": "null | error description",
@@ -141,14 +143,14 @@ The routing decision event is emitted as an OpenTelemetry span event with a sing
     "output_tokens": 200,
     "total_tokens": 300
   },
-  
+
   "fallback": {
     "fallback_triggered": false,
     "original_model": "null | model-name",
     "fallback_reason": "null | rate_limit | error | timeout",
     "fallback_attempt": 0
   },
-  
+
   "custom_attributes": {}
 }
 ```
@@ -364,6 +366,81 @@ Example notebooks:
 - `01_data_exploration.ipynb` - Analyze routing data
 - `02_train_knn_router.ipynb` - Train KNN router
 - `03_evaluate_routers.ipynb` - Compare router performance
+
+## Scheduled Retraining Loop (SageMaker + EventBridge)
+
+`litellm_llmrouter.mlops.retraining` (RouteIQ-8a24) closes the manual gap above
+with a **control-plane orchestration adapter** that turns the one-off training
+script into a scheduled loop:
+
+```mermaid
+flowchart LR
+    eb["EventBridge<br/>cron/rate rule"] --> start["Start SageMaker<br/>Training Job / Pipeline"]
+    start --> poll["Poll status<br/>describe_*"]
+    poll -->|Completed| reg["register_model_package<br/>(existing registry adapter)"]
+    reg --> approve["approve / promote<br/>(existing lifecycle)"]
+    start -. writes .-> s3["S3 model artifact<br/>(read by init/sidecar)"]
+```
+
+The adapter:
+
+1. **Starts a run** — `create_training_job` (`mode=training_job`) or
+   `start_pipeline_execution` (`mode=pipeline`), writing the model artifact to
+   `s3://<s3_artifact_bucket>/<s3_artifact_prefix>/...`.
+2. **Polls status** — `describe_training_job` / `describe_pipeline_execution`;
+   on `Completed`/`Succeeded` it extracts the produced `S3ModelArtifacts` URI.
+3. **Registers on success** — hands the S3 artifact to the **existing**
+   `mlops.sagemaker_registry.register_model_package`, so
+   train → register → approve → promote stays **one lifecycle**.
+4. **Schedules itself** — `build_schedule_descriptor()` returns the
+   `put_rule` + `put_targets` payloads; `put_schedule()` issues them so an
+   EventBridge cron/rate rule fires the retraining run.
+
+It is **cred-free + mockable**: the adapter takes injected boto3 `sagemaker` and
+`events` clients (unit tests pass `MagicMock`s). The methods **never raise** —
+when disabled or no client is available they return a dataclass with a `reason`.
+
+### Default OFF
+
+Live SageMaker / EventBridge calls are **operator-gated**. With
+`ROUTEIQ_MLOPS__RETRAINING__ENABLED=false` (the default) every method
+short-circuits and **no boto3 client is ever constructed**.
+
+### Environment Flags
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `ROUTEIQ_MLOPS__RETRAINING__ENABLED` | `false` | Master gate (default OFF). |
+| `ROUTEIQ_MLOPS__RETRAINING__MODE` | `training_job` | `training_job` or `pipeline`. |
+| `ROUTEIQ_MLOPS__RETRAINING__REGION` | (default chain) | AWS region for the boto3 clients. |
+| `ROUTEIQ_MLOPS__RETRAINING__TRAINING_IMAGE` | `""` | ECR training image URI. |
+| `ROUTEIQ_MLOPS__RETRAINING__ROLE_ARN` | `""` | IAM role SageMaker assumes. |
+| `ROUTEIQ_MLOPS__RETRAINING__INSTANCE_TYPE` | `ml.m5.xlarge` | Training instance type. |
+| `ROUTEIQ_MLOPS__RETRAINING__INSTANCE_COUNT` | `1` | Training instance count. |
+| `ROUTEIQ_MLOPS__RETRAINING__S3_ARTIFACT_BUCKET` | `""` | Bucket the run writes the artifact to. |
+| `ROUTEIQ_MLOPS__RETRAINING__S3_ARTIFACT_PREFIX` | `routeiq/routing-models` | Key prefix for the output. |
+| `ROUTEIQ_MLOPS__RETRAINING__S3_INPUT_URI` | `""` | Optional training input dataset URI. |
+| `ROUTEIQ_MLOPS__RETRAINING__PIPELINE_NAME` | `routeiq-routing-retrain` | SageMaker Pipeline name (pipeline mode). |
+| `ROUTEIQ_MLOPS__RETRAINING__SCHEDULE_EXPRESSION` | `rate(7 days)` | EventBridge cron/rate expression. |
+| `ROUTEIQ_MLOPS__RETRAINING__SCHEDULE_RULE_NAME` | `routeiq-routing-retrain` | EventBridge rule name. |
+
+The S3 artifact bucket/prefix flow through settings (not hardcoded) and point at
+the same location the model-artifact init/sidecar reads, so a freshly retrained
+model is registered, then promoted, then served — no manual artifact handoff.
+
+### Programmatic Use
+
+```python
+from litellm_llmrouter.mlops import get_retraining_adapter
+
+adapter = get_retraining_adapter()  # None unless ...RETRAINING__ENABLED=true
+if adapter:
+    run = adapter.start_retraining(hyperparameters={"router_type": "knn", "k": 5})
+    status = adapter.get_status(job_name=run.job_name)
+    if status.succeeded:
+        adapter.register_on_success(status=status, framework="sklearn")
+    adapter.put_schedule(target_arn="arn:aws:lambda:...:function/retrain-trigger")
+```
 
 ## CI/CD Integration
 

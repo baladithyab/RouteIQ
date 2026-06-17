@@ -1099,6 +1099,94 @@ class GovernanceSettings(BaseModel):
             "Env: ``ROUTEIQ_GOVERNANCE__BANNED_MODELS``."
         ),
     )
+    # -- Durable-store backend selection (RouteIQ-a865) ----------------------
+    # Which durable backend ``get_governance_store()`` returns. ``file``
+    # (default) keeps the file-backed in-memory + Aurora path unchanged
+    # (byte-stable); ``dynamodb`` selects the single-table DynamoDB store
+    # (``governance_store_dynamodb.DynamoDBGovernanceStore``). The DynamoDB
+    # store ALSO reads the flat ``ROUTEIQ_GOVERNANCE_BACKEND`` env directly
+    # (its ``governance_backend()`` helper) so both forms agree; this field
+    # surfaces the choice in the typed settings surface for discoverability.
+    backend: str = Field(
+        "file",
+        description=(
+            "Durable governance store backend: ``file`` (default; file-backed "
+            "in-memory + optional Aurora) or ``dynamodb`` (single-table "
+            "DynamoDB). Default ``file`` -> byte-stable. Env (flat, the source "
+            "of truth the DynamoDB store reads): ``ROUTEIQ_GOVERNANCE_BACKEND``."
+        ),
+    )
+
+
+# ============================================================================
+# Per-workspace cross-account arm synthesis (RouteIQ-c6e9) -- fresh region
+# ============================================================================
+
+
+class WorkspaceArmSynthesisSettings(BaseModel):
+    """Per-workspace cross-account Bedrock arm synthesis (RouteIQ-c6e9).
+
+    When a workspace declares an ``aws_role_arn`` (its models live in a DIFFERENT
+    AWS account), RouteIQ can synthesize per-workspace Bedrock deployment arms
+    (STS AssumeRole at call time) and merge them into the live ``model_list`` at
+    startup. Default OFF -> byte-stable no-op (no arms synthesized, the
+    operator-authored model_list is untouched).
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Synthesize per-workspace cross-account Bedrock arms (from each "
+            "registered workspace's ``aws_role_arn``) and merge them into the "
+            "live ``model_list`` at startup. Default OFF -> byte-stable no-op. "
+            "Env: ``ROUTEIQ_WORKSPACE_ARM_SYNTHESIS_ENABLED`` (flat) or "
+            "``ROUTEIQ_WORKSPACE_ARM_SYNTHESIS__ENABLED`` (nested)."
+        ),
+    )
+    default_region: Optional[str] = Field(
+        None,
+        description=(
+            "Fallback AWS region for synthesized arms when a workspace does not "
+            "carry its own ``aws_region``. Falls back to ``AWS_REGION`` resolution "
+            "in the synthesizer when unset. "
+            "Env: ``ROUTEIQ_WORKSPACE_ARM_SYNTHESIS__DEFAULT_REGION``."
+        ),
+    )
+
+
+# ============================================================================
+# AWS Secrets Manager credential vault (RouteIQ-3d33) -- fresh region
+# ============================================================================
+
+
+class SecretsVaultSettings(BaseModel):
+    """AWS Secrets Manager credential vault for provider keys (RouteIQ-3d33).
+
+    Surfaces the ``secrets_vault.SecretsVault`` backend in the typed settings
+    surface. The vault resolves ``aws-secrets://<id>[#<json-key>]`` references to
+    real provider keys at lookup time. Default OFF -> the vault is a transparent
+    pass-through (no boto3 import, no AWS call) so a default deployment is
+    byte-stable. The vault module ALSO reads the flat env vars directly so both
+    forms agree.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable the AWS Secrets Manager credential vault. When OFF (default) "
+            "``resolve()`` is a transparent pass-through (no AWS call). "
+            "Env (the source of truth the vault module reads): "
+            "``ROUTEIQ_SECRETS_VAULT_ENABLED``."
+        ),
+    )
+    region: Optional[str] = Field(
+        None,
+        description=(
+            "AWS region for the Secrets Manager client. Falls back to "
+            "``AWS_REGION`` (default ``us-east-1``) in the vault when unset. "
+            "Env: ``ROUTEIQ_SECRETS_VAULT__REGION``."
+        ),
+    )
 
 
 class MCPSettings(BaseModel):
@@ -2266,6 +2354,102 @@ class MLOpsOfflineEvalSettings(BaseModel):
     )
 
 
+class MLOpsRetrainingSettings(BaseModel):
+    """SageMaker scheduled-retraining orchestration (RouteIQ-8a24).
+
+    Turns the manual MLflow training step into an operator-gated, scheduled loop:
+    an EventBridge cron/rate rule triggers a SageMaker Training Job / Pipeline
+    execution that writes the routing-model artifact to S3; on success the
+    produced artifact is handed to the EXISTING SageMaker Model Registry adapter
+    (``settings.mlops.sagemaker``) so train -> register -> approve -> promote
+    stays one lifecycle.
+
+    Cred-free + mockable: the adapter takes injected boto3 sagemaker + events
+    clients, so unit tests pass mocks and never touch AWS.
+
+    Default OFF: live SageMaker / EventBridge calls are operator-gated.  With
+    ``enabled=False`` the adapter's start/poll/register/schedule methods
+    short-circuit and never construct a boto3 client.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable SageMaker scheduled-retraining orchestration. Live SageMaker "
+            "/ EventBridge calls are operator-gated; default off."
+        ),
+    )
+    mode: str = Field(
+        "training_job",
+        description=(
+            "Retraining run mode: 'training_job' (create_training_job) or "
+            "'pipeline' (start_pipeline_execution)."
+        ),
+    )
+    region: str = Field(
+        "",
+        description="AWS region for the boto3 clients (empty => default chain).",
+    )
+    training_image: str = Field(
+        "",
+        description="ECR image URI for the training container (training_job mode).",
+    )
+    role_arn: str = Field(
+        "",
+        description="IAM role ARN SageMaker assumes for the retraining run.",
+    )
+    instance_type: str = Field(
+        "ml.m5.xlarge",
+        description="Training instance type (training_job mode).",
+    )
+    instance_count: int = Field(
+        1,
+        description="Number of training instances (training_job mode).",
+    )
+    volume_size_gb: int = Field(
+        30,
+        description="Training EBS volume size in GB (training_job mode).",
+    )
+    max_runtime_seconds: int = Field(
+        86400,
+        description="Max training-job runtime in seconds before SageMaker stops it.",
+    )
+    s3_artifact_bucket: str = Field(
+        "",
+        description=(
+            "S3 bucket the retraining run writes the model artifact to (the same "
+            "location the model-artifact init/sidecar reads). Empty => no output."
+        ),
+    )
+    s3_artifact_prefix: str = Field(
+        "routeiq/routing-models",
+        description="S3 key prefix under the artifact bucket for the model output.",
+    )
+    s3_input_uri: str = Field(
+        "",
+        description="Optional S3 URI of the training input dataset channel.",
+    )
+    pipeline_name: str = Field(
+        "routeiq-routing-retrain",
+        description="SageMaker Pipeline name (pipeline mode).",
+    )
+    schedule_expression: str = Field(
+        "rate(7 days)",
+        description=(
+            "EventBridge cron/rate expression for the retraining schedule rule "
+            "(e.g. 'rate(7 days)' or 'cron(0 3 ? * SUN *)')."
+        ),
+    )
+    schedule_rule_name: str = Field(
+        "routeiq-routing-retrain",
+        description="EventBridge rule name for the retraining schedule.",
+    )
+    job_name_prefix: str = Field(
+        "routeiq-routing-retrain",
+        description="Prefix for auto-generated SageMaker training-job names.",
+    )
+
+
 class MLOpsSettings(BaseModel):
     """MLOps closed-loop configuration (Cluster H + Cluster M).
 
@@ -2317,6 +2501,10 @@ class MLOpsSettings(BaseModel):
     failure_capture: MLOpsFailureCaptureSettings = Field(
         default_factory=MLOpsFailureCaptureSettings,  # type: ignore[arg-type]
         description="Low-rate failure/timeout-path eval sample capture.",
+    )
+    retraining: MLOpsRetrainingSettings = Field(
+        default_factory=MLOpsRetrainingSettings,  # type: ignore[arg-type]
+        description="SageMaker scheduled-retraining orchestration (RouteIQ-8a24).",
     )
 
 
@@ -2804,6 +2992,55 @@ class EngineMetricsSettings(BaseModel):
     )
 
 
+class MultinodeAffinitySettings(BaseModel):
+    """Multinode engine-affinity passthrough configuration (default OFF).
+
+    Drives the LIVE wiring of :mod:`litellm_llmrouter.engine_affinity` +
+    :mod:`litellm_llmrouter.conversation_affinity` into the request path via
+    :class:`~litellm_llmrouter.gateway.plugin_callback_bridge.PluginCallbackBridge`
+    (RouteIQ-bdd0 + RouteIQ-3316). When enabled, the bridge's deployment hook
+    derives a session/conversation affinity key from the request, looks up a
+    sticky decode-worker hint, and injects ``x-worker-instance-id`` /
+    ``x-routeiq-affinity-key`` headers so a multi-turn conversation lands on the
+    same disaggregated decode worker; the success hook records the
+    ``response_id -> deployment`` mapping for the next turn.
+
+    Default DISABLED (opt-in). With ``enabled=False`` the bridge's affinity logic
+    is a byte-stable no-op: no tracker lookups, no header injection, no recording.
+
+    The master enable flag is the EXISTING ``ROUTEIQ_MULTINODE_AFFINITY_ENABLED``
+    env var, read by :func:`engine_affinity.multinode_affinity_enabled` (the
+    single source of truth for the gate); this nested model adds only the
+    disaggregation-default sub-flag.
+
+    Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix):
+    ``ROUTEIQ_MULTINODE_AFFINITY__DISAGG_DEFAULT_REMOTE_DECODE``,
+    ``ROUTEIQ_MULTINODE_AFFINITY__DISAGG_DEFAULT_REMOTE_PREFILL``.
+    """
+
+    disagg_default_remote_decode: bool = Field(
+        False,
+        description=(
+            "RouteIQ-3316: when set, every request (under the master "
+            "ROUTEIQ_MULTINODE_AFFINITY_ENABLED gate) carries do_remote_decode=true "
+            "to the engine as a forward-compat disaggregation-coordination "
+            "passthrough. RouteIQ makes NO disaggregation decision -- it only "
+            "carries the signal. Default OFF (byte-stable: non-disagg requests add "
+            "zero params). A per-request metadata flag overrides this default."
+        ),
+    )
+    disagg_default_remote_prefill: bool = Field(
+        False,
+        description=(
+            "RouteIQ-3316: when set, every request (under the master "
+            "ROUTEIQ_MULTINODE_AFFINITY_ENABLED gate) carries do_remote_prefill=true "
+            "to the engine as a forward-compat disaggregation-coordination "
+            "passthrough. Default OFF (byte-stable). A per-request metadata flag "
+            "overrides this default."
+        ),
+    )
+
+
 # ============================================================================
 # Custom env source -- comma-separated coercion for documented list fields
 # ============================================================================
@@ -3055,6 +3292,22 @@ class GatewaySettings(BaseSettings):
         default_factory=GovernanceSettings,  # type: ignore[arg-type]
         description="Workspace/key governance budget + rate-limit settings.",
     )
+    # Per-workspace cross-account arm synthesis (RouteIQ-c6e9; default off).
+    workspace_arm_synthesis: WorkspaceArmSynthesisSettings = Field(
+        default_factory=WorkspaceArmSynthesisSettings,  # type: ignore[arg-type]
+        description=(
+            "Per-workspace cross-account Bedrock arm synthesis settings "
+            "(RouteIQ-c6e9; default off / byte-stable)."
+        ),
+    )
+    # AWS Secrets Manager credential vault (RouteIQ-3d33; default off).
+    secrets_vault: SecretsVaultSettings = Field(
+        default_factory=SecretsVaultSettings,  # type: ignore[arg-type]
+        description=(
+            "AWS Secrets Manager credential vault settings (RouteIQ-3d33; "
+            "default off / pass-through)."
+        ),
+    )
     mcp: MCPSettings = Field(
         default_factory=MCPSettings,  # type: ignore[arg-type]
         description="MCP gateway settings.",
@@ -3082,6 +3335,10 @@ class GatewaySettings(BaseSettings):
     conversation_affinity: ConversationAffinitySettings = Field(
         default_factory=ConversationAffinitySettings,  # type: ignore[arg-type]
         description="Conversation routing affinity settings.",
+    )
+    multinode_affinity: MultinodeAffinitySettings = Field(
+        default_factory=MultinodeAffinitySettings,  # type: ignore[arg-type]
+        description="Multinode engine-affinity passthrough settings (RouteIQ-bdd0/3316).",
     )
     plugins: PluginSettings = Field(
         default_factory=PluginSettings,  # type: ignore[arg-type]
@@ -3287,6 +3544,57 @@ class GatewaySettings(BaseSettings):
                     data["otel"] = current.model_copy(
                         update={"endpoint": otlp_endpoint}
                     )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_flat_cluster_w2_aliases(cls, data: Any) -> Any:
+        """Map cluster-W2 flat env vars onto their nested settings fields.
+
+        pydantic-settings won't resolve a flat top-level env var onto a nested
+        ``BaseModel`` field, so (mirroring ``_map_flat_iam_aliases``) inject the
+        flat values here, before validation. All DEFAULT OFF / unset, so the
+        default path is byte-stable.
+
+        * ``ROUTEIQ_GOVERNANCE_BACKEND`` (RouteIQ-a865) -> ``governance.backend``
+        * ``ROUTEIQ_WORKSPACE_ARM_SYNTHESIS_ENABLED`` (RouteIQ-c6e9) ->
+          ``workspace_arm_synthesis.enabled``
+        * ``ROUTEIQ_SECRETS_VAULT_ENABLED`` (RouteIQ-3d33) ->
+          ``secrets_vault.enabled``
+
+        The nested ``ROUTEIQ_<SECTION>__<FIELD>`` form WINS if both are set.
+        """
+        import os as _os
+
+        def _truthy(value: Any) -> bool:
+            return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+        if not isinstance(data, dict):
+            return data
+
+        def _set_nested(section: str, field: str, value: Any) -> None:
+            current = data.get(section)
+            if current is None:
+                data[section] = {field: value}
+            elif isinstance(current, dict):
+                current.setdefault(field, value)
+            elif isinstance(current, BaseModel):
+                # Only fill when the field is still at its falsy default.
+                if not getattr(current, field, None):
+                    data[section] = current.model_copy(update={field: value})
+
+        backend = _os.environ.get("ROUTEIQ_GOVERNANCE_BACKEND")
+        if backend:
+            _set_nested("governance", "backend", backend.strip().lower())
+
+        arm_enabled = _os.environ.get("ROUTEIQ_WORKSPACE_ARM_SYNTHESIS_ENABLED")
+        if arm_enabled is not None and _truthy(arm_enabled):
+            _set_nested("workspace_arm_synthesis", "enabled", True)
+
+        vault_enabled = _os.environ.get("ROUTEIQ_SECRETS_VAULT_ENABLED")
+        if vault_enabled is not None and _truthy(vault_enabled):
+            _set_nested("secrets_vault", "enabled", True)
+
         return data
 
     @field_validator("litellm_master_key")

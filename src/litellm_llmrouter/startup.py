@@ -425,6 +425,99 @@ def merge_bedrock_discovered_models(
         return 0
 
 
+def merge_workspace_arm_synthesis(*, default_region: Optional[str] = None) -> int:
+    """Synthesize per-workspace cross-account Bedrock arms into the model_list.
+
+    LEADER- and flag-gated LIVE caller (RouteIQ-c6e9) for the previously-dark
+    :func:`governance.synthesize_workspace_arms`. Called from the lifespan AFTER
+    :func:`merge_bedrock_discovered_models` so workspace-specific cross-account
+    arms layer on top of the discovered/base catalogue.
+
+    For every registered workspace carrying an ``aws_role_arn`` (its models live
+    in a DIFFERENT AWS account), this builds one ``litellm_params``-shaped arm per
+    concrete allowed model (STS AssumeRole at call time) and APPENDS them to
+    ``llm_router.model_list``, rebuilding the Router's deployment indices via
+    ``set_model_list`` so the new arms are routable.
+
+    Behaviour:
+
+    * **Disabled (default)** -> byte-stable no-op (the model_list is untouched).
+    * **Non-leader replica** -> skips synthesis (a no-op) so only the leader
+      mutates the shared catalogue.
+    * **enabled + a workspace with ``aws_role_arn``** -> per-workspace arms are
+      appended.
+
+    ``default_region`` (the fallback region for a workspace lacking its own
+    ``aws_region``) is injectable so tests stay credential-free. Returns the
+    number of arms merged (0 when disabled, non-leader, or nothing to synthesize)
+    and never raises.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().workspace_arm_synthesis
+        if not getattr(cfg, "enabled", False):
+            return 0
+
+        if not _discovery_is_leader():
+            logger.debug("Workspace arm synthesis: not leader, skipping")
+            return 0
+
+        region = default_region or getattr(cfg, "default_region", None)
+
+        from litellm_llmrouter.governance import (
+            get_governance_engine,
+            synthesize_workspace_arms,
+        )
+
+        gov = get_governance_engine()
+        workspaces = gov.list_workspaces()
+        arms: list[dict] = []
+        for ws in workspaces:
+            arms.extend(synthesize_workspace_arms(ws, default_region=region))
+        if not arms:
+            return 0
+
+        # Wrap each synthesized litellm_params arm in a model_list entry. The
+        # model_name is the workspace-scoped logical model so a request for that
+        # workspace's model routes through the cross-account credentials.
+        entries = [
+            {
+                "model_name": arm["model"].removeprefix("bedrock/"),
+                "litellm_params": arm,
+            }
+            for arm in arms
+        ]
+
+        try:
+            from litellm.proxy.proxy_server import llm_router
+        except ImportError:
+            logger.warning(
+                "Workspace arm synthesis: llm_router unavailable; %d arms not merged",
+                len(entries),
+            )
+            return 0
+        if llm_router is None:
+            logger.warning(
+                "Workspace arm synthesis: Router not initialised; %d arms not merged",
+                len(entries),
+            )
+            return 0
+
+        existing = list(getattr(llm_router, "model_list", None) or [])
+        llm_router.set_model_list(existing + entries)
+        logger.info(
+            "Workspace arm synthesis: merged %d cross-account arm(s) for %d "
+            "workspace(s)",
+            len(entries),
+            len(workspaces),
+        )
+        return len(entries)
+    except Exception as exc:  # never block boot on synthesis
+        logger.warning("Workspace arm synthesis skipped/failed: %s", exc)
+        return 0
+
+
 def run_catalogue_drift_check(
     *,
     settings: Optional["BedrockDiscoverySettings"] = None,

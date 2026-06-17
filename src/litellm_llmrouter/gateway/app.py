@@ -747,6 +747,27 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("LiteLLM initialization failed: %s", exc)
 
+    # 0a1. Initialize the AWS Secrets Manager credential vault (RouteIQ-3d33).
+    #      DEFAULT-OFF: constructing the singleton reads the enablement flag but
+    #      builds NO boto3 client and issues NO AWS call until something actually
+    #      resolves an ``aws-secrets://`` reference, so a default deployment is
+    #      byte-stable (no client, no call). This makes the vault available + the
+    #      opt-in ``resolve()`` hook reachable cluster-wide; the full migration of
+    #      the scattered ``os.getenv`` provider-key lookups is a separate seed.
+    try:
+        from ..secrets_vault import get_secrets_vault
+
+        vault = get_secrets_vault()
+        if vault.enabled:
+            logger.info(
+                "Secrets Manager credential vault ENABLED "
+                "(aws-secrets:// references will resolve at lookup time)"
+            )
+        else:
+            logger.debug("Secrets Manager credential vault disabled (default)")
+    except Exception as exc:  # never block boot on the vault
+        logger.warning("Secrets vault init skipped/failed (non-fatal): %s", exc)
+
     # 0a2. Bedrock auto-discovery -> merge synthesized arms into the live
     #      model_list BEFORE the routing strategy is installed (RouteIQ-c417).
     #      Leader- and flag-gated: default-off => byte-stable no-op (the
@@ -871,6 +892,61 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
     except Exception as exc:
         logger.warning("Failed to load persisted governance state: %s", exc)
+
+    # 3c. One-time legacy self-service key backfill (RouteIQ-a433).
+    #     Legacy self-service keys created before the hashed-secret migration
+    #     stored the RAW api_key as the governance key_id and carried no
+    #     public_id/secret_hash/masked -- so the user portal LEAKS the secret as
+    #     the addressable id. The idempotent backfill stamps the three missing
+    #     fields. Guard: only run when a DURABLE store is enabled (so the stamped
+    #     rows are persisted, not lost on the next pod restart); the in-memory /
+    #     JSON-only deployment re-derives nothing durable so there is nothing to
+    #     migrate. Never raises (defensive -- a backfill blip must not block boot).
+    try:
+        from ..governance import get_governance_engine
+        from ..governance_store import (
+            backfill_self_service_key_metadata,
+            get_governance_store,
+        )
+
+        store = get_governance_store()
+        if getattr(store, "enabled", False):
+            gov = get_governance_engine()
+            backfilled = backfill_self_service_key_metadata(gov)
+            if backfilled:
+                # Persist the stamped rows through the same durable store the
+                # CRUD path uses so the migration survives pod churn.
+                for kg in list(getattr(gov, "_key_governance", {}).values()):
+                    metadata = getattr(kg, "metadata", None)
+                    if isinstance(metadata, dict) and metadata.get("self_service"):
+                        await store.upsert_key(kg)
+                logger.info(
+                    "Self-service key backfill: migrated + persisted %d legacy row(s)",
+                    backfilled,
+                )
+    except Exception as exc:  # never block boot on the backfill
+        logger.warning("Self-service key backfill skipped/failed: %s", exc)
+
+    # 3d. Per-workspace cross-account arm synthesis (RouteIQ-c6e9). Runs AFTER
+    #     governance hydration (step 3b) so the registered workspaces exist, and
+    #     conceptually after the Bedrock discovery merge (step 0a2) -- workspace
+    #     cross-account arms layer on top of the discovered/base catalogue. For
+    #     each workspace carrying an ``aws_role_arn`` (its models live in a
+    #     DIFFERENT AWS account) the synthesizer appends per-model STS-AssumeRole
+    #     arms to the live model_list (set_model_list rebuilds the Router indices
+    #     so they are routable). Leader- and flag-gated: default-off => byte-stable
+    #     no-op; never raises.
+    try:
+        from ..startup import merge_workspace_arm_synthesis
+
+        synthesized = merge_workspace_arm_synthesis()
+        if synthesized:
+            logger.info(
+                "Workspace arm synthesis merged %d cross-account arm(s)",
+                synthesized,
+            )
+    except Exception as exc:  # never block boot on synthesis
+        logger.warning("Workspace arm synthesis skipped/failed (non-fatal): %s", exc)
 
     # 4. Service discovery (informational only, never blocks startup)
     await _probe_services()
