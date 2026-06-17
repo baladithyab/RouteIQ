@@ -108,6 +108,30 @@ See [Routing Strategies](../features/routing.md) for the full list and configura
 | `ROUTEIQ_ADMIN_UI_ENABLED` | `false` | Enable admin UI |
 | `ROUTEIQ_OIDC_ENABLED` | `false` | Enable OIDC/SSO |
 
+### AWS Infra / Governance (default-off)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTEIQ_SCIM_ENABLED` | `false` | Expose the SCIM v2 provisioning router (`/scim/v2/Users`, `/scim/v2/Groups`). Bearer-token protected (RouteIQ-b8a2) |
+| `ROUTEIQ_SCIM_BEARER_TOKEN` | (unset) | Bearer token SCIM clients must present; fail-closed (401s) when unset |
+| `ROUTEIQ_KEY_ROTATION_ENABLED` | `false` | Enable scheduled API-key auto-rotation for keys with `metadata.auto_rotate` (RouteIQ-b8a2) |
+| `ROUTEIQ_KEY_ROTATION_MAX_AGE_SECONDS` | `7776000` | Max key age (90d) before auto-rotation |
+| `ROUTEIQ_SECRETS_VAULT_ENABLED` | `false` | Resolve `aws-secrets://<id>[#<key>]` provider keys from AWS Secrets Manager (RouteIQ-3d33) |
+| `ROUTEIQ_GOVERNANCE_BACKEND` | `file` | Governance store backend: `file` (default) or `dynamodb` (RouteIQ-a865) |
+| `ROUTEIQ_GOVERNANCE_DDB_TABLE` | `routeiq-governance` | DynamoDB table name when the DynamoDB backend is selected |
+| `ROUTEIQ_LOG_ARCHIVAL_ENABLED` | `false` | Archive full request/response logs to S3 (lifecycle-tiered, RouteIQ-6702) |
+| `ROUTEIQ_LOG_ARCHIVAL_BUCKET` | (unset) | Target S3 bucket; archival fails closed to no-op when unset |
+| `ROUTEIQ_LOG_ARCHIVAL_PREFIX` | `logs` | Key prefix; objects land under `<prefix>/dt=YYYY/MM/DD/HH/<id>.json` |
+| `ROUTEIQ_LOG_ARCHIVAL_TIER` | `STANDARD` | S3 storage-class hint (`STANDARD`/`STANDARD_IA`/`GLACIER`/`DEEP_ARCHIVE`/`INTELLIGENT_TIERING`) |
+| `ROUTEIQ_LEADER_DRAIN_HANDOFF` | `false` | Release HA leadership on voluntary drain/SIGTERM so a peer takes over immediately (RouteIQ-8387) |
+| `ROUTEIQ_MULTINODE_AFFINITY_ENABLED` | `false` | Propagate session/conversation affinity + disagg prefill/decode signals to the engine arm (RouteIQ-bdd0/3316) |
+| `BEDROCK_GUARDRAIL_REGION` | (unset) | Region the Bedrock guardrail lives in, when different from `AWS_REGION` (cross-region, RouteIQ-3024) |
+| `BEDROCK_GUARDRAIL_ROLE_ARN` | (unset) | IAM role to STS-assume so the guardrail can live in a different account (cross-account, RouteIQ-3024) |
+
+CDK context flags (default-off, byte-stable): `routeiq:enable_gitops_pipeline`,
+`routeiq:enable_sagemaker_retraining` (RouteIQ-8a24). Helm: `gitops.enabled`
+renders an ArgoCD `Application` / Flux `Kustomization` (RouteIQ-eb77).
+
 ## Hot Reload
 
 Enable config hot-reload to pick up changes without restarting:

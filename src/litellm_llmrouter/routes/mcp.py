@@ -28,6 +28,93 @@ from . import admin_router, llmrouter_router, handle_audit_write
 
 
 # =============================================================================
+# Caller access-group resolution (RouteIQ-2fa1)
+# =============================================================================
+
+
+def _coerce_access_groups(raw) -> list[str]:
+    """Normalise an access-group claim (list or CSV string) to a clean list."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [g.strip() for g in raw.split(",") if g.strip()]
+    try:
+        return [str(g).strip() for g in raw if str(g).strip()]
+    except TypeError:
+        return []
+
+
+def _get_attr_or_item(obj, key):
+    """Read ``key`` from a dict (item) or an object (attribute)."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _access_groups_from_key_governance(key_id: str | None) -> list[str]:
+    """Resolve a key's MCP access groups from its governance record.
+
+    Looks up the live :class:`KeyGovernance` record for ``key_id`` and reads
+    ``metadata['mcp_access_groups']`` (list or CSV). Returns an empty list when
+    governance is unavailable, the key is unknown, or no groups are configured
+    -- a fail-safe that, under enforcement, denies a gated tool to a key with no
+    declared groups. Never raises.
+    """
+    if not key_id:
+        return []
+    try:
+        from ..governance import get_governance_engine
+
+        kg = get_governance_engine().get_key_governance(key_id)
+        if kg is None:
+            return []
+        meta = getattr(kg, "metadata", None) or {}
+        return _coerce_access_groups(meta.get("mcp_access_groups"))
+    except Exception:
+        return []
+
+
+def _extract_caller_access_groups(rbac_info: dict) -> list[str]:
+    """Resolve the access groups the authenticated caller belongs to (RouteIQ-2fa1).
+
+    The groups gate which access-group-restricted MCP tools the caller may
+    invoke. Resolution covers BOTH auth tiers reaching this admin-gated route:
+
+    * **user keys** -- read from the LiteLLM key/user metadata on
+      ``rbac_info['user_info']`` (dict or ``UserAPIKeyAuth`` object) under
+      ``mcp_access_groups`` (direct or nested in ``metadata``);
+    * **admin keys** -- read from the key's governance record
+      (``KeyGovernance.metadata['mcp_access_groups']``), keyed by the admin key.
+
+    Accepts a list or comma-separated string. Returns an empty list when the
+    caller declares no groups (a non-member, which enforcement rejects for a
+    gated tool). There is NO blanket admin bypass: enforcement is opt-in
+    (default OFF -> byte-stable), and when ON every key is gated by its own
+    declared groups.
+    """
+    # User tier: metadata carried on the authed user_info.
+    user_info = rbac_info.get("user_info")
+    if user_info is not None:
+        raw = _get_attr_or_item(user_info, "mcp_access_groups")
+        if raw is None:
+            raw = _get_attr_or_item(
+                _get_attr_or_item(user_info, "metadata"), "mcp_access_groups"
+            )
+        groups = _coerce_access_groups(raw)
+        if groups:
+            return groups
+        # Fall through to governance lookup keyed by the user's api_key.
+        return _access_groups_from_key_governance(
+            _get_attr_or_item(user_info, "api_key")
+        )
+
+    # Admin tier: groups come from the admin key's governance record.
+    return _access_groups_from_key_governance(rbac_info.get("admin_key"))
+
+
+# =============================================================================
 # MCP Gateway Endpoints
 # =============================================================================
 
@@ -484,8 +571,18 @@ async def call_mcp_tool(
         )
 
     try:
+        # RouteIQ-2fa1: plumb the authed caller's access groups into the LIVE
+        # invocation so MCPGateway's access-group enforcement seam actually gates
+        # this HTTP entrypoint. A key lacking a required group is rejected (403)
+        # below. Enforcement is opt-in (default OFF -> byte-stable no-op).
+        caller_access_groups = _extract_caller_access_groups(rbac_info)
+
         # Invoke the tool
-        result = await gateway.invoke_tool(request.tool_name, request.arguments)
+        result = await gateway.invoke_tool(
+            request.tool_name,
+            request.arguments,
+            caller_access_groups=caller_access_groups,
+        )
 
         if not result.success:
             # Check for specific error codes in the error message
@@ -495,6 +592,24 @@ async def call_mcp_tool(
                     status_code=501,
                     detail={
                         "error": "tool_invocation_disabled",
+                        "message": error_msg.split(":", 1)[1].strip(),
+                        "request_id": request_id,
+                    },
+                )
+            if error_msg.startswith("access_denied:"):
+                # Access-group enforcement rejected this caller (RouteIQ-2fa1).
+                await handle_audit_write(
+                    AuditAction.MCP_TOOL_CALL,
+                    "mcp_tool",
+                    request.tool_name,
+                    AuditOutcome.DENIED,
+                    rbac_info,
+                    request_id,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "access_denied",
                         "message": error_msg.split(":", 1)[1].strip(),
                         "request_id": request_id,
                     },

@@ -85,10 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     # --- target ---
+    # NOT required at the argparse level: ``--dry-run`` short-circuits before any
+    # network call, so it needs no target. ``main()`` enforces --base-url for a
+    # real (non-dry-run) run instead, so an operator can preview the 10k plan with
+    # just ``routeiq-stress --dry-run`` (RouteIQ-3b18).
     p.add_argument(
         "--base-url",
-        required=True,
-        help="RouteIQ gateway base URL, e.g. http://localhost:4000.",
+        default=None,
+        help="RouteIQ gateway base URL, e.g. http://localhost:4000. "
+        "Required for a real run; OPTIONAL under --dry-run (no network call).",
     )
     p.add_argument(
         "--token",
@@ -216,7 +221,7 @@ def _print_dry_run(args: argparse.Namespace) -> None:
     )
     total_requests = sum(plan.values()) + conv_plan["total_turns"]
     print("=== routeiq-stress DRY RUN (no requests fired) ===")
-    print(f"base-url          : {args.base_url}")
+    print(f"base-url          : {args.base_url or '<unset> (dry-run needs none)'}")
     print(f"model field       : {args.model}")
     print(f"single-turn reqs  : {args.num_requests}")
     print(
@@ -372,10 +377,16 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.dry_run:
         _print_dry_run(args)
         return 0
+    # A real run MUST have a target. --base-url is optional at the argparse level
+    # (so --dry-run needs no target) but is enforced here for the network path
+    # (RouteIQ-3b18).
+    if not args.base_url:
+        parser.error("--base-url is required (unless --dry-run).")
     return run(args)
 
 

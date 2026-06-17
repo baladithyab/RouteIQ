@@ -275,6 +275,87 @@ A2A_TASK_TTL_SECONDS, A2A_TASK_STORE_MAX_TASKS, A2A_TASK_RATE_LIMIT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# AgentCore Memory / Identity persistence (RouteIQ-60e7)
+# ---------------------------------------------------------------------------
+
+
+def _agentcore_memory_enabled() -> bool:
+    """Whether to persist A2A invocations into AgentCore Memory (default OFF)."""
+    env = os.getenv("A2A_AGENTCORE_MEMORY_ENABLED")
+    if env is not None:
+        return env.strip().lower() in ("true", "1", "yes", "on")
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return bool(get_settings().a2a.agentcore_memory_enabled)
+    except Exception:
+        return False
+
+
+def _get_agentcore_plugin():
+    """Resolve the live bedrock-agentcore-mcp plugin instance, or None.
+
+    Iterates the started plugin manager looking for the plugin whose metadata
+    name is ``bedrock-agentcore-mcp``. Returns None when plugins are not loaded
+    or the plugin is absent. Never raises.
+    """
+    try:
+        from litellm_llmrouter.gateway.plugin_manager import get_plugin_manager
+
+        manager = get_plugin_manager()
+        for plugin in manager.plugins:
+            try:
+                if getattr(plugin.metadata, "name", "") == "bedrock-agentcore-mcp":
+                    return plugin
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+async def persist_a2a_event_to_agentcore(
+    agent_id: str,
+    session_id: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Persist one A2A agent/conversation event into AgentCore Memory.
+
+    Gated (RouteIQ-60e7): a no-op returning ``False`` when A2A AgentCore memory
+    persistence is disabled (the default) OR the bedrock-agentcore-mcp plugin is
+    absent / its Memory surface is itself disabled. When enabled and wired, calls
+    the plugin's ``memory_put_event`` (CreateEvent) with the agent as ``actorId``
+    and the A2A task/session as ``sessionId``. Best-effort / fail-open: any error
+    is swallowed so a memory hiccup never fails the agent invocation.
+
+    Returns True only when the event was actually persisted.
+    """
+    if not _agentcore_memory_enabled():
+        return False
+    plugin = _get_agentcore_plugin()
+    if plugin is None:
+        return False
+    put_event = getattr(plugin, "memory_put_event", None)
+    if not callable(put_event):
+        return False
+    try:
+        if hasattr(plugin, "is_memory_enabled") and not plugin.is_memory_enabled():
+            return False
+        await put_event(actor_id=agent_id, session_id=session_id, payload=payload)
+        verbose_proxy_logger.info(
+            "A2A: persisted agent '%s' event to AgentCore Memory", agent_id
+        )
+        return True
+    except Exception as exc:  # fail-open: never break the invocation
+        verbose_proxy_logger.warning(
+            "A2A: AgentCore memory persist skipped/failed for '%s': %s",
+            agent_id,
+            exc,
+        )
+        return False
+
+
 class TaskState(str, Enum):
     """A2A task lifecycle states per the A2A specification."""
 
@@ -1163,6 +1244,20 @@ class A2AGateway:
                 # Embed task info in the response result
                 if resp.result is not None and isinstance(resp.result, dict):
                     resp.result["_task"] = task.to_dict()
+
+                # RouteIQ-60e7: persist the agent/conversation turn into AgentCore
+                # Memory (gated, default OFF -> no-op). Uses the A2A task id as the
+                # session id so a conversation's turns share a memory session.
+                # Fail-open: never disturbs the response.
+                if resp.error is None:
+                    await persist_a2a_event_to_agentcore(
+                        agent_id=agent_id,
+                        session_id=task.id,
+                        payload={
+                            "request": forwarded_request.to_dict(),
+                            "result": resp.result,
+                        },
+                    )
                 return resp
 
         except httpx.TimeoutException:

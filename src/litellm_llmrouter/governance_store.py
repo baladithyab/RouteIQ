@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from litellm._logging import verbose_proxy_logger
 
@@ -964,6 +964,78 @@ class GovernanceStore:
 
 
 # =============================================================================
+# One-time legacy self-service key backfill (RouteIQ-a433)
+# =============================================================================
+
+
+def _mask_legacy_secret(secret: str) -> str:
+    """Non-secret preview of a plaintext key (prefix + last-4).
+
+    Mirrors the user-portal ``_mask_secret`` so a backfilled row's ``masked``
+    preview is byte-identical to one a freshly-created key would carry.
+    """
+    last4 = secret[-4:] if len(secret) >= 4 else ""
+    return f"sk-rq-...{last4}"
+
+
+def backfill_self_service_key_metadata(engine: Any) -> int:
+    """Backfill legacy self-service keys to the hashed-secret schema.
+
+    Self-service keys created before the hashed-secret migration stored the raw
+    api_key as the governance ``key_id`` and carried no ``public_id`` /
+    ``secret_hash`` / ``masked`` in ``metadata``. The user portal falls back to
+    the raw ``key_id`` as the public id for those rows -- which LEAKS the secret
+    as the addressable id. This one-time, idempotent backfill stamps the three
+    missing fields so legacy rows match the current schema:
+
+      * ``public_id``   -- a fresh non-secret ``kid_<token>`` id
+      * ``secret_hash`` -- SHA-256 of the raw secret (the legacy ``key_id``)
+      * ``masked``      -- the ``sk-rq-...<last4>`` preview
+
+    A row is a backfill candidate when ``metadata.self_service`` is truthy and
+    ``metadata.public_id`` is absent. Rows already carrying a ``public_id`` (new
+    schema) and non-self-service rows are left untouched, so running this twice
+    is a no-op (idempotent). Operates purely on the in-memory engine state; the
+    caller persists via the engine's normal save path (file/durable store).
+
+    Returns the number of rows backfilled (0 when nothing matched).
+    """
+    import hashlib
+    import secrets as _secrets
+
+    key_governance = getattr(engine, "_key_governance", None)
+    if not key_governance:
+        return 0
+
+    count = 0
+    for kg in list(key_governance.values()):
+        metadata = getattr(kg, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        if not metadata.get("self_service"):
+            continue
+        if metadata.get("public_id"):
+            continue  # already migrated -> idempotent skip
+
+        raw_secret = str(getattr(kg, "key_id", "") or "")
+        metadata["public_id"] = f"kid_{_secrets.token_urlsafe(12)}"
+        metadata["secret_hash"] = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
+        metadata["masked"] = _mask_legacy_secret(raw_secret)
+        count += 1
+        verbose_proxy_logger.info(
+            "Backfilled legacy self-service key %s -> public_id=%s",
+            raw_secret[:6] + "..." if raw_secret else "?",
+            metadata["public_id"],
+        )
+
+    if count:
+        verbose_proxy_logger.info(
+            "Self-service key backfill: migrated %d legacy row(s)", count
+        )
+    return count
+
+
+# =============================================================================
 # Singleton
 # =============================================================================
 
@@ -990,4 +1062,5 @@ __all__ = [
     "GovernanceStore",
     "get_governance_store",
     "reset_governance_store",
+    "backfill_self_service_key_metadata",
 ]

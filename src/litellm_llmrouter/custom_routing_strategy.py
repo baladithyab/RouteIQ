@@ -239,6 +239,18 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         # 1. Amplification guard
         self._check_amplification_guard(request_kwargs)
 
+        # 1b. KV-cache-/queue-aware engine routing (RouteIQ-08d6/6a89). Gated
+        #     default OFF -> no-op (strategy absent from the registry). When ON,
+        #     consumes the live scraped engine gauges to land load on the
+        #     least-busy self-hosted arm BEFORE the ML/pipeline decision.
+        result = await self._route_via_kv_cache_aware(
+            model=model,
+            messages=messages,
+            request_kwargs=request_kwargs,
+        )
+        if result is not None:
+            return result
+
         # 2. Try pipeline routing
         if USE_PIPELINE_ROUTING:
             result = self._route_via_pipeline(
@@ -687,6 +699,121 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             return None
         except Exception as e:
             logger.warning(f"Centroid routing failed, falling back: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Public: cost-cascade RETRY completion (RouteIQ-3ff5)
+    # ------------------------------------------------------------------
+
+    async def acompletion_with_cascade(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        **kwargs: Any,
+    ) -> Any:
+        """Completion entrypoint that climbs the cost-cascade ladder (RouteIQ-3ff5).
+
+        Gated, default OFF -> byte-stable: when the cascade retry consumer is
+        disabled (or the cost-cascade strategy is not registered) this issues a
+        single ``router.acompletion`` exactly as before. When ON, it routes the
+        cheapest rung via :class:`CostCascadeRoutingStrategy` (mode (a)), scores
+        the response confidence, and RE-ISSUES pinned to the next rung up the
+        ``routeiq_cascade`` ladder while confidence is below threshold.
+
+        This is the LIVE consumer of the previously-dark mode-(a) ladder.
+        """
+        consumer = None
+        cascade_strategy = None
+        try:
+            from litellm_llmrouter.cascade_retry import get_cascade_retry_consumer
+            from litellm_llmrouter.strategy_registry import get_routing_registry
+
+            consumer = get_cascade_retry_consumer()
+            cascade_strategy = get_routing_registry().get("llmrouter-cost-cascade")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Cascade retry consumer unavailable: %s", e)
+
+        # Disabled / not registered -> byte-stable single-shot completion.
+        if consumer is None or cascade_strategy is None:
+            return await self._router.acompletion(
+                model=model, messages=messages, **kwargs
+            )
+
+        from litellm_llmrouter.strategy_registry import RoutingContext
+
+        def _select_rung(rung_index: int):
+            ctx = RoutingContext(
+                router=self._router,
+                model=model,
+                messages=messages,
+                input=None,
+                request_kwargs={"cascade_rung": rung_index - 1}
+                if rung_index > 0
+                else {},
+            )
+            return cascade_strategy.select_deployment(ctx)
+
+        async def _complete(deployment: dict, rung_index: int):
+            rung_model = deployment.get("litellm_params", {}).get("model", model)
+            return await self._router.acompletion(
+                model=rung_model, messages=messages, **kwargs
+            )
+
+        return await consumer.complete_with_cascade(
+            select_rung=_select_rung,
+            complete=_complete,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal: KV-cache-/queue-aware engine routing (RouteIQ-08d6 / 6a89)
+    # ------------------------------------------------------------------
+
+    async def _route_via_kv_cache_aware(
+        self,
+        model: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        request_kwargs: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Route to the least-loaded self-hosted engine arm (RouteIQ-08d6/6a89).
+
+        Gated, default OFF -> byte-stable no-op: the registry only holds the
+        ``llmrouter-kv-cache-aware`` strategy when
+        ``engine_metrics.kv_aware_routing_enabled`` is True. When present, this
+        scrapes each candidate arm's engine ``/metrics`` (the RouteIQ-6a89 live
+        gauges) and picks the lowest queue-depth / KV-cache-pressure arm. Any
+        error falls back (returns None) so routing continues down the normal
+        path. This runs in the async select path so the live scrape is awaited.
+        """
+        try:
+            from litellm_llmrouter.strategy_registry import (
+                RoutingContext,
+                get_routing_registry,
+            )
+
+            strategy = get_routing_registry().get("llmrouter-kv-cache-aware")
+            if strategy is None:
+                return None
+            selector = getattr(strategy, "select_least_loaded", None)
+            if not callable(selector):
+                return None
+
+            context = RoutingContext(
+                router=self._router,
+                model=model,
+                messages=messages,
+                input=None,
+                request_kwargs=request_kwargs,
+            )
+            result = await selector(context)
+            if result is not None:
+                logger.debug(
+                    "KV-cache-aware routing selected: %s (model=%s)",
+                    result.get("litellm_params", {}).get("model", "unknown"),
+                    model,
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"KV-cache-aware routing failed, falling back: {e}")
             return None
 
     # ------------------------------------------------------------------

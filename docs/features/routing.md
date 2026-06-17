@@ -58,6 +58,37 @@ ML-based strategies from [LLMRouter](https://github.com/ulab-uiuc/LLMRouter):
 | `llmrouter-knn-multiround` | KNN agentic router |
 | `llmrouter-llm-multiround` | LLM agentic router |
 
+### Router-R1 cost/latency gating + eval-loop feedback (RouteIQ-81bc)
+
+`router_r1.py` implements the native Router-R1 iterative reasoning router. An
+iterative router trades **cost and latency for quality** — it issues several LLM
+rounds per query — so RouteIQ lets an operator cap that tradeoff and feeds the
+run's observed quality back into the routing loop.
+
+**Cost/latency gates.** Two optional budgets stop the iterative loop *before* it
+issues another round when the cumulative cost/latency would exceed the cap:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `ROUTEIQ_ROUTER_R1_MAX_TOTAL_TOKENS` | `0` (off) | Token cap (cost proxy). When cumulative tokens reach this, the loop stops. |
+| `ROUTEIQ_ROUTER_R1_MAX_TOTAL_LATENCY_MS` | `0` (off) | Wall-clock latency cap. When elapsed time reaches this, the loop stops. |
+
+`0` disables the respective gate, so the default behaviour is byte-stable. Every
+run records why it stopped on `R1Result.stop_reason` — one of `answer`,
+`max_iterations`, `token_budget`, `latency_budget`, `size_limit`, `timeout`, or
+`error` — so an operator can see when a budget cut a run short.
+
+**Eval-loop feedback.** When the evaluation pipeline is enabled, each completed
+Router-R1 run is handed to it (the COLLECT arm) as an `EvalSample` carrying the
+final answer plus the observed cost (`total_tokens`) and `latency_ms`. The
+LLM-as-judge then grades it and the score feeds the
+COLLECT→EVALUATE→AGGREGATE→FEEDBACK loop (see [evaluation](../observability.md)).
+The emit is best-effort: a disabled or erroring eval pipeline is a silent no-op
+so a feedback hiccup never breaks routing.
+
+The stress harness exposes the cost/latency tradeoff for any iterative router via
+its `latency-cost` verdict family (informational p50/p95 latency + total tokens).
+
 ## Routing Decision Flow
 
 The following diagram shows how a request is routed from arrival through

@@ -112,6 +112,16 @@ class WorkspaceConfig(BaseModel):
     default_routing_profile: Optional[str] = None
     config_override_allowed: bool = True  # Can keys override workspace config?
 
+    # Cross-account model arm synthesis (RouteIQ-c6e9). When a workspace's models
+    # live in a DIFFERENT AWS account, the workspace carries the assume-role +
+    # (optionally) the region so RouteIQ can synthesize per-workspace Bedrock
+    # arms that the deployment routes through that account's credentials. All
+    # default None/unset -> no synthesis (byte-stable; these are not persisted as
+    # store columns and round-trip via defaults).
+    aws_account_id: Optional[str] = None
+    aws_role_arn: Optional[str] = None
+    aws_region: Optional[str] = None
+
     # Metadata
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: Optional[float] = None
@@ -962,6 +972,76 @@ def load_governance_state(engine: GovernanceEngine) -> int:
         return 0
 
 
+# -- Cross-account arm synthesis (RouteIQ-c6e9) ------------------------------
+
+
+def synthesize_workspace_arm(
+    workspace: "WorkspaceConfig",
+    model: str,
+    *,
+    default_region: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Synthesize a cross-account Bedrock arm spec from a workspace.
+
+    When a workspace declares an ``aws_role_arn`` (and optionally an
+    ``aws_region`` / ``aws_account_id``), its models live in a different AWS
+    account; this builds the ``litellm_params``-shaped dict a deployment arm
+    needs so requests for that workspace's models route through the workspace's
+    account credentials (STS AssumeRole at call time, performed by the engine
+    arm / boto3 layer using ``aws_role_name``).
+
+    Returns ``None`` (no synthesis) when the workspace has no ``aws_role_arn``
+    -- the default, byte-stable path where every workspace shares the gateway's
+    own account. When a role is present, returns::
+
+        {
+            "model": "bedrock/<model>",
+            "aws_region_name": <workspace region or default>,
+            "aws_role_name": <role arn>,
+            "aws_session_name": "routeiq-ws-<workspace_id>",
+        }
+
+    The result is a pure dict (no AWS calls), so it is safe to build at
+    config-synthesis time and unit-test credential-free.
+    """
+    role_arn = (workspace.aws_role_arn or "").strip()
+    if not role_arn:
+        return None
+    region = (workspace.aws_region or default_region or "").strip()
+    arm: Dict[str, Any] = {
+        "model": model if model.startswith("bedrock/") else f"bedrock/{model}",
+        "aws_role_name": role_arn,
+        "aws_session_name": f"routeiq-ws-{workspace.workspace_id}",
+    }
+    if region:
+        arm["aws_region_name"] = region
+    return arm
+
+
+def synthesize_workspace_arms(
+    workspace: "WorkspaceConfig",
+    *,
+    default_region: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Synthesize cross-account arms for every model in a workspace allowlist.
+
+    Iterates ``workspace.allowed_models`` (skipping wildcard patterns, which
+    cannot resolve to a concrete arm) and returns one arm spec per concrete
+    model. Empty when the workspace has no ``aws_role_arn`` or no concrete
+    models -> byte-stable no-op.
+    """
+    if not (workspace.aws_role_arn or "").strip():
+        return []
+    arms: List[Dict[str, Any]] = []
+    for model in workspace.allowed_models:
+        if "*" in model or "?" in model:
+            continue  # wildcard pattern: cannot synthesize a concrete arm
+        arm = synthesize_workspace_arm(workspace, model, default_region=default_region)
+        if arm is not None:
+            arms.append(arm)
+    return arms
+
+
 # -- Singleton ---------------------------------------------------------------
 
 _engine: Optional[GovernanceEngine] = None
@@ -998,6 +1078,9 @@ __all__ = [
     "reset_governance_engine",
     # Spend write path
     "record_governance_spend",
+    # Cross-account arm synthesis (RouteIQ-c6e9)
+    "synthesize_workspace_arm",
+    "synthesize_workspace_arms",
     # Canonical scope derivation (shared by WRITE + READ paths)
     "derive_spend_scope_from_ctx",
     # Persistence

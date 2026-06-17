@@ -1214,3 +1214,43 @@ fluentBit:
     # The AWS region the cloudwatch_logs output writes to. Falls back to the
     # render-time aws.region when empty.
     region: ""
+
+# -----------------------------------------------------------------------------
+# GitOps Application manifest (RouteIQ-eb77)
+# -----------------------------------------------------------------------------
+# Render an ArgoCD Application (or Flux Kustomization) manifest so a GitOps
+# controller can reconcile this chart from a git repo as the source of truth.
+#
+# DEFAULT OFF (gitops.enabled=false) -> no Application/Kustomization is rendered
+# and the chart render stays byte-identical. Enable for a GitOps deploy where
+# ArgoCD/Flux owns reconciliation instead of `helm install`.
+#
+# Choose ONE provider: "argocd" (default) or "flux". The manifest points the
+# controller at the chart's git source (repoURL/path/targetRevision); the chart
+# does not provision the controller itself (that is an operator concern).
+gitops:
+  enabled: false
+  # "argocd" -> ArgoCD Application; "flux" -> Flux Kustomization.
+  provider: "argocd"
+  # Git source the controller reconciles from.
+  repoURL: "https://github.com/baladithyab/routeiq"
+  path: "deploy/charts/routeiq-gateway"
+  targetRevision: "main"
+  # Destination cluster + namespace the app is deployed to.
+  destination:
+    server: "https://kubernetes.default.svc"
+    namespace: "routeiq"
+  # ArgoCD project (argocd provider only).
+  project: "default"
+  # Automated sync (prune + selfHeal). When false the controller only reports
+  # drift and an operator syncs manually.
+  syncPolicy:
+    automated: false
+    prune: true
+    selfHeal: true
+  # Flux source interval (flux provider only).
+  flux:
+    interval: "5m"
+    sourceRef:
+      kind: "GitRepository"
+      name: "routeiq"

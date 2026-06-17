@@ -554,6 +554,19 @@ class CostCascadeSettings(BaseModel):
             "metadata and caps how far mode (b) can escalate."
         ),
     )
+    retry_consumer_enabled: bool = Field(
+        False,
+        description=(
+            "RouteIQ-3ff5: enable the mode-(a) cascade RETRY consumer -- a "
+            "component that reads the ``routeiq_cascade`` ladder on the cheapest "
+            "rung's response, scores the response confidence, and RE-ISSUES the "
+            "request pinned to the NEXT (stronger) rung when confidence is below "
+            "``confidence_threshold``, climbing up to ``max_rungs`` rungs. Default "
+            "OFF -- byte-stable: with it off a single cheapest-rung completion is "
+            "returned unchanged. Env: "
+            "``ROUTEIQ_COST_CASCADE__RETRY_CONSUMER_ENABLED``."
+        ),
+    )
 
 
 class SemanticIntentSettings(BaseModel):
@@ -1041,6 +1054,17 @@ class A2ASettings(BaseModel):
         100,
         ge=1,
         description="Per-agent rate limit: max task creates per minute.",
+    )
+    agentcore_memory_enabled: bool = Field(
+        False,
+        description=(
+            "RouteIQ-60e7: persist A2A agent/conversation state into AWS Bedrock "
+            "AgentCore Memory after a successful agent invocation (via the live "
+            "bedrock-agentcore-mcp plugin's CreateEvent). Default OFF -- "
+            "byte-stable: the A2A invocation path is unchanged and issues no "
+            "AgentCore call until an operator opts in. Env: "
+            "``ROUTEIQ_A2A__AGENTCORE_MEMORY_ENABLED`` (or A2A_AGENTCORE_MEMORY_ENABLED)."
+        ),
     )
 
 
@@ -2258,6 +2282,18 @@ class BedrockDiscoverySettings(BaseModel):
             "``ROUTEIQ_BEDROCK_DISCOVERY__DRIFT_METRIC_ENABLED``."
         ),
     )
+    drift_check_interval_seconds: float = Field(
+        900.0,
+        ge=30.0,
+        le=86400.0,
+        description=(
+            "RouteIQ-9a42: interval (seconds) between periodic leader-gated "
+            "catalogue-drift checks. Only consulted when "
+            "``drift_metric_enabled`` AND ``enabled`` are True; otherwise the "
+            "periodic task never starts (byte-stable). Default 900s (15 min). "
+            "Env: ``ROUTEIQ_BEDROCK_DISCOVERY__DRIFT_CHECK_INTERVAL_SECONDS``."
+        ),
+    )
 
     @field_validator("source_regions", mode="before")
     @classmethod
@@ -2496,6 +2532,38 @@ class EngineMetricsSettings(BaseModel):
             "Per-scrape HTTP GET timeout in seconds. An engine that does not "
             "answer within this budget yields an empty (reachable=False) "
             "snapshot, never an exception."
+        ),
+    )
+    kv_aware_routing_enabled: bool = Field(
+        False,
+        description=(
+            "RouteIQ-08d6/6a89: enable the KV-cache-/queue-aware routing path for "
+            "self-hosted engine arms. When ON the router scrapes each candidate "
+            "arm's engine /metrics (vllm:num_requests_waiting, kv_cache_usage_perc) "
+            "and selects the LEAST-LOADED arm. Requires ``enabled`` (the scraper) "
+            "to also be True. Default OFF -- byte-stable: the KV-aware pre-step is "
+            "skipped entirely and routing is unchanged. Env: "
+            "``ROUTEIQ_ENGINE_METRICS__KV_AWARE_ROUTING_ENABLED``."
+        ),
+    )
+    kv_cache_usage_weight: float = Field(
+        1.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Weight applied to an arm's KV-cache usage fraction (0..1) when "
+            "scoring engine load for KV-aware routing. Higher => avoid "
+            "cache-pressured arms more aggressively."
+        ),
+    )
+    waiting_queue_weight: float = Field(
+        0.1,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Weight applied to an arm's num_requests_waiting (queue depth) when "
+            "scoring engine load for KV-aware routing. The load score is "
+            "kv_cache_usage_weight*kv_usage + waiting_queue_weight*num_waiting."
         ),
     )
 

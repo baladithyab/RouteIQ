@@ -223,6 +223,14 @@ def main() -> None:
             # mutation). The LIVE deploy is operator-gated. Off keeps the default
             # synth byte-stable (zero CodePipeline/CodeBuild/deployer resources).
             enable_gitops_pipeline=_bool_ctx(app, "routeiq:enable_gitops_pipeline", False),
+            # RouteIQ-8a24 (scheduled SageMaker retraining): DEFAULT OFF. When true
+            # the P2 stack adds an EventBridge schedule -> SageMaker CreateTrainingJob
+            # -> S3 artifact bucket + the narrow invoker/execution IAM. The LIVE
+            # training job is operator-gated. Off keeps the default synth byte-stable
+            # (zero Events::Rule / SageMaker / artifact-bucket resources).
+            enable_sagemaker_retraining=_bool_ctx(
+                app, "routeiq:enable_sagemaker_retraining", False
+            ),
             notify_emails=_split_csv_or_list(_ctx(app, "routeiq:notify_emails", [])),
         )
 

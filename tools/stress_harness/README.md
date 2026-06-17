@@ -43,16 +43,18 @@ PYTHONPATH=tools uv run python -m stress_harness --base-url http://localhost:400
 
 ### `--dry-run` (no network)
 
-`--dry-run` short-circuits before any network call and prints the allocation:
+`--dry-run` short-circuits before any network call and prints the allocation.
+Because it fires nothing, it needs **no `--base-url`** (RouteIQ-3b18):
 
 ```bash
-PYTHONPATH=tools uv run python -m stress_harness --base-url http://localhost:4000 \
-    --num-requests 10000 --dry-run
+PYTHONPATH=tools uv run python -m stress_harness --num-requests 10000 --dry-run
 ```
 
 allocates exactly 10,000 requests across the five buckets (2000 each at uniform
 weight) with no socket opened. Largest-remainder (Hamilton) rounding guarantees
 the per-bucket counts sum *exactly* to the requested total for any weighting.
+`--base-url` is required only for a *real* run (the CLI errors if it is missing
+without `--dry-run`).
 
 ### The headline 10k run
 
@@ -75,7 +77,7 @@ and `--num-users 50` to exercise per-user personalized routing.
 
 | flag | default | purpose |
 |------|---------|---------|
-| `--base-url` | (required) | RouteIQ gateway base URL |
+| `--base-url` | (required for a real run; **optional under `--dry-run`**) | RouteIQ gateway base URL |
 | `--token` | none | data-plane key (`Authorization: Bearer`) |
 | `--model` | `auto` | OpenAI `model` field — keep `auto` to exercise routing |
 | `--num-requests` | `50` | single-turn requests (headline: `10000`) |
@@ -136,14 +138,32 @@ and version suffixes don't break dispatch. The first matching family wins:
 | `fan-out` | kumaraswamy-thompson, thompson, bandit | healthy bandit **spreads** across arms; unhealthy = pinned to one model |
 | `consistency` | knn, svm, mlp, mf, elo, routerdc, hybrid, centroid, graph, automix, causallm | same category routes to a **dominant** model |
 | `cost-aware` | cost-aware | **cheap** models serve easy categories (flag premium-on-easy) |
-| `personalized` | personalized, gmt | per-user **drift** — different users diverge |
+| `cost-cascade` | cost-cascade, cascade, cheap-first | **cheap-first invariant**: cheap tier carries more traffic than premium AND no easy bucket is premium-dominated |
+| `semantic-intent` | semantic-intent, semantic, intent | **bucket→group dispatch**: each semantic bucket routes dominantly AND distinct buckets dispatch to distinct models |
+| `personalized` | personalized, gmt | per-user **drift** — different users diverge (reads `/me/stats` per-user routing when available, see below) |
 | `latency-cost` | router-r1, *multiround | latency / token-cost **tradeoff** report (informational) |
 | **generic** | *anything unregistered* | restates the distribution + "no strategy-specific verdict for `<name>`" — **never crashes** |
 
-5 registered families + the generic fallback (the acceptance floor is 3). An
+7 registered families + the generic fallback (the acceptance floor is 3). An
 unknown / future strategy always gets the generic verdict; a verdict plugin that
 itself errors degrades to generic with a note, so one buggy plugin can never crash
 the report.
+
+The `cost-cascade` family precedes `cost-aware`, and `semantic-intent` precedes
+the broad `consistency` family, in the token-match order — so a router that
+explicitly cascades cheap→expensive (RouteIQ-f086) or dispatches by intent gets
+its more-specific verdict rather than the broad one.
+
+### Per-user routing from `/me/stats` (RouteIQ-2bbe)
+
+The `personalized` verdict prefers RouteIQ's **caller-scoped `/me/stats`**
+surface when it can read it. `/me/stats` returns ONLY the authenticated caller's
+own `recent_models`, so the harness reads the authoritative per-user routing view
+by GETting it once per synthetic user with that user's own data-plane token
+(`RouteIQStatsClient.fetch_per_user_recent_models({user_id: token})`). When that
+server-side view is present it drives the drift verdict; otherwise the verdict
+falls back to grouping the client-observed responses by `user_id`. The verdict's
+`findings["source"]` records which view was used.
 
 ### 4. Cross-strategy compare (RouteIQ-833c)
 
@@ -181,6 +201,29 @@ uv run pytest tests/stress_harness/ -q
 
 Covers: workload allocation (incl. the 10k plan), the client request/response
 capture, the per-strategy verdict dispatch (fan-out + consistency + cost-aware +
-personalized + latency-cost) and the unknown-strategy generic fallback, the stats
-client reading/merging/degrading, the cross-strategy compare, the CW-Logs parser,
-and the full CLI pipeline (`--dry-run` + a mocked end-to-end run).
+cost-cascade + semantic-intent + personalized + latency-cost) and the
+unknown-strategy generic fallback, the stats client reading/merging/degrading
+(incl. the per-user `/me/stats` reader), the cross-strategy compare, the CW-Logs
+parser **and** its CLI wiring, and the full CLI pipeline (`--dry-run` with and
+without `--base-url`, CW-Logs enrichment, plus a mocked end-to-end run).
+
+## Companion tool: semantic-intent centroid calibration (RouteIQ-44a1)
+
+`tools/centroid_calibration.py` is a **standalone** operator utility (it does not
+import or modify the routing strategy class) that reports **inter-centroid cosine
+separation** so an operator can catch overlapping intent centroids at config-load
+time instead of in production. Two input modes:
+
+```bash
+# 1. report separation for the shipped *_centroid.npy vectors
+uv run python tools/centroid_calibration.py --centroid-dir models/centroids
+
+# 2. A/B a proposed intent taxonomy from operator exemplar phrases
+uv run python tools/centroid_calibration.py --exemplars intents.json --json
+```
+
+`cosine_separation = 1 - cosine_similarity` (0 = identical direction =
+un-discriminable, 1 = orthogonal, 2 = opposite). A pair below `--min-separation`
+(default `0.10`) is flagged `WEAK` and the CLI exits non-zero so it can gate a
+config-load check. The core math is pure-numpy and credential-free; the exemplar
+mode lazily uses `sentence-transformers` only on that path.

@@ -69,6 +69,7 @@ HTTP_246_GUARDRAIL_WARNING = 246
 class GuardrailPhase(str, Enum):
     INPUT = "input"  # Pre-request
     OUTPUT = "output"  # Post-response
+    DURING_CALL = "during_call"  # Mid-stream (streaming output, buffered)
 
 
 class GuardrailAction(str, Enum):
@@ -312,6 +313,49 @@ class GuardrailPolicyEngine:
         if not isinstance(content, str):
             content = str(content)
         return await self._evaluate_policies(policies, content, response_data)
+
+    async def evaluate_during_call(
+        self,
+        buffered_content: str,
+        workspace_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> List[GuardrailResult]:
+        """Evaluate DURING_CALL guardrails against a streamed-so-far buffer.
+
+        This is the streaming/mid-stream phase (RouteIQ-0ae5): as output tokens
+        stream back, the caller accumulates them into a rolling buffer (via
+        :class:`StreamingGuardrailBuffer`) and periodically passes the
+        buffered text here so an output-style check (e.g. ``regex_deny`` of a
+        leaked secret/PII) can DENY mid-stream rather than only after the full
+        response is assembled.
+
+        Default-off: no policy defaults to ``DURING_CALL`` (the enum default is
+        ``INPUT``), so when no operator has registered a ``during_call`` policy
+        this returns an empty list and is a byte-stable no-op on the hot path.
+
+        STREAMING-BUFFER LIMITATION: this is a *buffered* phase, not a true
+        token-by-token interceptor.  The caller decides the cadence (every N
+        chunks / bytes) and the engine evaluates the buffer-so-far; tokens
+        already flushed to the client cannot be retracted.  A DENY result means
+        the caller SHOULD stop the upstream stream and surface a 446, but any
+        bytes already sent are sent.  For pre-flush blocking the operator must
+        set the cadence small (buffer-then-flush), trading latency for safety.
+
+        Args:
+            buffered_content: The output text streamed so far (the rolling
+                buffer the caller maintains across chunks).
+            workspace_id: Scope to this workspace (+ global policies).
+            data: Optional request/response context (model name, metadata).
+
+        Returns:
+            List of GuardrailResult for all evaluated DURING_CALL policies.
+        """
+        policies = self._matching_policies(GuardrailPhase.DURING_CALL, workspace_id)
+        if not policies:
+            return []
+        ctx = dict(data or {})
+        ctx.setdefault("content", buffered_content)
+        return await self._evaluate_policies(policies, buffered_content, ctx)
 
     def has_deny_result(self, results: List[GuardrailResult]) -> bool:
         """Check if any result has a DENY action and failed."""
@@ -1237,9 +1281,65 @@ class GuardrailPolicyEngine:
             "output_policies": len(
                 [p for p in enabled if p.phase == GuardrailPhase.OUTPUT]
             ),
+            "during_call_policies": len(
+                [p for p in enabled if p.phase == GuardrailPhase.DURING_CALL]
+            ),
             "check_types": sorted({p.check_type.value for p in enabled}),
             "custom_handlers": sorted(self._custom_handlers.keys()),
         }
+
+
+# ---------------------------------------------------------------------------
+# Streaming guardrail buffer (RouteIQ-0ae5: during_call phase)
+# ---------------------------------------------------------------------------
+
+
+class StreamingGuardrailBuffer:
+    """Rolling buffer that drives the DURING_CALL guardrail phase on a stream.
+
+    A streaming output handler appends each chunk's text via :meth:`feed`; the
+    buffer signals (via the returned bool) when enough new content has
+    accumulated to warrant a guardrail evaluation, at which point the caller
+    runs :meth:`GuardrailPolicyEngine.evaluate_during_call` on :attr:`text`.
+
+    The cadence is a byte threshold (``flush_bytes``): a smaller threshold
+    blocks earlier (lower leak surface) at the cost of more evaluations; a
+    larger one is cheaper but lets more bytes flush before a DENY can fire.
+
+    This is intentionally tiny and dependency-free so it can be embedded in any
+    streaming response path without coupling to LiteLLM's stream object.
+    """
+
+    def __init__(self, flush_bytes: int = 256) -> None:
+        self._chunks: List[str] = []
+        self._flush_bytes = max(1, int(flush_bytes))
+        self._since_last_eval = 0
+
+    @property
+    def text(self) -> str:
+        """The full content streamed so far."""
+        return "".join(self._chunks)
+
+    def feed(self, chunk: str) -> bool:
+        """Append a chunk; return True when an evaluation cadence is reached.
+
+        Returns ``True`` when at least ``flush_bytes`` of new content has
+        arrived since the last positive return (so the caller knows to
+        evaluate). Resets the cadence counter when it returns ``True``.
+        """
+        if not chunk:
+            return False
+        self._chunks.append(chunk)
+        self._since_last_eval += len(chunk)
+        if self._since_last_eval >= self._flush_bytes:
+            self._since_last_eval = 0
+            return True
+        return False
+
+    def reset(self) -> None:
+        """Clear the buffer (e.g. for a new stream)."""
+        self._chunks.clear()
+        self._since_last_eval = 0
 
 
 # ---------------------------------------------------------------------------

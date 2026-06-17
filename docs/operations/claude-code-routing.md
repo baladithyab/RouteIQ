@@ -55,6 +55,24 @@ gpt-oss, any future provider) collapses to the single `claude-auto`
 `model_name`; each arm keeps an `arm_id` in `model_info` so telemetry still shows
 which physical model served the request.
 
+#### Per-logical-model groups (RouteIQ-1c9d)
+
+`AUTO_GROUP` collapses *everything* into one group. When you instead want **one
+logical model_name per model, each fanned out across its region / account /
+mantle arms**, use `DiscoveryResult.synthesize_model_groups()`. It binds arms by
+their *logical model identity* -- the region-varying parts (the `global.` /
+`us.` / `eu.` tier-geo prefix and the `-v1:0` version suffix) are stripped -- so:
+
+- `global.anthropic.claude-sonnet-4-v1:0` discovered in `us-east-1`,
+- the `eu.anthropic.claude-sonnet-4-v1:0` geo profile in `eu-west-1`, and
+- a Bedrock Marketplace / **mantle** custom-deployment endpoint of the same model
+
+all land under the single `anthropic.claude-sonnet-4` `model_name` as three arms,
+while a *different* logical model (e.g. Nova) forms its own group. Each arm keeps
+a distinct `model_info.arm_id` (`region/invocation_id`) for telemetry. This is
+the building block for routing one logical alias across regions/accounts when you
+don't want a single all-models group.
+
 ### Option B -- static recipe
 
 Use the worked recipe at [`config/config.claude-code.yaml`](https://github.com/baladithyab/RouteIQ/blob/main/config/config.claude-code.yaml).

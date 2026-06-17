@@ -63,7 +63,18 @@ VerdictFn = Callable[
 # broad learned-router consistency family.
 _FAMILY_TOKENS: list[tuple[str, tuple[str, ...]]] = [
     ("fan-out", ("kumaraswamy", "thompson", "bandit")),
+    # cost-cascade precedes cost-aware: a router that explicitly CASCADES cheap->
+    # expensive (try-cheap-first) is a distinct family from a one-shot cost-aware
+    # picker, so its more-specific tokens must win.
+    ("cost-cascade", ("cost-cascade", "cost_cascade", "cascade", "cheap-first")),
     ("cost-aware", ("cost-aware", "cost_aware", "costaware")),
+    # semantic-intent precedes the broad learned-router consistency family: an
+    # intent-classifier router dispatches each SEMANTIC BUCKET to a model GROUP,
+    # which is a stronger claim than generic per-category dominance.
+    (
+        "semantic-intent",
+        ("semantic-intent", "semantic_intent", "semantic", "intent"),
+    ),
     ("personalized", ("personalized", "personalised", "gmt", "per-user")),
     ("latency-cost", ("router-r1", "router_r1", "routerr1", "r1", "multiround")),
     (
@@ -338,6 +349,223 @@ def cost_aware_verdict(
     )
 
 
+def cost_cascade_verdict(
+    active_strategy: str,
+    records: list[EnrichedRecord],
+    stats: RouteIQStats | None,
+    result: AnalysisResult,
+    *,
+    easy_premium_threshold: float = DEFAULT_COST_EASY_PREMIUM_THRESHOLD,
+) -> StrategyVerdict:
+    """CHEAP-FIRST CASCADE invariant (cost-cascade strategy, RouteIQ-f086).
+
+    A cost cascade tries the cheapest arm FIRST and only escalates to a
+    premium/large model when the cheap arm is insufficient. So across the WHOLE
+    run, the cheap tier should carry the bulk of traffic, and the premium tier
+    should concentrate on HARD work — never dominate EASY work.
+
+    Two invariants are checked:
+
+      1. EASY buckets must not be premium-dominated (premium share on easy must
+         be <= ``easy_premium_threshold``) — the same cheap-on-easy guard the
+         cost-aware family uses, but here it is the cascade's FLOOR.
+      2. Cheap-first spread: the cheap (non-premium) tier must carry strictly
+         MORE total successful traffic than the premium tier (cheap_share >
+         premium_share over the whole run). A cascade that escalates everything
+         to premium has lost its cheap-first invariant.
+
+    Healthy when BOTH hold. Not assessable (healthy=None) when there is no
+    successful traffic at all.
+    """
+    from .workload import easy_categories
+
+    # (1) easy-bucket premium domination (cheap-on-easy floor).
+    easy = easy_categories()
+    easy_flagged: list[str] = []
+    easy_detail: dict[str, Any] = {}
+    for category in sorted(easy):
+        counts = result.category_model_counts.get(category, {})
+        total = sum(counts.values())
+        if total == 0:
+            continue
+        premium = sum(c for m, c in counts.items() if _is_premium(m))
+        share = premium / total
+        flagged = share > easy_premium_threshold
+        easy_detail[category] = {
+            "n": total,
+            "premium_share": round(share, 4),
+            "flagged": flagged,
+        }
+        if flagged:
+            easy_flagged.append(category)
+
+    # (2) run-wide cheap-first spread.
+    premium_total = 0
+    cheap_total = 0
+    for model in _distinct_real_models(result.model_distribution):
+        count = int(result.model_distribution[model]["count"])
+        if _is_premium(model):
+            premium_total += count
+        else:
+            cheap_total += count
+    graded_total = premium_total + cheap_total
+
+    if graded_total == 0:
+        return StrategyVerdict(
+            strategy=active_strategy,
+            family="cost-cascade",
+            healthy=None,
+            summary="No successful traffic to assess the cheap-first cascade.",
+            findings={
+                "cheap_total": 0,
+                "premium_total": 0,
+                "easy_per_category": easy_detail,
+            },
+        )
+
+    cheap_share = cheap_total / graded_total
+    premium_share = premium_total / graded_total
+    cheap_first = cheap_total > premium_total
+    healthy = cheap_first and not easy_flagged
+
+    if healthy:
+        summary = (
+            f"HEALTHY: cheap-first cascade — cheap tier carries "
+            f"{cheap_share:.1%} of traffic vs premium {premium_share:.1%}, and "
+            f"no easy bucket is premium-dominated."
+        )
+    else:
+        reasons: list[str] = []
+        if not cheap_first:
+            reasons.append(
+                f"premium tier dominates ({premium_share:.1%} >= cheap "
+                f"{cheap_share:.1%}) — cascade escalated past the cheap arm"
+            )
+        if easy_flagged:
+            reasons.append(
+                f"premium models dominate easy traffic on "
+                f"{', '.join(easy_flagged)} (> {easy_premium_threshold:.0%})"
+            )
+        summary = "CASCADE BROKEN: " + "; ".join(reasons) + "."
+
+    return StrategyVerdict(
+        strategy=active_strategy,
+        family="cost-cascade",
+        healthy=healthy,
+        summary=summary,
+        findings={
+            "cheap_total": cheap_total,
+            "premium_total": premium_total,
+            "cheap_share": round(cheap_share, 4),
+            "premium_share": round(premium_share, 4),
+            "cheap_first": cheap_first,
+            "easy_premium_threshold": easy_premium_threshold,
+            "easy_per_category": easy_detail,
+            "easy_flagged_categories": easy_flagged,
+        },
+        messages=[summary],
+    )
+
+
+def semantic_intent_verdict(
+    active_strategy: str,
+    records: list[EnrichedRecord],
+    stats: RouteIQStats | None,
+    result: AnalysisResult,
+    *,
+    min_top_share: float = DEFAULT_CONSISTENCY_MIN_TOP_SHARE,
+) -> StrategyVerdict:
+    """BUCKET -> GROUP DISPATCH check (semantic-intent router, RouteIQ-f086).
+
+    A semantic-intent router classifies each request into a semantic bucket and
+    dispatches that bucket to a dedicated model (group). Two properties make the
+    dispatch healthy:
+
+      1. WITHIN-bucket dominance: each semantic bucket routes consistently to a
+         dominant model (top-model share >= ``min_top_share``) — the bucket has a
+         clear handler, not a smear across models.
+      2. BETWEEN-bucket differentiation: distinct buckets dispatch to DISTINCT
+         dominant models (the router actually discriminates by intent rather than
+         collapsing every bucket onto one model). With >= 2 buckets carrying
+         traffic we require at least two distinct dominant handlers.
+
+    The harness's own ground-truth category tag is the proxy for the semantic
+    bucket (the workload tags each request at send time). Healthy when both
+    properties hold; not assessable (healthy=None) when fewer than one bucket
+    carries traffic.
+    """
+    per_bucket: dict[str, Any] = {}
+    smeared: list[str] = []
+    dominant_by_bucket: dict[str, str] = {}
+    for bucket, counts in sorted(result.category_model_counts.items()):
+        total = sum(counts.values())
+        if total == 0:
+            continue
+        top_model = max(counts, key=lambda m: counts[m])
+        share = counts[top_model] / total
+        dominant = share >= min_top_share
+        per_bucket[bucket] = {
+            "top_model": top_model,
+            "top_share": round(share, 4),
+            "n": total,
+            "dominant": dominant,
+        }
+        dominant_by_bucket[bucket] = top_model
+        if not dominant:
+            smeared.append(bucket)
+
+    if not per_bucket:
+        return StrategyVerdict(
+            strategy=active_strategy,
+            family="semantic-intent",
+            healthy=None,
+            summary="No per-bucket traffic to assess intent dispatch.",
+            findings={"per_bucket": {}, "min_top_share": min_top_share},
+        )
+
+    distinct_handlers = len(set(dominant_by_bucket.values()))
+    n_buckets = len(per_bucket)
+    # differentiation only meaningful with >= 2 buckets carrying traffic.
+    differentiated = n_buckets < 2 or distinct_handlers > 1
+    within_ok = not smeared
+    healthy = within_ok and differentiated
+
+    if healthy:
+        summary = (
+            f"HEALTHY: {n_buckets} semantic bucket(s) each dispatch to a dominant "
+            f"handler (>= {min_top_share:.0%}) across {distinct_handlers} distinct "
+            f"model(s) — intent dispatch differentiates by bucket."
+        )
+    else:
+        reasons = []
+        if smeared:
+            reasons.append(
+                f"buckets smeared below the {min_top_share:.0%} dominant-model "
+                f"threshold: {', '.join(smeared)}"
+            )
+        if not differentiated:
+            reasons.append(
+                f"all {n_buckets} buckets collapse onto a single model "
+                f"(no intent differentiation)"
+            )
+        summary = "INTENT DISPATCH WEAK: " + "; ".join(reasons) + "."
+
+    return StrategyVerdict(
+        strategy=active_strategy,
+        family="semantic-intent",
+        healthy=healthy,
+        summary=summary,
+        findings={
+            "per_bucket": per_bucket,
+            "min_top_share": min_top_share,
+            "distinct_handlers": distinct_handlers,
+            "smeared_buckets": smeared,
+            "differentiated": differentiated,
+        },
+        messages=[summary],
+    )
+
+
 def personalized_verdict(
     active_strategy: str,
     records: list[EnrichedRecord],
@@ -346,22 +574,37 @@ def personalized_verdict(
 ) -> StrategyVerdict:
     """PER-USER DRIFT check (personalized / GMT routers).
 
-    Per-user preference learning should let different users diverge. We group
-    successful requests by ``user_id`` and measure, per user, the distinct models
-    seen and the dominant model; "drift" means at least two users have different
-    dominant models. With no user ids in the workload (multi-tenant sim off) the
-    verdict is not assessable (healthy=None) and says so.
+    Per-user preference learning should let different users diverge. We measure,
+    per user, the distinct models seen and the dominant model; "drift" means at
+    least two users have different dominant models.
+
+    Source preference (RouteIQ-2bbe): when ``stats.per_user_recent_models`` was
+    read from RouteIQ's caller-scoped ``/me/stats`` surface, that AUTHORITATIVE
+    server-side per-user routing view is used (the server attributes each
+    decision to the user's key). Otherwise we fall back to grouping the
+    client-observed successful requests by ``user_id``. With no per-user data at
+    all (multi-tenant sim off) the verdict is not assessable (healthy=None).
     """
     by_user: dict[str, dict[str, int]] = {}
-    for rec in records:
-        if not rec.request.ok:
-            continue
-        uid = rec.request.user_id
-        if not uid:
-            continue
-        model = rec.effective_model or "<none>"
-        by_user.setdefault(uid, {}).setdefault(model, 0)
-        by_user[uid][model] += 1
+    source = "client-observed records"
+    server_per_user = stats.per_user_recent_models if stats is not None else None
+    if server_per_user:
+        # AUTHORITATIVE: /me/stats recent_models per user (RouteIQ-2bbe).
+        source = "/me/stats recent_models (server-authoritative)"
+        for uid, recent in server_per_user.items():
+            counts = by_user.setdefault(uid, {})
+            for model in recent:
+                counts[model] = counts.get(model, 0) + 1
+    else:
+        for rec in records:
+            if not rec.request.ok:
+                continue
+            uid = rec.request.user_id
+            if not uid:
+                continue
+            model = rec.effective_model or "<none>"
+            by_user.setdefault(uid, {}).setdefault(model, 0)
+            by_user[uid][model] += 1
     if not by_user:
         return StrategyVerdict(
             strategy=active_strategy,
@@ -388,7 +631,8 @@ def personalized_verdict(
     drift = distinct_dominant > 1
     summary = (
         f"{'DRIFT OBSERVED' if drift else 'NO DRIFT'}: {len(by_user)} users, "
-        f"{distinct_dominant} distinct dominant model(s) across users — "
+        f"{distinct_dominant} distinct dominant model(s) across users "
+        f"(via {source}) — "
         f"{'personalized routing diverges per user' if drift else 'all users converge to one model'}."
     )
     return StrategyVerdict(
@@ -402,6 +646,7 @@ def personalized_verdict(
             "users": len(by_user),
             "distinct_dominant_models": distinct_dominant,
             "per_user": per_user,
+            "source": source,
         },
         messages=[summary],
     )
@@ -506,6 +751,8 @@ _REGISTRY: dict[str, VerdictFn] = {
     "fan-out": fan_out_verdict,
     "consistency": consistency_verdict,
     "cost-aware": cost_aware_verdict,
+    "cost-cascade": cost_cascade_verdict,
+    "semantic-intent": semantic_intent_verdict,
     "personalized": personalized_verdict,
     "latency-cost": latency_cost_verdict,
 }

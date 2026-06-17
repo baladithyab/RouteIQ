@@ -290,7 +290,13 @@ def instrument_mcp_gateway() -> bool:
         original_invoke_tool = gateway.invoke_tool
 
         @functools.wraps(original_invoke_tool)
-        async def traced_invoke_tool(tool_name: str, arguments: dict[str, Any]):
+        async def traced_invoke_tool(
+            tool_name: str, arguments: dict[str, Any], *args: Any, **kwargs: Any
+        ):
+            # RouteIQ-2fa1: forward *args/**kwargs (e.g. caller_access_groups) to
+            # the underlying invoke_tool so the access-group enforcement seam still
+            # receives the caller's groups through the tracing wrapper. Without this
+            # pass-through the access-controlled production path raised TypeError.
             server = gateway.find_server_for_tool(tool_name)
             server_id = server.server_id if server else "unknown"
             server_name = server.name if server else "unknown"
@@ -305,7 +311,9 @@ def instrument_mcp_gateway() -> bool:
                 if not gateway.is_tool_invocation_enabled():
                     add_invocation_disabled_attribute(span, True)
 
-                result = await original_invoke_tool(tool_name, arguments)
+                result = await original_invoke_tool(
+                    tool_name, arguments, *args, **kwargs
+                )
 
                 duration_ms = (time.perf_counter() - start_time) * 1000
 

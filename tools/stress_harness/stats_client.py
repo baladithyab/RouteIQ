@@ -31,6 +31,10 @@ from .models import RouteIQStats
 ROUTING_CONFIG_PATH = "/api/v1/routeiq/routing/config"
 GLOBAL_STATS_PATH = "/api/v1/routeiq/stats/global"
 ROUTING_STATS_PATH = "/api/v1/routeiq/routing/stats"
+#: Caller-scoped per-user stats (RouteIQ-2bbe). Returns the AUTHENTICATED
+#: caller's own ``recent_models`` + ``decision_count`` for the key on the
+#: request, so the per-user routing view is read with each user's own token.
+ME_STATS_PATH = "/api/v1/routeiq/me/stats"
 
 DEFAULT_TIMEOUT_S = 30.0
 
@@ -100,6 +104,58 @@ class RouteIQStatsClient:
         return self._merge(
             config, glob, routing, errors=[config_err, glob_err, routing_err]
         )
+
+    async def fetch_per_user_recent_models(
+        self, user_tokens: dict[str, str]
+    ) -> dict[str, list[str]]:
+        """Read each user's AUTHORITATIVE ``recent_models`` from ``/me/stats``.
+
+        ``/me/stats`` is caller-scoped: it returns ONLY the key on the request,
+        so the harness reads the per-user routing view by GETting it once per
+        synthetic user, each with that user's own data-plane bearer token
+        (``user_tokens`` maps ``user_id -> token``). Returns ``user_id ->
+        recent_models``; a user whose stats are unreachable / malformed is simply
+        omitted (never raises). Empty ``user_tokens`` -> ``{}`` (no /me/stats
+        call), so a single-tenant run pays nothing here (RouteIQ-2bbe).
+        """
+        if not user_tokens:
+            return {}
+        owns_client = self._injected is None
+        client = self._injected or httpx.AsyncClient()
+        out: dict[str, list[str]] = {}
+        try:
+            for user_id, token in user_tokens.items():
+                models = await self._fetch_one_user(client, token)
+                if models is not None:
+                    out[user_id] = models
+        finally:
+            if owns_client:
+                await client.aclose()
+        return out
+
+    async def _fetch_one_user(
+        self, client: httpx.AsyncClient, token: str
+    ) -> list[str] | None:
+        """GET ``/me/stats`` with ``token`` and return its ``recent_models`` list
+        (or None on any failure / non-list shape). Never raises."""
+        url = f"{self._base_url}{ME_STATS_PATH}"
+        headers = {"accept": "application/json", "authorization": f"Bearer {token}"}
+        try:
+            resp = await client.get(url, headers=headers, timeout=self._timeout)
+        except Exception:  # noqa: BLE001 — degrade, never abort
+            return None
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return None
+        try:
+            data = resp.json()
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        recent = data.get("recent_models")
+        if not isinstance(recent, list):
+            return None
+        return [str(m) for m in recent if isinstance(m, str)]
 
     def _merge(
         self,

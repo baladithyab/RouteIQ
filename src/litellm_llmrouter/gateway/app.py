@@ -59,6 +59,7 @@ Usage standalone (without LiteLLM):
     app = create_standalone_app()
 """
 
+import asyncio
 import importlib.metadata
 import logging
 import os
@@ -498,6 +499,42 @@ async def _shutdown_http_client_pool() -> None:
     await shutdown_http_client_pool()
 
 
+def _maybe_start_catalogue_drift_task() -> Optional["asyncio.Task[None]"]:
+    """Start the leader-gated periodic catalogue-drift task (RouteIQ-9a42).
+
+    Returns the created :class:`asyncio.Task`, or ``None`` when drift detection
+    is disabled (the default -> byte-stable: no task, no scan, no metric). The
+    interval is read from ``settings.bedrock_discovery.drift_check_interval_seconds``.
+    Each cycle runs :func:`startup.run_catalogue_drift_check`, which is itself
+    leader- and flag-gated and never raises.
+    """
+    try:
+        bd = get_settings().bedrock_discovery
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not (
+        getattr(bd, "drift_metric_enabled", False) and getattr(bd, "enabled", False)
+    ):
+        return None
+
+    interval = float(getattr(bd, "drift_check_interval_seconds", 900.0))
+
+    async def _drift_loop() -> None:
+        from ..startup import run_catalogue_drift_check
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await asyncio.to_thread(run_catalogue_drift_check)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # pragma: no cover - loop must not die
+                logger.warning("Catalogue-drift periodic check failed: %s", exc)
+
+    logger.info("Catalogue-drift periodic task started (interval=%.0fs)", interval)
+    return asyncio.create_task(_drift_loop())
+
+
 def _register_adapter_loader_plugin(manager: Any) -> bool:
     """Register the out-of-tree adapter loader behind a feature flag.
 
@@ -724,6 +761,14 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.warning("Bedrock discovery merge skipped/failed (non-fatal): %s", exc)
 
+    # 0a3. Leader-gated PERIODIC catalogue-drift detection (RouteIQ-9a42).
+    #      Re-runs discovery on an interval, diffs the discovered catalogue vs
+    #      the live model_list, and emits gateway.bedrock.catalogue_drift so the
+    #      deployed-vs-offered gap is detected OVER TIME (not just at boot).
+    #      Gated on drift_metric_enabled AND enabled -> byte-stable no-op when
+    #      off (the default): the task is never created.
+    drift_task = _maybe_start_catalogue_drift_task()
+
     # 0b. Install RouteIQ plugin routing strategy on the LiteLLM Router
     if getattr(app.state, "use_plugin_strategy", True):
         try:
@@ -853,6 +898,20 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     logger.info("MLOps closed loop wired into eval pipeline")
             except Exception as exc:
                 logger.warning("MLOps loop wiring skipped/failed: %s", exc)
+
+            # 4c. Wire the upstream adaptive-router queue flush (RouteIQ-f699)
+            #     onto the SAME running eval pipeline: each push_feedback() drains
+            #     the selected upstream router's update queue to the durable store
+            #     so cross-restart adaptive state is not lost. Gated on
+            #     settings.mlops.upstream_router.enabled -> byte-stable no-op when
+            #     delegation is off (the default). Never blocks startup.
+            try:
+                from ..mlops import wire_upstream_router_flush
+
+                if wire_upstream_router_flush(eval_pipeline=eval_pipeline):
+                    logger.info("Upstream router queue-flush wired into eval pipeline")
+            except Exception as exc:
+                logger.warning("Upstream router flush wiring skipped/failed: %s", exc)
     except ImportError:
         logger.debug("Eval pipeline module not available")
     except Exception as exc:
@@ -864,6 +923,14 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # === SHUTDOWN ===
     logger.info("RouteIQ Gateway shutting down...")
+
+    # 0pre. Stop the periodic catalogue-drift task (RouteIQ-9a42), if started.
+    if drift_task is not None:
+        drift_task.cancel()
+        try:
+            await drift_task
+        except (Exception, BaseException):  # CancelledError + defensive
+            pass
 
     # 0. Stop eval pipeline background loop
     if eval_pipeline is not None:
@@ -1287,6 +1354,20 @@ def create_standalone_app(
                 drain_manager = get_drain_manager()
                 await drain_manager.start_drain()
                 await drain_manager.wait_for_drain()
+            # Flush durable bandit posteriors AFTER drain (RouteIQ-95ae): mirror
+            # the _routeiq_lifespan shutdown so the standalone path also persists
+            # the debounced tail the FilePosteriorBackend has not yet written —
+            # otherwise convergence-across-restarts regresses on this path too.
+            # Best-effort / fail-open; a no-op for the memory backend.
+            try:
+                from ..kumaraswamy_thompson import flush_posteriors_on_shutdown
+
+                flush_posteriors_on_shutdown()
+            except Exception as exc:
+                logger.warning(
+                    "KTS posterior flush at standalone shutdown skipped/failed: %s",
+                    exc,
+                )
             if enable_plugins:
                 await _run_plugin_shutdown(app)
             # Reset OIDC state

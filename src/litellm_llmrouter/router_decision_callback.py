@@ -1300,8 +1300,115 @@ class RouterDecisionCallback:
         user_api_key_dict: Any,
         response: Any,
     ) -> None:
-        """Called after successful API call. Required by LiteLLM callback interface."""
-        pass
+        """Called after successful API call. Required by LiteLLM callback interface.
+
+        RouteIQ-3ff5: this is the registered hot-path success hook, so it is the
+        LIVE callsite that climbs the cost-cascade mode-(a) ladder. When the
+        cascade RETRY consumer is enabled (default OFF -> no-op) and the cheapest
+        rung's response scored low confidence, it re-issues the request up the
+        ``routeiq_cascade`` ladder and replaces the response content in place.
+        Fail-open: any error leaves the original response untouched.
+        """
+        try:
+            await self._maybe_climb_cascade(data, response)
+        except Exception as exc:  # pragma: no cover - hook must never raise
+            logger.debug("Cascade escalation in post-call hook skipped: %s", exc)
+
+    async def _maybe_climb_cascade(self, data: Dict[str, Any], response: Any) -> None:
+        """Climb the cost-cascade ladder on a low-confidence response (RouteIQ-3ff5).
+
+        Gated, default OFF: returns immediately unless the cascade retry consumer
+        is enabled AND the cost-cascade strategy is registered. Re-issues at the
+        next rung when the response confidence is below threshold, then copies the
+        escalated choices back onto ``response`` so the caller observes the
+        stronger answer.
+        """
+        from litellm_llmrouter.cascade_retry import (
+            extract_response_confidence,
+            get_cascade_retry_consumer,
+        )
+
+        consumer = get_cascade_retry_consumer()
+        if consumer is None:
+            return
+        # Only escalate a low-confidence response (no signal -> leave as-is).
+        confidence = extract_response_confidence(response)
+        if confidence is None or confidence >= consumer._confidence_threshold:
+            return
+
+        try:
+            from litellm.proxy.proxy_server import llm_router
+        except ImportError:
+            return
+        if llm_router is None:
+            return
+
+        from litellm_llmrouter.strategy_registry import (
+            RoutingContext,
+            get_routing_registry,
+        )
+
+        cascade_strategy = get_routing_registry().get("llmrouter-cost-cascade")
+        if cascade_strategy is None:
+            return
+
+        model = data.get("model")
+        messages = data.get("messages")
+        if not model or not messages:
+            return
+
+        def _select_rung(rung_index: int):
+            ctx = RoutingContext(
+                router=llm_router,
+                model=model,
+                messages=messages,
+                input=None,
+                request_kwargs=(
+                    {"cascade_rung": rung_index - 1} if rung_index > 0 else {}
+                ),
+            )
+            return cascade_strategy.select_deployment(ctx)
+
+        # Rung 0 has already been served (this is its response). Start the climb
+        # from rung 1 by feeding rung 0's response as the prior.
+        first = True
+
+        async def _complete(deployment: dict, rung_index: int):
+            nonlocal first
+            if first and rung_index == 0:
+                first = False
+                return response  # reuse the already-served cheapest-rung response
+            rung_model = deployment.get("litellm_params", {}).get("model", model)
+            return await llm_router.acompletion(model=rung_model, messages=messages)
+
+        escalated = await consumer.complete_with_cascade(
+            select_rung=_select_rung, complete=_complete
+        )
+        if escalated is not None and escalated is not response:
+            self._copy_choices(escalated, response)
+
+    @staticmethod
+    def _copy_choices(src: Any, dst: Any) -> None:
+        """Copy the message choices from an escalated response onto the original."""
+        try:
+            src_choices = (
+                src.get("choices")
+                if isinstance(src, dict)
+                else getattr(src, "choices", None)
+            )
+            if src_choices is None:
+                return
+            if isinstance(dst, dict):
+                dst["choices"] = src_choices
+                dst["routeiq_cascade_escalated"] = True
+            else:
+                setattr(dst, "choices", src_choices)
+                try:
+                    setattr(dst, "routeiq_cascade_escalated", True)
+                except Exception:
+                    pass
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     async def async_post_call_failure_hook(
         self,

@@ -193,6 +193,12 @@ class RouteIQStats:
     model_distribution: dict[str, int] = field(default_factory=dict)
     strategy_distribution: dict[str, int] = field(default_factory=dict)
     total_decisions: int = 0
+    # Per-user routing read from RouteIQ's caller-scoped ``/me/stats`` surface
+    # (RouteIQ-2bbe): user_id -> ``recent_models`` the server attributes to that
+    # user's key. Empty when the harness fired no synthetic users or could not
+    # read /me/stats; the personalized verdict prefers this AUTHORITATIVE
+    # server-side view over the client-observed body model when present.
+    per_user_recent_models: dict[str, list[str]] = field(default_factory=dict)
     # raw payloads kept for the report's provenance / debugging section.
     raw: dict[str, Any] = field(default_factory=dict)
     # human-readable notes on which surfaces were/weren't reachable.
@@ -210,7 +216,8 @@ class StrategyVerdict:
 
     ``strategy`` is the active strategy name the verdict was produced for.
     ``family`` is the plugin family that handled it (``fan-out``, ``consistency``,
-    ``cost-aware``, ``personalized``, ``latency-cost``, or ``generic``).
+    ``cost-aware``, ``cost-cascade``, ``semantic-intent``, ``personalized``,
+    ``latency-cost``, or ``generic``).
     ``healthy`` is the plugin's pass/fail (None == not assessable, e.g. the
     generic fallback or insufficient data). ``findings`` carries the verdict's
     structured numbers; ``messages`` the human-readable lines for the report.

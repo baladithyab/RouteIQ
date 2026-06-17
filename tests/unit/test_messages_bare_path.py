@@ -23,8 +23,8 @@ so no real LiteLLM routing, network, or AWS credentials are exercised.
 """
 
 import pytest
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from litellm_llmrouter.routes.messages import (
@@ -246,3 +246,186 @@ def test_build_messages_router_imports_real_upstream_handler():
     router = build_messages_router()
     paths = {route.path for route in router.routes}
     assert paths == {"/v1/messages", "/v1/messages/count_tokens"}
+
+
+# ==========================================================================
+# RouteIQ-db1d — bare-path REAL wiring + streaming + auth-reject coverage
+# ==========================================================================
+
+
+def test_real_router_wires_upstream_handlers_and_auth():
+    """The REAL router endpoints delegate to the upstream LiteLLM Anthropic
+    handlers and depend on the upstream ``user_api_key_auth`` (so auth + beta-
+    header passthrough behave identically to hitting LiteLLM directly)."""
+    pytest.importorskip("litellm.proxy.anthropic_endpoints.endpoints")
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    router = build_messages_router()
+    by_path = {route.path: route for route in router.routes}
+
+    # every bare route depends on the upstream auth dependency.
+    for path in ("/v1/messages", "/v1/messages/count_tokens"):
+        deps = by_path[path].dependant.dependencies
+        dep_calls = {d.call for d in deps}
+        assert user_api_key_auth in dep_calls, f"{path} missing upstream auth dep"
+
+
+def test_streaming_response_passes_through(monkeypatch):
+    """An SSE streaming Anthropic response flows through the bare-path handler
+    unchanged (the handler returns whatever the upstream handler returns, so a
+    StreamingResponse streams)."""
+    calls: dict[str, dict] = {}
+
+    async def _sse_body():
+        # minimal Anthropic SSE event stream.
+        yield b'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+        yield b"event: message_stop\ndata: {}\n\n"
+
+    async def _fake_anthropic_response(*, fastapi_response, request, user_api_key_dict):
+        body = await request.json()
+        calls["messages"] = {"stream": body.get("stream")}
+        return StreamingResponse(_sse_body(), media_type="text/event-stream")
+
+    async def _fake_count_tokens(*, request, user_api_key_dict):
+        return {"input_tokens": 1}
+
+    async def _fake_user_api_key_auth():
+        return object()
+
+    import litellm_llmrouter.routes.messages as messages_mod
+
+    def _fake_build_router():
+        from fastapi import APIRouter, Depends
+
+        router = APIRouter()
+
+        @router.post("/v1/messages")
+        async def messages(
+            fastapi_response: Response,
+            request: Request,
+            user_api_key_dict=Depends(_fake_user_api_key_auth),
+        ):
+            return await _fake_anthropic_response(
+                fastapi_response=fastapi_response,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+            )
+
+        return router
+
+    monkeypatch.setattr(messages_mod, "build_messages_router", _fake_build_router)
+
+    app = FastAPI()
+    register_messages_routes(app)
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer test-api-key"},
+    ) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        body = b"".join(resp.iter_bytes())
+
+    assert calls["messages"]["stream"] is True
+    assert b"message_start" in body
+    assert b"message_stop" in body
+
+
+def test_auth_rejection_blocks_delegation(monkeypatch):
+    """When the auth dependency REJECTS (raises 401), the request never reaches
+    the upstream delegating handler — the bare path is fail-closed on auth."""
+    delegated = {"called": False}
+
+    async def _fake_anthropic_response(
+        *, fastapi_response, request, user_api_key_dict
+    ):  # pragma: no cover - must NOT be reached on auth failure
+        delegated["called"] = True
+        return JSONResponse({"id": "msg"})
+
+    async def _rejecting_auth():
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    import litellm_llmrouter.routes.messages as messages_mod
+
+    def _fake_build_router():
+        from fastapi import APIRouter, Depends
+
+        router = APIRouter()
+
+        @router.post("/v1/messages")
+        async def messages(
+            fastapi_response: Response,
+            request: Request,
+            user_api_key_dict=Depends(_rejecting_auth),
+        ):
+            return await _fake_anthropic_response(
+                fastapi_response=fastapi_response,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+            )
+
+        return router
+
+    monkeypatch.setattr(messages_mod, "build_messages_router", _fake_build_router)
+
+    app = FastAPI()
+    register_messages_routes(app)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "claude-sonnet-4", "messages": []},
+        headers={"Authorization": "Bearer bad-key"},
+    )
+    assert resp.status_code == 401
+    # the upstream handler was never invoked (auth gated it).
+    assert delegated["called"] is False
+
+
+# ==========================================================================
+# RouteIQ-b9fe — contract guard: detect upstream adding a bare /messages route
+# ==========================================================================
+
+
+def test_upstream_does_not_register_bare_messages_route():
+    """Contract guard: RouteIQ registers the BARE ``/v1/messages`` family BECAUSE
+    upstream LiteLLM registers the Anthropic Messages family ONLY at the
+    ``/v1``-prefixed path inside its own app (so the /v1 mount doubles it to
+    /v1/v1/messages).
+
+    If a future LiteLLM adds the family at the BARE path too, mounting it under
+    /v1 would no longer hide it and RouteIQ's parent-app registration would
+    DOUBLE-register the route. This test fails loudly if upstream starts
+    exposing a bare ``/messages`` / ``/v1/messages`` on its OWN app router, so the
+    double-register is caught at CI time, not in production."""
+    endpoints = pytest.importorskip("litellm.proxy.anthropic_endpoints.endpoints")
+
+    router = getattr(endpoints, "router", None)
+    assert router is not None, "upstream anthropic endpoints router not found"
+
+    paths = {getattr(route, "path", None) for route in router.routes}
+    # Upstream registers the Anthropic family at the /v1-prefixed path ONLY.
+    # The contract RouteIQ relies on: upstream must NOT also expose a BARE
+    # ``/messages`` on its own router (which, once mounted under /v1, would mean
+    # RouteIQ's bare /v1/messages collides / double-registers).
+    assert "/messages" not in paths, (
+        "Upstream LiteLLM now registers a BARE /messages route on its own router. "
+        "Mounting it under /v1 no longer doubles it, so RouteIQ's bare-path "
+        "registration in routes/messages.py would DOUBLE-register. Re-evaluate "
+        "register_messages_routes() (RouteIQ-b9fe contract guard)."
+    )
+    # The /v1-prefixed form upstream DOES register (the reason the doubling
+    # happens) should still be present — if it vanished the fix's premise changed.
+    assert "/v1/messages" in paths, (
+        "Upstream LiteLLM no longer registers /v1/messages on its own router; "
+        "the premise of routes/messages.py (doubled /v1/v1/messages) has changed "
+        "(RouteIQ-b9fe contract guard)."
+    )

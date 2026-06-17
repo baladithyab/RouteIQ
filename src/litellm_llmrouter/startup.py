@@ -409,6 +409,78 @@ def merge_bedrock_discovered_models(
         return 0
 
 
+def run_catalogue_drift_check(
+    *,
+    settings: Optional["BedrockDiscoverySettings"] = None,
+    client_factory: Optional[Callable[[str], Any]] = None,
+) -> Optional[int]:
+    """Run one Bedrock model-catalogue drift check (RouteIQ-9a42).
+
+    Re-runs discovery, diffs the discovered catalogue against the LIVE
+    ``model_list`` via :func:`bedrock_discovery.compute_catalogue_drift`, and
+    emits the ``gateway.bedrock.catalogue_drift`` metric so a CloudWatch/Prom
+    alarm fires when the deployed catalogue drifts from what Bedrock offers.
+
+    Leader- and flag-gated, like :func:`merge_bedrock_discovered_models`:
+
+    * disabled (``drift_metric_enabled=False``, the default) -> returns ``None``
+      (byte-stable no-op; no scan, no metric);
+    * non-leader replica -> returns ``None`` (only the leader scans);
+    * enabled + leader -> returns the drift count (``missing + extra``) and
+      records the metric.
+
+    Never raises -- a drift-check failure must not disturb the running gateway.
+    """
+    try:
+        from litellm_llmrouter.bedrock_discovery import (
+            compute_catalogue_drift,
+            discover_models,
+            record_catalogue_drift_metric,
+        )
+
+        if settings is None:
+            from litellm_llmrouter.settings import get_settings
+
+            settings = get_settings().bedrock_discovery
+
+        if not getattr(settings, "drift_metric_enabled", False):
+            return None
+        if not getattr(settings, "enabled", False):
+            return None
+        if not _discovery_is_leader():
+            logger.debug("Bedrock drift check: not leader, skipping scan")
+            return None
+
+        result = discover_models(settings=settings, client_factory=client_factory)
+
+        configured: list = []
+        try:
+            from litellm.proxy.proxy_server import llm_router
+
+            if llm_router is not None:
+                configured = list(getattr(llm_router, "model_list", None) or [])
+        except ImportError:
+            configured = []
+
+        drift = compute_catalogue_drift(
+            result,
+            configured,
+            residency_constraint=getattr(settings, "residency_constraint", False),
+        )
+        record_catalogue_drift_metric(drift)
+        if drift.has_drift:
+            logger.info(
+                "Bedrock catalogue drift: %d missing (offered-not-routed), "
+                "%d extra (routed-not-offered)",
+                len(drift.missing),
+                len(drift.extra),
+            )
+        return drift.drift_count
+    except Exception as exc:  # never disturb the gateway on a drift check
+        logger.warning("Bedrock catalogue drift check skipped/failed: %s", exc)
+        return None
+
+
 def start_config_sync_if_enabled():
     """Start background config sync if enabled."""
     if os.getenv("CONFIG_HOT_RELOAD", "false").lower() == "true":
@@ -851,6 +923,22 @@ def run_litellm_proxy_inprocess(config_path: str, host: str, port: int, **kwargs
         async def _shutdown_sequence():
             if hasattr(app.state, "graceful_shutdown"):
                 await app.state.graceful_shutdown()
+            # Flush durable bandit posteriors AFTER drain (RouteIQ-95ae): the
+            # legacy create_app path drives shutdown here (not _routeiq_lifespan),
+            # so without this hook a clean SIGTERM loses the FilePosteriorBackend's
+            # debounced tail and convergence-across-restarts regresses. Best-effort
+            # / fail-open; a no-op for the memory backend.
+            try:
+                from litellm_llmrouter.kumaraswamy_thompson import (
+                    flush_posteriors_on_shutdown,
+                )
+
+                flush_posteriors_on_shutdown()
+            except Exception as exc:  # pragma: no cover - defensive at shutdown
+                logger.warning(
+                    "KTS posterior flush at legacy shutdown skipped/failed: %s",
+                    exc,
+                )
             # Reset OIDC state
             if hasattr(app.state, "llmrouter_oidc_shutdown"):
                 app.state.llmrouter_oidc_shutdown()

@@ -878,6 +878,124 @@ class DiscoveryResult:
             entries.append(mp_entry)
         return entries
 
+    def synthesize_model_groups(
+        self,
+        *,
+        residency_constraint: bool = False,
+        register_cost: bool = True,
+        name_prefix: str = "",
+        bind_marketplace: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Bind each LOGICAL model into ONE group fanned out over its arms
+        (RouteIQ-1c9d).
+
+        Unlike :meth:`to_auto_group_model_list` (which collapses EVERY discovered
+        model onto a single shared group), this binds arms by their *logical
+        model identity*: ``global.anthropic.claude-sonnet-4-v1:0`` discovered in
+        ``us-east-1``, the ``us.`` geo profile in ``us-west-2``, and a raw
+        ``anthropic.claude-sonnet-4-v1:0`` ON_DEMAND arm in ``eu-west-1`` all land
+        under the SINGLE ``model_name`` ``<name_prefix>anthropic.claude-sonnet-4``
+        as three arms. So one logical ``model_name`` fans out across region /
+        account / mantle arms automatically and a routing strategy picks the best
+        arm per request.
+
+        Each arm carries a ``model_info`` ``arm_id`` (its distinct
+        ``region/invocation_id``), ``provider``, ``tier``, and ``region`` so
+        telemetry can still attribute the physical arm. Arms with an identical
+        ``arm_id`` discovered from multiple source regions are deduped.
+
+        ``bind_marketplace`` (default True) also binds each routable marketplace /
+        mantle endpoint into the logical group derived from its model source, so a
+        custom-deployment arm of the same model joins its serverless siblings.
+        Models with no serverless path under ``residency_constraint`` are skipped
+        (logged at debug). Returns an empty list when nothing was discovered.
+        """
+        # logical model_name -> list of arm entries.
+        groups: dict[str, list[dict[str, Any]]] = {}
+        seen_arms: set[str] = set()
+
+        def _add_arm(group: str, entry: dict[str, Any], arm_id: str) -> None:
+            if arm_id in seen_arms:
+                return
+            seen_arms.add(arm_id)
+            info = entry.setdefault("model_info", {})
+            info["arm_id"] = arm_id
+            groups.setdefault(group, []).append(entry)
+
+        for m in self.models:
+            try:
+                sel = select_invocation_path(
+                    m, residency_constraint=residency_constraint
+                )
+            except NoServerlessPathInRegion as exc:
+                logger.debug("skipping %s for model-group bind: %s", m.model_id, exc)
+                continue
+            logical = f"{name_prefix}{_logical_model_name(m.model_id, m.provider_name)}"
+            entry = to_litellm_entry(
+                sel, model_name=logical, register_cost=register_cost
+            )
+            arm_id = f"{sel.region}/{sel.invocation_id}"
+            info = entry.setdefault("model_info", {})
+            info["provider"] = sel.provider_name
+            info["tier"] = sel.tier.value
+            info["region"] = sel.region
+            _add_arm(logical, entry, arm_id)
+
+        if bind_marketplace:
+            for ep in self.marketplace_endpoints:
+                if not ep.is_routable:
+                    continue
+                # The model source is a marketplace-model ARN; take the tail (the
+                # model id) so a mantle custom-deployment of the SAME logical model
+                # binds into that model's group, not a separate ARN-named group.
+                source_id = (ep.model_source or "").rsplit("/", 1)[-1]
+                logical = (
+                    f"{name_prefix}{_logical_model_name(source_id, 'marketplace')}"
+                )
+                entry = marketplace_to_litellm_entry(ep, model_name=logical)
+                arm_id = entry["model_info"]["arm_id"]
+                _add_arm(logical, entry, arm_id)
+
+        # Flatten in deterministic group order; arms keep discovery order.
+        out: list[dict[str, Any]] = []
+        for group in sorted(groups):
+            out.extend(groups[group])
+        return out
+
+
+def _logical_model_name(model_id: str, provider_name: str) -> str:
+    """Derive a stable LOGICAL model name from a Bedrock modelId (RouteIQ-1c9d).
+
+    The same logical model is offered across many regions/accounts under distinct
+    invocation ids (raw modelId, ``us.``/``eu.`` geo profiles, ``global.``
+    profiles). To bind those arms under ONE ``model_name`` we strip the
+    region-varying parts:
+
+      * any leading tier/geo prefix (``global.`` / ``us.`` / ``eu.`` / ...), and
+      * the trailing Bedrock version suffix (``-v1:0`` / ``:0``).
+
+    so ``global.anthropic.claude-sonnet-4-v1:0``, ``us.anthropic.claude-sonnet-4``
+    and the raw ``anthropic.claude-sonnet-4-v1:0`` all collapse to one logical
+    ``anthropic.claude-sonnet-4`` group. The provider name is only used as a
+    fallback when the modelId is empty.
+    """
+    base = model_id or provider_name.lower()
+    lowered = base.lower()
+    # Strip a leading tier prefix (global.) or geo prefix (us./eu./...).
+    if lowered.startswith("global."):
+        base = base[len("global.") :]
+    else:
+        for pref in _GEO_PREFIXES:
+            if lowered.startswith(pref):
+                base = base[len(pref) :]
+                break
+    # Strip the trailing Bedrock version suffix: "-v<NN>:<MM>" or ":<MM>".
+    import re
+
+    base = re.sub(r"-v\d+:\d+$", "", base)
+    base = re.sub(r":\d+$", "", base)
+    return base or (model_id or provider_name.lower())
+
 
 def discover_models(
     *,

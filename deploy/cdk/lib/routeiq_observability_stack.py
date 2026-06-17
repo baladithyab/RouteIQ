@@ -87,6 +87,7 @@ from .gitops_pipeline_construct import GitOpsPipelineConstruct
 from .naming import routing_log_group_name as _routing_log_group_name
 from .obs_nag_suppressions import apply_observability_nag_suppressions
 from .observability_construct import ObservabilityConstruct
+from .sagemaker_retraining_construct import SageMakerRetrainingConstruct
 
 if TYPE_CHECKING:  # pragma: no cover - forward ref only
     from .routeiq_stack import RouteIqStack
@@ -120,6 +121,7 @@ class RouteIqObservabilityStack(Stack):
         enable_data_lake: bool = False,
         enable_config_audit: bool = False,
         enable_gitops_pipeline: bool = False,
+        enable_sagemaker_retraining: bool = False,
         enable_rollback_monitor: bool = False,
         notify_emails: list[str] | None = None,
         cost_center: str | None = None,
@@ -239,6 +241,20 @@ class RouteIqObservabilityStack(Stack):
                 source_log_group=self.routing_log_group,
             )
             self.athena_workgroup = self._build_athena_workgroup(self.data_lake)
+
+        # -- 3c. Scheduled SageMaker retraining (RouteIQ-8a24; flag-gated, OFF) -
+        # EventBridge schedule -> SageMaker CreateTrainingJob -> S3 artifact
+        # bucket + the narrow invoker/execution IAM. The in-process side is the
+        # existing model-artifact loader. DEFAULT OFF -> zero Events::Rule /
+        # SageMaker / artifact-bucket resources -> the default P2 synth/snapshot
+        # stays byte-stable. The LIVE training job is operator-gated.
+        self.sagemaker_retraining: SageMakerRetrainingConstruct | None = None
+        if enable_sagemaker_retraining:
+            self.sagemaker_retraining = SageMakerRetrainingConstruct(
+                self,
+                "SageMakerRetrainingConstruct",
+                env_name=env_name,
+            )
 
         # -- 3b. Cross-stack pod-role grants (the combined-deploy seam) ---------
         # RouteIQ-569f (AppConfig runtime poll) + RouteIQ-74c0/717b (aps:RemoteWrite).

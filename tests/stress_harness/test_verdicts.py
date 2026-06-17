@@ -270,3 +270,201 @@ def test_buggy_plugin_note_carried_through_to_report_family(monkeypatch):
     # The report must read the DEGRADED family from the verdict, not recompute.
     assert report._dispatched_family(result) == "generic"
     assert report.build_json(result)["verdict_family"] == "generic"
+
+
+# ==========================================================================
+# RouteIQ-f086 — cost-cascade + semantic-intent as first-class families
+# ==========================================================================
+
+
+def test_f086_new_families_registered_and_routed():
+    """Both new families are registered AND the dispatch routes their tokens to
+    them (not to the broader cost-aware / consistency families)."""
+    families = set(registered_families())
+    assert {"cost-cascade", "semantic-intent"}.issubset(families)
+    # cost-cascade tokens win over the broad cost-aware family.
+    assert family_for("llmrouter-cost-cascade") == "cost-cascade"
+    assert family_for("cheap-first-cascade") == "cost-cascade"
+    # semantic-intent tokens win over the broad consistency family.
+    assert family_for("llmrouter-semantic-intent") == "semantic-intent"
+    assert family_for("intent-classifier") == "semantic-intent"
+    # the older families still route to themselves (no regression).
+    assert family_for("llmrouter-cost-aware") == "cost-aware"
+    assert family_for("llmrouter-knn") == "consistency"
+
+
+# --- cost-cascade ---------------------------------------------------------
+
+
+def test_cost_cascade_healthy_cheap_first():
+    """Cheap tier carries the bulk of traffic and no easy bucket is premium-
+    dominated -> the cheap-first cascade invariant holds."""
+    records = (
+        [_ok_record("easy-chitchat", "cheap-haiku") for _ in range(6)]
+        + [_ok_record("math", "cheap-haiku") for _ in range(3)]
+        # one escalation to a premium model on the hard bucket is fine.
+        + [_ok_record("hard-reasoning", "anthropic.claude-opus-4-8")]
+    )
+    result = _result_from(records)
+    verdict = dispatch_verdict("llmrouter-cost-cascade", records, None, result)
+    assert verdict.family == "cost-cascade"
+    assert verdict.healthy is True
+    assert verdict.findings["cheap_first"] is True
+    assert verdict.findings["cheap_total"] > verdict.findings["premium_total"]
+
+
+def test_cost_cascade_broken_when_premium_dominates():
+    """If the premium tier carries MORE traffic than cheap, the cascade has lost
+    its cheap-first invariant -> unhealthy."""
+    records = [
+        _ok_record("hard-reasoning", "anthropic.claude-opus-4-8") for _ in range(6)
+    ] + [_ok_record("math", "cheap-haiku")]
+    result = _result_from(records)
+    verdict = dispatch_verdict("cost-cascade", records, None, result)
+    assert verdict.family == "cost-cascade"
+    assert verdict.healthy is False
+    assert verdict.findings["cheap_first"] is False
+    assert "premium tier dominates" in verdict.summary
+
+
+def test_cost_cascade_broken_when_easy_is_premium():
+    """Even with overall cheap-first spread, a premium-dominated EASY bucket
+    breaks the cascade floor (cheap-on-easy)."""
+    records = [
+        _ok_record("easy-chitchat", "anthropic.claude-opus-4-8") for _ in range(3)
+    ] + [_ok_record("math", "cheap-haiku") for _ in range(10)]
+    result = _result_from(records)
+    verdict = dispatch_verdict("llmrouter-cost-cascade", records, None, result)
+    assert verdict.family == "cost-cascade"
+    # cheap_first holds (10 cheap > 3 premium) but easy bucket is premium-heavy.
+    assert verdict.findings["cheap_first"] is True
+    assert "easy-chitchat" in verdict.findings["easy_flagged_categories"]
+    assert verdict.healthy is False
+
+
+def test_cost_cascade_not_assessable_when_no_traffic():
+    result = _result_from([])
+    verdict = dispatch_verdict("cost-cascade", [], None, result)
+    assert verdict.family == "cost-cascade"
+    assert verdict.healthy is None
+
+
+# --- semantic-intent ------------------------------------------------------
+
+
+def test_semantic_intent_healthy_when_buckets_dispatch_distinctly():
+    """Each bucket routes dominantly to a DISTINCT model -> intent dispatch
+    differentiates by bucket."""
+    records = [_ok_record("math", "math-model") for _ in range(5)] + [
+        _ok_record("code", "code-model") for _ in range(5)
+    ]
+    result = _result_from(records)
+    verdict = dispatch_verdict("llmrouter-semantic-intent", records, None, result)
+    assert verdict.family == "semantic-intent"
+    assert verdict.healthy is True
+    assert verdict.findings["distinct_handlers"] == 2
+    assert verdict.findings["differentiated"] is True
+
+
+def test_semantic_intent_weak_when_bucket_smeared():
+    """A bucket smeared 50/50 across two models falls below the dominance
+    threshold -> weak intent dispatch."""
+    records = [
+        _ok_record("math", "model-a"),
+        _ok_record("math", "model-b"),
+        _ok_record("math", "model-a"),
+        _ok_record("math", "model-b"),
+        _ok_record("code", "code-model"),
+    ]
+    result = _result_from(records)
+    verdict = dispatch_verdict("semantic-intent", records, None, result)
+    assert verdict.family == "semantic-intent"
+    assert verdict.healthy is False
+    assert "math" in verdict.findings["smeared_buckets"]
+
+
+def test_semantic_intent_weak_when_no_differentiation():
+    """All buckets collapse onto ONE model -> the router is not discriminating by
+    intent even though each bucket is internally dominant."""
+    records = [_ok_record("math", "one-model") for _ in range(5)] + [
+        _ok_record("code", "one-model") for _ in range(5)
+    ]
+    result = _result_from(records)
+    verdict = dispatch_verdict("semantic-intent", records, None, result)
+    assert verdict.family == "semantic-intent"
+    assert verdict.findings["distinct_handlers"] == 1
+    assert verdict.findings["differentiated"] is False
+    assert verdict.healthy is False
+
+
+def test_semantic_intent_not_assessable_without_traffic():
+    result = _result_from([])
+    verdict = dispatch_verdict("semantic-intent", [], None, result)
+    assert verdict.family == "semantic-intent"
+    assert verdict.healthy is None
+
+
+# ==========================================================================
+# RouteIQ-2bbe — personalized verdict reads /me/stats per-user routing
+# ==========================================================================
+
+
+def test_personalized_prefers_me_stats_per_user_view():
+    """When stats.per_user_recent_models is populated (read from /me/stats), the
+    AUTHORITATIVE server-side per-user view drives the drift verdict — even when
+    the client-observed records carry NO user ids."""
+    from stress_harness.models import RouteIQStats
+
+    stats = RouteIQStats(
+        active_strategy="personalized",
+        per_user_recent_models={
+            "user-000": ["model-a", "model-a", "model-b"],
+            "user-001": ["model-c", "model-c"],
+        },
+    )
+    # records carry NO user_id — the server view must still be used.
+    records = [_ok_record("math", "model-x"), _ok_record("code", "model-y")]
+    result = _result_from(records)
+    verdict = dispatch_verdict("personalized", records, stats, result)
+    assert verdict.family == "personalized"
+    assert verdict.findings["users"] == 2
+    # user-000 dominant=model-a, user-001 dominant=model-c -> 2 distinct -> drift.
+    assert verdict.findings["distinct_dominant_models"] == 2
+    assert verdict.healthy is True
+    assert "/me/stats" in verdict.findings["source"]
+    assert "/me/stats" in verdict.summary
+
+
+def test_personalized_me_stats_no_drift_when_all_converge():
+    """Server per-user view where every user converges to one model -> no drift
+    (soft warning, not a hard fail)."""
+    from stress_harness.models import RouteIQStats
+
+    stats = RouteIQStats(
+        per_user_recent_models={
+            "user-000": ["model-a", "model-a"],
+            "user-001": ["model-a"],
+        },
+    )
+    records = [_ok_record("math", "model-a")]
+    result = _result_from(records)
+    verdict = dispatch_verdict("personalized", records, stats, result)
+    assert verdict.findings["distinct_dominant_models"] == 1
+    assert verdict.healthy is False  # >1 user but no drift
+
+
+def test_personalized_falls_back_to_records_without_me_stats():
+    """With no /me/stats per-user view, the verdict falls back to client-observed
+    records grouped by user_id (the prior behaviour) and says so."""
+    records = [
+        _ok_record("math", "model-a", user_id="user-000"),
+        _ok_record("math", "model-b", user_id="user-001"),
+    ]
+    result = _result_from(records)
+    # stats present but WITHOUT per_user_recent_models.
+    from stress_harness.models import RouteIQStats
+
+    stats = RouteIQStats(active_strategy="personalized")
+    verdict = dispatch_verdict("personalized", records, stats, result)
+    assert verdict.findings["users"] == 2
+    assert "client-observed records" in verdict.findings["source"]

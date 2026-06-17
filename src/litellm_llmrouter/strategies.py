@@ -1874,6 +1874,8 @@ LLMROUTER_STRATEGIES = [
     "llmrouter-least-busy",  # LeastBusyRoutingStrategy - fewest in-flight requests
     # Feature-vector contextual bandit (RouteIQ-6c67)
     "llmrouter-linucb",  # LinUCBRoutingStrategy - LinUCB feature-vector bandit
+    # KV-cache-/queue-aware engine router (RouteIQ-08d6 / 6a89)
+    "llmrouter-kv-cache-aware",  # KVCacheAwareRoutingStrategy - least-loaded engine arm
 ]
 
 
@@ -1972,6 +1974,11 @@ DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
         "alpha": 1.0,
         "tenant_buckets": 8,
         "seed": None,
+    },
+    # KV-cache-/queue-aware engine router (RouteIQ-08d6 / 6a89)
+    "kv-cache-aware": {
+        "kv_cache_usage_weight": 1.0,
+        "waiting_queue_weight": 0.1,
     },
 }
 
@@ -4307,6 +4314,215 @@ def register_cost_cascade_strategy() -> bool:
         return False
 
 
+class KVCacheAwareRoutingStrategy(RoutingStrategy):
+    """KV-cache-/queue-aware engine router (RouteIQ-08d6, fed by RouteIQ-6a89).
+
+    For a self-hosted inference fleet (vLLM / vLLM Production Stack / AIBrix /
+    llm-d), several ``model_list`` arms back the SAME model but front different
+    engine replicas. This strategy consumes the LIVE engine ``/metrics`` gauges
+    scraped by :mod:`engine_metrics` (``vllm:num_requests_waiting`` and the
+    ``kv_cache_usage`` perc gauge) and selects the LEAST-LOADED arm so new load
+    lands where queue depth + KV-cache pressure are lowest.
+
+    Each candidate deployment declares its engine ``/metrics`` URL under
+    ``model_info['engine_metrics_url']`` (or ``litellm_params``). Arms with no
+    metrics URL, or whose scrape is unreachable, are treated as load 0.0 LAST
+    (they sort after any arm with live signal so a reachable-but-busy arm still
+    loses to a no-signal arm only when its load exceeds the no-signal default;
+    arms with live signal are always preferred). The arm with the lowest
+    ``kv_cache_usage_weight*kv_usage + waiting_queue_weight*num_waiting`` wins;
+    ties keep config order (stable).
+
+    The base :meth:`select_deployment` is SYNC and serves the most recent cached
+    snapshots (refreshed by :meth:`select_least_loaded`, the async LIVE path the
+    custom routing strategy calls). With no cache yet it returns the first
+    candidate (graceful no-op).
+    """
+
+    def __init__(
+        self,
+        *,
+        kv_cache_usage_weight: float = 1.0,
+        waiting_queue_weight: float = 0.1,
+    ) -> None:
+        self._kv_weight = float(kv_cache_usage_weight)
+        self._queue_weight = float(waiting_queue_weight)
+        # endpoint -> last load score (refreshed by the async scrape path)
+        self._cached_load: Dict[str, float] = {}
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-kv-cache-aware"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    @staticmethod
+    def _metrics_endpoint(dep: Dict) -> Optional[str]:
+        """The engine /metrics URL declared on a deployment, or None."""
+        info = dep.get("model_info") or {}
+        url = info.get("engine_metrics_url")
+        if not url:
+            params = dep.get("litellm_params") or {}
+            url = params.get("engine_metrics_url")
+        return str(url) if url else None
+
+    def _get_candidates(self, context: RoutingContext) -> List[Dict]:
+        """Candidate deployments for the requested model group (cooldown-filtered)."""
+        router = context.router
+        if router is None:
+            return []
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", [])
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+        try:
+            from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+            return filter_routable_candidates(router, group_matched, context)
+        except Exception:
+            return group_matched
+
+    def _score_load(self, snapshot) -> float:
+        """Load score from a scraped snapshot (lower is less loaded)."""
+        kv = snapshot.kv_cache_usage()
+        waiting = snapshot.num_waiting()
+        kv = 0.0 if kv is None else float(kv)
+        waiting = 0.0 if waiting is None else float(waiting)
+        return self._kv_weight * kv + self._queue_weight * waiting
+
+    async def select_least_loaded(self, context: RoutingContext) -> Optional[Dict]:
+        """LIVE path: scrape each candidate's engine metrics, pick least-loaded.
+
+        This is the real consumer of the RouteIQ-6a89 scraped gauges. For each
+        candidate with a declared metrics endpoint it scrapes a fresh snapshot
+        (the scraper is itself default-off -> graceful empty), scores load, and
+        returns the lowest-load arm. Candidates WITH a reachable snapshot are
+        preferred over candidates with no live signal. Refreshes the sync cache
+        as a side effect. Returns None only when there are no candidates.
+        """
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        from litellm_llmrouter.engine_metrics import get_engine_metrics_scraper
+
+        scraper = get_engine_metrics_scraper()
+
+        best: Optional[Dict] = None
+        best_score = float("inf")
+        best_has_signal = False
+        for dep in candidates:
+            endpoint = self._metrics_endpoint(dep)
+            score = float("inf")
+            has_signal = False
+            if endpoint:
+                try:
+                    snap = await scraper.scrape(endpoint)
+                    if snap.reachable:
+                        score = self._score_load(snap)
+                        has_signal = True
+                        self._cached_load[endpoint] = score
+                except Exception:  # scrape must never crash routing
+                    score = float("inf")
+            # Prefer an arm with live signal over one without; among same
+            # signal-class prefer the lower load. First candidate seeds best.
+            better = best is None or (
+                (has_signal and not best_has_signal)
+                or (has_signal == best_has_signal and score < best_score)
+            )
+            if better:
+                best, best_score, best_has_signal = dep, score, has_signal
+
+        if best is None:
+            return candidates[0]
+        _record_selection_metric(
+            "kv-cache-aware",
+            best.get("litellm_params", {}).get("model", "unknown"),
+        )
+        return best
+
+    def select_deployment(self, context: RoutingContext) -> Optional[Dict]:
+        """SYNC path: pick least-loaded using the most recent cached load scores.
+
+        Reads the cache refreshed by :meth:`select_least_loaded` (the async LIVE
+        path). With no cached signal for any candidate, returns the first
+        candidate (graceful no-op -- never blocks or scrapes synchronously).
+        """
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+        best = candidates[0]
+        best_score = float("inf")
+        best_has_signal = False
+        for dep in candidates:
+            endpoint = self._metrics_endpoint(dep)
+            if endpoint is not None and endpoint in self._cached_load:
+                score = self._cached_load[endpoint]
+                has_signal = True
+            else:
+                score = float("inf")
+                has_signal = False
+            if best is candidates[0] and dep is candidates[0]:
+                # seed score for the first candidate
+                best_score, best_has_signal = score, has_signal
+                continue
+            if (has_signal and not best_has_signal) or (
+                has_signal == best_has_signal and score < best_score
+            ):
+                best, best_score, best_has_signal = dep, score, has_signal
+        return best
+
+
+def register_kv_cache_aware_strategy() -> bool:
+    """Register the KV-cache-aware strategy in the routing registry (RouteIQ-08d6).
+
+    Makes :class:`KVCacheAwareRoutingStrategy` available as
+    ``"llmrouter-kv-cache-aware"``. Opt-in: registers only when
+    ``settings.engine_metrics.kv_aware_routing_enabled`` is True (which also
+    needs the scraper ``enabled`` to produce live signal). Default OFF ->
+    byte-stable: nothing is registered.
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().engine_metrics
+    except Exception:
+        return False
+
+    if not getattr(cfg, "kv_aware_routing_enabled", False):
+        verbose_proxy_logger.debug(
+            "KV-cache-aware routing disabled "
+            "(ROUTEIQ_ENGINE_METRICS__KV_AWARE_ROUTING_ENABLED=false)"
+        )
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        registry.register(
+            "llmrouter-kv-cache-aware",
+            KVCacheAwareRoutingStrategy(
+                kv_cache_usage_weight=getattr(cfg, "kv_cache_usage_weight", 1.0),
+                waiting_queue_weight=getattr(cfg, "waiting_queue_weight", 0.1),
+            ),
+        )
+        verbose_proxy_logger.info(
+            "Registered KV-cache-aware strategy as 'llmrouter-kv-cache-aware'"
+        )
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(f"Failed to register KV-cache-aware strategy: {e}")
+        return False
+
+
 def register_semantic_intent_strategy() -> bool:
     """Register the semantic intent router in the routing registry.
 
@@ -4514,5 +4730,6 @@ def register_llmrouter_strategies():
     register_tag_routing_strategy()
     register_latency_aware_strategies()
     register_linucb_strategy()
+    register_kv_cache_aware_strategy()
 
     return LLMROUTER_STRATEGIES

@@ -140,6 +140,7 @@ def make_obs_stack(
     enable_data_lake: bool = False,
     enable_config_audit: bool = False,
     enable_gitops_pipeline: bool = False,
+    enable_sagemaker_retraining: bool = False,
     enable_rollback_monitor: bool = False,
     notify_emails: list[str] | None = None,
     construct_id: str | None = None,
@@ -177,6 +178,7 @@ def make_obs_stack(
         enable_data_lake=enable_data_lake,
         enable_config_audit=enable_config_audit,
         enable_gitops_pipeline=enable_gitops_pipeline,
+        enable_sagemaker_retraining=enable_sagemaker_retraining,
         enable_rollback_monitor=enable_rollback_monitor,
         notify_emails=notify_emails,
     )

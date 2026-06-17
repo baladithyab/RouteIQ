@@ -27,6 +27,7 @@
     "routeiq:enable_data_lake": false,
     "routeiq:enable_config_audit": false,
     "routeiq:enable_gitops_pipeline": false,
+    "routeiq:enable_sagemaker_retraining": false,
     "routeiq:routing_log_group_name": null,
     "routeiq:notify_emails": [],
     "routeiq:enable_state_stack": true,

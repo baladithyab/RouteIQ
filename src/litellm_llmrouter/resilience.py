@@ -374,6 +374,80 @@ def reset_drain_manager() -> None:
     _drain_manager = None
 
 
+def _leader_handoff_enabled() -> bool:
+    """Whether to release HA leadership on voluntary drain (RouteIQ-8387).
+
+    Default OFF (``ROUTEIQ_LEADER_DRAIN_HANDOFF=false``): a draining replica
+    keeps its lease and lets it expire naturally, exactly as today (byte-stable
+    no-op). When ON, the draining pod proactively releases the lease at the top
+    of drain so a peer can take over within one acquisition cycle instead of
+    waiting out the full lease TTL.
+    """
+    return os.getenv("ROUTEIQ_LEADER_DRAIN_HANDOFF", "false").lower() == "true"
+
+
+async def release_leadership_for_handoff() -> bool:
+    """Release HA leadership so a peer can take over (leader-aware drain).
+
+    Voluntary-disruption hand-off (RouteIQ-8387): on SIGTERM / start_drain a
+    pod that holds the leader lease should hand it off *immediately* rather than
+    letting the lease TTL run down -- otherwise leader-only work (config sync,
+    migrations) stalls for up to one lease period after the leader starts
+    draining. This stops the renewal thread and releases the lease.
+
+    Safe + best-effort:
+    * No-op (returns ``True``) when leader election is disabled, this pod is not
+      the leader, or the hand-off flag is off.
+    * Never raises -- a release failure during shutdown is logged and swallowed
+      so it cannot wedge the drain sequence.
+
+    Returns ``True`` when there was nothing to do or the release succeeded;
+    ``False`` only when an active release attempt failed.
+    """
+    if not _leader_handoff_enabled():
+        return True
+    try:
+        from litellm_llmrouter.leader_election import get_leader_election
+
+        election = get_leader_election()
+    except Exception as exc:  # pragma: no cover - import/config guard
+        logger.debug("Leader hand-off: leader election unavailable: %s", exc)
+        return True
+    if election is None or not election.is_leader:
+        return True
+    try:
+        # Stop renewing first so a slow release cannot re-extend the lease.
+        election.stop_renewal()
+        released = await election.release()
+        logger.info(
+            "Leader hand-off: released leadership for graceful drain (released=%s)",
+            released,
+        )
+        return released
+    except Exception as exc:
+        logger.warning("Leader hand-off: release failed during drain: %s", exc)
+        return False
+
+
+async def leader_aware_drain() -> bool:
+    """Run the full graceful-drain sequence with HA leadership hand-off.
+
+    Sequence (RouteIQ-8387):
+      1. Release HA leadership (if leader + hand-off enabled) so a peer can
+         take over leader-only work immediately.
+      2. Start drain mode (readiness goes non-200, new requests rejected).
+      3. Wait for in-flight requests to finish (bounded by the drain timeout).
+
+    Returns the drain result (``True`` if all requests finished, ``False`` on
+    drain timeout). The leadership release is best-effort and does not affect
+    the returned drain result.
+    """
+    await release_leadership_for_handoff()
+    dm = get_drain_manager()
+    await dm.start_drain()
+    return await dm.wait_for_drain()
+
+
 class BackpressureMiddleware:
     """
     ASGI middleware for concurrency limiting and load shedding.
@@ -1322,6 +1396,74 @@ def reset_circuit_breaker_manager() -> None:
     global _circuit_breaker_manager
     _circuit_breaker_manager = None
     reset_shared_circuit_breaker_state()
+
+
+# The three well-known infra breakers always have a state series; provider
+# breakers are created lazily so their series only exist once a provider is
+# touched. We re-baseline whichever breakers already exist on the manager.
+_KNOWN_INFRA_BREAKERS = (
+    CircuitBreakerManager.DATABASE,
+    CircuitBreakerManager.REDIS,
+    CircuitBreakerManager.LEADER_ELECTION,
+)
+
+
+def reset_circuit_breaker_state_metrics(
+    manager: CircuitBreakerManager | None = None,
+) -> int:
+    """Re-baseline the per-breaker state gauge to CLOSED at startup (RouteIQ-c714).
+
+    The ``gateway.circuit_breaker.state`` gauge is driven by deltas
+    (``record_circuit_breaker_state`` emits ``+1`` on the new state and ``-1``
+    on the old). If a worker crashes while a breaker is OPEN, the last delta it
+    pushed leaves the scraped series at ``open=1`` -- a STALE non-zero gauge
+    that survives the crash and makes a freshly-restarted, healthy process look
+    degraded until the breaker next transitions.
+
+    This function, called once on startup BEFORE any breaker can transition,
+    drives every known breaker's series to a clean closed baseline (``closed``
+    -> 1, ``open`` -> 0, ``half_open`` -> 0) so the gauge reflects the real
+    boot-time state (all breakers start closed) rather than a pre-crash value.
+
+    Default-safe: a no-op when OTel/metrics are unavailable (telemetry never
+    breaks startup). Idempotent -- emitting the closed baseline twice is a
+    benign duplicate delta on a counter-modelled gauge that the
+    ``record_circuit_breaker_state`` ``from==to`` guard already tolerates.
+
+    Returns the number of breaker series re-baselined (for test assertions /
+    logging).
+    """
+    try:
+        from litellm_llmrouter.metrics import get_gateway_metrics
+
+        m = get_gateway_metrics()
+    except Exception:  # pragma: no cover - telemetry must not break startup
+        return 0
+    if m is None:
+        return 0
+
+    mgr = manager or get_circuit_breaker_manager()
+    # Re-baseline the well-known infra breakers plus any already-created ones
+    # (e.g. provider breakers touched in a prior run within the same process).
+    names = set(_KNOWN_INFRA_BREAKERS) | set(mgr._breakers.keys())
+    count = 0
+    for name in sorted(names):
+        try:
+            # Drive each non-closed series to 0 and the closed series to 1.
+            # Use the public per-series counter directly so this is independent
+            # of any cached from_state the breaker holds.
+            m.circuit_breaker_state.add(0, {"breaker": name, "state": "open"})
+            m.circuit_breaker_state.add(0, {"breaker": name, "state": "half_open"})
+            # Transition the breaker's reported state to closed via the helper
+            # so the +1/-1 bookkeeping matches the model used everywhere else.
+            m.record_circuit_breaker_state(name, "open", "closed")
+            count += 1
+        except Exception:  # pragma: no cover - per-breaker best-effort
+            continue
+    logger.info(
+        "Circuit breaker state metrics re-baselined to closed (%d breakers)", count
+    )
+    return count
 
 
 def compute_model_health_summary(

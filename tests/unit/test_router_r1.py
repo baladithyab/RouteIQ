@@ -485,3 +485,176 @@ class TestDataclasses:
         r2 = R1Result(answer="b")
         r1.models_used.append("gpt-4o")
         assert len(r2.models_used) == 0
+
+    def test_r1_result_stop_reason_default_empty(self):
+        assert R1Result(answer="x").stop_reason == ""
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-81bc — cost/latency gating + eval-loop feedback
+# ---------------------------------------------------------------------------
+
+
+class TestCostLatencyGating:
+    """The iterative router trades cost/latency for quality; an operator caps
+    that tradeoff with token / latency budgets (RouteIQ-81bc)."""
+
+    def test_no_gate_by_default(self):
+        r = RouterR1()
+        assert r._max_total_tokens == 0
+        assert r._max_total_latency_ms == 0.0
+        res = R1Result(answer="x", total_tokens=10_000)
+        # 0 disables both gates -> never trips.
+        assert r._budget_tripped(res, start=0.0) is None
+
+    def test_token_budget_trips(self):
+        r = RouterR1(max_total_tokens=100)
+        res = R1Result(answer="x", total_tokens=150)
+        assert r._budget_tripped(res, start=0.0) == "token_budget"
+
+    def test_token_budget_not_tripped_below_cap(self):
+        r = RouterR1(max_total_tokens=100)
+        res = R1Result(answer="x", total_tokens=50)
+        assert r._budget_tripped(res, start=0.0) is None
+
+    def test_latency_budget_trips(self):
+        import time
+
+        r = RouterR1(max_total_latency_ms=1.0)
+        # start far in the past -> elapsed exceeds the 1ms cap.
+        assert (
+            r._budget_tripped(R1Result(answer="x"), start=time.monotonic() - 5.0)
+            == "latency_budget"
+        )
+
+    @pytest.mark.asyncio
+    async def test_token_gate_stops_loop_and_sets_stop_reason(self):
+        """A token gate set below one round's cost stops the loop BEFORE a second
+        round and records the stop_reason."""
+        r = RouterR1(
+            router_model="gpt-4o-mini",
+            max_iterations=5,
+            timeout_per_iteration=10.0,
+            max_total_tokens=50,  # one round (~80 tokens) trips it next iteration.
+        )
+        # never produces an <answer> so only the gate can stop the loop.
+        partial = _make_response(
+            "<think>still working</think>\nLet me continue...", total_tokens=80
+        )
+        with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+            mock_ac.return_value = partial
+            result = await r.route("hard query", [{"model_name": "gpt-4o-mini"}])
+        # iteration 0 runs (80 tokens), iteration 1's top-of-loop gate trips.
+        assert result.stop_reason == "token_budget"
+        assert result.total_iterations == 1
+
+    @pytest.mark.asyncio
+    async def test_answer_sets_stop_reason_answer(self, router, sample_deployments):
+        mock_response = _make_response("<answer>done</answer>")
+        with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+            mock_ac.return_value = mock_response
+            result = await router.route("q", sample_deployments)
+        assert result.stop_reason == "answer"
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_sets_stop_reason(self, router, sample_deployments):
+        partial = _make_response("<think>...</think>", total_tokens=10)
+        with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+            mock_ac.return_value = partial
+            result = await router.route("q", sample_deployments)
+        assert result.stop_reason == "max_iterations"
+
+    def test_gating_wired_from_env(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_ROUTER_R1_ENABLED", "true")
+        monkeypatch.setenv("ROUTEIQ_ROUTER_R1_MAX_TOTAL_TOKENS", "5000")
+        monkeypatch.setenv("ROUTEIQ_ROUTER_R1_MAX_TOTAL_LATENCY_MS", "12000")
+        r = get_router_r1()
+        assert r is not None
+        assert r._max_total_tokens == 5000
+        assert r._max_total_latency_ms == 12000.0
+
+
+class TestEvalLoopFeedback:
+    """A completed R1 run is handed to the eval pipeline (COLLECT arm) so its
+    answer is graded and its cost/latency feed the FEEDBACK loop (RouteIQ-81bc)."""
+
+    @pytest.mark.asyncio
+    async def test_run_emits_eval_sample_when_pipeline_enabled(
+        self, router, sample_deployments
+    ):
+        from litellm_llmrouter import eval_pipeline as ep_mod
+
+        collected = []
+
+        class _FakePipeline:
+            def should_sample(self):
+                return True
+
+            def collect(self, sample):
+                collected.append(sample)
+
+        with patch.object(ep_mod, "get_eval_pipeline", lambda: _FakePipeline()):
+            with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+                mock_ac.return_value = _make_response(
+                    "<answer>the answer is 42</answer>", total_tokens=123
+                )
+                result = await router.route("what is the answer?", sample_deployments)
+
+        assert len(collected) == 1
+        sample = collected[0]
+        assert sample.strategy == "router-r1"
+        assert sample.response_content == "the answer is 42"
+        # observed cost/latency from the run flow into the sample.
+        assert sample.response_tokens == 123
+        assert sample.latency_ms == result.total_latency_ms
+
+    @pytest.mark.asyncio
+    async def test_no_eval_sample_when_pipeline_disabled(
+        self, router, sample_deployments
+    ):
+        from litellm_llmrouter import eval_pipeline as ep_mod
+
+        # get_eval_pipeline returns None when eval is disabled -> no-op.
+        with patch.object(ep_mod, "get_eval_pipeline", lambda: None):
+            with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+                mock_ac.return_value = _make_response("<answer>ok</answer>")
+                # must not raise.
+                result = await router.route("q", sample_deployments)
+        assert result.answer == "ok"
+
+    @pytest.mark.asyncio
+    async def test_eval_emit_failure_does_not_break_routing(
+        self, router, sample_deployments
+    ):
+        from litellm_llmrouter import eval_pipeline as ep_mod
+
+        def _boom():
+            raise RuntimeError("eval pipeline exploded")
+
+        with patch.object(ep_mod, "get_eval_pipeline", _boom):
+            with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+                mock_ac.return_value = _make_response("<answer>still ok</answer>")
+                result = await router.route("q", sample_deployments)
+        # routing returns its answer despite the feedback hiccup.
+        assert result.answer == "still ok"
+
+    @pytest.mark.asyncio
+    async def test_not_collected_when_should_sample_false(
+        self, router, sample_deployments
+    ):
+        from litellm_llmrouter import eval_pipeline as ep_mod
+
+        collected = []
+
+        class _FakePipeline:
+            def should_sample(self):
+                return False
+
+            def collect(self, sample):  # pragma: no cover - must not be called
+                collected.append(sample)
+
+        with patch.object(ep_mod, "get_eval_pipeline", lambda: _FakePipeline()):
+            with patch("litellm.acompletion", new_callable=AsyncMock) as mock_ac:
+                mock_ac.return_value = _make_response("<answer>ok</answer>")
+                await router.route("q", sample_deployments)
+        assert collected == []
