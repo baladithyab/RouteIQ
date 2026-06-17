@@ -385,6 +385,43 @@ helm upgrade routeiq deploy/charts/routeiq-gateway \
 > collector's `AWS_REGION`/`AWS_DEFAULT_REGION`. With no region set the collector
 > still renders (cloud-agnostic), but the exporters cannot write.
 
+#### CloudWatch GenAI Observability + Transaction Search (RouteIQ-ebf8)
+
+The `awsemf` exporter **declares** the `gen_ai.*` dimension sets the CloudWatch
+GenAI Observability dashboards key on, so the GenAI metrics RouteIQ emits
+(`gen_ai.client.operation.duration`, `gen_ai.client.token.usage`,
+`gen_ai.server.time_to_first_token`, …) surface as **CloudWatch dimensions** —
+not just EMF fields. EMF only promotes an attribute to a *dimension* if it is
+named in a `metric_declaration`; the chart declares
+`[gen_ai.request.model, gen_ai.system, gen_ai.operation.name]` (plus coarser
+`[model, system]` / `[system]` fallbacks), matching
+`telemetry_contracts.GenAIAttributes`. `dimension_rollup_option:
+NoDimensionRollup` keeps only those sets (avoids the zero-/single-dimension
+blow-up that inflates custom-metric cost). The `awsxray` exporter likewise
+**indexes** the same `gen_ai.*` span attributes so traces are
+filterable/aggregatable by model + system in Transaction Search. Toggle both via
+`gateway.otel.collector.emf.genaiObservability.enabled` and
+`gateway.otel.collector.xray.transactionSearch.enabled` (default **ON**).
+
+> **Transaction Search is OPERATOR-GATED (one-time account step).** The collector
+> config alone does **not** enable Transaction Search. An operator must turn it
+> on at the account level so X-Ray trace segments are written to CloudWatch Logs
+> (the `aws/spans` group) and indexed:
+>
+> - **Console:** CloudWatch → Application Signals → **Transaction Search** →
+>   *Enable*, choosing the indexed-trace sampling percentage.
+> - **API:**
+>   ```bash
+>   aws xray update-trace-segment-destination --destination CloudWatchLogs
+>   aws xray update-indexing-rule --name "Default" \
+>       --rule '{"Probabilistic":{"DesiredSamplingPercentage":5}}'
+>   ```
+>
+> The collector's IAM identity must additionally allow `xray:PutTraceSegments` +
+> `logs:PutLogEvents` to the `aws/spans` log group. Not provable by
+> `helm template`; the chart only ships the exporter `indexed_attributes` —
+> verify on a live account.
+
 Disabling the collector (`otel.collector.enabled=false`) removes all four
 collector resources **and** drops the gateway's auto-targeted
 `OTEL_EXPORTER_OTLP_ENDPOINT` — point `externalOtel.endpoint` (or

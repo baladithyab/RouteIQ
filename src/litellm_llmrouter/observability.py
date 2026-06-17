@@ -46,6 +46,93 @@ from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExp
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
+# RouteIQ-3c0a: AWS X-Ray trace-ID generator + X-Amzn-Trace-Id propagation
+# ==============================================================================
+# CloudWatch Transaction Search / X-Ray require trace IDs in the X-Ray epoch
+# format (the first 32 bits are a Unix epoch second), and the edge<->service
+# trace context is carried in the ``X-Amzn-Trace-Id`` header (NOT W3C
+# ``traceparent``). Wiring BOTH on the app side gives a single edge-to-Bedrock
+# trace in X-Ray.
+#
+# The two pieces ship in OPTIONAL OTel-contrib packages (the ``otel`` extra):
+#   * ``opentelemetry-sdk-extension-aws`` -> ``AwsXRayIdGenerator``
+#   * ``opentelemetry-propagator-aws-xray`` -> ``AwsXRayPropagator``
+# Their absence must NEVER break boot (mirrors the optional
+# ``opentelemetry-exporter-prometheus`` guard in ``_build_prometheus_metric_reader``).
+# When unavailable we degrade to the default W3C ID generator + propagator.
+
+
+def _build_xray_id_generator() -> Optional[Any]:
+    """Construct the AWS X-Ray ``IdGenerator``, or ``None`` if unavailable.
+
+    Returns an ``AwsXRayIdGenerator`` instance to pass as the ``id_generator``
+    of a NEW ``TracerProvider`` so generated trace IDs are X-Ray epoch format
+    (RouteIQ-3c0a). Returns ``None`` when the optional
+    ``opentelemetry-sdk-extension-aws`` package is not installed (degrades to the
+    default random W3C ID generator).
+
+    Never raises: a missing optional dependency (or any construction failure) is
+    logged at warning/debug and falls back to W3C — it must not break boot.
+    """
+    try:
+        from opentelemetry.sdk.extension.aws.trace import (  # type: ignore[import-not-found]
+            AwsXRayIdGenerator,
+        )
+    except Exception:
+        logger.warning(
+            "X-Ray enabled but opentelemetry-sdk-extension-aws is not installed; "
+            "trace IDs will stay W3C-format (install the `otel` extra). "
+            "X-Ray / CloudWatch Transaction Search will not group these spans."
+        )
+        return None
+
+    try:
+        return AwsXRayIdGenerator()
+    except Exception:  # pragma: no cover - defensive: never break boot
+        logger.debug("Failed to construct AwsXRayIdGenerator", exc_info=True)
+        return None
+
+
+def _install_xray_propagator() -> bool:
+    """Install the AWS X-Ray propagator as the global text-map.
+
+    Sets ``AwsXRayPropagator`` via ``set_global_textmap`` so the gateway both
+    extracts an inbound ``X-Amzn-Trace-Id`` parent context AND injects it on
+    outbound requests (round-trips the X-Ray trace header, RouteIQ-3c0a).
+
+    Returns ``True`` when the propagator was installed, ``False`` when the
+    optional ``opentelemetry-propagator-aws-xray`` package is absent (the global
+    W3C ``tracecontext``/``baggage`` propagator is left intact).
+
+    Never raises: a missing optional dependency (or any wiring failure) is logged
+    at warning/debug and the default propagator is kept — it must not break boot.
+    """
+    try:
+        from opentelemetry.propagate import set_global_textmap
+        from opentelemetry.propagators.aws import (  # type: ignore[import-not-found]
+            AwsXRayPropagator,
+        )
+    except Exception:
+        logger.warning(
+            "X-Ray enabled but opentelemetry-propagator-aws-xray is not installed; "
+            "the X-Amzn-Trace-Id header will not be propagated (install the `otel` "
+            "extra). The default W3C propagator is kept."
+        )
+        return False
+
+    try:
+        set_global_textmap(AwsXRayPropagator())
+        logger.info(
+            "Installed AwsXRayPropagator as the global text-map propagator "
+            "(X-Amzn-Trace-Id propagation enabled)"
+        )
+        return True
+    except Exception:  # pragma: no cover - defensive: never break boot
+        logger.debug("Failed to install AwsXRayPropagator", exc_info=True)
+        return False
+
+
+# ==============================================================================
 # TG4.1: Router Decision Span Attributes
 # ==============================================================================
 # These span attribute keys align with the TG4.1 acceptance criteria for
@@ -896,6 +983,7 @@ class ObservabilityManager:
         enable_logs: bool = True,
         enable_metrics: bool = True,
         sampler: Optional[Sampler] = None,
+        xray_enabled: Optional[bool] = None,
     ):
         """
         Initialize the observability manager.
@@ -910,6 +998,10 @@ class ObservabilityManager:
             enable_metrics: Whether to enable metrics collection
             sampler: Optional custom Sampler. If None, the sampler is configured from
                      environment variables (OTEL_TRACES_SAMPLER, LLMROUTER_OTEL_SAMPLE_RATE).
+            xray_enabled: Whether to emit AWS X-Ray-format trace IDs and propagate
+                     the ``X-Amzn-Trace-Id`` header (RouteIQ-3c0a). If None, the
+                     value is read from ``settings.otel.xray_enabled`` (default
+                     OFF, so trace IDs stay W3C-format unless opted in).
         """
         self.service_name = service_name
         self.service_version = service_version
@@ -932,6 +1024,18 @@ class ObservabilityManager:
         self.enable_metrics = enable_metrics
         # Resolve sampler: explicit > env-based > default
         self._sampler = sampler if sampler is not None else _get_sampler_from_env()
+        # Resolve X-Ray gating: explicit arg > settings.otel.xray_enabled > False.
+        # Default OFF keeps trace IDs W3C-format unless an operator opts in
+        # (RouteIQ-3c0a). Read via get_settings per ADR-0013, fail-closed to off.
+        if xray_enabled is not None:
+            self._xray_enabled = xray_enabled
+        else:
+            try:
+                from litellm_llmrouter.settings import get_settings
+
+                self._xray_enabled = bool(get_settings().otel.xray_enabled)
+            except Exception:
+                self._xray_enabled = False
 
         # Create resource with service identification
         # ADR-0019: Include gen_ai.system at the resource level so every
@@ -992,25 +1096,54 @@ class ObservabilityManager:
         """
         existing_provider = trace.get_tracer_provider()
 
+        # RouteIQ-3c0a: when X-Ray is enabled, resolve the AWS X-Ray IdGenerator
+        # so a NEW provider emits X-Ray-epoch-format trace IDs. The generator can
+        # ONLY be set at provider CONSTRUCTION — an already-configured reused SDK
+        # provider cannot be retrofitted with a different id_generator (mirrors the
+        # sampler caveat documented in this method's docstring).
+        xray_id_generator = _build_xray_id_generator() if self._xray_enabled else None
+
         # Check if we have an actual SDK TracerProvider we can reuse
         if _is_sdk_tracer_provider(existing_provider):
             # Reuse existing SDK provider - this is the preferred path
             # It ensures all spans go to the same exporter
             self._tracer_provider = cast(TracerProvider, existing_provider)
             logger.info("Reusing existing SDK TracerProvider - attaching OTLP exporter")
+            if self._xray_enabled:
+                logger.warning(
+                    "X-Ray enabled but an existing SDK TracerProvider is being "
+                    "reused; its id_generator cannot be changed post-construction, "
+                    "so trace IDs follow the existing provider's format. The "
+                    "X-Amzn-Trace-Id propagator is still installed below."
+                )
         else:
             # No SDK provider exists yet - create one with our resource and sampler
-            # This happens when our code runs before any auto-instrumentation
-            self._tracer_provider = TracerProvider(
-                resource=self.resource,
-                sampler=self._sampler,
-            )
+            # This happens when our code runs before any auto-instrumentation.
+            # RouteIQ-3c0a: pass the X-Ray id_generator only when resolved (else
+            # the SDK default random W3C generator is used).
+            provider_kwargs: dict[str, Any] = {
+                "resource": self.resource,
+                "sampler": self._sampler,
+            }
+            if xray_id_generator is not None:
+                provider_kwargs["id_generator"] = xray_id_generator
+            self._tracer_provider = TracerProvider(**provider_kwargs)
             trace.set_tracer_provider(self._tracer_provider)
             logger.info(
-                "Created new SDK TracerProvider with resource: %s, sampler: %s",
+                "Created new SDK TracerProvider with resource: %s, sampler: %s, "
+                "id_generator: %s",
                 self.service_name,
                 type(self._sampler).__name__,
+                type(xray_id_generator).__name__
+                if xray_id_generator is not None
+                else "default(W3C)",
             )
+
+        # RouteIQ-3c0a: install the X-Ray propagator (X-Amzn-Trace-Id round-trip)
+        # regardless of the new-vs-reused provider branch above — propagation is a
+        # global text-map concern independent of which provider owns the spans.
+        if self._xray_enabled:
+            _install_xray_propagator()
 
         # Add our OTLP exporter as a BatchSpanProcessor
         # This ensures spans are exported even if LiteLLM didn't configure OTLP
@@ -1310,6 +1443,11 @@ class ObservabilityManager:
     def sampler(self) -> Sampler:
         """Get the configured sampler for tracing."""
         return self._sampler
+
+    @property
+    def xray_enabled(self) -> bool:
+        """Whether AWS X-Ray ID generation + propagation is enabled (RouteIQ-3c0a)."""
+        return self._xray_enabled
 
 
 # Global observability manager instance

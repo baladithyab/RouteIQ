@@ -166,6 +166,88 @@ def test_default_render_gateway_points_otlp_at_collector() -> None:
     assert n == 1, f"expected exactly one OTEL_EXPORTER_OTLP_ENDPOINT, got {n}"
 
 
+def test_default_render_awsemf_declares_genai_dimensions() -> None:
+    """RouteIQ-ebf8: CloudWatch GenAI Observability keys on the gen_ai.* EMF
+    dimensions. The awsemf exporter must DECLARE those dimension sets (an
+    attribute is only a CloudWatch dimension if named in a metric_declaration)
+    matching the gen_ai.* attribute names RouteIQ emits."""
+    rendered = _helm_template()
+    cm = _by_kind_name(rendered, "ConfigMap", "-adot-collector")
+    pipeline = yaml.safe_load(cm["data"]["collector.yaml"])
+    awsemf = pipeline["exporters"]["awsemf"]
+
+    # resource_to_telemetry_conversion promotes gen_ai.system (a resource attr)
+    # into a metric label so it can be a dimension.
+    assert awsemf["resource_to_telemetry_conversion"]["enabled"] is True
+
+    # The GenAI metric_declarations must be present and carry the gen_ai.* dims.
+    decls = awsemf.get("metric_declarations")
+    assert decls, "awsemf must declare gen_ai.* metric_declarations for GenAI Obs"
+    all_dims = {d for decl in decls for dimset in decl["dimensions"] for d in dimset}
+    assert "gen_ai.request.model" in all_dims, (
+        f"gen_ai.request.model dimension missing from EMF declarations: {all_dims}"
+    )
+    assert "gen_ai.system" in all_dims, (
+        f"gen_ai.system dimension missing from EMF declarations: {all_dims}"
+    )
+    assert "gen_ai.operation.name" in all_dims, (
+        f"gen_ai.operation.name dimension missing from EMF declarations: {all_dims}"
+    )
+    # The selectors must target the gen_ai.* instruments (dot + prom-translated).
+    selectors = [s for decl in decls for s in decl["metric_name_selectors"]]
+    assert any("gen_ai" in s for s in selectors), (
+        f"metric_name_selectors must target gen_ai.* metrics: {selectors}"
+    )
+
+
+def test_default_render_awsxray_indexes_genai_attrs_for_transaction_search() -> None:
+    """RouteIQ-ebf8: Transaction Search must index the gen_ai.* span attributes so
+    traces are searchable/aggregatable by model + system in CloudWatch."""
+    rendered = _helm_template()
+    cm = _by_kind_name(rendered, "ConfigMap", "-adot-collector")
+    pipeline = yaml.safe_load(cm["data"]["collector.yaml"])
+    awsxray = pipeline["exporters"]["awsxray"]
+
+    indexed = awsxray.get("indexed_attributes")
+    assert indexed, "awsxray must index gen_ai.* attributes for Transaction Search"
+    assert "gen_ai.request.model" in indexed
+    assert "gen_ai.system" in indexed
+    assert "gen_ai.operation.name" in indexed
+
+
+def test_genai_observability_disable_flag_drops_emf_declarations() -> None:
+    """Operators can opt out of the GenAI dimension declarations without losing
+    the awsemf exporter itself (metrics still land, just without the declared
+    GenAI dimension sets)."""
+    rendered = _helm_template(
+        "gateway.otel.collector.emf.genaiObservability.enabled=false"
+    )
+    cm = _by_kind_name(rendered, "ConfigMap", "-adot-collector")
+    pipeline = yaml.safe_load(cm["data"]["collector.yaml"])
+    awsemf = pipeline["exporters"]["awsemf"]
+    assert "metric_declarations" not in awsemf, (
+        "disabling genaiObservability must drop the EMF metric_declarations"
+    )
+    # The exporter is still present and wired (metrics keep flowing).
+    assert "awsemf" in pipeline["service"]["pipelines"]["metrics"]["exporters"]
+
+
+def test_transaction_search_disable_flag_drops_xray_indexed_attributes() -> None:
+    rendered = _helm_template(
+        "gateway.otel.collector.xray.transactionSearch.enabled=false"
+    )
+    cm = _by_kind_name(rendered, "ConfigMap", "-adot-collector")
+    pipeline = yaml.safe_load(cm["data"]["collector.yaml"])
+    # With no region + no indexed_attributes the awsxray mapping is empty (parses
+    # to None) — which by definition carries no indexed_attributes.
+    awsxray = pipeline["exporters"]["awsxray"] or {}
+    assert "indexed_attributes" not in awsxray, (
+        "disabling transactionSearch must drop awsxray indexed_attributes"
+    )
+    # The exporter is still present and wired (traces keep flowing to X-Ray).
+    assert "awsxray" in pipeline["service"]["pipelines"]["traces"]["exporters"]
+
+
 def test_region_threads_into_collector_exporters() -> None:
     # aws.region is LOAD-BEARING for live delivery (awsemf/awsxray need a region).
     rendered = _helm_template("aws.region=us-west-2")

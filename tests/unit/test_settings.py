@@ -80,6 +80,7 @@ _ENV_VARS_TO_CLEAR = (
     "ROUTEIQ_OTEL__ENDPOINT",
     "ROUTEIQ_OTEL__SERVICE_NAME",
     "ROUTEIQ_OTEL__SAMPLE_RATE",
+    "ROUTEIQ_OTEL__XRAY_ENABLED",
     # Nested: oidc
     "ROUTEIQ_OIDC__ENABLED",
     "ROUTEIQ_OIDC__ISSUER_URL",
@@ -161,6 +162,13 @@ class TestDefaults:
         assert s.otel.endpoint is None
         assert s.otel.service_name == "litellm-gateway"
         assert s.otel.sample_rate == 1.0
+        # RouteIQ-3c0a: X-Ray is default OFF (byte-stable; W3C unless opted in).
+        assert s.otel.xray_enabled is False
+
+    def test_nested_otel_xray_enabled_via_env(self, monkeypatch):
+        monkeypatch.setenv("ROUTEIQ_OTEL__XRAY_ENABLED", "true")
+        s = GatewaySettings()
+        assert s.otel.xray_enabled is True
 
     def test_nested_routing_defaults(self):
         s = GatewaySettings()

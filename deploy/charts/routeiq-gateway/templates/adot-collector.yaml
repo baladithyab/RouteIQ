@@ -74,12 +74,50 @@ data:
         {{- if $region }}
         region: {{ $region | quote }}
         {{- end }}
+        # Promote OTel resource attributes (incl. gen_ai.system) into metric
+        # labels so they are available as EMF dimensions below.
         resource_to_telemetry_conversion:
           enabled: true
+        # CloudWatch GenAI Observability (the bedrock-agentcore-shaped GenAI
+        # dashboards) keys on the OTel GenAI semantic-convention dimensions. EMF
+        # only surfaces an attribute as a CloudWatch DIMENSION if it is named in a
+        # metric_declaration's dimensions; otherwise it is just an EMF field (not
+        # queryable as a dimension). So we DECLARE the gen_ai.* dimension sets the
+        # GenAI dashboards expect — matching the gen_ai.request.model /
+        # gen_ai.system / gen_ai.operation.name attribute names RouteIQ emits
+        # (telemetry_contracts.GenAIAttributes + the METRIC_CATALOG label_keys).
+        {{- if $c.emf.genaiObservability.enabled }}
+        dimension_rollup_option: {{ $c.emf.genaiObservability.dimensionRollupOption | quote }}
+        metric_declarations:
+          # Per-model + per-system + per-operation GenAI metrics (the GenAI
+          # dashboards' primary breakdown). metric_name_selectors matches the
+          # Prometheus-translated gen_ai.* instrument names (dots -> underscores).
+          - dimensions:
+              - [{{ join ", " $c.emf.genaiObservability.dimensions }}]
+              - [gen_ai.request.model, gen_ai.system]
+              - [gen_ai.system]
+            metric_name_selectors:
+              - "^gen_ai_.*"
+              - "^gen_ai\\..*"
+        {{- end }}
       # Traces -> X-Ray (Transaction Search reads the X-Ray trace store).
       awsxray:
         {{- if $region }}
         region: {{ $region | quote }}
+        {{- end }}
+        # Transaction Search (RouteIQ-ebf8): index the gen_ai.* span attributes so
+        # they are searchable/aggregatable as trace fields in CloudWatch
+        # Transaction Search / X-Ray analytics. indexed_attributes promotes these
+        # span attributes into X-Ray indexed annotations. NOTE: live Transaction
+        # Search ALSO requires the operator one-time enablement (X-Ray trace
+        # segment destination = CloudWatch Logs + an indexing rule) — that is an
+        # account-level console/API step, documented in values.yaml + the README,
+        # not something the collector config alone turns on.
+        {{- if $c.xray.transactionSearch.enabled }}
+        indexed_attributes:
+          {{- range $c.xray.transactionSearch.indexedAttributes }}
+          - {{ . | quote }}
+          {{- end }}
         {{- end }}
     service:
       pipelines:

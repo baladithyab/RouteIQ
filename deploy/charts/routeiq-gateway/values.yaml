@@ -429,6 +429,50 @@ gateway:
       emf:
         namespace: "RouteIQ/Gateway"
         logGroupName: "/aws/routeiq/otel"
+        # CloudWatch GenAI Observability (RouteIQ-ebf8). When enabled, the awsemf
+        # exporter DECLARES gen_ai.* dimension sets so the GenAI metrics RouteIQ
+        # emits (gen_ai.client.operation.duration, gen_ai.client.token.usage,
+        # gen_ai.server.time_to_first_token, ...) surface as CloudWatch DIMENSIONS
+        # the GenAI dashboards key on — not just EMF fields. The attribute names
+        # match telemetry_contracts.GenAIAttributes (gen_ai.request.model /
+        # gen_ai.system / gen_ai.operation.name).
+        genaiObservability:
+          enabled: true
+          # The richest dimension set (per request-model + system + operation).
+          # The template also emits coarser fallbacks ([model, system], [system]).
+          dimensions:
+            - gen_ai.request.model
+            - gen_ai.system
+            - gen_ai.operation.name
+          # EMF dimension rollup: NoDimensionRollup keeps ONLY the declared
+          # dimension sets (avoids the zero-dimension + single-dimension blow-up
+          # that pollutes the GenAI namespace and inflates custom-metric cost).
+          dimensionRollupOption: "NoDimensionRollup"
+      # CloudWatch Transaction Search / X-Ray (RouteIQ-ebf8). When transaction
+      # search is enabled, the awsxray exporter INDEXES these gen_ai.* span
+      # attributes so they are searchable/aggregatable as trace fields.
+      #
+      # OPERATOR ONE-TIME STEP (config alone does NOT turn it on): enable
+      # Transaction Search at the account level so X-Ray trace segments are
+      # written to CloudWatch Logs and indexed. Via the console: CloudWatch ->
+      # Application Signals (APM) -> Transaction Search -> Enable, choosing the
+      # indexed-trace sampling percentage. Or via API:
+      #   aws xray update-trace-segment-destination --destination CloudWatchLogs
+      #   aws xray update-indexing-rule --name "Default" \
+      #       --rule '{"Probabilistic":{"DesiredSamplingPercentage":5}}'
+      # The collector's IAM identity must also allow xray:PutTraceSegments +
+      # logs:PutLogEvents to the aws/spans log group. See README.
+      xray:
+        transactionSearch:
+          enabled: true
+          # gen_ai.* span attributes promoted to X-Ray indexed annotations so
+          # Transaction Search can filter/group traces by model + system +
+          # operation. Mirrors the EMF dimensions above (one trace<->metric story).
+          indexedAttributes:
+            - gen_ai.request.model
+            - gen_ai.system
+            - gen_ai.operation.name
+            - gen_ai.routeiq.strategy
       service:
         # OTLP receiver ports the gateway dials. 4317 = gRPC, 4318 = HTTP/protobuf.
         grpcPort: 4317
