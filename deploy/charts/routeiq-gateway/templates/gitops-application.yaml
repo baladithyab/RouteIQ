@@ -1,0 +1,64 @@
+{{- /*
+  RouteIQ-eb77: GitOps Application manifest (ArgoCD Application / Flux Kustomization).
+
+  Renders a GitOps controller resource so ArgoCD or Flux can reconcile this
+  chart from a git repo as the source of truth, instead of an imperative
+  `helm install`. DEFAULT OFF (gitops.enabled=false) so the default render is
+  byte-identical and no Application/Kustomization is emitted.
+
+  provider=argocd -> argoproj.io/v1alpha1 Application
+  provider=flux   -> kustomize.toolkit.fluxcd.io/v1 Kustomization
+
+  OPERATOR CONCERN (not provisioned here): the GitOps controller itself
+  (argocd-server / flux source-controller) must be installed, and the git
+  source repoURL must be reachable by the controller. See values.yaml gitops.
+*/ -}}
+{{- if .Values.gitops.enabled }}
+{{- $g := .Values.gitops }}
+{{- if eq $g.provider "argocd" }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}
+  namespace: argocd
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ $g.project | quote }}
+  source:
+    repoURL: {{ $g.repoURL | quote }}
+    path: {{ $g.path | quote }}
+    targetRevision: {{ $g.targetRevision | quote }}
+  destination:
+    server: {{ $g.destination.server | quote }}
+    namespace: {{ $g.destination.namespace | quote }}
+  syncPolicy:
+    {{- if $g.syncPolicy.automated }}
+    automated:
+      prune: {{ $g.syncPolicy.prune }}
+      selfHeal: {{ $g.syncPolicy.selfHeal }}
+    {{- end }}
+    syncOptions:
+      - CreateNamespace=true
+{{- else if eq $g.provider "flux" }}
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: {{ include "routeiq-gateway.fullname" . }}
+  namespace: flux-system
+  labels:
+    {{- include "routeiq-gateway.labels" . | nindent 4 }}
+spec:
+  interval: {{ $g.flux.interval | quote }}
+  path: {{ printf "./%s" $g.path | quote }}
+  prune: {{ $g.syncPolicy.prune }}
+  targetNamespace: {{ $g.destination.namespace | quote }}
+  sourceRef:
+    kind: {{ $g.flux.sourceRef.kind | quote }}
+    name: {{ $g.flux.sourceRef.name | quote }}
+{{- else }}
+{{- fail (printf "gitops.provider must be 'argocd' or 'flux', got %q" $g.provider) }}
+{{- end }}
+{{- end }}
