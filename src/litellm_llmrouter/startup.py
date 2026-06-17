@@ -362,12 +362,27 @@ def merge_bedrock_discovered_models(
 
             settings = get_settings().bedrock_discovery
 
-        if not getattr(settings, "enabled", False):
+        # Resolve through the effective-setting helpers so the full-coverage
+        # rollup (RouteIQ-77e8: ``full_bedrock_coverage`` implies enabled +
+        # marketplace + logical_groups) is applied WITHOUT mutating stored
+        # config. Fall back to the raw fields for any settings shim lacking the
+        # helpers (defensive -- never block boot).
+        effective_enabled = getattr(
+            settings, "effective_enabled", getattr(settings, "enabled", False)
+        )
+        if not effective_enabled:
             return 0
 
         if not _discovery_is_leader():
             logger.debug("Bedrock discovery: not leader, skipping scan")
             return 0
+
+        effective_synthesis_mode = getattr(settings, "effective_synthesis_mode", None)
+        synthesis_mode = (
+            getattr(effective_synthesis_mode, "value", effective_synthesis_mode)
+            if effective_synthesis_mode is not None
+            else None
+        )
 
         result = discover_models(settings=settings, client_factory=client_factory)
         entries = result.to_litellm_model_list(
@@ -375,6 +390,7 @@ def merge_bedrock_discovered_models(
             register_cost=getattr(settings, "register_cost", True),
             auto_group=getattr(settings, "auto_group", False),
             auto_group_name=getattr(settings, "auto_group_name", "claude-auto"),
+            synthesis_mode=synthesis_mode,
         )
         if not entries:
             return 0

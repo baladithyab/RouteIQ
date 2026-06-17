@@ -1,0 +1,63 @@
+# RouteIQ -- Claude Code -> FULL Bedrock-coverage routing recipe (RouteIQ-77e8)
+# =============================================================================
+# Goal: route Claude Code (or any Anthropic SDK client) across the ENTIRE
+# Bedrock + Bedrock-Marketplace (mantle) surface -- every serverless foundation
+# model and every REGISTERED marketplace endpoint the account can reach, in
+# every source region -- as routable groups the Kumaraswamy-Thompson bandit
+# cascades across. Intelligence-first: the bandit learns the cheapest arm that
+# still meets your quality bar, so you stop paying Opus-only prices per turn.
+#
+# Unlike config.claude-code.yaml (which hand-declares a static "claude-auto"
+# group), this file ships an EMPTY model_list on purpose: the full-coverage
+# discovery scan POPULATES it at startup. Turn it on with ONE switch:
+#
+#   export ROUTEIQ_BEDROCK_DISCOVERY__FULL_BEDROCK_COVERAGE=true
+#   export ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS="us-east-1,us-west-2,eu-west-1"
+#
+# FULL_BEDROCK_COVERAGE is a rolled-up flag -- it implies (without you setting
+# them) ENABLED=true + INCLUDE_MARKETPLACE_ENDPOINTS=true +
+# SYNTHESIS_MODE=logical_groups, with the global>geo>regional inference-profile
+# preference left on (residency off). The scan is provider-agnostic (no
+# allow-list) so MiniMax / Kimi / DeepSeek / gpt-oss / any future provider
+# auto-onboard the moment Bedrock offers them.
+#
+# SYNTHESIS_MODE=logical_groups => one model_name PER LOGICAL model (e.g.
+# anthropic.claude-sonnet-4) fanned across its global / geo / regional / mantle
+# arms. Point ANTHROPIC_MODEL at a synthesized logical group name, or rewrite a
+# pinned id onto it via the model-alias layer (ROUTEIQ_MODEL_ALIAS__*).
+#
+# Full env + bandit + learning-loop walkthrough:
+#   docs/operations/claude-code-routing.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model list -- INTENTIONALLY EMPTY.
+# -----------------------------------------------------------------------------
+# The full-coverage discovery scan appends the synthesized logical_groups arms
+# into the live model_list at startup (before the routing strategy is installed).
+# Leave it empty here; add operator-pinned arms only if you want a static
+# fallback that survives even when discovery is off.
+model_list: []
+
+router_settings:
+  # RouteIQ installs its OWN CustomRoutingStrategyBase plugin; the
+  # Kumaraswamy-Thompson bandit rides the RouteIQ routing pipeline (selected via
+  # ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED=true +
+  # ROUTEIQ_ROUTING__ACTIVE_STRATEGY=routeiq-kumaraswamy-thompson -- see the doc
+  # page). This LiteLLM-level routing_strategy is only the pre-plugin fallback.
+  routing_strategy: simple-shuffle
+
+  # Cross-region / context-window resilience composes with the bandit: if a
+  # whole group attempt fails (Bedrock 429, context overflow) LiteLLM retries
+  # against another arm in the same logical group.
+  num_retries: 2
+  retry_after: 5
+  timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true  # Anthropic <-> Bedrock param differences are dropped, not fatal
+  success_callback: ["otel"]
+  failure_callback: ["otel"]

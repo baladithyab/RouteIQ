@@ -36,10 +36,67 @@ unmodified Anthropic client works unchanged.
 
 ## 2. Build the `claude-auto` group
 
-### Option A -- auto-discovery (recommended on AWS)
+### Option A -- FULL-COVERAGE auto-discovery (recommended on AWS, one switch)
 
-Let RouteIQ assemble the group from whatever serverless Bedrock models the
-account is entitled to. No hand-maintained `model_list`:
+The fastest path: flip **one** flag and RouteIQ routes across the **entire
+Bedrock + Bedrock-Marketplace (mantle) surface** -- every serverless foundation
+model and every *registered* marketplace endpoint your account can reach, in
+every source region, preferring inference profiles `global` > geo (`us.`/`eu.`/
+`apac.`/...) > regional:
+
+```bash
+export ROUTEIQ_BEDROCK_DISCOVERY__FULL_BEDROCK_COVERAGE=true
+export ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS="us-east-1,us-west-2,eu-west-1"
+```
+
+`FULL_BEDROCK_COVERAGE=true` is a *rolled-up* switch -- so you do not have to flip
+four flags. It implies, without you setting them:
+
+- `ENABLED=true` (run the read-only control-plane scan),
+- `INCLUDE_MARKETPLACE_ENDPOINTS=true` (also enumerate mantle custom-deployment
+  endpoints via `ListMarketplaceModelEndpoints`),
+- `SYNTHESIS_MODE=logical_groups` (see below), and
+- the default `global` > geo > regional profile preference (residency off).
+
+The scan is **provider-agnostic** -- there is no allow-list -- so MiniMax, Kimi,
+DeepSeek, gpt-oss, or any future provider auto-onboard the moment Bedrock offers
+them in your account. Discovery is **off by default**; nothing happens until you
+set the flag.
+
+> Point Claude Code's `model=` at the resulting group (step 1) and you get
+> intelligence-first routing across all Bedrock + mantle models, with the bandit
+> (step 3) cascading across them for cost.
+
+### Choosing how the surface folds into groups -- `SYNTHESIS_MODE`
+
+`ROUTEIQ_BEDROCK_DISCOVERY__SYNTHESIS_MODE` controls how the discovered arms
+become routable `model_list` entries:
+
+| Mode | Result |
+|------|--------|
+| `distinct` (default) | One distinct `model_name` per discovered arm. Byte-stable -- the operator-authored list is only extended. |
+| `auto_group` | **Every** arm (all providers/tiers) collapses onto the single `AUTO_GROUP_NAME` (default `claude-auto`). One group spanning the whole surface. |
+| `logical_groups` | **One group per LOGICAL model** (e.g. `anthropic.claude-sonnet-4`) fanned across its global/geo/regional/mantle arms. Better observability than `auto_group` (you see per-model groups) while the bandit still cascades within each group. This is what `FULL_BEDROCK_COVERAGE` selects. |
+
+`SYNTHESIS_MODE` supersedes the legacy `AUTO_GROUP` bool. For back-compat,
+`AUTO_GROUP=true` with the default `SYNTHESIS_MODE` still maps to `auto_group`.
+
+`logical_groups` (RouteIQ-1c9d) binds arms by their *logical model identity* --
+the region-varying parts (the `global.`/`us.`/`eu.` tier-geo prefix and the
+`-v1:0` version suffix) are stripped -- so:
+
+- `global.anthropic.claude-sonnet-4-v1:0` discovered in `us-east-1`,
+- the `eu.anthropic.claude-sonnet-4-v1:0` geo profile in `eu-west-1`, and
+- a Bedrock Marketplace / **mantle** custom-deployment endpoint of the same model
+
+all land under the single `anthropic.claude-sonnet-4` `model_name` as three arms,
+while a *different* logical model (e.g. Nova) forms its own group. Each arm keeps
+a distinct `model_info.arm_id` (`region/invocation_id`) for telemetry.
+
+### Option A (legacy) -- single all-models `auto_group`
+
+If you specifically want every model collapsed under ONE name (the original
+recipe), keep using the explicit flags:
 
 ```bash
 export ROUTEIQ_BEDROCK_DISCOVERY__ENABLED=true
@@ -48,30 +105,10 @@ export ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP=true
 export ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP_NAME="claude-auto"   # default
 ```
 
-Discovery is a read-only control-plane scan (`ListFoundationModels` /
-`ListInferenceProfiles`) and is **off by default** -- nothing happens until you
-opt in. With `AUTO_GROUP=true` every discovered serverless arm (Claude, Nova,
-gpt-oss, any future provider) collapses to the single `claude-auto`
-`model_name`; each arm keeps an `arm_id` in `model_info` so telemetry still shows
-which physical model served the request.
-
-#### Per-logical-model groups (RouteIQ-1c9d)
-
-`AUTO_GROUP` collapses *everything* into one group. When you instead want **one
-logical model_name per model, each fanned out across its region / account /
-mantle arms**, use `DiscoveryResult.synthesize_model_groups()`. It binds arms by
-their *logical model identity* -- the region-varying parts (the `global.` /
-`us.` / `eu.` tier-geo prefix and the `-v1:0` version suffix) are stripped -- so:
-
-- `global.anthropic.claude-sonnet-4-v1:0` discovered in `us-east-1`,
-- the `eu.anthropic.claude-sonnet-4-v1:0` geo profile in `eu-west-1`, and
-- a Bedrock Marketplace / **mantle** custom-deployment endpoint of the same model
-
-all land under the single `anthropic.claude-sonnet-4` `model_name` as three arms,
-while a *different* logical model (e.g. Nova) forms its own group. Each arm keeps
-a distinct `model_info.arm_id` (`region/invocation_id`) for telemetry. This is
-the building block for routing one logical alias across regions/accounts when you
-don't want a single all-models group.
+With `AUTO_GROUP=true` every discovered serverless arm (Claude, Nova, gpt-oss,
+any future provider) collapses to the single `claude-auto` `model_name`; each arm
+keeps an `arm_id` in `model_info` so telemetry still shows which physical model
+served the request.
 
 ### Option B -- static recipe
 
@@ -84,6 +121,26 @@ for your region's entitlements. Works without discovery.
 uv run python -m litellm_llmrouter.startup \
   --config config/config.claude-code.yaml --port 4000
 ```
+
+### Option C -- full-coverage recipe (discovery + bandit, batteries-included)
+
+[`config/config.claude-code-full-coverage.yaml`](https://github.com/baladithyab/RouteIQ/blob/main/config/config.claude-code-full-coverage.yaml)
+is the one-switch recipe: it ships with the bandit-friendly `router_settings`
+and leaves the `model_list` empty -- the full-coverage scan (Option A)
+populates the `logical_groups` at startup. Run it with the full-coverage env:
+
+```bash
+export ROUTEIQ_BEDROCK_DISCOVERY__FULL_BEDROCK_COVERAGE=true
+export ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS="us-east-1,us-west-2,eu-west-1"
+export ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED=true
+export ROUTEIQ_ROUTING__ACTIVE_STRATEGY="routeiq-kumaraswamy-thompson"
+uv run python -m litellm_llmrouter.startup \
+  --config config/config.claude-code-full-coverage.yaml --port 4000
+```
+
+Then point Claude Code's `ANTHROPIC_MODEL` at one of the synthesized logical
+group names (e.g. `anthropic.claude-sonnet-4`), or use the model-alias layer
+(step 4) to rewrite a pinned id onto it.
 
 ## 3. Turn on the Kumaraswamy-Thompson bandit
 
@@ -148,26 +205,30 @@ export ROUTEIQ_ADAPTER_FRAMEWORK__MLOPS_FEEDBACK_LOOP=false
 ## Putting it together
 
 ```bash
-# 1. Build the group (auto-discovery)
-export ROUTEIQ_BEDROCK_DISCOVERY__ENABLED=true
-export ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS="us-east-1,us-west-2"
-export ROUTEIQ_BEDROCK_DISCOVERY__AUTO_GROUP=true
+# 1. Build the group -- FULL COVERAGE in one switch (all Bedrock + mantle,
+#    logical_groups, global>geo>regional profiles preferred)
+export ROUTEIQ_BEDROCK_DISCOVERY__FULL_BEDROCK_COVERAGE=true
+export ROUTEIQ_BEDROCK_DISCOVERY__SOURCE_REGIONS="us-east-1,us-west-2,eu-west-1"
 
 # 2. Bandit + learning loop
 export ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED=true
 export ROUTEIQ_ROUTING__ACTIVE_STRATEGY="routeiq-kumaraswamy-thompson"
 # (MLOPS_FEEDBACK_LOOP defaults to true)
 
-# 3. Transparent alias (only if you cannot set ANTHROPIC_MODEL=claude-auto)
+# 3. Transparent alias (rewrite a pinned id onto a synthesized logical group)
 export ROUTEIQ_MODEL_ALIAS__ENABLED=true
-export ROUTEIQ_MODEL_ALIAS__REGEX='{"^claude-.*$":"claude-auto"}'
+export ROUTEIQ_MODEL_ALIAS__REGEX='{"^claude-.*$":"anthropic.claude-sonnet-4"}'
 
 # 4. Point Claude Code at RouteIQ
 export ANTHROPIC_BASE_URL="http://localhost:4000"
 export ANTHROPIC_API_KEY="$LITELLM_MASTER_KEY"
-export ANTHROPIC_MODEL="claude-auto"
+export ANTHROPIC_MODEL="anthropic.claude-sonnet-4"   # a synthesized logical group
 ```
 
-Now every Claude Code turn flows through RouteIQ, gets routed across your mixed
-Bedrock pool by the bandit, and the loop keeps tuning the mix to your real
-quality bar.
+Now every Claude Code turn flows through RouteIQ, gets routed across your full
+Bedrock + mantle pool by the bandit, and the loop keeps tuning the mix to your
+real quality bar.
+
+> Prefer a single all-models group instead of per-logical groups? Swap step 1 for
+> `ROUTEIQ_BEDROCK_DISCOVERY__ENABLED=true` + `..._AUTO_GROUP=true` and point
+> `ANTHROPIC_MODEL` at `claude-auto`.

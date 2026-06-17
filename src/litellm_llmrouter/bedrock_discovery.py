@@ -777,6 +777,7 @@ class DiscoveryResult:
         register_cost: bool = True,
         auto_group: bool = False,
         auto_group_name: str = "claude-auto",
+        synthesis_mode: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Map every discovered model to a LiteLLM ``model_list`` entry.
 
@@ -784,17 +785,34 @@ class DiscoveryResult:
         skipped (logged at debug) rather than raising -- the orchestrator
         produces a best-effort list.
 
-        When ``auto_group`` is True the per-model ``model_name`` values are all
-        collapsed to the single ``auto_group_name`` so the entries form one
-        LiteLLM routing GROUP (multiple arms behind one alias). LiteLLM treats
-        every ``model_list`` row sharing a ``model_name`` as an arm of that
-        group, which the routing strategy (e.g. the Kumaraswamy-Thompson bandit)
-        then picks between. Default ``auto_group=False`` preserves the prior
-        byte-stable behavior (one distinct ``model_name`` per discovered arm).
+        ``synthesis_mode`` (RouteIQ-77e8) selects HOW the discovered arms fold
+        into the list and, when given, SUPERSEDES the legacy ``auto_group`` bool:
+
+        * ``"distinct"`` (default when neither arg is set) -- one distinct
+          ``model_name`` per discovered arm (byte-stable historical behavior).
+        * ``"auto_group"`` -- every arm collapses onto the single
+          ``auto_group_name`` group (delegates to
+          :meth:`to_auto_group_model_list`).
+        * ``"logical_groups"`` -- one group PER LOGICAL model fanned across its
+          global/geo/regional/mantle arms (delegates to
+          :meth:`synthesize_model_groups`). Closes RouteIQ-1c9d's built-not-wired
+          gap.
+
+        For back-compat, when ``synthesis_mode`` is None the legacy
+        ``auto_group=True`` maps to ``"auto_group"`` (and ``auto_group=False`` to
+        ``"distinct"``). LiteLLM treats every ``model_list`` row sharing a
+        ``model_name`` as an arm of that group, which the routing strategy (e.g.
+        the Kumaraswamy-Thompson bandit) then picks between.
         """
-        if auto_group:
+        mode = synthesis_mode or ("auto_group" if auto_group else "distinct")
+        if mode == "auto_group":
             return self.to_auto_group_model_list(
                 group_name=auto_group_name,
+                residency_constraint=residency_constraint,
+                register_cost=register_cost,
+            )
+        if mode == "logical_groups":
+            return self.synthesize_model_groups(
                 residency_constraint=residency_constraint,
                 register_cost=register_cost,
             )
@@ -1016,8 +1034,12 @@ def discover_models(
     """
     if settings is None:
         settings = _get_discovery_settings()
-    if not settings.enabled:
-        logger.debug("bedrock discovery disabled (enabled=False); no-op")
+    # Resolve through the effective-setting helpers so the ``full_bedrock_coverage``
+    # rollup (RouteIQ-77e8) turns discovery + marketplace on with one flag. Fall
+    # back to the raw fields for any settings shim lacking the helpers.
+    effective_enabled = getattr(settings, "effective_enabled", settings.enabled)
+    if not effective_enabled:
+        logger.debug("bedrock discovery disabled (effective_enabled=False); no-op")
         return DiscoveryResult()
 
     regions = resolve_source_regions(settings.source_regions)
@@ -1028,7 +1050,11 @@ def discover_models(
         )
         return DiscoveryResult()
 
-    include_marketplace = getattr(settings, "include_marketplace_endpoints", False)
+    include_marketplace = getattr(
+        settings,
+        "effective_include_marketplace_endpoints",
+        getattr(settings, "include_marketplace_endpoints", False),
+    )
     factory = client_factory or _bedrock_control_client
     result = DiscoveryResult()
     for region in regions:
