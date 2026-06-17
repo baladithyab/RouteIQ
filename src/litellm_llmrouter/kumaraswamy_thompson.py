@@ -1248,3 +1248,380 @@ def register_kumaraswamy_thompson_strategy() -> bool:
     except Exception as e:
         logger.warning("KTS register failed: %s", e)
         return False
+
+
+# ===========================================================================
+# LinUCB feature-vector contextual bandit (RouteIQ-6c67)
+# ===========================================================================
+#
+# The Kumaraswamy-Thompson bandit above is BUCKET-contextual: one Beta posterior
+# per coarse ``(task_bucket, arm)`` pair. LinUCB is FEATURE-VECTOR contextual --
+# it learns a per-arm linear reward model ``r ~= theta·x`` over a REAL-VALUED
+# context vector ``x`` and scores each arm by its Upper Confidence Bound:
+#
+#     UCB(arm) = theta·x + alpha * sqrt(x^T A^-1 x)
+#
+# where ``A = I + sum_t x_t x_t^T`` (ridge design matrix) and ``theta = A^-1 b``,
+# ``b = sum_t r_t x_t``. The exploration term ``alpha*sqrt(...)`` is LARGE when an
+# arm has seen little evidence in the direction of ``x`` (cold-start explores) and
+# SHRINKS as evidence accumulates in that direction (converges to greedy exploit).
+#
+# DISCIPLINE: pure stdlib, NO numpy (matches the KT module). The only nontrivial
+# linear-algebra op LinUCB needs is ``A^-1`` applied to a vector; we maintain the
+# inverse ``A^-1`` DIRECTLY and update it with the rank-1 Sherman-Morrison
+# formula on each observation, so there is never a full O(d^3) inversion and no
+# matrix library is required. The feature dimension ``d`` is small (a prompt-
+# length feature, a few requested-profile one-hots, and a hashed tenant bucket),
+# so the per-decision cost is O(num_arms * d^2) with tiny d.
+#
+# This is ADDITIVE alongside the KT bandit: a separate strategy class, a separate
+# registry name (``llmrouter-linucb``), and a separate settings flag.
+
+LINUCB_STRATEGY_NAME = "llmrouter-linucb"
+LINUCB_STRATEGY_VERSION = "v1"
+
+# Requested-profile labels that get a dedicated one-hot slot in the feature
+# vector. An unrecognized profile contributes no profile slot (graceful).
+_LINUCB_PROFILES = ("fast", "balanced", "powerful")
+
+
+def identity_matrix(d: int) -> list[list[float]]:
+    """A ``d x d`` identity matrix as a list-of-lists (stdlib, no numpy)."""
+    return [[1.0 if i == j else 0.0 for j in range(d)] for i in range(d)]
+
+
+def mat_vec(m: list[list[float]], v: list[float]) -> list[float]:
+    """Matrix-vector product ``m @ v`` (stdlib)."""
+    return [sum(m[i][k] * v[k] for k in range(len(v))) for i in range(len(m))]
+
+
+def dot(a: list[float], b: list[float]) -> float:
+    """Vector dot product (stdlib)."""
+    return sum(x * y for x, y in zip(a, b))
+
+
+def sherman_morrison_update(
+    a_inv: list[list[float]], x: list[float]
+) -> list[list[float]]:
+    """Return ``(A + x x^T)^-1`` from ``A^-1`` via the Sherman-Morrison formula.
+
+    ``(A + x x^T)^-1 = A^-1 - (A^-1 x x^T A^-1) / (1 + x^T A^-1 x)``.
+
+    Pure stdlib (no numpy). Because every LinUCB update adds the rank-1 term
+    ``x x^T`` to a positive-definite ``A`` (seeded as the identity ridge), the
+    denominator ``1 + x^T A^-1 x`` is always ``>= 1`` so the update is stable and
+    never divides by zero. Returns a NEW matrix; the input is not mutated.
+    """
+    d = len(a_inv)
+    ainv_x = mat_vec(a_inv, x)  # A^-1 x  (column vector)
+    denom = 1.0 + dot(x, ainv_x)  # 1 + x^T A^-1 x  (scalar, >= 1)
+    # x^T A^-1  (row vector) == (A^-1 x)^T because A^-1 is symmetric.
+    new = [[0.0] * d for _ in range(d)]
+    for i in range(d):
+        for j in range(d):
+            new[i][j] = a_inv[i][j] - (ainv_x[i] * ainv_x[j]) / denom
+    return new
+
+
+@dataclass
+class _LinUCBArm:
+    """Per-arm LinUCB state: the inverse design matrix ``A^-1`` and ``b``.
+
+    ``A`` starts as the identity (ridge regularization ``lambda=1``); ``A_inv``
+    is maintained directly via Sherman-Morrison. ``b = sum_t r_t x_t`` and
+    ``theta = A_inv @ b`` (recomputed lazily on score).
+    """
+
+    a_inv: list[list[float]]
+    b: list[float]
+
+    @classmethod
+    def fresh(cls, d: int) -> "_LinUCBArm":
+        return cls(a_inv=identity_matrix(d), b=[0.0] * d)
+
+    def theta(self) -> list[float]:
+        """``theta = A^-1 b`` (the ridge-regression weight estimate)."""
+        return mat_vec(self.a_inv, self.b)
+
+    def ucb(self, x: list[float], alpha: float) -> float:
+        """UCB score ``theta·x + alpha*sqrt(x^T A^-1 x)`` for context ``x``."""
+        mean = dot(self.theta(), x)
+        ainv_x = mat_vec(self.a_inv, x)
+        var = max(0.0, dot(x, ainv_x))  # x^T A^-1 x (>= 0; floored for fp drift)
+        return mean + alpha * math.sqrt(var)
+
+    def update(self, x: list[float], reward: float) -> None:
+        """Observe ``(x, reward)``: rank-1 ``A`` update + ``b += reward*x``."""
+        self.a_inv = sherman_morrison_update(self.a_inv, x)
+        for i in range(len(self.b)):
+            self.b[i] += reward * x[i]
+
+
+class LinUCBRoutingStrategy(RoutingStrategy):
+    """Feature-vector contextual bandit via LinUCB (RouteIQ-6c67).
+
+    Learns a per-arm linear reward model over a real-valued context vector and
+    selects the arm with the highest Upper Confidence Bound. ADDITIVE alongside
+    the bucket-contextual :class:`KumaraswamyThompsonStrategy` (separate class,
+    registry name ``llmrouter-linucb``, and settings flag).
+
+    Feature vector (fixed dimension ``d``, all stdlib floats):
+        - bias term (constant 1.0),
+        - prompt-length feature (``log1p(approx_tokens) / 10``, ~[0, 1.x]),
+        - requested-profile one-hots for ``fast`` / ``balanced`` / ``powerful``
+          (read from ``request_kwargs`` / ``metadata`` key ``profile``),
+        - a one-hot over ``tenant_buckets`` hashed tenant slots
+          (``hash(tenant_id) % tenant_buckets``).
+
+    Cold start: a fresh arm's ``A`` is the identity, so its UCB exploration term
+    ``alpha*sqrt(x^T x)`` is large and the bandit EXPLORES untried arms. As an arm
+    accumulates ``(x, reward)`` observations the confidence width shrinks in the
+    seen directions and the bandit converges to exploiting the higher-reward arm.
+
+    Reward is fed via :meth:`update` (model, score, request_id) -- the score is
+    mapped from the ``[-1, 1]`` feedback contract into ``[0, 1]`` (matching the KT
+    bandit's reward shaping). The context vector used at decision time is logged
+    per ``request_id`` (bounded FIFO) so the offline feedback path can recover it.
+
+    Pure stdlib, no numpy: the per-arm inverse design matrix is maintained via
+    rank-1 :func:`sherman_morrison_update`. The RNG (tie-breaking only) is a
+    threaded ``random.Random`` object.
+
+    Stress-harness validation: ``tools/stress_harness`` resolves the active
+    strategy by name; ``linucb`` is not a registered verdict family so it hits the
+    generic distribution verdict (``stress_harness.verdicts.generic_verdict``).
+    Feed rewards via :meth:`update` and confirm the higher-reward arm comes to
+    dominate the per-bucket selection distribution.
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 1.0,
+        tenant_buckets: int = 8,
+        seed: Optional[int] = None,
+        bucket_log_capacity: int = 4096,
+        **kwargs: Any,
+    ) -> None:
+        self._alpha = max(0.0, float(alpha))
+        self._tenant_buckets = max(1, int(tenant_buckets))
+        # d = bias(1) + prompt_len(1) + profiles(3) + tenant one-hot(tenant_buckets)
+        self._dim = 2 + len(_LINUCB_PROFILES) + self._tenant_buckets
+        self._arms: Dict[str, _LinUCBArm] = {}
+        self._rng = random.Random(seed)
+        self._lock = threading.RLock()
+        # request_id -> feature vector recovery for the offline feedback path.
+        self._ctx_log: Dict[str, list[float]] = {}
+        self._ctx_log_order: list[str] = []
+        self._ctx_log_capacity = max(1, bucket_log_capacity)
+
+    @property
+    def name(self) -> str:
+        return LINUCB_STRATEGY_NAME
+
+    @property
+    def version(self) -> Optional[str]:
+        return LINUCB_STRATEGY_VERSION
+
+    # ------------------------------------------------------------------
+    # Feature engineering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _context_text(context: RoutingContext) -> str:
+        if isinstance(context.input, str) and context.input:
+            return context.input
+        for msg in reversed(context.messages or []):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+        return ""
+
+    @staticmethod
+    def _requested_profile(context: RoutingContext) -> str:
+        for src in (context.request_kwargs, context.metadata):
+            if isinstance(src, dict):
+                prof = src.get("profile")
+                if isinstance(prof, str) and prof:
+                    return prof.lower()
+        return ""
+
+    def _featurize(self, context: RoutingContext) -> list[float]:
+        """Build the fixed-dimension feature vector for the request (stdlib)."""
+        x = [0.0] * self._dim
+        x[0] = 1.0  # bias
+        text = self._context_text(context)
+        approx_tokens = len(text) // 4 if text else 0
+        x[1] = math.log1p(approx_tokens) / 10.0  # prompt-length feature
+        prof = self._requested_profile(context)
+        for i, label in enumerate(_LINUCB_PROFILES):
+            if prof == label:
+                x[2 + i] = 1.0
+        tenant = context.tenant_id or context.user_id or ""
+        if tenant:
+            slot = hash(tenant) % self._tenant_buckets
+            x[2 + len(_LINUCB_PROFILES) + slot] = 1.0
+        return x
+
+    # ------------------------------------------------------------------
+    # Candidate selection (mirrors the KT bandit)
+    # ------------------------------------------------------------------
+
+    def _candidates(self, context: RoutingContext) -> list[Dict]:
+        router = context.router
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", []) or []
+        return [d for d in healthy if d.get("model_name") == context.model]
+
+    @staticmethod
+    def _arm_key(deployment: Dict) -> str:
+        return str(deployment.get("litellm_params", {}).get("model", ""))
+
+    def _get_arm(self, model: str) -> _LinUCBArm:
+        arm = self._arms.get(model)
+        if arm is None:
+            arm = _LinUCBArm.fresh(self._dim)
+            self._arms[model] = arm
+        return arm
+
+    # ------------------------------------------------------------------
+    # The hot path
+    # ------------------------------------------------------------------
+
+    def select_deployment(self, context: RoutingContext) -> Optional[Dict]:
+        """Pick the arm with the highest LinUCB score for the request context."""
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        cands = self._candidates(context)
+        cands = filter_routable_candidates(context.router, cands)
+        if not cands:
+            return None
+
+        x = self._featurize(context)
+        if len(cands) == 1:
+            self._log_ctx(context.request_id, x)
+            _record_selection_metric(LINUCB_STRATEGY_NAME, self._arm_key(cands[0]))
+            return cands[0]
+
+        best: Optional[Dict] = None
+        best_score = -float("inf")
+        with self._lock:
+            for dep in cands:
+                model = self._arm_key(dep)
+                score = self._get_arm(model).ucb(x, self._alpha)
+                # Tie-break with a tiny deterministic-RNG jitter so equal cold
+                # arms don't always pick the first (spreads cold-start explore).
+                score += self._rng.random() * 1e-9
+                if score > best_score:
+                    best_score, best = score, dep
+
+        self._log_ctx(context.request_id, x)
+        if best is not None:
+            _record_selection_metric(LINUCB_STRATEGY_NAME, self._arm_key(best))
+        return best
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        if self._alpha < 0.0:
+            return False, "alpha must be >= 0"
+        if self._tenant_buckets < 1:
+            return False, "tenant_buckets must be >= 1"
+        return True, None
+
+    # ------------------------------------------------------------------
+    # Feedback recovery + online update
+    # ------------------------------------------------------------------
+
+    def _log_ctx(self, request_id: Optional[str], x: list[float]) -> None:
+        if not request_id:
+            return
+        with self._lock:
+            if request_id not in self._ctx_log:
+                self._ctx_log_order.append(request_id)
+                if len(self._ctx_log_order) > self._ctx_log_capacity:
+                    oldest = self._ctx_log_order.pop(0)
+                    self._ctx_log.pop(oldest, None)
+            self._ctx_log[request_id] = x
+
+    def _recover_ctx(self, request_id: Optional[str]) -> Optional[list[float]]:
+        if not request_id:
+            return None
+        with self._lock:
+            return self._ctx_log.get(request_id)
+
+    def update(
+        self,
+        model: str,
+        score: float,
+        *,
+        request_id: Optional[str] = None,
+        features: Optional[list[float]] = None,
+    ) -> None:
+        """Apply one reward observation to ``model``'s LinUCB arm.
+
+        The reward is mapped from the ``[-1, 1]`` feedback contract into
+        ``[0, 1]`` (matching the KT bandit). The context vector is taken from
+        ``features`` if supplied, else recovered from ``request_id`` (the vector
+        logged at decision time). With neither, the update is a no-op (there is
+        no context to attribute the reward to).
+
+        Args:
+            model: Arm key (``litellm_params.model``).
+            score: Quality score, ``[-1, 1]`` (feedback contract) or ``[0, 1]``.
+            request_id: Recovers the feature vector logged at decision time.
+            features: Explicit feature vector (overrides ``request_id`` recovery).
+        """
+        x = features or self._recover_ctx(request_id)
+        if x is None:
+            return
+        if -1.0 <= score <= 1.0:
+            reward = (score + 1.0) / 2.0
+        else:
+            reward = min(max(score, 0.0), 1.0)
+        with self._lock:
+            self._get_arm(model).update(list(x), reward)
+
+    def update_from_feedback(self, feedback: "RoutingFeedback") -> None:
+        """Protocol-conformant adapter entry — delegates to :meth:`update`."""
+        self.update(
+            feedback.model,
+            feedback.score,
+            request_id=getattr(feedback, "request_id", None),
+        )
+
+
+def register_linucb_strategy() -> bool:
+    """Register the LinUCB contextual bandit in the routing registry.
+
+    Mirrors :func:`register_kumaraswamy_thompson_strategy`: self-contained,
+    gated by ``settings.linucb.enabled`` (default off, byte-stable startup).
+    ADDITIVE alongside the KT bandit — separate name / flag.
+
+    Returns:
+        True if registered, False if disabled or registration failed.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = getattr(get_settings(), "linucb", None)
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return False
+
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        strategy = LinUCBRoutingStrategy(
+            alpha=getattr(cfg, "alpha", 1.0),
+            tenant_buckets=getattr(cfg, "tenant_buckets", 8),
+            seed=getattr(cfg, "seed", None),
+        )
+        get_routing_registry().register(
+            LINUCB_STRATEGY_NAME,
+            strategy,
+            version=LINUCB_STRATEGY_VERSION,
+            family=LINUCB_STRATEGY_NAME,
+        )
+        logger.info("Registered LinUCB strategy as %r", LINUCB_STRATEGY_NAME)
+        return True
+    except Exception as e:
+        logger.warning("LinUCB register failed: %s", e)
+        return False

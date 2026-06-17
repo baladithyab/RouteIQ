@@ -1,4 +1,11 @@
-{{- if .Values.autoscaling.enabled }}
+{{- /*
+  RouteIQ-9c4c: the chart-managed CPU/mem HPA and the KEDA ScaledObject are
+  MUTUALLY EXCLUSIVE. When autoscaling.keda.enabled is true, KEDA creates and
+  owns its own HPA for the Deployment, so this template emits NOTHING -- two
+  HPAs targeting one Deployment fight over the replica count. KEDA owns scaling
+  when on; the CPU/mem HPA is the default (keda.enabled=false).
+*/ -}}
+{{- if and .Values.autoscaling.enabled (not .Values.autoscaling.keda.enabled) }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

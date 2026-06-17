@@ -14,10 +14,12 @@ Security Notes:
 
 import json
 import logging
+import math
 import os
 import pickle
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1864,6 +1866,14 @@ LLMROUTER_STRATEGIES = [
     "llmrouter-nadirclaw-centroid",  # CentroidRoutingStrategy - zero-config intelligent routing
     # Semantic / intent routers
     "llmrouter-semantic-intent",  # SemanticIntentRoutingStrategy - intent->model-group dispatch
+    # Tag / regex / User-Agent routers (RouteIQ-6865)
+    "llmrouter-tag-regex-ua",  # TagRegexUserAgentRoutingStrategy - tag/regex/UA -> group
+    # Live-signal routers (RouteIQ-904b)
+    "llmrouter-latency-sla",  # LatencySLARoutingStrategy - meet a p-latency target
+    "llmrouter-usage-based",  # UsageBasedRoutingStrategy - spread by recent usage
+    "llmrouter-least-busy",  # LeastBusyRoutingStrategy - fewest in-flight requests
+    # Feature-vector contextual bandit (RouteIQ-6c67)
+    "llmrouter-linucb",  # LinUCBRoutingStrategy - LinUCB feature-vector bandit
 ]
 
 
@@ -1945,6 +1955,23 @@ DEFAULT_ROUTER_HPARAMS: Dict[str, Dict[str, Any]] = {
     "semantic-intent": {
         "intent_model_groups": {},
         "similarity_threshold": 0.0,
+    },
+    "tag-regex-ua": {
+        "tag_model_groups": {},
+        "regex_model_groups": {},
+        "user_agent_model_groups": {},
+    },
+    "latency-sla": {
+        "p_latency_target_ms": 2000.0,
+        "percentile": 0.95,
+        "max_latency_samples": 256,
+    },
+    "usage-based": {},
+    "least-busy": {},
+    "linucb": {
+        "alpha": 1.0,
+        "tenant_buckets": 8,
+        "seed": None,
     },
 }
 
@@ -3715,6 +3742,528 @@ class SemanticIntentRoutingStrategy(RoutingStrategy):
         return True, None
 
 
+class TagRegexUserAgentRoutingStrategy(RoutingStrategy):
+    """Tag / regex / User-Agent routing strategy (RouteIQ-6865).
+
+    Upstream LiteLLM ``tag_based_routing`` is BYPASSED by the RouteIQ custom
+    routing strategy (``set_custom_routing_strategy``), so RouteIQ re-implements
+    tag-style routing natively.  A request is matched against three signal
+    sources, in strict priority order, and the FIRST matching rule maps the
+    request to a model-group subset (an ordered list of model-name patterns):
+
+    1. **Tag** -- an explicit tag in ``context.request_kwargs["tags"]`` /
+       ``context.metadata["tags"]`` (a list or a scalar), matched EXACTLY against
+       :attr:`tag_model_groups` keys.
+    2. **Regex** -- a Python regex over the request text (last user message /
+       ``context.input``), matched against :attr:`regex_model_groups` keys
+       (``re.search``, first key in insertion order to match wins).
+    3. **User-Agent** -- the ``User-Agent`` request header (read case-insensitively
+       from ``context.request_kwargs["headers"]`` / ``context.metadata["headers"]``)
+       matched as a case-insensitive SUBSTRING against
+       :attr:`user_agent_model_groups` keys.
+
+    Once a group is chosen, the request routes to the first candidate whose
+    ``litellm_params.model`` matches one of the group's patterns (exact match
+    first, then substring, both in pattern order).  Every off-path condition
+    (no rule matched, matched group has no available candidate) falls back to the
+    first available candidate -- it returns ``None`` only when there are no
+    candidates at all.
+
+    Stress-harness validation: ``tools/stress_harness`` resolves the active
+    strategy by name; ``tag-regex-ua`` is not a registered verdict family so it
+    hits the generic distribution verdict
+    (``stress_harness.verdicts.generic_verdict``).  Drive a workload tagged with
+    the configured tags (or matching regexes / User-Agents) and confirm the
+    per-bucket model-group dispatch is the configured one.
+    """
+
+    def __init__(
+        self,
+        tag_model_groups: Optional[Dict[str, List[str]]] = None,
+        regex_model_groups: Optional[Dict[str, List[str]]] = None,
+        user_agent_model_groups: Optional[Dict[str, List[str]]] = None,
+        **kwargs: Any,
+    ):
+        self._tag_model_groups = tag_model_groups or {}
+        self._regex_model_groups = regex_model_groups or {}
+        self._user_agent_model_groups = user_agent_model_groups or {}
+        # Pre-compile regexes once; an invalid pattern is skipped (logged), never
+        # raised, so one bad config entry cannot break routing.
+        self._compiled_regex: List[Tuple[Any, List[str]]] = []
+        import re
+
+        for pattern, group in self._regex_model_groups.items():
+            try:
+                self._compiled_regex.append((re.compile(pattern), group or []))
+            except re.error as exc:  # pragma: no cover - defensive
+                verbose_proxy_logger.warning(
+                    f"TagRouting: skipping invalid regex {pattern!r}: {exc}"
+                )
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-tag-regex-ua"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    def _get_candidates(self, context: RoutingContext) -> List[Dict]:
+        """Candidate deployments for the requested model group (filtered)."""
+        router = context.router
+        if router is None:
+            return []
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", [])
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
+
+    @staticmethod
+    def _sources(context: RoutingContext) -> List[Dict]:
+        """Ordered context dicts to read signals from (request_kwargs first)."""
+        sources: List[Dict] = []
+        if context.request_kwargs:
+            sources.append(context.request_kwargs)
+        if context.metadata:
+            sources.append(context.metadata)
+        return sources
+
+    def _extract_tags(self, context: RoutingContext) -> List[str]:
+        """Collect request tags from request_kwargs / metadata (list or scalar)."""
+        tags: List[str] = []
+        for src in self._sources(context):
+            raw = src.get("tags")
+            if raw is None:
+                continue
+            if isinstance(raw, (list, tuple, set)):
+                tags.extend(str(t) for t in raw)
+            else:
+                tags.append(str(raw))
+        return tags
+
+    @staticmethod
+    def _extract_text(context: RoutingContext) -> str:
+        """Best-effort request text: last user message, else input."""
+        for msg in reversed(context.messages or []):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+            if isinstance(content, list):
+                parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                joined = " ".join(parts).strip()
+                if joined:
+                    return joined
+        inp = context.input
+        if isinstance(inp, str):
+            return inp
+        if isinstance(inp, list) and inp:
+            return str(inp[0])
+        return ""
+
+    def _extract_user_agent(self, context: RoutingContext) -> str:
+        """Read the User-Agent header (case-insensitive key) from the context."""
+        for src in self._sources(context):
+            headers = src.get("headers")
+            if not isinstance(headers, dict):
+                continue
+            for key, value in headers.items():
+                if str(key).lower() == "user-agent" and value:
+                    return str(value)
+        return ""
+
+    def _select_group(self, context: RoutingContext) -> Optional[List[str]]:
+        """Resolve the model-group patterns for the request, in priority order.
+
+        Tag (exact) -> regex (search) -> User-Agent (substring, ci). Returns the
+        first matching group's pattern list, or ``None`` if nothing matched.
+        """
+        # 1. Tag (exact key match, request-order priority).
+        for tag in self._extract_tags(context):
+            group = self._tag_model_groups.get(tag)
+            if group:
+                return group
+
+        # 2. Regex over the request text (insertion order = priority).
+        text = self._extract_text(context)
+        if text:
+            for compiled, group in self._compiled_regex:
+                if group and compiled.search(text):
+                    return group
+
+        # 3. User-Agent substring (case-insensitive, insertion order).
+        ua = self._extract_user_agent(context).lower()
+        if ua:
+            for needle, group in self._user_agent_model_groups.items():
+                if group and needle.lower() in ua:
+                    return group
+        return None
+
+    @staticmethod
+    def _match_in_group(patterns: List[str], candidates: List[Dict]) -> Optional[Dict]:
+        """First candidate matching the group (exact model first, then substring)."""
+        # Pass 1: exact (case-insensitive) model-name equality, pattern order.
+        for pattern in patterns:
+            p = pattern.lower()
+            for dep in candidates:
+                model = dep.get("litellm_params", {}).get("model", "").lower()
+                if model == p:
+                    return dep
+        # Pass 2: substring, pattern order.
+        for pattern in patterns:
+            p = pattern.lower()
+            for dep in candidates:
+                model = dep.get("litellm_params", {}).get("model", "").lower()
+                if p in model:
+                    return dep
+        return None
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        """Route by tag / regex / User-Agent -> model group, graceful fallback.
+
+        Returns ``None`` only when there are no candidates; any non-match falls
+        back to the first available candidate.
+        """
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        group = self._select_group(context)
+        if group is None:
+            return candidates[0]  # no rule matched -> fallback
+
+        matched = self._match_in_group(group, candidates)
+        if matched is None:
+            return candidates[0]  # group matched but no candidate in it
+
+        selected_model = matched.get("litellm_params", {}).get("model", "unknown")
+        _record_selection_metric("tag-regex-ua", selected_model)
+        return matched
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        """Ready iff at least one of the three maps is configured."""
+        if not (
+            self._tag_model_groups
+            or self._regex_model_groups
+            or self._user_agent_model_groups
+        ):
+            return False, "no tag / regex / user_agent model groups configured"
+        return True, None
+
+
+# ---------------------------------------------------------------------------
+# Latency-SLA / usage-based / least-busy strategies (RouteIQ-904b)
+# ---------------------------------------------------------------------------
+#
+# Upstream LiteLLM's latency-based / usage-based / least-busy routers are
+# BYPASSED by RouteIQ's custom routing strategy (``set_custom_routing_strategy``).
+# These three RouteIQ-native strategies re-implement that family, reading LIVE
+# signals from the per-worker ``RoutingStatsAccumulator`` (decision counts +
+# rolling latency) and a per-strategy in-flight counter, degrading gracefully
+# (deterministic fallback) when no signal exists yet. They share a small mixin
+# for candidate resolution.
+
+
+class _SignalAwareRoutingMixin:
+    """Shared candidate resolution for the live-signal routing strategies."""
+
+    @staticmethod
+    def _get_candidates(context: RoutingContext) -> List[Dict]:
+        router = context.router
+        if router is None:
+            return []
+        healthy = getattr(router, "healthy_deployments", None)
+        if healthy is None:
+            healthy = getattr(router, "model_list", [])
+        group_matched = [
+            dep for dep in healthy if dep.get("model_name") == context.model
+        ]
+        from litellm_llmrouter.candidate_filter import filter_routable_candidates
+
+        return filter_routable_candidates(router, group_matched)
+
+    @staticmethod
+    def _arm_key(deployment: Dict) -> str:
+        return str(deployment.get("litellm_params", {}).get("model", ""))
+
+
+class LatencySLARoutingStrategy(_SignalAwareRoutingMixin, RoutingStrategy):
+    """Latency-SLA router (RouteIQ-904b): pick a deployment meeting a p-latency
+    target.
+
+    Maintains a bounded per-model ring buffer of OBSERVED latency samples
+    (milliseconds), fed via :meth:`record_latency` from the post-response path
+    (or by tests).  On each decision it estimates each candidate's percentile
+    latency and selects, in candidate (config) order, the FIRST deployment whose
+    percentile latency is at or below ``p_latency_target_ms``.  If NONE meet the
+    target (or none have samples yet -- cold start), it falls back to the
+    lowest observed-percentile deployment, and finally to the first candidate
+    (so it never returns ``None`` while candidates exist).
+
+    Live-signal source: its OWN per-model sample buffer (process-local, bounded).
+    A model with no samples is treated as meeting the SLA (optimistic cold-start)
+    so a fresh deployment is given a chance instead of being starved.
+
+    Stress-harness: not a registered verdict family -> generic distribution
+    verdict.  Seed per-model latencies via :meth:`record_latency` and confirm
+    the sub-target deployment dominates.
+    """
+
+    def __init__(
+        self,
+        p_latency_target_ms: float = 2000.0,
+        percentile: float = 0.95,
+        max_latency_samples: int = 256,
+        **kwargs: Any,
+    ):
+        self._target_ms = max(0.0, float(p_latency_target_ms))
+        self._percentile = max(0.0, min(1.0, percentile))
+        self._max_samples = max(1, int(max_latency_samples))
+        # model -> bounded list of latency samples (ms). Mutated under lock.
+        self._samples: Dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-latency-sla"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    def record_latency(self, model: str, latency_ms: float) -> None:
+        """Record one observed latency sample (ms) for ``model`` (bounded ring)."""
+        if not model or latency_ms is None or latency_ms < 0:
+            return
+        with self._lock:
+            buf = self._samples.get(model)
+            if buf is None:
+                buf = deque(maxlen=self._max_samples)
+                self._samples[model] = buf
+            buf.append(float(latency_ms))
+
+    def _percentile_latency(self, model: str) -> Optional[float]:
+        """Estimate the configured percentile latency for ``model``.
+
+        Returns ``None`` when the model has no samples (cold start). Uses the
+        nearest-rank percentile over a sorted copy of the bounded buffer.
+        """
+        with self._lock:
+            buf = self._samples.get(model)
+            samples = sorted(buf) if buf else []
+        if not samples:
+            return None
+        if len(samples) == 1:
+            return samples[0]
+        # Nearest-rank: index = ceil(p * n) - 1, clamped.
+        rank = max(
+            0, min(len(samples) - 1, math.ceil(self._percentile * len(samples)) - 1)
+        )
+        return samples[rank]
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        best_below: Optional[Dict] = None
+        lowest_dep: Optional[Dict] = None
+        lowest_lat = float("inf")
+        for dep in candidates:
+            model = self._arm_key(dep)
+            p_lat = self._percentile_latency(model)
+            if p_lat is None:
+                # Cold start: no samples -> treat as meeting the SLA (optimistic).
+                if best_below is None:
+                    best_below = dep
+                continue
+            if p_lat <= self._target_ms and best_below is None:
+                best_below = dep
+            if p_lat < lowest_lat:
+                lowest_lat = p_lat
+                lowest_dep = dep
+
+        selected = best_below or lowest_dep or candidates[0]
+        _record_selection_metric("latency-sla", self._arm_key(selected))
+        return selected
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        if not (0.0 <= self._percentile <= 1.0):
+            return False, "percentile must be between 0.0 and 1.0"
+        return True, None
+
+
+class UsageBasedRoutingStrategy(_SignalAwareRoutingMixin, RoutingStrategy):
+    """Usage-based router (RouteIQ-904b): spread load by RECENT decision usage.
+
+    Reads the LIVE per-model decision counts from the process-local
+    :class:`~litellm_llmrouter.router_decision_callback.RoutingStatsAccumulator`
+    (``model_distribution``) and routes to the candidate with the FEWEST recorded
+    decisions, so traffic spreads toward under-used deployments.  Ties (and the
+    cold-start all-zero case) break on candidate (config) order, so the first
+    decision is deterministic.
+
+    Live-signal source: the shared stats accumulator (per-worker scope -- the
+    same scope the admin stats panel reports).  Reads are best-effort and
+    fail-open: if the accumulator is unavailable, every count is treated as 0 and
+    the strategy degrades to first-candidate order.
+
+    NOTE: the accumulator's model key is the ``litellm_params.model`` arm key
+    recorded at decision time.  This strategy keys on the same value, so its view
+    matches what the stats panel shows.
+
+    Stress-harness: generic distribution verdict.  Over many decisions the
+    selection distribution flattens across candidates (the spread property).
+    """
+
+    def __init__(self, **kwargs: Any):
+        pass
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-usage-based"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    @staticmethod
+    def _usage_counts() -> Dict[str, int]:
+        """Live per-model decision counts from the stats accumulator (fail-open)."""
+        try:
+            from litellm_llmrouter.router_decision_callback import (
+                get_stats_accumulator,
+            )
+
+            snap = get_stats_accumulator().global_snapshot()
+            dist = snap.get("model_distribution", {}) or {}
+            return {str(k): int(v) for k, v in dist.items()}
+        except Exception:  # pragma: no cover - signal read must never break routing
+            return {}
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        counts = self._usage_counts()
+        best: Optional[Dict] = None
+        best_count = float("inf")
+        for dep in candidates:
+            model = self._arm_key(dep)
+            c = counts.get(model, 0)
+            if c < best_count:
+                best_count = c
+                best = dep
+
+        selected = best or candidates[0]
+        _record_selection_metric("usage-based", self._arm_key(selected))
+        return selected
+
+
+class LeastBusyRoutingStrategy(_SignalAwareRoutingMixin, RoutingStrategy):
+    """Least-busy router (RouteIQ-904b): pick the deployment with the fewest
+    in-flight requests.
+
+    Maintains a process-local per-model IN-FLIGHT counter.  The caller signals
+    request lifecycle via :meth:`acquire` (on dispatch) and :meth:`release` (on
+    completion); :meth:`select_deployment` picks the candidate with the lowest
+    current in-flight count and increments it.  Ties (and the cold-start all-zero
+    case) break on candidate order.
+
+    Live-signal source: its OWN per-model in-flight gauge (the upstream
+    ``least-busy`` strategy is bypassed, and the OTel ``backpressure.active_requests``
+    gauge is write-only / process-aggregate, not per-model, so a strategy-owned
+    counter is the available signal).  ``acquire`` is called inside
+    :meth:`select_deployment`; ``release`` MUST be called by the response path
+    (or a test) to decrement.  Releasing an unknown / already-zero model is a
+    safe no-op (never goes negative).
+
+    Stress-harness: generic distribution verdict.  Without paired release calls
+    the counters only grow, so the strategy round-robins (each pick increments
+    the chosen arm, making it momentarily busier) -- a useful no-feedback default.
+    """
+
+    def __init__(self, **kwargs: Any):
+        self._inflight: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def name(self) -> str:
+        return "llmrouter-least-busy"
+
+    @property
+    def version(self) -> Optional[str]:
+        return "1.0.0"
+
+    def acquire(self, model: str) -> None:
+        """Increment the in-flight counter for ``model`` (request dispatched)."""
+        if not model:
+            return
+        with self._lock:
+            self._inflight[model] = self._inflight.get(model, 0) + 1
+
+    def release(self, model: str) -> None:
+        """Decrement the in-flight counter for ``model`` (request completed).
+
+        Floors at 0 so an unmatched / double release never drives it negative.
+        """
+        if not model:
+            return
+        with self._lock:
+            current = self._inflight.get(model, 0)
+            if current > 0:
+                self._inflight[model] = current - 1
+
+    def in_flight(self, model: str) -> int:
+        """Current in-flight count for ``model`` (0 if unseen)."""
+        with self._lock:
+            return self._inflight.get(model, 0)
+
+    def select_deployment(
+        self,
+        context: RoutingContext,
+    ) -> Optional[Dict]:
+        candidates = self._get_candidates(context)
+        if not candidates:
+            return None
+
+        with self._lock:
+            best: Optional[Dict] = None
+            best_count = float("inf")
+            for dep in candidates:
+                model = self._arm_key(dep)
+                c = self._inflight.get(model, 0)
+                if c < best_count:
+                    best_count = c
+                    best = dep
+            selected = best or candidates[0]
+            sel_model = self._arm_key(selected)
+            # Acquire the slot under the same lock so concurrent selects spread.
+            self._inflight[sel_model] = self._inflight.get(sel_model, 0) + 1
+
+        _record_selection_metric("least-busy", sel_model)
+        return selected
+
+
 def register_cost_cascade_strategy() -> bool:
     """Register the cost-aware cascade strategy in the routing registry.
 
@@ -3804,6 +4353,123 @@ def register_semantic_intent_strategy() -> bool:
         return False
 
 
+def register_tag_routing_strategy() -> bool:
+    """Register the tag/regex/User-Agent router in the routing registry.
+
+    Makes :class:`TagRegexUserAgentRoutingStrategy` available as
+    ``"llmrouter-tag-regex-ua"`` for direct selection / A/B testing. Opt-in:
+    only registers when ``settings.tag_routing.enabled`` is True (RouteIQ-6865).
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().tag_routing
+    except Exception:
+        return False
+
+    if not cfg.enabled:
+        verbose_proxy_logger.debug(
+            "Tag routing disabled (ROUTEIQ_TAG_ROUTING__ENABLED=false)"
+        )
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        registry.register(
+            "llmrouter-tag-regex-ua",
+            TagRegexUserAgentRoutingStrategy(
+                tag_model_groups=cfg.tag_model_groups,
+                regex_model_groups=cfg.regex_model_groups,
+                user_agent_model_groups=cfg.user_agent_model_groups,
+            ),
+        )
+        verbose_proxy_logger.info(
+            "Registered tag routing strategy as 'llmrouter-tag-regex-ua'"
+        )
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(f"Failed to register tag routing strategy: {e}")
+        return False
+
+
+def register_latency_aware_strategies() -> bool:
+    """Register the latency-SLA / usage-based / least-busy routers (RouteIQ-904b).
+
+    Makes :class:`LatencySLARoutingStrategy` (``"llmrouter-latency-sla"``),
+    :class:`UsageBasedRoutingStrategy` (``"llmrouter-usage-based"``), and
+    :class:`LeastBusyRoutingStrategy` (``"llmrouter-least-busy"``) available for
+    direct selection / A/B testing. Opt-in: only registers when
+    ``settings.latency_aware.enabled`` is True. All three are registered
+    together (one flag) but each under its own registry name.
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        cfg = get_settings().latency_aware
+    except Exception:
+        return False
+
+    if not cfg.enabled:
+        verbose_proxy_logger.debug(
+            "Latency-aware routing disabled (ROUTEIQ_LATENCY_AWARE__ENABLED=false)"
+        )
+        return False
+
+    try:
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        registry = get_routing_registry()
+        registry.register(
+            "llmrouter-latency-sla",
+            LatencySLARoutingStrategy(
+                p_latency_target_ms=cfg.p_latency_target_ms,
+                percentile=cfg.percentile,
+                max_latency_samples=cfg.max_latency_samples,
+            ),
+        )
+        registry.register("llmrouter-usage-based", UsageBasedRoutingStrategy())
+        registry.register("llmrouter-least-busy", LeastBusyRoutingStrategy())
+        verbose_proxy_logger.info(
+            "Registered latency-sla / usage-based / least-busy strategies"
+        )
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(
+            f"Failed to register latency-aware strategies: {e}"
+        )
+        return False
+
+
+def register_linucb_strategy() -> bool:
+    """Register the LinUCB contextual-bandit router (RouteIQ-6c67).
+
+    Makes :class:`~litellm_llmrouter.kumaraswamy_thompson.LinUCBRoutingStrategy`
+    available as ``"llmrouter-linucb"`` for direct selection / A/B testing.
+    Opt-in: only registers when ``settings.linucb.enabled`` is True. ADDITIVE
+    alongside the Kumaraswamy-Thompson bandit (independent flag / name).
+
+    Returns:
+        True if registration succeeded, False otherwise (disabled / error).
+    """
+    try:
+        from litellm_llmrouter.kumaraswamy_thompson import (
+            register_linucb_strategy as _reg,
+        )
+
+        return _reg()
+    except Exception as e:  # pragma: no cover - defensive
+        verbose_proxy_logger.warning(f"Failed to register LinUCB strategy: {e}")
+        return False
+
+
 def register_llmrouter_strategies():
     """
     Log available LLMRouter strategies and return their names.
@@ -3813,15 +4479,21 @@ def register_llmrouter_strategies():
     ``custom_routing_strategy.py``); this function does NOT register them in the
     runtime registry.
 
-    It DOES opt-in-register the two RouteIQ-native, registry-backed strategies
+    It DOES opt-in-register the RouteIQ-native, registry-backed strategies
     when enabled via settings:
     - ``llmrouter-cost-cascade`` (RouteIQ-90d0) via
       :func:`register_cost_cascade_strategy`
     - ``llmrouter-semantic-intent`` (RouteIQ-7936) via
       :func:`register_semantic_intent_strategy`
+    - ``llmrouter-tag-regex-ua`` (RouteIQ-6865) via
+      :func:`register_tag_routing_strategy`
+    - ``llmrouter-latency-sla`` / ``llmrouter-usage-based`` /
+      ``llmrouter-least-busy`` (RouteIQ-904b) via
+      :func:`register_latency_aware_strategies`
+    - ``llmrouter-linucb`` (RouteIQ-6c67) via :func:`register_linucb_strategy`
 
-    This mirrors the centroid pattern (``register_centroid_strategy``): both are
-    no-ops unless their respective ``enabled`` flag is set, so default startup
+    This mirrors the centroid pattern (``register_centroid_strategy``): each is
+    a no-op unless its respective ``enabled`` flag is set, so default startup
     behavior is unchanged.
 
     Returns:
@@ -3839,5 +4511,8 @@ def register_llmrouter_strategies():
     # Opt-in registry-backed RouteIQ-native strategies (no-op unless enabled).
     register_cost_cascade_strategy()
     register_semantic_intent_strategy()
+    register_tag_routing_strategy()
+    register_latency_aware_strategies()
+    register_linucb_strategy()
 
     return LLMROUTER_STRATEGIES

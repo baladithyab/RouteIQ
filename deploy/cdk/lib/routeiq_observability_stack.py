@@ -120,6 +120,7 @@ class RouteIqObservabilityStack(Stack):
         enable_data_lake: bool = False,
         enable_config_audit: bool = False,
         enable_gitops_pipeline: bool = False,
+        enable_rollback_monitor: bool = False,
         notify_emails: list[str] | None = None,
         cost_center: str | None = None,
         team: str | None = None,
@@ -180,6 +181,11 @@ class RouteIqObservabilityStack(Stack):
             "ConfigStateConstruct",
             env_name=env_name,
             enable_config_audit=enable_config_audit,
+            # RouteIQ-b056: the CloudWatch-alarm rollback Monitor on the AppConfig
+            # environment. DEFAULT OFF so the default P2 synth/snapshot stays
+            # byte-stable; when on, the environment carries a Monitor (alarmArn +
+            # alarmRoleArn) so a bad config auto-rolls-back during the bake.
+            enable_rollback_monitor=enable_rollback_monitor,
         )
 
         # -- 1b. GitOps deploy tier (RouteIQ-1669; flag-gated, DEFAULT OFF) -----

@@ -138,6 +138,12 @@ def _mint_db_token(*, host: str, port: int, user: str, region: str) -> str:
 
 _pool = None  # Optional[asyncpg.Pool]
 _pool_lock: Optional[asyncio.Lock] = None
+# RouteIQ-65ed: separate read pool for the optional reader endpoint (Aurora
+# reader endpoint / RDS Proxy read endpoint). None until first use; only built
+# when ``settings.postgres.reader_host`` is set, otherwise reads fall back to the
+# writer pool (so the single-pool path stays byte-stable).
+_read_pool = None  # Optional[asyncpg.Pool]
+_read_pool_lock: Optional[asyncio.Lock] = None
 
 
 def _get_pool_lock() -> asyncio.Lock:
@@ -148,9 +154,154 @@ def _get_pool_lock() -> asyncio.Lock:
     return _pool_lock
 
 
+def _get_read_pool_lock() -> asyncio.Lock:
+    """Lazily initialize the read-pool lock to avoid binding to wrong event loop."""
+    global _read_pool_lock
+    if _read_pool_lock is None:
+        _read_pool_lock = asyncio.Lock()
+    return _read_pool_lock
+
+
+def _reader_host() -> str | None:
+    """Return the configured reader endpoint host, or None (RouteIQ-65ed).
+
+    Fail-soft: any settings error returns None so reads fall back to the writer
+    pool and the single-pool path is byte-for-byte unchanged.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        return get_settings().postgres.reader_host or None
+    except Exception:
+        return None
+
+
+def _swap_url_host(url: str, new_host: str) -> str:
+    """Return ``url`` with its host replaced by ``new_host`` (RouteIQ-65ed).
+
+    Preserves the scheme, userinfo, port, path, query, and fragment so the reader
+    pool inherits the writer URL's credentials/port/db; only the endpoint host is
+    swapped to the Aurora reader / RDS Proxy read endpoint. The username (used to
+    mint the IAM token) and port are unchanged, so the IAM-auth path applies to
+    the reader verbatim against the new host.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    userinfo = ""
+    if parts.username is not None:
+        userinfo = parts.username
+        if parts.password is not None:
+            userinfo += f":{parts.password}"
+        userinfo += "@"
+    port = f":{parts.port}" if parts.port else ""
+    netloc = f"{userinfo}{new_host}{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+async def _create_pool(url: str, *, role: str = "writer"):
+    """Create one asyncpg pool against ``url`` with RouteIQ's pool/IAM/SSL discipline.
+
+    Shared by the writer (:func:`get_db_pool`) and the optional reader
+    (:func:`get_read_db_pool`, RouteIQ-65ed) so both honour the identical pool
+    sizing, ``ssl_mode``, and the ADR-0028 rds-db:connect IAM-token-as-callable
+    path. ``role`` only colours the log lines. Returns the pool or None; re-raises
+    :class:`IamRegionUnresolvedError` (fail-loud) past its own broad handler.
+    """
+    try:
+        import asyncpg
+
+        # Read pool settings from Pydantic settings if available
+        try:
+            from litellm_llmrouter.settings import get_settings
+
+            settings = get_settings()
+            min_size = settings.postgres.pool_min
+            max_size = settings.postgres.pool_max
+            ssl_mode = settings.postgres.ssl_mode
+        except Exception:
+            min_size = 2
+            max_size = 10
+            ssl_mode = "prefer"
+
+        # IAM auth (ADR-0028): when ROUTEIQ_DB_IAM_AUTH is set, mint a 15-min
+        # rds-db:connect token and pass it as a CALLABLE password. asyncpg
+        # invokes the callable per new physical connection AND on pool
+        # reconnects, so the token refreshes for free (no custom pool wrapper).
+        # Default OFF -> the static-URL path below is byte-for-byte unchanged.
+        # On any setup failure we log (NEVER the token) and fall through to the
+        # static URL so a misconfig degrades softly instead of crashing boot.
+        connect_kwargs: dict[str, Any] = {}
+        # RouteIQ-6829: confirming IAM-on is fail-soft (a settings-read error
+        # degrades to the static URL), but an UNRESOLVED region once IAM IS on
+        # must fail loud rather than silently sign Region=None. So the region
+        # is resolved OUTSIDE this fail-soft try.
+        _iam_on = False
+        _iam_region = None
+        try:
+            from litellm_llmrouter.settings import get_settings as _gs
+
+            _pg = _gs().postgres
+            _iam_on = _pg.iam_auth
+            _iam_region = _pg.iam_region
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"DB IAM token setup failed; using static URL: {e}"
+            )
+        if _iam_on:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(url)
+            host = parts.hostname
+            port = parts.port or 5432
+            user = parts.username  # "routeiq" / DbRuntimeUser
+            # RouteIQ-65ed: the reader endpoint is a DIFFERENT host, so resolve the
+            # region against THAT host (host-parse fallback uses the reader host's
+            # .<region>.rds.amazonaws.com label); the user/port are inherited from
+            # the writer URL so the rds-db:connect token mints for the reader node.
+            region = _resolve_db_iam_region(host, _iam_region)  # fail-loud
+
+            def _password() -> str:
+                # asyncpg calls this per new/replacement connection -> 15-min refresh.
+                return _mint_db_token(host=host, port=port, user=user, region=region)
+
+            connect_kwargs["password"] = _password
+            verbose_proxy_logger.info(
+                "DB IAM auth enabled: minting rds-db:connect token per connection"
+            )  # no token value logged
+
+        pool = await asyncpg.create_pool(
+            url,
+            min_size=min_size,
+            max_size=max_size,
+            command_timeout=30,
+            # SSL enforcement when available
+            ssl=ssl_mode,
+            **connect_kwargs,
+        )
+        verbose_proxy_logger.info(
+            f"Database {role} connection pool created (min={min_size}, max={max_size})"
+        )
+        return pool
+    except ImportError:
+        verbose_proxy_logger.warning(
+            "asyncpg not installed, database pool not available"
+        )
+        return None
+    except IamRegionUnresolvedError:
+        # RouteIQ-6829: an unresolved region on the IAM path is a FAIL-LOUD
+        # misconfiguration, NOT a soft degradation. Re-raise it past the
+        # broad handler below so it is never swallowed into a static-URL
+        # fallback that would then sign with no/invalid region.
+        raise
+    except Exception as e:
+        verbose_proxy_logger.error(f"Failed to create database {role} pool: {e}")
+        return None
+
+
 async def get_db_pool(db_url: Optional[str] = None):
     """
-    Get or create the shared database connection pool.
+    Get or create the shared (writer) database connection pool.
 
     Uses double-checked locking to ensure only one pool is created
     even under concurrent access. The pool is lazily initialized on
@@ -175,103 +326,60 @@ async def get_db_pool(db_url: Optional[str] = None):
         if not url:
             return None
 
-        try:
-            import asyncpg
+        _pool = await _create_pool(url, role="writer")
+        return _pool
 
-            # Read pool settings from Pydantic settings if available
-            try:
-                from litellm_llmrouter.settings import get_settings
 
-                settings = get_settings()
-                min_size = settings.postgres.pool_min
-                max_size = settings.postgres.pool_max
-                ssl_mode = settings.postgres.ssl_mode
-            except Exception:
-                min_size = 2
-                max_size = 10
-                ssl_mode = "prefer"
+async def get_read_db_pool(db_url: Optional[str] = None):
+    """Get or create the read pool for read-only queries (RouteIQ-65ed).
 
-            # IAM auth (ADR-0028): when ROUTEIQ_DB_IAM_AUTH is set, mint a 15-min
-            # rds-db:connect token and pass it as a CALLABLE password. asyncpg
-            # invokes the callable per new physical connection AND on pool
-            # reconnects, so the token refreshes for free (no custom pool wrapper).
-            # Default OFF -> the static-URL path below is byte-for-byte unchanged.
-            # On any setup failure we log (NEVER the token) and fall through to the
-            # static URL so a misconfig degrades softly instead of crashing boot.
-            connect_kwargs: dict[str, Any] = {}
-            # RouteIQ-6829: confirming IAM-on is fail-soft (a settings-read error
-            # degrades to the static URL), but an UNRESOLVED region once IAM IS on
-            # must fail loud rather than silently sign Region=None. So the region
-            # is resolved OUTSIDE this fail-soft try.
-            _iam_on = False
-            _iam_region = None
-            try:
-                from litellm_llmrouter.settings import get_settings as _gs
+    When ``settings.postgres.reader_host`` is set, builds a SEPARATE asyncpg pool
+    against the reader endpoint (Aurora reader endpoint / RDS Proxy read endpoint)
+    -- the writer URL's host swapped to ``reader_host`` (port/db/user/credentials
+    and the ADR-0028 IAM-auth discipline inherited). When ``reader_host`` is empty
+    (the default) this transparently returns the WRITER pool, so callers can route
+    read-only queries here unconditionally and the single-pool path stays
+    byte-stable.
 
-                _pg = _gs().postgres
-                _iam_on = _pg.iam_auth
-                _iam_region = _pg.iam_region
-            except Exception as e:
-                verbose_proxy_logger.error(
-                    f"DB IAM token setup failed; using static URL: {e}"
-                )
-            if _iam_on:
-                from urllib.parse import urlsplit
+    Args:
+        db_url: Optional base URL override. Falls back to DATABASE_URL env var.
 
-                parts = urlsplit(url)
-                host = parts.hostname
-                port = parts.port or 5432
-                user = parts.username  # "routeiq" / DbRuntimeUser
-                region = _resolve_db_iam_region(host, _iam_region)  # fail-loud
+    Returns:
+        asyncpg.Pool for the reader, the writer pool when no reader is configured,
+        or None if no database is configured / asyncpg is unavailable.
+    """
+    global _read_pool
 
-                def _password() -> str:
-                    # asyncpg calls this per new/replacement connection -> 15-min refresh.
-                    return _mint_db_token(
-                        host=host, port=port, user=user, region=region
-                    )
+    reader = _reader_host()
+    if not reader:
+        # No reader configured -> reads share the writer pool (byte-stable default).
+        return await get_db_pool(db_url)
 
-                connect_kwargs["password"] = _password
-                verbose_proxy_logger.info(
-                    "DB IAM auth enabled: minting rds-db:connect token per connection"
-                )  # no token value logged
+    if _read_pool is not None:
+        return _read_pool
 
-            _pool = await asyncpg.create_pool(
-                url,
-                min_size=min_size,
-                max_size=max_size,
-                command_timeout=30,
-                # SSL enforcement when available
-                ssl=ssl_mode,
-                **connect_kwargs,
-            )
-            verbose_proxy_logger.info(
-                f"Database connection pool created (min={min_size}, max={max_size})"
-            )
-            return _pool
-        except ImportError:
-            verbose_proxy_logger.warning(
-                "asyncpg not installed, database pool not available"
-            )
+    async with _get_read_pool_lock():
+        if _read_pool is not None:  # Double-check after acquiring lock
+            return _read_pool
+
+        base_url = db_url or os.environ.get("DATABASE_URL")
+        if not base_url:
             return None
-        except IamRegionUnresolvedError:
-            # RouteIQ-6829: an unresolved region on the IAM path is a FAIL-LOUD
-            # misconfiguration, NOT a soft degradation. Re-raise it past the
-            # broad handler below so it is never swallowed into a static-URL
-            # fallback that would then sign with no/invalid region.
-            raise
-        except Exception as e:
-            verbose_proxy_logger.error(f"Failed to create database pool: {e}")
-            return None
+
+        reader_url = _swap_url_host(base_url, reader)
+        _read_pool = await _create_pool(reader_url, role="reader")
+        return _read_pool
 
 
 async def close_db_pool() -> None:
     """
-    Close the shared database connection pool.
+    Close the shared database connection pool(s).
 
-    Call during gateway shutdown to cleanly release all connections.
-    Safe to call multiple times or when no pool exists.
+    Call during gateway shutdown to cleanly release all connections (writer +
+    the optional RouteIQ-65ed reader pool). Safe to call multiple times or when
+    no pool exists.
     """
-    global _pool
+    global _pool, _read_pool
     if _pool is not None:
         try:
             await _pool.close()
@@ -280,18 +388,28 @@ async def close_db_pool() -> None:
             verbose_proxy_logger.error(f"Error closing database pool: {e}")
         finally:
             _pool = None
+    if _read_pool is not None:
+        try:
+            await _read_pool.close()
+            verbose_proxy_logger.info("Database reader connection pool closed")
+        except Exception as e:
+            verbose_proxy_logger.error(f"Error closing database reader pool: {e}")
+        finally:
+            _read_pool = None
 
 
 def reset_db_pool() -> None:
     """
-    Reset pool reference for testing.
+    Reset pool reference(s) for testing.
 
     Does NOT close the pool — use close_db_pool() for that.
     This is intended for unit tests that need to reset module-level state.
     """
-    global _pool, _pool_lock
+    global _pool, _pool_lock, _read_pool, _read_pool_lock
     _pool = None
     _pool_lock = None
+    _read_pool = None
+    _read_pool_lock = None
 
 
 # =============================================================================

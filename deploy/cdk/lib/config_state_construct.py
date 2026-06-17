@@ -76,6 +76,7 @@ from pathlib import Path
 
 from aws_cdk import Aws, BundlingOptions, CfnOutput, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_appconfig as appconfig
+from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
@@ -180,6 +181,15 @@ class ConfigStateConstruct(Construct):
         # Handler string + runtime behaviour). The deploy path is documented; the
         # gate-tested path is the synth default.
         bundle_validator_asset: bool | None = None,
+        # RouteIQ-b056: the flag-gated, DEFAULT-OFF AppConfig rollback Monitor.
+        # When True the AppConfig environment carries a CloudWatch-alarm Monitor
+        # (alarmArn + a roleArn AppConfig assumes to read the alarm), so a bad
+        # config deployment auto-rolls-back when the alarm goes ALARM during the
+        # bake. When False (the default) NO alarm / monitor-role resources are
+        # emitted and the environment has no Monitors, so the synth/snapshot stays
+        # byte-stable. The alarm watches the SAME router-error metric the
+        # ObservabilityConstruct already filters from the routing log group.
+        enable_rollback_monitor: bool | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -216,6 +226,27 @@ class ConfigStateConstruct(Construct):
         # Public attrs the audit populates (None when off, so consumers can guard).
         self.audit_topic: sns.Topic | None = None
         self.audit_rule: events.Rule | None = None
+
+        # Resolve the rollback-monitor toggle (RouteIQ-b056): explicit kwarg wins;
+        # else the ``routeiq:enable_rollback_monitor`` context flag (CLI string or
+        # cdk.json bool); else the DEFAULT-OFF (no alarm/monitor-role resources, so
+        # the synth/snapshot stays byte-stable and the environment has no Monitors).
+        if enable_rollback_monitor is None:
+            ctx = self.node.try_get_context("routeiq:enable_rollback_monitor")
+            if isinstance(ctx, bool):
+                enable_rollback_monitor = ctx
+            elif ctx is None:
+                enable_rollback_monitor = False
+            else:
+                enable_rollback_monitor = str(ctx).strip().lower() in (
+                    "true",
+                    "1",
+                    "yes",
+                )
+        self.enable_rollback_monitor = enable_rollback_monitor
+        # Public attrs the rollback monitor populates (None when off).
+        self.rollback_alarm: cloudwatch.Alarm | None = None
+        self.monitor_role: iam.Role | None = None
 
         (
             self.appconfig_application,
@@ -325,6 +356,114 @@ class ConfigStateConstruct(Construct):
             ),
         )
 
+    def _build_rollback_monitor(
+        self, env_name: str
+    ) -> list[appconfig.CfnEnvironment.MonitorsProperty] | None:
+        """Build the CloudWatch-alarm AppConfig rollback Monitor (RouteIQ-b056).
+
+        ADR-0026 deploys config via the Linear20Pct3Min strategy with a 5-min final
+        bake. A Monitor makes that bake SELF-HEALING: AppConfig watches a CloudWatch
+        alarm during the deployment + bake, and if the alarm goes ALARM (a bad
+        config spiking errors) AppConfig automatically rolls the deployment back to
+        the previous version. Returns the ``Monitors`` list for the environment, or
+        None when the flag is off (DEFAULT) so the environment carries no Monitors
+        and the synth/snapshot stays byte-stable.
+
+        The Monitor needs two ARNs:
+          * ``alarmArn`` -- a CloudWatch alarm. We watch a RouteIQ router-error
+            metric (the same metric family ObservabilityConstruct filters from the
+            routing log group) so a config that breaks routing trips the rollback.
+          * ``alarmRoleArn`` -- a role AppConfig (appconfig.amazonaws.com) assumes
+            to READ the alarm state (cloudwatch:DescribeAlarms). Scoped to the
+            CloudWatch describe action; AppConfig is the only principal.
+
+        ASCII-only descriptions (P0 4.5: an em-dash fails the IAM CREATE API).
+        """
+        if not self.enable_rollback_monitor:
+            return None
+
+        # The alarm AppConfig watches during the deploy + bake. Watches a RouteIQ
+        # router-error count metric; when it breaches during the bake, AppConfig
+        # rolls the config deployment back. Metric namespace + name mirror the
+        # RouteIQ metrics namespace convention (RouteIQ/RouterErrorCount).
+        self.rollback_alarm = cloudwatch.Alarm(
+            self,
+            "ConfigRollbackAlarm",
+            alarm_name=f"routeiq-{env_name}-config-rollback",
+            alarm_description=(
+                "Watched by the AppConfig environment Monitor: if RouteIQ router "
+                "errors spike during a config deployment bake, AppConfig "
+                "auto-rolls-back the config to the previous version (ADR-0026)."
+            ),
+            metric=cloudwatch.Metric(
+                namespace="RouteIQ",
+                metric_name="RouterErrorCount",
+                statistic="Sum",
+                period=Duration.minutes(1),
+                dimensions_map={"Environment": env_name},
+            ),
+            threshold=5,
+            evaluation_periods=1,
+            comparison_operator=(cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD),
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+        # The role AppConfig assumes to read the alarm state during the bake.
+        self.monitor_role = iam.Role(
+            self,
+            "ConfigMonitorRole",
+            assumed_by=iam.ServicePrincipal("appconfig.amazonaws.com"),
+            description=(
+                "Role AppConfig assumes to read the CloudWatch rollback alarm "
+                "during a config deployment bake (RouteIQ-b056)."
+            ),
+        )
+        # AppConfig reads alarm state via cloudwatch:DescribeAlarms. DescribeAlarms
+        # does not support resource-level scoping (it filters in the request), so it
+        # is granted on "*"; this is the AWS-documented AppConfig monitor-role shape.
+        self.monitor_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="AppConfigDescribeRollbackAlarm",
+                effect=iam.Effect.ALLOW,
+                actions=["cloudwatch:DescribeAlarms"],
+                resources=["*"],
+            )
+        )
+        NagSuppressions.add_resource_suppressions(
+            self.monitor_role,
+            [
+                NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
+                        "cloudwatch:DescribeAlarms does not support resource-level "
+                        "permissions (it filters by AlarmNames in the request), so "
+                        "the AppConfig monitor role must grant it on '*'. This is "
+                        "the AWS-documented AppConfig rollback-monitor role shape. "
+                        "Owner: RouteIQ P2 ConfigStateConstruct."
+                    ),
+                    applies_to=["Resource::*"],
+                ),
+            ],
+            apply_to_children=True,
+        )
+
+        CfnOutput(
+            self,
+            "ConfigRollbackAlarmArn",
+            value=self.rollback_alarm.alarm_arn,
+            description=(
+                "CloudWatch alarm the AppConfig environment Monitor watches to "
+                "auto-roll-back a bad config deployment (RouteIQ-b056)."
+            ),
+        )
+
+        return [
+            appconfig.CfnEnvironment.MonitorsProperty(
+                alarm_arn=self.rollback_alarm.alarm_arn,
+                alarm_role_arn=self.monitor_role.role_arn,
+            )
+        ]
+
     def appconfig_poll_statement(self) -> iam.PolicyStatement:
         """Return the AppConfig runtime-poll PolicyStatement for the pod role.
 
@@ -395,12 +534,19 @@ class ConfigStateConstruct(Construct):
             description="RouteIQ AppConfig application",
         )
 
+        # RouteIQ-b056: the optional CloudWatch-alarm rollback Monitor. Built BEFORE
+        # the environment so the CfnEnvironment.MonitorsProperty can reference the
+        # alarm ARN + the role AppConfig assumes to read it. DEFAULT OFF -> monitors
+        # stays None and the environment carries no Monitors (byte-stable).
+        monitors = self._build_rollback_monitor(env_name)
+
         environment = appconfig.CfnEnvironment(
             self,
             "AppConfigEnvironment",
             application_id=application.ref,
             name=env_name,
             description=f"RouteIQ AppConfig environment for {env_name}",
+            monitors=monitors,
         )
 
         profile = appconfig.CfnConfigurationProfile(

@@ -55,6 +55,53 @@ autoscaling:
   #   scaleDown:
   #     stabilizationWindowSeconds: 300
 
+  # KEDA event-driven autoscaling (RouteIQ-9c4c). DEFAULT OFF -> the CPU/mem HPA
+  # above stays the default. When keda.enabled=true, a KEDA ScaledObject is
+  # rendered INSTEAD of the HPA (mutually exclusive: KEDA owns the HPA it
+  # creates, so the chart-managed HPA is suppressed to avoid two controllers
+  # fighting over the same Deployment's replica count). KEDA scales on a load
+  # signal -- the backpressure in-flight gauge (default) or RPS -- not just
+  # CPU/mem, so the gateway scales to actual request pressure.
+  #
+  # OPERATOR PREREQUISITES (not provisioned by this chart):
+  #   * KEDA installed in the cluster (the keda-operator + the
+  #     keda-operator-metrics-apiserver).
+  #   * A metrics backend the trigger reads from. The default trigger is
+  #     ``prometheus`` (needs a Prometheus reachable at serverAddress scraping
+  #     the gateway's /metrics -- e.g. via the ServiceMonitor under metrics.*).
+  #     Set type=cloudwatch to use the AWS CloudWatch adapter instead (needs the
+  #     CloudWatch metrics + pod-role cloudwatch:GetMetricData; AMP users can
+  #     point serverAddress at the AMP query endpoint with a sigv4 auth
+  #     TriggerAuthentication, supplied out-of-band).
+  keda:
+    enabled: false
+    # Polling + cooldown knobs (KEDA ScaledObject spec defaults shown).
+    pollingInterval: 30
+    cooldownPeriod: 300
+    # min/maxReplicas fall back to autoscaling.minReplicas / .maxReplicas when
+    # unset, so a single place controls the bounds for both HPA and KEDA.
+    minReplicaCount: null
+    maxReplicaCount: null
+    # The scaler trigger. type is "prometheus" (default) or "cloudwatch".
+    trigger:
+      type: prometheus
+      # Prometheus query endpoint KEDA's metrics adapter reads.
+      serverAddress: http://prometheus-operated.monitoring.svc:9090
+      # PromQL the trigger evaluates. Defaults to the backpressure in-flight
+      # gauge (RouteIQ-6cd5 shipped gateway_backpressure_active_requests) summed
+      # across pods; swap for an RPS query
+      # (sum(rate(routeiq_requests_total[1m]))) to scale on request rate.
+      query: sum(gateway_backpressure_active_requests)
+      # Target value per replica; KEDA targets desiredReplicas = ceil(value/threshold).
+      threshold: "20"
+      # CloudWatch-only fields (used when type=cloudwatch). Operator-supplied.
+      awsRegion: ""
+      namespace: ""
+      metricName: ""
+      # Authentication ref for the trigger (e.g. a TriggerAuthentication for
+      # CloudWatch sigv4 / AMP). Empty -> no authenticationRef emitted.
+      authenticationRef: ""
+
 # Pod Disruption Budget (optional)
 podDisruptionBudget:
   enabled: false

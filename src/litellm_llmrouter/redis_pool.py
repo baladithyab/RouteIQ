@@ -283,6 +283,19 @@ def _resolve_iam_region(host: str) -> str:
     return region
 
 
+def _cluster_mode_enabled() -> bool:
+    """True when Redis cluster mode is requested (RouteIQ-5d8f).
+
+    Reads ``settings.redis.cluster_mode`` (env ``ROUTEIQ_REDIS__CLUSTER_MODE``).
+    Fail-soft: any settings error returns False so the single-endpoint path is
+    left completely unchanged (byte-stable default).
+    """
+    try:
+        return bool(get_settings().redis.cluster_mode)
+    except Exception:
+        return False
+
+
 def _mint_elasticache_token(user: str, cache_name: str, region: str) -> str:
     """Mint an ``elasticache:Connect`` SigV4-presigned AUTH token (local, no network).
 
@@ -402,6 +415,25 @@ async def get_async_redis_client() -> Optional[Any]:
         except Exception as e:
             logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
 
+        if _cluster_mode_enabled():
+            # RouteIQ-5d8f: cluster-mode client. RedisCluster discovers shards from
+            # the configuration endpoint (host:port); it does NOT take a ``db`` kwarg
+            # (cluster mode is db 0 only) and so the static-path ``db`` is dropped.
+            # The static-cred + IAM-auth username/password splice above applies
+            # verbatim (same AUTH on every node).
+            _async_client = aioredis.RedisCluster(
+                host=redis_cfg["host"],
+                port=redis_cfg["port"],
+                username=username,
+                password=password,
+                ssl=redis_cfg["ssl"],
+                decode_responses=True,
+                socket_connect_timeout=2.0,
+                socket_timeout=2.0,
+            )
+            logger.info("Async Redis CLUSTER client singleton created (host=%s)", host)
+            return _async_client
+
         _async_client = aioredis.Redis(
             host=redis_cfg["host"],
             port=redis_cfg["port"],
@@ -505,6 +537,21 @@ def get_sync_redis_client() -> Optional[Any]:
             logger.info("Redis IAM auth enabled (user=%s)", username)  # no token
     except Exception as e:
         logger.error("Redis IAM token mint failed; using static AUTH: %s", e)
+
+    if _cluster_mode_enabled():
+        # RouteIQ-5d8f: cluster-mode client (mirrors the async splice above).
+        # RedisCluster takes no ``db`` kwarg (cluster mode is db 0 only).
+        _sync_client = redis.RedisCluster(
+            host=redis_cfg["host"],
+            port=redis_cfg["port"],
+            username=username,
+            password=password,
+            ssl=redis_cfg["ssl"],
+            decode_responses=True,
+            socket_timeout=5.0,
+        )
+        logger.info("Sync Redis CLUSTER client singleton created (host=%s)", host)
+        return _sync_client
 
     _sync_client = redis.Redis(
         host=redis_cfg["host"],

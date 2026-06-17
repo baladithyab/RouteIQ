@@ -157,6 +157,18 @@ class RedisSettings(BaseModel):
             "(use1), so set this or AWS_REGION explicitly on the serverless path."
         ),
     )
+    cluster_mode: bool = Field(
+        False,
+        description=(
+            "Build a ``redis.asyncio.RedisCluster`` / sync ``redis.RedisCluster`` "
+            "client instead of a single-endpoint ``Redis`` (RouteIQ-5d8f). For "
+            "ElastiCache cluster-mode-enabled / Redis Cluster deployments where the "
+            "host is the cluster configuration endpoint. The static-cred + IAM-auth "
+            "(SigV4 elasticache:Connect) paths both apply to the cluster client. "
+            "Env: ROUTEIQ_REDIS__CLUSTER_MODE. Default OFF -> the single-endpoint "
+            "path is byte-for-byte unchanged."
+        ),
+    )
 
 
 class PostgresSettings(BaseModel):
@@ -204,6 +216,17 @@ class PostgresSettings(BaseModel):
         description=(
             "AWS region for the rds-db:connect signer. Falls back to host parse "
             "(.<region>.rds.amazonaws.com) / AWS_REGION."
+        ),
+    )
+    reader_host: Optional[str] = Field(
+        None,
+        description=(
+            "Optional read-only endpoint host (Aurora reader endpoint / RDS Proxy "
+            "read endpoint) for read replica routing (RouteIQ-65ed). When set, a "
+            "SEPARATE read pool is built against this host (same port/db/user/IAM "
+            "discipline as the writer) and used for read-only queries. Default "
+            "empty -> reads go to the writer pool, so the single-pool path is "
+            "byte-for-byte unchanged. Env: ROUTEIQ_POSTGRES__READER_HOST."
         ),
     )
 
@@ -555,6 +578,124 @@ class SemanticIntentSettings(BaseModel):
         description=(
             "Minimum top-1 cosine similarity to accept an intent classification. "
             "Below this the request is treated as UNMAPPED and falls back."
+        ),
+    )
+
+
+class TagRoutingSettings(BaseModel):
+    """Tag / regex / User-Agent routing strategy configuration (RouteIQ-6865).
+
+    Upstream LiteLLM ``tag_based_routing`` is BYPASSED by the RouteIQ custom
+    routing strategy (``set_custom_routing_strategy``), so RouteIQ re-implements
+    tag routing natively.  A request is matched against three signal sources, in
+    priority order, and the FIRST matching rule selects a model-group subset:
+
+    1. An explicit request **tag** (``context.request_kwargs["tags"]`` /
+       ``context.metadata["tags"]`` -- list or scalar) matched against
+       ``tag_model_groups`` keys (exact).
+    2. A **regex** over the request text (last user message / input) matched
+       against ``regex_model_groups`` keys (each key is a Python regex).
+    3. The **User-Agent** header (``context.request_kwargs["headers"]`` /
+       ``context.metadata["headers"]``, case-insensitive) matched against
+       ``user_agent_model_groups`` keys (substring, case-insensitive).
+
+    Each value is an ordered list of model-name patterns; the request is routed
+    to the first candidate whose ``litellm_params.model`` matches one pattern
+    (exact first, then substring).  No match (or no candidate in the matched
+    group) falls back to the first available candidate -- never ``None`` unless
+    the group is empty.
+
+    Env vars: ``ROUTEIQ_TAG_ROUTING__ENABLED``,
+    ``ROUTEIQ_TAG_ROUTING__TAG_MODEL_GROUPS`` (JSON map),
+    ``ROUTEIQ_TAG_ROUTING__REGEX_MODEL_GROUPS`` (JSON map),
+    ``ROUTEIQ_TAG_ROUTING__USER_AGENT_MODEL_GROUPS`` (JSON map) (``__`` delimiter).
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Register the tag/regex/User-Agent routing strategy at startup.",
+    )
+    tag_model_groups: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of request tag -> ordered list of model-name patterns. A tag in "
+            "``request_kwargs['tags']`` / ``metadata['tags']`` dispatches to the "
+            'first matching candidate in its group (e.g. {"premium": ["gpt-4o"]}).'
+        ),
+    )
+    regex_model_groups: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of Python regex -> ordered list of model-name patterns. The "
+            "request text is matched against each key; the first matching regex "
+            "dispatches to its group. Consulted only when no tag matched."
+        ),
+    )
+    user_agent_model_groups: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of User-Agent substring (case-insensitive) -> ordered list of "
+            "model-name patterns. Matched against the request User-Agent header. "
+            "Consulted only when neither a tag nor a regex matched."
+        ),
+    )
+
+
+class LatencyAwareSettings(BaseModel):
+    """Latency-SLA / usage-based / least-busy routing strategy configuration
+    (RouteIQ-904b).
+
+    Upstream LiteLLM's ``latency-based-routing`` / ``usage-based-routing`` /
+    ``least-busy`` strategies are BYPASSED by RouteIQ's custom routing strategy
+    (``set_custom_routing_strategy``).  These three RouteIQ-native strategies
+    re-implement that family, reading LIVE signals from the per-worker
+    :class:`~litellm_llmrouter.router_decision_callback.RoutingStatsAccumulator`
+    (decision counts + rolling latency) and a per-strategy in-flight counter,
+    and degrade gracefully (deterministic fallback) when no signal exists yet.
+
+    All three share this one settings block (gated by ``enabled``); each is
+    independently registry-registered under its own name:
+    ``llmrouter-latency-sla`` / ``llmrouter-usage-based`` /
+    ``llmrouter-least-busy``.
+
+    Env vars: ``ROUTEIQ_LATENCY_AWARE__ENABLED``,
+    ``ROUTEIQ_LATENCY_AWARE__P_LATENCY_TARGET_MS``,
+    ``ROUTEIQ_LATENCY_AWARE__PERCENTILE`` (``__`` nested delimiter).
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Register the latency-SLA / usage-based / least-busy strategies "
+            "at startup (all three, each under its own registry name)."
+        ),
+    )
+    p_latency_target_ms: float = Field(
+        2000.0,
+        ge=0.0,
+        description=(
+            "Latency-SLA target (milliseconds) at the configured percentile. The "
+            "latency-SLA strategy prefers the cheapest/first deployment whose "
+            "observed percentile latency is at or below this target; if none "
+            "meet it, it picks the lowest-latency deployment (best effort)."
+        ),
+    )
+    percentile: float = Field(
+        0.95,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Latency percentile the SLA target is evaluated at (e.g. 0.95 = p95). "
+            "Computed from the per-model latency samples held by the strategy."
+        ),
+    )
+    max_latency_samples: int = Field(
+        256,
+        ge=1,
+        le=4096,
+        description=(
+            "Per-model ring-buffer size for latency samples used to estimate the "
+            "percentile. Bounded so memory stays constant on the hot path."
         ),
     )
 
@@ -1421,6 +1562,56 @@ class KumaraswamyThompsonSettings(BaseModel):
     )
 
 
+class LinUCBSettings(BaseModel):
+    """Feature-vector contextual-bandit (LinUCB) routing strategy configuration
+    (RouteIQ-6c67).
+
+    The Kumaraswamy-Thompson bandit is BUCKET-contextual (one posterior per
+    coarse ``(task_bucket, arm)`` pair).  LinUCB is FEATURE-VECTOR contextual: it
+    learns a linear reward model over a real-valued context vector (prompt-length
+    feature, requested-profile one-hot, tenant hash bucket) and scores each arm
+    by its UCB ``theta·x + alpha·sqrt(x^T A^-1 x)`` -- the second term drives
+    cold-start exploration that shrinks as evidence accumulates.
+
+    ADDITIVE alongside the KT bandit: it is a SEPARATE registry strategy
+    (``llmrouter-linucb``), gated independently by ``enabled``.  Pure stdlib
+    (no numpy): per-arm state is the incremental ``A^-1`` maintained via
+    rank-1 Sherman-Morrison updates, matching the KT module's numpy-free
+    discipline.  The RNG (used only for tie-breaking) is threaded as a
+    ``random.Random`` object.
+
+    Env vars: ``ROUTEIQ_LINUCB__ENABLED``, ``ROUTEIQ_LINUCB__ALPHA``,
+    ``ROUTEIQ_LINUCB__TENANT_BUCKETS``, ``ROUTEIQ_LINUCB__SEED`` (``__`` delim).
+    """
+
+    enabled: bool = Field(
+        False,
+        description="Register the LinUCB contextual-bandit strategy at startup.",
+    )
+    alpha: float = Field(
+        1.0,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Exploration coefficient on the UCB confidence width. Higher = more "
+            "exploration; 0 = pure greedy exploit. Default 1.0 (textbook LinUCB)."
+        ),
+    )
+    tenant_buckets: int = Field(
+        8,
+        ge=1,
+        le=256,
+        description=(
+            "Number of hashed tenant feature buckets in the context vector. "
+            "Bounds the feature dimension so per-arm matrices stay small."
+        ),
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="RNG seed for deterministic tie-breaking in tests/replay.",
+    )
+
+
 class AdapterFrameworkSettings(BaseModel):
     """Strategy-agnostic routing-adapter framework configuration.
 
@@ -1915,6 +2106,20 @@ class GatewaySettings(BaseSettings):
     semantic_intent: SemanticIntentSettings = Field(
         default_factory=SemanticIntentSettings,  # type: ignore[arg-type]
         description="Semantic / embedding intent-router strategy settings.",
+    )
+    tag_routing: TagRoutingSettings = Field(
+        default_factory=TagRoutingSettings,  # type: ignore[arg-type]
+        description="Tag / regex / User-Agent routing strategy settings.",
+    )
+    latency_aware: LatencyAwareSettings = Field(
+        default_factory=LatencyAwareSettings,  # type: ignore[arg-type]
+        description=(
+            "Latency-SLA / usage-based / least-busy routing strategy settings."
+        ),
+    )
+    linucb: LinUCBSettings = Field(
+        default_factory=LinUCBSettings,  # type: ignore[arg-type]
+        description="LinUCB feature-vector contextual-bandit routing settings.",
     )
 
     # ------------------------------------------------------------------
