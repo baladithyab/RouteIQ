@@ -813,6 +813,62 @@ async def _probe_services() -> None:
         logger.warning("Service discovery failed: %s", exc)
 
 
+def _reconcile_litellm_master_key(proxy_server) -> None:
+    """Make LiteLLM's data-plane master key match what clients actually send.
+
+    RouteIQ-d051.  At startup :func:`litellm_llmrouter.auth.apply_key_prefix`
+    rewrites ``LITELLM_MASTER_KEY`` to the RouteIQ-prefixed canonical form
+    (``sk-riq-<original>``).  LiteLLM then loads *that* prefixed value into its
+    module global ``litellm.proxy.proxy_server.master_key`` via
+    ``initialize() -> load_config()``.
+
+    The control plane accepts both the prefixed and the unprefixed form (see
+    :func:`litellm_llmrouter.auth._load_admin_api_keys`), but the data plane is
+    served by upstream LiteLLM, whose master-key check is a single exact
+    ``secrets.compare_digest(api_key, master_key)``.  Data-plane clients send
+    the *operator-configured* (unprefixed) value, so without this reconciliation
+    the comparison never matches and the request falls through to LiteLLM's DB
+    path — returning ``No connected db`` when there is no prisma client (the
+    creds-free / DB-free local data plane).
+
+    This is purely additive to LiteLLM's auth: a master key is still required and
+    still compared in constant time.  It does NOT open an unauthenticated data
+    plane — it only points the comparison at the exact key the operator set.
+    Prod is unaffected when the operator already sets a ``sk-riq-`` master key
+    (the original == prefixed, so this is a no-op).
+    """
+    try:
+        from ..auth import ROUTEIQ_KEY_PREFIX, get_unprefixed_master_key
+
+        current = getattr(proxy_server, "master_key", None)
+        if not isinstance(current, str) or not current:
+            return
+
+        # Prefer the value captured before the env was rewritten; fall back to
+        # stripping the RouteIQ prefix from whatever LiteLLM loaded so the fix
+        # is robust even if apply_key_prefix() ran via a different code path.
+        original = get_unprefixed_master_key()
+        if not original and current.startswith(ROUTEIQ_KEY_PREFIX):
+            original = current[len(ROUTEIQ_KEY_PREFIX) :]
+
+        if original and original != current:
+            proxy_server.master_key = original
+            # Keep LiteLLM's cached master-key hash in sync so any hash-keyed
+            # consumer (spend logs, cache seeding) matches the served key.
+            try:
+                from litellm.proxy.utils import hash_token
+
+                proxy_server.litellm_master_key_hash = hash_token(original)
+            except Exception:
+                pass
+            logger.info(
+                "Reconciled LiteLLM data-plane master key to the operator-"
+                "configured (unprefixed) form (RouteIQ-d051)."
+            )
+    except Exception as exc:  # never block boot on the reconciliation
+        logger.warning("Master-key reconciliation skipped/failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """RouteIQ application lifespan manager (ADR-0012).
@@ -850,6 +906,8 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 telemetry=False,
             )
             logger.info("LiteLLM proxy initialized (config=%s)", config_path)
+            # RouteIQ-d051: reconcile LiteLLM's data-plane master key.
+            _reconcile_litellm_master_key(_proxy_server)
         else:
             logger.warning(
                 "No LITELLM_CONFIG_PATH set — LiteLLM proxy not initialized. "

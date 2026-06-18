@@ -7,10 +7,81 @@ These tests verify that:
 3. Plugin lifecycle hooks are invoked correctly
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 # Mark all tests in this module as asyncio
 pytestmark = pytest.mark.asyncio
+
+
+class TestReconcileLiteLLMMasterKey:
+    """RouteIQ-d051: after LiteLLM initialize(), the data-plane master_key must
+    equal the operator-configured (unprefixed) value clients actually send, so a
+    master-key request authorizes creds-free / DB-free instead of falling through
+    to LiteLLM's 'No connected db' path.
+
+    These tests are synchronous (override the module asyncio marker)."""
+
+    def test_reconciles_to_captured_original(self):
+        from litellm_llmrouter.gateway import app as app_mod
+
+        # LiteLLM loaded the RouteIQ-prefixed form (the actual bug condition).
+        proxy = SimpleNamespace(
+            master_key="sk-riq-sk-mock-master",
+            litellm_master_key_hash="hash-of-prefixed",
+        )
+        with patch.object(
+            app_mod,
+            "_reconcile_litellm_master_key",
+            app_mod._reconcile_litellm_master_key,
+        ):
+            with patch(
+                "litellm_llmrouter.auth.get_unprefixed_master_key",
+                return_value="sk-mock-master",
+            ):
+                app_mod._reconcile_litellm_master_key(proxy)
+        assert proxy.master_key == "sk-mock-master"
+
+    def test_falls_back_to_stripping_prefix(self):
+        """Robust even if apply_key_prefix() never captured the original
+        (e.g. a different boot path) — strip the RouteIQ prefix off whatever
+        LiteLLM loaded."""
+        from litellm_llmrouter.gateway import app as app_mod
+
+        proxy = SimpleNamespace(master_key="sk-riq-sk-mock-master")
+        with patch(
+            "litellm_llmrouter.auth.get_unprefixed_master_key",
+            return_value=None,
+        ):
+            app_mod._reconcile_litellm_master_key(proxy)
+        assert proxy.master_key == "sk-mock-master"
+
+    def test_noop_when_already_unprefixed(self):
+        """Prod where the operator already sets a sk-riq-* master key: the
+        original equals the loaded value -> no change, no weakening."""
+        from litellm_llmrouter.gateway import app as app_mod
+
+        proxy = SimpleNamespace(master_key="sk-riq-prod-key")
+        with patch(
+            "litellm_llmrouter.auth.get_unprefixed_master_key",
+            return_value="sk-riq-prod-key",
+        ):
+            app_mod._reconcile_litellm_master_key(proxy)
+        assert proxy.master_key == "sk-riq-prod-key"
+
+    def test_noop_when_no_master_key(self):
+        """No master key configured (e.g. LiteLLM no-auth dev mode) -> untouched."""
+        from litellm_llmrouter.gateway import app as app_mod
+
+        proxy = SimpleNamespace(master_key=None)
+        with patch(
+            "litellm_llmrouter.auth.get_unprefixed_master_key",
+            return_value=None,
+        ):
+            app_mod._reconcile_litellm_master_key(proxy)
+        assert proxy.master_key is None
 
 
 class TestStandaloneApp:

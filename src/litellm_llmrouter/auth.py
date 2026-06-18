@@ -149,6 +149,30 @@ def _apply_key_prefix_to_env() -> None:
 # Guard: track whether key prefix has been applied
 _key_prefix_applied = False
 
+# The master key as the OPERATOR configured it (and as data-plane clients send
+# it), captured BEFORE :func:`_apply_key_prefix_to_env` rewrites the env var to
+# the RouteIQ-prefixed canonical form.  RouteIQ accepts BOTH the prefixed and the
+# unprefixed form on the control plane (see :func:`_load_admin_api_keys`); the
+# data plane is served by upstream LiteLLM, whose master-key check is a single
+# exact ``secrets.compare_digest`` against ``litellm.proxy.proxy_server.master_key``.
+# Because ``LITELLM_MASTER_KEY`` is rewritten to the prefixed form before LiteLLM
+# loads it, LiteLLM ends up comparing against ``sk-riq-<original>`` while clients
+# send ``<original>`` — so the master key never authorizes the data plane and the
+# request falls through to LiteLLM's DB path (``No connected db`` when there is no
+# prisma client).  We stash the original here so the gateway can reconcile
+# LiteLLM's master_key back to the value clients actually send (RouteIQ-d051).
+_original_master_key: Optional[str] = None
+
+
+def get_unprefixed_master_key() -> Optional[str]:
+    """Return the operator-configured master key BEFORE the RouteIQ prefix.
+
+    This is the value data-plane clients send in ``Authorization: Bearer``.
+    Returns ``None`` when no master key is configured or
+    :func:`apply_key_prefix` has not run yet.
+    """
+    return _original_master_key
+
 
 def apply_key_prefix() -> None:
     """Apply the RouteIQ key prefix to env vars.
@@ -156,9 +180,13 @@ def apply_key_prefix() -> None:
     Safe to call multiple times — subsequent calls are no-ops.
     Should be called from startup.py rather than on import.
     """
-    global _key_prefix_applied
+    global _key_prefix_applied, _original_master_key
     if _key_prefix_applied:
         return
+    # Capture the operator-configured master key BEFORE we rewrite the env to
+    # the prefixed form, so the gateway can reconcile LiteLLM's data-plane
+    # master_key back to the value clients send (RouteIQ-d051).
+    _original_master_key = os.getenv("LITELLM_MASTER_KEY", "").strip() or None
     _apply_key_prefix_to_env()
     _key_prefix_applied = True
 

@@ -836,6 +836,47 @@ class TestApplyKeyPrefixToEnv:
             assert "ADMIN_API_KEY" not in os.environ
 
 
+class TestUnprefixedMasterKeyCapture:
+    """RouteIQ-d051: apply_key_prefix() captures the operator-configured
+    (unprefixed) master key so the data plane can be reconciled to the value
+    clients actually send."""
+
+    def _reset_guard(self):
+        import litellm_llmrouter.auth as auth_mod
+
+        auth_mod._key_prefix_applied = False
+        auth_mod._original_master_key = None
+
+    def test_captures_unprefixed_master_key(self):
+        import litellm_llmrouter.auth as auth_mod
+
+        self._reset_guard()
+        try:
+            with patch.dict(
+                os.environ,
+                {"LITELLM_MASTER_KEY": "sk-mock-master"},
+                clear=True,
+            ):
+                auth_mod.apply_key_prefix()
+                # env is rewritten to the prefixed canonical form ...
+                assert os.environ["LITELLM_MASTER_KEY"] == "sk-riq-sk-mock-master"
+                # ... but the unprefixed original is preserved for the data plane.
+                assert auth_mod.get_unprefixed_master_key() == "sk-mock-master"
+        finally:
+            self._reset_guard()
+
+    def test_no_master_key_returns_none(self):
+        import litellm_llmrouter.auth as auth_mod
+
+        self._reset_guard()
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                auth_mod.apply_key_prefix()
+                assert auth_mod.get_unprefixed_master_key() is None
+        finally:
+            self._reset_guard()
+
+
 # =============================================================================
 # Load Admin Keys with Prefix Backwards-Compatibility Tests
 # =============================================================================
