@@ -211,7 +211,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             specific_deployment=specific_deployment,
             request_kwargs=request_kwargs,
         )
-        return self._guard_selected(selected, model)
+        return self._guard_selected(
+            selected, model, request_kwargs=request_kwargs, messages=messages
+        )
 
     async def _async_select(
         self,
@@ -318,7 +320,9 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             specific_deployment=specific_deployment,
             request_kwargs=request_kwargs,
         )
-        return self._guard_selected(selected, model)
+        return self._guard_selected(
+            selected, model, request_kwargs=request_kwargs, messages=messages
+        )
 
     def _sync_select(
         self,
@@ -381,7 +385,13 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
     # Internal: Gov-ban chokepoint (RouteIQ-a073)
     # ------------------------------------------------------------------
 
-    def _guard_selected(self, selected: Optional[Dict], model: str) -> Optional[Dict]:
+    def _guard_selected(
+        self,
+        selected: Optional[Dict],
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+    ) -> Optional[Dict]:
         """Post-selection backstop: never return a gov-banned deployment.
 
         This is the SINGLE chokepoint mandated by RouteIQ-a073. Every routing
@@ -395,6 +405,16 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         regardless. Fail-CLOSED: a banned selection is refused; we then attempt
         the (already-filtered) fallback, and if that is also banned/empty return
         ``None`` (a banned-only group must yield no deployment).
+
+        RouteIQ-1216: ``request_kwargs`` + ``messages`` are threaded into the
+        backstop ``_fallback_deployment`` probe so the per-request capability-tier
+        FLOOR (RouteIQ-8e37) AND region/data-residency pre-filter (RouteIQ-60cc)
+        apply on THIS path too. Without them the backstop probe ran context-free,
+        so a banned-arm re-guard on a HARD reasoning request could fall back to a
+        sub-tier (or out-of-region) arm the floor would have excluded everywhere
+        else. Byte-stable when capability_routing / region_routing are off (both
+        filters no-op and, with no context, fall back to the legacy candidate
+        set).
         """
         if selected is None:
             return None
@@ -412,9 +432,12 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             arm,
             model,
         )
-        # _fallback_deployment is already gov-ban filtered; re-guard it so a
+        # _fallback_deployment is already gov-ban filtered AND (with the threaded
+        # context) capability-floor / region filtered; re-guard it so a
         # double-banned group resolves to None rather than a banned arm.
-        fallback = self._fallback_deployment(model)
+        fallback = self._fallback_deployment(
+            model, request_kwargs=request_kwargs, messages=messages
+        )
         if fallback is not None and not is_gov_banned(fallback):
             return fallback
         return None

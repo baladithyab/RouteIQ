@@ -413,6 +413,75 @@ class TestCircuitBreakerStateGauge:
 
 
 # ---------------------------------------------------------------------------
+# RouteIQ-c714: circuit-breaker state-gauge re-baseline at startup (LIVE wiring)
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerStateResetOnStart:
+    """The reset-on-start runs THROUGH the real ``init_gateway_metrics`` callsite
+    (not by calling the helper directly), gated default-OFF so the metric stream
+    at init stays byte-stable."""
+
+    def _meter(self, metric_reader: InMemoryMetricReader) -> Any:
+        provider = MeterProvider(metric_readers=[metric_reader])
+        return provider.get_meter("test-cb-reset-meter", "0.1.0")
+
+    def test_default_off_init_emits_no_state_series(self, metric_reader):
+        """Default (flag off): ``init_gateway_metrics`` emits NO baseline series
+        -- byte-stable with the prior suite."""
+        from litellm_llmrouter.resilience import reset_circuit_breaker_manager
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        reset_circuit_breaker_manager()
+        get_settings()  # resilience.reset_circuit_breaker_state_on_start defaults False
+        try:
+            init_gateway_metrics(self._meter(metric_reader))
+            assert not _data_points(metric_reader, "gateway.circuit_breaker.state")
+        finally:
+            reset_settings()
+            reset_circuit_breaker_manager()
+
+    def test_flag_on_init_rebaselines_series_to_closed(self, metric_reader):
+        """Flag on: ``init_gateway_metrics`` drives every known infra breaker's
+        CLOSED series to 1 at startup (the real boot-time state) and pushes a
+        compensating ``open`` delta. In production this cancels a stale ``open=1``
+        a crashed worker left, leaving the gauge at the clean closed baseline."""
+        from litellm_llmrouter.resilience import reset_circuit_breaker_manager
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        reset_circuit_breaker_manager()
+        get_settings(resilience={"reset_circuit_breaker_state_on_start": True})
+        try:
+            init_gateway_metrics(self._meter(metric_reader))
+            for breaker in ("database", "redis", "leader_election"):
+                # the closed series is driven to 1 (the real boot-time state).
+                assert (
+                    _sum_value(
+                        metric_reader,
+                        "gateway.circuit_breaker.state",
+                        {"breaker": breaker, "state": "closed"},
+                    )
+                    == 1
+                )
+                # a compensating open delta of -1 is pushed: from a STALE open=1
+                # (crashed worker) this nets to the clean 0 baseline; from a
+                # fresh reader it reads -1 (the helper's transition model).
+                assert (
+                    _sum_value(
+                        metric_reader,
+                        "gateway.circuit_breaker.state",
+                        {"breaker": breaker, "state": "open"},
+                    )
+                    == -1
+                )
+        finally:
+            reset_settings()
+            reset_circuit_breaker_manager()
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: the new instruments surface on GET /metrics (RouteIQ-6cd5 -> KEDA)
 # ---------------------------------------------------------------------------
 

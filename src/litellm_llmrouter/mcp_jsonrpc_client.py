@@ -97,10 +97,20 @@ def _build_headers(
         "Accept": _DEFAULT_ACCEPT,
     }
     meta = metadata or {}
+    # Provider-key resolution (RouteIQ-1786): route the upstream MCP server
+    # credential through the secrets vault so an operator may store it as an
+    # ``aws-secrets://<id>[#key]`` reference. Byte-stable when the vault is
+    # disabled (resolve_provider_value returns the value unchanged).
+    from .secrets_vault import resolve_provider_value
+
     if auth_type == "bearer_token" and meta.get("auth_token"):
-        headers["Authorization"] = f"Bearer {meta['auth_token']}"
+        token = resolve_provider_value(meta["auth_token"])
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     elif auth_type == "api_key" and meta.get("api_key"):
-        headers["X-API-Key"] = meta["api_key"]
+        key = resolve_provider_value(meta["api_key"])
+        if key:
+            headers["X-API-Key"] = key
     # MCP session continuity: the server hands out an Mcp-Session-Id on
     # initialize; subsequent requests echo it back.
     if session_id:

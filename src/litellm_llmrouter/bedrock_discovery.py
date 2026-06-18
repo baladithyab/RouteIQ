@@ -989,13 +989,27 @@ def _logical_model_name(model_id: str, provider_name: str) -> str:
     profiles). To bind those arms under ONE ``model_name`` we strip the
     region-varying parts:
 
-      * any leading tier/geo prefix (``global.`` / ``us.`` / ``eu.`` / ...), and
-      * the trailing Bedrock version suffix (``-v1:0`` / ``:0``).
+      * any leading tier/geo prefix (``global.`` / ``us.`` / ``eu.`` / ...),
+      * the trailing Bedrock version suffix (``-v1:0`` / ``:0``), and
+      * a trailing date-stamp segment (``-YYYYMMDD``) — RouteIQ-6952.
 
     so ``global.anthropic.claude-sonnet-4-v1:0``, ``us.anthropic.claude-sonnet-4``
     and the raw ``anthropic.claude-sonnet-4-v1:0`` all collapse to one logical
     ``anthropic.claude-sonnet-4`` group. The provider name is only used as a
     fallback when the modelId is empty.
+
+    RouteIQ-6952 (date-segment normalization): some arms of the SAME logical
+    model carry an embedded release-date segment
+    (``anthropic.claude-sonnet-4-20250101``) while a date-less id of the same
+    model (``anthropic.claude-sonnet-4``) does not. Without stripping the date
+    the two land in DIFFERENT logical groups under ``synthesis_mode=
+    logical_groups``, breaking cross-region fan-out. We strip a trailing
+    ``-YYYYMMDD`` (exactly 8 digits, a plausible date) AFTER the version suffix
+    is removed (Bedrock glues the version after the date:
+    ``...-sonnet-4-20250101-v1:0``), so both collapse to one logical key. A
+    non-date numeric segment (a version number like ``-4`` or a 4-digit ``-2024``
+    fragment that is not a full date) is left intact — only a full 8-digit
+    YYYYMMDD-shaped trailer is treated as a date.
     """
     base = model_id or provider_name.lower()
     lowered = base.lower()
@@ -1012,6 +1026,12 @@ def _logical_model_name(model_id: str, provider_name: str) -> str:
 
     base = re.sub(r"-v\d+:\d+$", "", base)
     base = re.sub(r":\d+$", "", base)
+    # Strip a trailing embedded date-stamp segment "-YYYYMMDD" (RouteIQ-6952) so a
+    # date-bearing arm and a date-less arm of the same model share one logical
+    # key. Done AFTER the version strip so "...-20250101-v1:0" reduces correctly.
+    # Constrained to a YYYYMMDD shape (year 19xx/20xx, month 01-12, day 01-31) so
+    # an ordinary numeric suffix is never mistaken for a date.
+    base = re.sub(r"-(?:19|20)\d\d(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$", "", base)
     return base or (model_id or provider_name.lower())
 
 

@@ -343,34 +343,102 @@ _DEFAULT_SIMPLE_MIN_TIER = "fast"
 _DEFAULT_COMPLEX_MIN_TIER = "expert"
 
 
+def _tier_key_matches(
+    key: str,
+    name_tokens: List[str],
+    key_tokens: List[str],
+    *,
+    single_token_tail_only: bool = False,
+) -> bool:
+    """True if family ``key`` matches the model whose tokens are ``name_tokens``.
+
+    RouteIQ-2b53: a TOKEN/SEGMENT-boundary match (reusing the gov-ban matcher
+    ``candidate_filter._contains_token_seq``), NOT a raw bidirectional substring.
+    The family ``key``'s token run must appear CONTIGUOUSLY inside the model's
+    tokens — the same single direction the gov-ban path uses (the family pattern
+    is the needle, the arm is the haystack). So:
+
+    - a region/version-prefixed arm still matches its family
+      (``bedrock/global.anthropic.claude-opus-4-6-20250918`` ⊇
+      ``[claude, opus, 4, 6, 20250918]`` -> expert);
+    - a FUSED substring no longer matches: ``"o1"`` -> ``(o1,)`` is absent from
+      ``gpt-4o1x`` -> ``[gpt, 4o1x]`` (the ``o1`` is welded into ``4o1x``);
+    - the legacy REVERSE direction (model tokens ⊆ key tokens) is DROPPED, which
+      is what let a bare ``"gpt"`` -> ``[gpt]`` fuse-match the ``gpt-5`` /
+      ``gpt-4o`` keys and resolve expert/advanced by dict-iteration order. A bare
+      ``"gpt"`` now falls through to the safe ``default`` tier.
+
+    ``single_token_tail_only`` (set for the built-in default table) additionally
+    requires a SINGLE-token family key (e.g. the ambiguous 2-char ``"o1"``) to
+    sit at the TAIL of the model id, so a spurious interior ``o1`` token in an
+    unrelated arm (``foo-o1-bar`` -> ``[foo, o1, bar]``) does NOT promote it to
+    expert, while a real prefixed ``bedrock/us.openai.o1`` -> ``[..., o1]`` still
+    does. Operator overrides do NOT set this flag — an operator who configures a
+    single-token family (e.g. ``{"haiku": "expert"}``) means it to match anywhere
+    in the id (``claude-3-5-haiku-20241022``), which is explicit intent, not an
+    accidental fuse.
+    """
+    if not key_tokens:
+        return False
+    # Lazy import keeps module import side-effect-free and avoids any import
+    # ordering coupling with candidate_filter (which imports this module lazily).
+    from litellm_llmrouter.candidate_filter import _contains_token_seq
+
+    if single_token_tail_only and len(key_tokens) == 1:
+        # A lone ambiguous token must terminate the model id (real arms put the
+        # model family at the tail after provider/region prefixes).
+        return bool(name_tokens) and name_tokens[-1] == key_tokens[0]
+
+    # Single direction (gov-ban semantics): the family token run is the needle,
+    # the arm tokens are the haystack. ``_contains_token_seq`` compares each
+    # slice against ``seq`` as a TUPLE, so the needle must be a tuple.
+    return _contains_token_seq(name_tokens, tuple(key_tokens))
+
+
 def get_model_tier(model_name: str, model_tiers: Dict[str, str], default: str) -> str:
     """Resolve a model's capability TIER (config-overridable, fuzzy, safe default).
 
     Resolution order (first hit wins):
 
-    1. Operator override ``model_tiers`` — exact, then substring (either
-       direction), so a family token (e.g. ``"claude-opus"``) pins every
-       region/version-prefixed arm.
+    1. Operator override ``model_tiers`` — exact, then token-boundary fuzzy
+       (the family token run must appear in the arm), so a family token (e.g.
+       ``"claude-opus"``) pins every region/version-prefixed arm WITHOUT a short
+       key fuse-matching an unrelated arm. Operator single-token families match
+       anywhere in the id (explicit intent).
     2. The built-in :data:`MODEL_CAPABILITY_TIERS` defaults — exact, then
-       substring.
+       token-boundary fuzzy; a built-in SINGLE-token key (the ambiguous ``"o1"``)
+       additionally must sit at the model-id TAIL so a spurious interior token
+       never promotes an unrelated arm.
     3. ``default`` (the safe MIDDLE tier) for an UNKNOWN model, so it is never
        WRONGLY excluded by a tier floor.
+
+    RouteIQ-2b53: the fuzzy step now matches on a token/segment boundary (reuses
+    ``candidate_filter._contains_token_seq``) rather than a raw substring, so
+    ``"o1"`` matches a clean ``o1`` token run, not the fused ``gpt-4o1x`` /
+    ``foo-o1-bar``, and a bare ``"gpt"`` no longer resolves expert by dict order.
     """
     name = str(model_name or "")
+    # Reuse the gov-ban tokenizer so tier matching shares one boundary
+    # definition (RouteIQ-2b53). Lazy import: side-effect-free module load.
+    from litellm_llmrouter.candidate_filter import _tokens
+
+    name_tokens = _tokens(name)
     # 1. Operator overrides (highest precedence).
     if model_tiers:
         tier = model_tiers.get(name)
         if tier:
             return str(tier)
         for key, val in model_tiers.items():
-            if key and (key in name or name in key):
+            if key and _tier_key_matches(key, name_tokens, _tokens(key)):
                 return str(val)
     # 2. Built-in family defaults.
     tier = MODEL_CAPABILITY_TIERS.get(name)
     if tier:
         return tier
     for key, val in MODEL_CAPABILITY_TIERS.items():
-        if key in name or name in key:
+        if _tier_key_matches(
+            key, name_tokens, _tokens(key), single_token_tail_only=True
+        ):
             return val
     # 3. Unknown -> safe middle tier (never wrongly excluded).
     return default

@@ -199,9 +199,171 @@ def reset_log_archiver() -> None:
     _archiver = None
 
 
+# ---------------------------------------------------------------------------
+# LiteLLM success-callback live callsite (RouteIQ-6702 wiring)
+# ---------------------------------------------------------------------------
+
+
+def _settings_archival_wiring_enabled() -> bool:
+    """Whether the LIVE archival callback should be wired in.
+
+    Requires BOTH ``settings.log_archival.enabled`` AND the explicit
+    ``settings.log_archival.pii_acknowledged`` PII gate to be true. Any settings
+    read failure degrades to ``False`` (default-off, byte-stable). This is the
+    gate the app lifespan consults before registering the callback; the archiver
+    itself additionally requires a configured bucket.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        la = get_settings().log_archival
+        return bool(
+            getattr(la, "enabled", False) and getattr(la, "pii_acknowledged", False)
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _custom_logger_base() -> type:
+    """Resolve the litellm ``CustomLogger`` base lazily (no import side effects)."""
+    try:
+        from litellm.integrations.custom_logger import CustomLogger
+
+        return CustomLogger
+    except Exception:  # pragma: no cover - litellm always present in prod
+        return object
+
+
+class LogArchivalCallback(_custom_logger_base()):  # type: ignore[misc]
+    """LiteLLM ``CustomLogger`` that archives each successful call to S3.
+
+    Registered into ``litellm.callbacks`` only when archival is enabled +
+    PII-acknowledged + a bucket is configured. On each success event it extracts
+    a request id, the request kwargs, and the response payload and hands them to
+    the :class:`LogArchiver`. Fail-safe: archival never raises into the hot path.
+    """
+
+    def __init__(self, archiver: Optional[LogArchiver] = None) -> None:
+        try:
+            super().__init__()
+        except Exception:  # pragma: no cover - base may be ``object``
+            pass
+        self._archiver = archiver or get_log_archiver()
+
+    @staticmethod
+    def _request_id(kwargs: dict) -> str:
+        meta = (kwargs.get("litellm_params") or {}).get("metadata") or {}
+        return str(
+            kwargs.get("litellm_call_id")
+            or meta.get("request_id")
+            or kwargs.get("id")
+            or "unknown"
+        )
+
+    @staticmethod
+    def _to_payload(obj: Any) -> dict:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        for attr in ("model_dump", "dict"):
+            fn = getattr(obj, attr, None)
+            if callable(fn):
+                try:
+                    out = fn()
+                    if isinstance(out, dict):
+                        return out
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        return {"repr": str(obj)}
+
+    def _archive(self, kwargs: dict, response_obj: Any) -> None:
+        if not self._archiver.enabled:
+            return
+        try:
+            request_payload = {
+                "model": kwargs.get("model", ""),
+                "messages": kwargs.get("messages"),
+                "input": kwargs.get("input"),
+            }
+            self._archiver.archive(
+                self._request_id(kwargs),
+                request_payload,
+                self._to_payload(response_obj),
+            )
+        except Exception as exc:  # pragma: no cover - fail-safe
+            logger.warning("Log archival callback failed: %s", exc)
+
+    def log_success_event(
+        self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        self._archive(kwargs, response_obj)
+
+    async def async_log_success_event(
+        self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        self._archive(kwargs, response_obj)
+
+
+def register_log_archival_callback() -> Optional[LogArchivalCallback]:
+    """Register the S3 archival success callback with LiteLLM (RouteIQ-6702).
+
+    The LIVE callsite for the archiver: invoked from the app lifespan startup.
+    No-op (returns ``None``) unless archival is enabled + PII-acknowledged
+    (settings gate) AND the archiver has a configured bucket -- so a default
+    deployment registers nothing, builds no boto3 client, and is byte-stable.
+    Idempotent: an already-registered callback is reused.
+    """
+    if not _settings_archival_wiring_enabled():
+        return None
+    archiver = get_log_archiver()
+    if not archiver.enabled:
+        logger.warning(
+            "Log archival enabled in settings but archiver inactive "
+            "(no bucket?); skipping callback registration."
+        )
+        return None
+    try:
+        import litellm
+
+        if not hasattr(litellm, "callbacks") or litellm.callbacks is None:
+            litellm.callbacks = []
+        for existing in litellm.callbacks:
+            if isinstance(existing, LogArchivalCallback):
+                return existing
+        cb = LogArchivalCallback(archiver)
+        litellm.callbacks.append(cb)
+        logger.info("Registered LogArchivalCallback with LiteLLM (S3 archival ON)")
+        return cb
+    except ImportError:  # pragma: no cover - litellm always present in prod
+        logger.warning("LiteLLM not available; cannot register log archival callback")
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Failed to register log archival callback: %s", exc)
+        return None
+
+
+def unregister_log_archival_callback() -> None:
+    """Remove the archival callback from ``litellm.callbacks`` (shutdown/test)."""
+    try:
+        import litellm
+
+        callbacks = getattr(litellm, "callbacks", None)
+        if not callbacks:
+            return
+        litellm.callbacks = [
+            cb for cb in callbacks if not isinstance(cb, LogArchivalCallback)
+        ]
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 __all__ = [
     "VALID_STORAGE_TIERS",
     "LogArchiver",
+    "LogArchivalCallback",
     "get_log_archiver",
     "reset_log_archiver",
+    "register_log_archival_callback",
+    "unregister_log_archival_callback",
 ]

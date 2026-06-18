@@ -77,6 +77,34 @@ def _claude_geo_residency(region: str = "eu-west-1") -> DiscoveredModel:
     )
 
 
+def _claude_dated_global(region: str = "us-east-1") -> DiscoveredModel:
+    """The SAME Claude Sonnet 4 logical model, but its id carries an embedded
+    release-DATE segment (``-20250101``) while ``_claude_global`` does not
+    (RouteIQ-6952). Both must bind under ONE logical group despite the date."""
+    arn = "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-20250101-v1:0"
+    return DiscoveredModel(
+        model_id="anthropic.claude-sonnet-4-20250101-v1:0",
+        model_arn=arn,
+        provider_name="Anthropic",
+        region=region,
+        inference_types=("INFERENCE_PROFILE",),
+        output_modalities=("TEXT",),
+        serverless_class=ServerlessClass.INFERENCE_PROFILE,
+        profiles=[
+            InferenceProfileRef(
+                profile_id="us.anthropic.claude-sonnet-4-20250101-v1:0",
+                arn=(
+                    f"arn:aws:bedrock:{region}::inference-profile/"
+                    "us.anthropic.claude-sonnet-4-20250101-v1:0"
+                ),
+                profile_type="SYSTEM_DEFINED",
+                tier=ProfileTier.GEOGRAPHIC,
+                geo_prefix="us.",
+            )
+        ],
+    )
+
+
 def _nova(region: str = "us-east-1") -> DiscoveredModel:
     """A DIFFERENT logical model (Nova) — must form its OWN group."""
     arn = "arn:aws:bedrock:::foundation-model/amazon.nova-pro-v1:0"
@@ -117,9 +145,70 @@ def test_logical_name_strips_tier_geo_and_version():
     )
 
 
+def test_logical_name_strips_embedded_date_segment():
+    """RouteIQ-6952: a trailing ``-YYYYMMDD`` date segment is stripped so a
+    date-bearing and a date-less id of the SAME model collapse to one key."""
+    assert (
+        _logical_model_name("anthropic.claude-sonnet-4-20250101", "Anthropic")
+        == "anthropic.claude-sonnet-4"
+    )
+    # date followed by the version suffix (the real Bedrock id shape).
+    assert (
+        _logical_model_name("anthropic.claude-sonnet-4-20250101-v1:0", "Anthropic")
+        == "anthropic.claude-sonnet-4"
+    )
+    # geo prefix + date + version all strip together.
+    assert (
+        _logical_model_name("us.anthropic.claude-sonnet-4-20250101-v1:0", "Anthropic")
+        == "anthropic.claude-sonnet-4"
+    )
+    # the date-bearing and the date-less ids resolve to the SAME logical key.
+    assert _logical_model_name(
+        "anthropic.claude-sonnet-4-20250101", "Anthropic"
+    ) == _logical_model_name("anthropic.claude-sonnet-4", "Anthropic")
+
+
+def test_logical_name_keeps_non_date_numeric_suffix():
+    """A non-date numeric segment is NOT mistaken for a date and left intact.
+
+    Only a full 8-digit YYYYMMDD-shaped trailer is treated as a date; a plain
+    version number (``-4``) or a 4-digit fragment (``-2024``) survives.
+    """
+    assert (
+        _logical_model_name("anthropic.claude-sonnet-4", "Anthropic")
+        == "anthropic.claude-sonnet-4"
+    )
+    assert _logical_model_name("vendor.model-2024", "Vendor") == "vendor.model-2024"
+    # an 8-digit run that is NOT a valid date (month 13) is left intact.
+    assert (
+        _logical_model_name("vendor.model-20251301", "Vendor")
+        == "vendor.model-20251301"
+    )
+
+
 # ---------------------------------------------------------------------------
 # THE acceptance: one logical model_name fans out across region arms
 # ---------------------------------------------------------------------------
+
+
+def test_inconsistent_date_suffixes_bind_to_single_group():
+    """RouteIQ-6952 ACCEPTANCE: two arms of ONE logical model with inconsistent
+    date suffixes (one date-bearing, one date-less) bind to a SINGLE group rather
+    than splitting into two — restoring cross-region fan-out under
+    ``synthesis_mode=logical_groups``."""
+    result = DiscoveryResult(
+        models=[
+            _claude_global("eu-west-1"),  # date-LESS id (eu. geo)
+            _claude_dated_global("us-east-1"),  # date-BEARING id (us. geo)
+        ]
+    )
+    entries = result.synthesize_model_groups()
+    names = {e["model_name"] for e in entries}
+    # ONE logical group, NOT two split by the date segment.
+    assert names == {"anthropic.claude-sonnet-4"}
+    assert len(entries) == 2  # both arms bound under the single group
+    regions = {e["model_info"]["region"] for e in entries}
+    assert regions == {"eu-west-1", "us-east-1"}
 
 
 def test_one_logical_name_fans_out_across_region_arms():

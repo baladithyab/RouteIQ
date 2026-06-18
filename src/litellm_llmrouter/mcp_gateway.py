@@ -946,12 +946,21 @@ class MCPGateway:
         else:
             read_url = f"{base_url}/mcp/resources/read"
 
-        # Build headers (include auth if configured)
+        # Build headers (include auth if configured). Provider-key resolution
+        # (RouteIQ-1786): route the upstream credential through the secrets vault
+        # so it may be stored as an ``aws-secrets://<id>[#key]`` reference.
+        # Byte-stable when the vault is disabled (pass-through).
+        from .secrets_vault import resolve_provider_value
+
         headers = {"Content-Type": "application/json"}
         if server.auth_type == "bearer_token" and server.metadata.get("auth_token"):
-            headers["Authorization"] = f"Bearer {server.metadata['auth_token']}"
+            token = resolve_provider_value(server.metadata["auth_token"])
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
         elif server.auth_type == "api_key" and server.metadata.get("api_key"):
-            headers["X-API-Key"] = server.metadata["api_key"]
+            key = resolve_provider_value(server.metadata["api_key"])
+            if key:
+                headers["X-API-Key"] = key
 
         # Proxy the request to the upstream server
         timeout = httpx.Timeout(

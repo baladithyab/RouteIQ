@@ -130,6 +130,39 @@ def test_operator_override_wins_over_default():
     assert get_model_tier("my-7b", {"my-7b": "fast"}, "advanced") == "fast"
 
 
+def test_get_model_tier_token_boundary_not_fused_substring():
+    """RouteIQ-2b53: ``o1`` is a TOKEN-boundary match, never a fused substring.
+
+    The prior bidirectional raw-substring fuzzy over-matched short keys:
+    ``"o1"`` matched the fused ``gpt-4o1x`` and an interior ``foo-o1-bar``, and a
+    bare ``"gpt"`` resolved a tier by dict-iteration order. The token-boundary
+    matcher (reusing ``candidate_filter._contains_token_seq``) drops all three to
+    the SAFE default while still matching a clean ``o1`` token run.
+    """
+    # Fused: ``o1`` is welded into ``4o1x`` -> not a token -> safe default.
+    assert get_model_tier("gpt-4o1x", {}, "advanced") == "advanced"
+    # Interior spurious ``o1`` token in an unrelated arm -> safe default (a lone
+    # ambiguous built-in token must sit at the model-id TAIL).
+    assert get_model_tier("foo-o1-bar", {}, "advanced") == "advanced"
+    # Bare ``"gpt"`` no longer fuse-matches a gpt-* key by dict order.
+    assert get_model_tier("gpt", {}, "advanced") == "advanced"
+    # Control: a CLEAN ``o1`` token run still resolves expert.
+    assert get_model_tier("o1", {}, "advanced") == "expert"
+    assert get_model_tier("bedrock/us.openai.o1", {}, "advanced") == "expert"
+    # Control: the 2-token ``o1-mini`` family still matches a prefixed arm.
+    assert get_model_tier("bedrock/us.openai.o1-mini", {}, "advanced") == "expert"
+
+
+def test_get_model_tier_safe_direction_unknown_to_middle():
+    """RouteIQ-2b53: the safe-direction default is preserved — an UNKNOWN model
+    (no clean family token run) resolves to the MIDDLE ``default_tier`` so the
+    capability floor never WRONGLY excludes it."""
+    assert get_model_tier("some-brand-new-model-7b", {}, "advanced") == "advanced"
+    # Even a name that merely *contains* a frontier substring fused into a token
+    # falls through safely (no over-classification UP past a floor).
+    assert get_model_tier("xgpt5y", {}, "advanced") == "advanced"
+
+
 def test_deepseek_minimax_kimi_o_series_are_expert():
     """The reasoning families called out in the directive default to expert."""
     for arm in (
@@ -539,6 +572,102 @@ def test_custom_strategy_fallback_keeps_expert(monkeypatch):
     )
     assert out is not None
     assert out["litellm_params"]["model"] == "claude-opus-4-6-20250918"
+
+
+# ---------------------------------------------------------------------------
+# RouteIQ-1216: the gov-ban re-guard backstop applies the capability floor too
+# ---------------------------------------------------------------------------
+
+
+def _banned_dep(dep_id: str) -> Dict:
+    """A Fable-5 always-banned arm (also expert-tier-ish, to prove the floor is
+    what excludes it on the backstop, not just the ban)."""
+    return {
+        "model_name": "claude",
+        "litellm_params": {"model": "bedrock/global.anthropic.claude-fable-5"},
+        "model_info": {"id": dep_id},
+    }
+
+
+def test_guard_reguard_backstop_applies_capability_floor(monkeypatch):
+    """RouteIQ-1216: when the chokepoint REFUSES a gov-banned selection and probes
+    the backstop fallback on a HARD-reasoning request, the capability-tier FLOOR
+    is applied to that probe too. In strict mode with NO expert arm the probe set
+    empties -> the backstop yields None instead of a sub-tier arm.
+
+    Before the fix ``_guard_selected`` called ``_fallback_deployment(model)``
+    context-free, so the floor no-opped on this single path and the backstop
+    could return a sub-tier ``gpt-4o`` for a reasoning request.
+    """
+    monkeypatch.setattr(
+        "litellm_llmrouter.candidate_filter.cooled_down_ids",
+        lambda router: set(),
+    )
+    from litellm_llmrouter.custom_routing_strategy import RouteIQRoutingStrategy
+
+    _configure(enabled=True, strict=True)
+    banned = _banned_dep("dban")
+    gpt4o = _dep("gpt-4o", "d2")  # advanced — sub-expert
+    router = _StaticRouter([banned, gpt4o])
+    strat = RouteIQRoutingStrategy(router_instance=router)
+    # The chokepoint refuses the banned selection and re-guards the backstop with
+    # the HARD-request context; strict floor empties the sub-tier-only set -> None.
+    out = strat._guard_selected(
+        banned,
+        "claude",
+        request_kwargs=None,
+        messages=[{"role": "user", "content": _HARD_PROMPT}],
+    )
+    assert out is None
+
+
+def test_guard_reguard_backstop_keeps_expert_arm(monkeypatch):
+    """Control: with an EXPERT arm present the re-guard backstop returns it (the
+    floor narrows to the expert arm; the banned arm is never re-introduced)."""
+    monkeypatch.setattr(
+        "litellm_llmrouter.candidate_filter.cooled_down_ids",
+        lambda router: set(),
+    )
+    from litellm_llmrouter.custom_routing_strategy import RouteIQRoutingStrategy
+
+    _configure(enabled=True, strict=True)
+    banned = _banned_dep("dban")
+    gpt4o = _dep("gpt-4o", "d2")  # advanced — dropped by the floor
+    opus = _dep("claude-opus-4-6-20250918", "d3")  # expert — kept
+    router = _StaticRouter([banned, gpt4o, opus])
+    strat = RouteIQRoutingStrategy(router_instance=router)
+    out = strat._guard_selected(
+        banned,
+        "claude",
+        request_kwargs=None,
+        messages=[{"role": "user", "content": _HARD_PROMPT}],
+    )
+    assert out is not None
+    assert out["litellm_params"]["model"] == "claude-opus-4-6-20250918"
+
+
+def test_guard_selected_byte_stable_when_capability_off(monkeypatch):
+    """Byte-stable: capability_routing OFF -> the backstop re-guard behaves exactly
+    as before (returns the first non-banned arm regardless of tier)."""
+    monkeypatch.setattr(
+        "litellm_llmrouter.candidate_filter.cooled_down_ids",
+        lambda router: set(),
+    )
+    from litellm_llmrouter.custom_routing_strategy import RouteIQRoutingStrategy
+
+    _configure(enabled=False)
+    banned = _banned_dep("dban")
+    gpt4o = _dep("gpt-4o", "d2")
+    router = _StaticRouter([banned, gpt4o])
+    strat = RouteIQRoutingStrategy(router_instance=router)
+    out = strat._guard_selected(
+        banned,
+        "claude",
+        request_kwargs=None,
+        messages=[{"role": "user", "content": _HARD_PROMPT}],
+    )
+    assert out is not None
+    assert out["litellm_params"]["model"] == "gpt-4o"
 
 
 # ---------------------------------------------------------------------------

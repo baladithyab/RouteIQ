@@ -176,6 +176,55 @@ def resolve_secret(value: Optional[str]) -> Optional[str]:
     return get_secrets_vault().resolve(value)
 
 
+# ---------------------------------------------------------------------------
+# Provider-key resolver (RouteIQ-1786, phase 2)
+# ---------------------------------------------------------------------------
+#
+# The single helper that scattered provider/model API-key call-sites migrate to.
+# It unifies the two ways a provider key reaches the gateway:
+#
+#   1. An environment variable (e.g. an operator exports ``MCP_AUTH_TOKEN`` or a
+#      model_list ``api_key`` is sourced from env).
+#   2. A literal/config value already in hand (e.g. ``server.metadata['api_key']``
+#      loaded from the registry).
+#
+# In BOTH forms the value is routed through the vault's :meth:`resolve`, so an
+# operator may store the real secret as an ``aws-secrets://<id>[#key]`` reference
+# and have it dereferenced from AWS Secrets Manager at lookup time.
+#
+# BYTE-STABLE GUARANTEE: when the vault is disabled (default), ``resolve`` is a
+# transparent pass-through, so:
+#   * ``resolve_provider_key("X")`` returns exactly ``os.getenv("X", default)``;
+#   * ``resolve_provider_value(v)`` returns exactly ``v``.
+# A migrated call-site therefore behaves identically to its pre-migration
+# ``os.getenv`` / direct-read form until the vault is explicitly turned on.
+
+
+def resolve_provider_value(value: Optional[str]) -> Optional[str]:
+    """Resolve an in-hand provider-key value through the vault.
+
+    Use at a call-site that already holds the configured key (e.g. a value
+    loaded from a server registry / model config) rather than reading it from
+    the environment. When the vault is disabled this returns ``value`` unchanged
+    (byte-stable); when enabled, an ``aws-secrets://...`` reference is
+    dereferenced and a plain value is returned as-is.
+    """
+    return get_secrets_vault().resolve(value)
+
+
+def resolve_provider_key(env_var: str, default: Optional[str] = None) -> Optional[str]:
+    """Resolve a provider/model API key by name: vault-first, env fallback.
+
+    Reads ``os.getenv(env_var, default)`` and routes the result through the
+    vault's :meth:`SecretsVault.resolve`. With the vault disabled this is exactly
+    ``os.getenv(env_var, default)`` (byte-stable). With it enabled, a value of
+    the form ``aws-secrets://<id>[#key]`` is dereferenced from Secrets Manager;
+    a plain value (or a missing var) is returned unchanged (or ``default``).
+    """
+    raw = os.getenv(env_var, default)
+    return get_secrets_vault().resolve(raw)
+
+
 __all__ = [
     "VAULT_REF_PREFIX",
     "SecretsVault",
@@ -183,4 +232,6 @@ __all__ = [
     "get_secrets_vault",
     "reset_secrets_vault",
     "resolve_secret",
+    "resolve_provider_key",
+    "resolve_provider_value",
 ]

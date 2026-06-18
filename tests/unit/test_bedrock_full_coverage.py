@@ -390,8 +390,9 @@ class TestFullCoverageWiring:
         # operator-authored entry preserved.
         assert "gpt-4o" in names
         # logical-group names per logical model (NOT one collapsed name); the
-        # version suffix is stripped, the date is kept.
-        assert "anthropic.claude-sonnet-4-20250101" in names
+        # version suffix AND the trailing date segment are stripped (RouteIQ-6952)
+        # so a date-bearing and a date-less arm of the same model share one key.
+        assert "anthropic.claude-sonnet-4" in names
         assert "amazon.nova-pro" in names
         # marketplace mantle arm bound into a logical group too.
         assert any("deepseek" in n for n in names)
@@ -399,7 +400,7 @@ class TestFullCoverageWiring:
         claude = [
             m
             for m in router.model_list
-            if m["model_name"] == "anthropic.claude-sonnet-4-20250101"
+            if m["model_name"] == "anthropic.claude-sonnet-4"
         ][0]
         assert claude["litellm_params"]["model"].startswith("bedrock/converse/global.")
 

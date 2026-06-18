@@ -494,7 +494,24 @@ class RetrainingPipelineAdapter:
                 result.reason = f"registry_import_failed: {e}"
                 return result
         if adapter is None:
+            # RouteIQ-fe8e: a SUCCESSFUL retrain produced an artifact but the
+            # SageMaker Model Registry adapter is disabled, so the train ->
+            # register -> approve -> promote lifecycle silently stops here.
+            # Surface a clear WARNING (this used to be a silent no-op) so the
+            # operator knows the produced artifact at ``model_artifact_uri`` was
+            # NOT registered and must be enabled / registered out of band. The
+            # ``no_registry_adapter`` reason already carries the no-registry
+            # signal on the result; ``registry_reason`` mirrors it for callers
+            # that inspect the registry-side reason field.
             result.reason = "no_registry_adapter"
+            result.registry_reason = "no_registry"
+            logger.warning(
+                "Retrain succeeded (artifact=%s) but the SageMaker Model Registry "
+                "adapter is disabled; the model package was NOT registered. Enable "
+                "settings.mlops.sagemaker to close the train->register->promote "
+                "lifecycle.",
+                status.model_artifact_uri,
+            )
             return result
 
         artifact: Dict[str, Any] = {

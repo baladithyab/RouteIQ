@@ -1311,6 +1311,24 @@ class ResilienceSettings(BaseModel):
         description="Enable per-provider circuit breakers.",
     )
 
+    # --- Circuit-breaker state-gauge re-baseline on start (RouteIQ-c714) -------
+    # The ``gateway.circuit_breaker.state`` gauge is delta-driven, so a worker
+    # that crashed while a breaker was OPEN leaves a STALE non-zero series until
+    # the next transition / scrape staleness. When enabled, the metrics layer
+    # drives every known breaker's series to a clean CLOSED baseline at startup
+    # (the real boot-time state) via ``reset_circuit_breaker_state_metrics``.
+    # Default OFF so the metric stream at init is byte-stable; operators relying
+    # on Prometheus staleness leave it off, operators wanting a deterministic
+    # boot baseline set ROUTEIQ_RESILIENCE__RESET_CIRCUIT_BREAKER_STATE_ON_START=true.
+    reset_circuit_breaker_state_on_start: bool = Field(
+        False,
+        description=(
+            "Re-baseline the circuit-breaker state gauge to closed at startup "
+            "(RouteIQ-c714), clearing a stale OPEN series left by a crashed "
+            "worker. Default off (rely on Prometheus scrape staleness)."
+        ),
+    )
+
 
 class ConfigSyncSettings(BaseModel):
     """Remote config sync from S3/GCS.
@@ -3042,6 +3060,50 @@ class MultinodeAffinitySettings(BaseModel):
 
 
 # ============================================================================
+# Cluster TC-WIRE additions (fresh region — do not reformat blocks above)
+# ============================================================================
+
+
+class LogArchivalSettings(BaseModel):
+    """S3 archival of full request/response logs (RouteIQ-6702).
+
+    Opt-in, PII-gated long-term retention of full request/response payloads to an
+    S3 bucket (compliance / audit / offline-eval corpus). Default DISABLED: when
+    ``enabled=False`` the gateway registers no archival callback, builds no boto3
+    client, and writes nothing to S3 (byte-stable). When enabled, a successful
+    LLM call's request/response is streamed to a date-partitioned, lifecycle-tier
+    -friendly S3 key the operator's S3 lifecycle policy transitions by tier.
+
+    PII gate: archival of full payloads is gated behind an explicit
+    ``pii_acknowledged`` flag so a deployment cannot silently begin persisting
+    prompt/response text. Both ``enabled`` AND ``pii_acknowledged`` must be true
+    for the live callback to be wired.
+
+    Env vars (``__`` nested delimiter under the ``ROUTEIQ_`` prefix), e.g.
+    ``ROUTEIQ_LOG_ARCHIVAL__ENABLED=true``. The legacy flat
+    ``ROUTEIQ_LOG_ARCHIVAL_ENABLED`` / ``ROUTEIQ_LOG_ARCHIVAL_BUCKET`` etc. read
+    directly by :mod:`litellm_llmrouter.log_archival` are still honoured by the
+    archiver itself; this block drives the LIVE callback wiring decision.
+    """
+
+    enabled: bool = Field(
+        False,
+        description=(
+            "Enable S3 archival of full request/response logs. Default off "
+            "(no callback, no boto3 client, byte-stable)."
+        ),
+    )
+    pii_acknowledged: bool = Field(
+        False,
+        description=(
+            "Explicit acknowledgement that archiving full payloads persists "
+            "prompt/response text (PII). The live archival callback is wired only "
+            "when this AND ``enabled`` are both true."
+        ),
+    )
+
+
+# ============================================================================
 # Custom env source -- comma-separated coercion for documented list fields
 # ============================================================================
 
@@ -3473,6 +3535,13 @@ class GatewaySettings(BaseSettings):
         description=(
             "Self-hosted-engine /metrics scrape settings (vLLM / Production "
             "Stack / AIBrix / llm-d queue-depth + KV-cache gauges; default off)."
+        ),
+    )
+    log_archival: LogArchivalSettings = Field(
+        default_factory=LogArchivalSettings,  # type: ignore[arg-type]
+        description=(
+            "S3 archival of full request/response logs (RouteIQ-6702; opt-in, "
+            "PII-gated, default off / byte-stable)."
         ),
     )
 

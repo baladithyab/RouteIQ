@@ -352,8 +352,69 @@ def _register_routes(app: FastAPI, include_admin: bool = True) -> None:
     except Exception as e:
         logger.warning(f"OIDC route registration failed: {e}")
 
+    # MLOps admin control-plane routes (RouteIQ-035c): an in-process trigger for
+    # the SageMaker scheduled-retraining pipeline. Admin-auth gated. The router
+    # is always registered (so the surface is documented + middleware-wrapped),
+    # but every handler is inert when settings.mlops.retraining.enabled is false
+    # (adapter singleton is None) -> returns a ``disabled`` result, builds no
+    # boto3 client, never contacts AWS (byte-stable default).
+    try:
+        from ..routes.mlops import create_mlops_router
+
+        app.include_router(create_mlops_router())
+        logger.debug("Registered MLOps admin router (/api/v1/routeiq/mlops/*)")
+    except Exception as e:
+        logger.warning("MLOps admin route registration failed: %s", e)
+
+    # SCIM v2 provisioning router (RouteIQ-b8a2): mounted ONLY when
+    # ROUTEIQ_SCIM_ENABLED=true. Default off => the router is never created and
+    # not mounted (byte-stable). The router is bearer-token protected + fail-
+    # closed when no ROUTEIQ_SCIM_BEARER_TOKEN is configured.
+    try:
+        from ..scim import create_scim_router, scim_enabled
+
+        if scim_enabled():
+            app.include_router(create_scim_router())
+            logger.info("SCIM v2 provisioning routes registered (/scim/v2/*)")
+    except Exception as e:
+        logger.warning("SCIM route registration failed: %s", e)
+
     # Note: MCP parity layer, JSON-RPC, and SSE transport routers have been
     # removed. These are now provided natively by LiteLLM.
+
+
+def _conversation_affinity_enabled() -> bool:
+    """True when conversation-affinity is enabled (RouteIQ-40fd).
+
+    Honours the documented flat ``CONVERSATION_AFFINITY_ENABLED`` env var first,
+    then the typed ``settings.conversation_affinity.enabled`` (settings.py:1450).
+    Any read failure defaults OFF. This is the second gate for initialising the
+    :class:`ConversationAffinityTracker` at startup.
+    """
+    raw = os.getenv("CONVERSATION_AFFINITY_ENABLED")
+    if raw is not None:
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    try:
+        return bool(get_settings().conversation_affinity.enabled)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _affinity_tracker_should_init() -> bool:
+    """Whether to initialise the affinity tracker at startup (RouteIQ-40fd).
+
+    Requires BOTH the multinode-affinity master gate
+    (``ROUTEIQ_MULTINODE_AFFINITY_ENABLED``, the single source of truth read by
+    :func:`engine_affinity.multinode_affinity_enabled`) AND the existing
+    conversation-affinity flag. Default OFF on either => not initialised, so a
+    default deployment leaves ``get_affinity_tracker()`` returning ``None``
+    (byte-stable; the worker-pin stays inert).
+    """
+    try:
+        from ..engine_affinity import multinode_affinity_enabled
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return multinode_affinity_enabled() and _conversation_affinity_enabled()
 
 
 def _input_guardrail_policies_configured() -> bool:
@@ -427,6 +488,29 @@ async def _run_plugin_startup(app: FastAPI) -> None:
             f"Wired {len(middleware_plugins)} middleware plugins into PluginMiddleware"
         )
 
+    # Initialize the ConversationAffinityTracker singleton at startup
+    # (RouteIQ-40fd). Previously ``init_affinity_tracker()`` was only ever called
+    # from tests, so live ``get_affinity_tracker()`` returned ``None`` and the
+    # bridge's affinity worker-pin was inert. Gate on BOTH the multinode-affinity
+    # master flag AND the conversation-affinity flag -> default OFF on either
+    # leaves the tracker uninitialised (byte-stable). The tracker's background
+    # cleanup task is started so the in-memory TTL store is reaped.
+    if _affinity_tracker_should_init():
+        try:
+            from ..conversation_affinity import (
+                get_affinity_tracker,
+                init_affinity_tracker,
+            )
+
+            tracker = get_affinity_tracker() or init_affinity_tracker()
+            await tracker.start()
+            logger.info(
+                "ConversationAffinityTracker initialised at startup "
+                "(multinode-affinity + conversation-affinity enabled)"
+            )
+        except Exception as exc:
+            logger.warning("Affinity tracker init skipped/failed: %s", exc)
+
     # Wire callback-capable plugins into LiteLLM via PluginCallbackBridge.
     #
     # SECURITY: the bridge ALSO hosts the input-guardrail deny seam, which must
@@ -434,15 +518,21 @@ async def _run_plugin_startup(app: FastAPI) -> None:
     # callback-capable plugins. Registering only when callback_plugins is
     # non-empty would silently bypass input guardrails for an operator whose
     # only control-plane surface is guardrail policies (fail-open). So we force
-    # registration when guardrail policies may exist. Byte-stable when neither
-    # plugins nor guardrail policies are present (register_callback_bridge
-    # returns None without touching litellm.callbacks).
+    # registration when guardrail policies may exist.
+    #
+    # AFFINITY (RouteIQ-24e6): the bridge ALSO hosts the engine/conversation
+    # affinity deployment + success hooks. With zero plugins AND no guardrail
+    # policies but multinode-affinity ON, the bridge would never register and the
+    # affinity hook would silently never run. So affinity ON also forces
+    # registration. Byte-stable when none of {plugins, guardrails, affinity} are
+    # present (register_callback_bridge returns None without touching
+    # litellm.callbacks).
     callback_plugins = manager.get_callback_plugins()
     guardrails_require_bridge = _input_guardrail_policies_configured()
-    if callback_plugins or guardrails_require_bridge:
-        bridge = register_callback_bridge(
-            callback_plugins, force=guardrails_require_bridge
-        )
+    affinity_requires_bridge = _affinity_tracker_should_init()
+    force_bridge = guardrails_require_bridge or affinity_requires_bridge
+    if callback_plugins or force_bridge:
+        bridge = register_callback_bridge(callback_plugins, force=force_bridge)
         if bridge:
             if callback_plugins:
                 logger.info(
@@ -452,6 +542,11 @@ async def _run_plugin_startup(app: FastAPI) -> None:
                 logger.info(
                     "Wired PluginCallbackBridge into LiteLLM for input guardrail "
                     "enforcement (no callback plugins; guardrail policies present)"
+                )
+            if affinity_requires_bridge and not callback_plugins:
+                logger.info(
+                    "Wired PluginCallbackBridge into LiteLLM for engine/conversation "
+                    "affinity (no callback plugins; multinode affinity enabled)"
                 )
 
 
@@ -473,6 +568,22 @@ async def _run_plugin_shutdown(app: FastAPI) -> None:
 
     # Clear callback bridge
     reset_callback_bridge()
+
+    # Stop + reset the ConversationAffinityTracker (RouteIQ-40fd): cancels the
+    # background cleanup task and drops the singleton so a re-created app does not
+    # inherit a stale tracker. No-op when it was never initialised (default off).
+    try:
+        from ..conversation_affinity import (
+            get_affinity_tracker,
+            reset_affinity_tracker,
+        )
+
+        tracker = get_affinity_tracker()
+        if tracker is not None:
+            await tracker.stop()
+            reset_affinity_tracker()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Affinity tracker shutdown skipped/failed: %s", exc)
 
     # Then run plugin shutdown hooks
     manager = get_plugin_manager()
@@ -948,6 +1059,53 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:  # never block boot on synthesis
         logger.warning("Workspace arm synthesis skipped/failed (non-fatal): %s", exc)
 
+    # 3e. Scheduled API-key auto-rotation pass (RouteIQ-b8a2). Runs AFTER
+    #     governance hydration (step 3b) so the keys to rotate exist. Triple-
+    #     gated: rotate_stale_keys() is a no-op unless ROUTEIQ_KEY_ROTATION_ENABLED
+    #     (default off => byte-stable), and we additionally leader-gate it (mirror
+    #     the config-sync / discovery leader gate) so N replicas don't all rotate.
+    #     Rotated rows are persisted through the durable store when enabled so the
+    #     new secret_hash/public_id survive pod churn. Never raises.
+    try:
+        from ..scim import key_rotation_enabled, rotate_stale_keys
+
+        if key_rotation_enabled():
+            from ..startup import _discovery_is_leader
+
+            if _discovery_is_leader():
+                from ..governance import get_governance_engine
+                from ..governance_store import get_governance_store
+
+                gov = get_governance_engine()
+                rotated = rotate_stale_keys(gov)
+                if rotated:
+                    store = get_governance_store()
+                    if getattr(store, "enabled", False):
+                        rotated_ids = {r["key_id"] for r in rotated}
+                        for kg in list(getattr(gov, "_key_governance", {}).values()):
+                            if getattr(kg, "key_id", "") in rotated_ids:
+                                await store.upsert_key(kg)
+                    logger.info(
+                        "Key auto-rotation: rotated %d stale key(s) at startup",
+                        len(rotated),
+                    )
+    except Exception as exc:  # never block boot on rotation
+        logger.warning("Key auto-rotation skipped/failed (non-fatal): %s", exc)
+
+    # 3f. S3 archival of full request/response logs (RouteIQ-6702). Opt-in +
+    #     PII-gated: register_log_archival_callback() is a no-op unless BOTH
+    #     settings.log_archival.enabled AND .pii_acknowledged are true AND the
+    #     archiver has a configured bucket -> default deployment registers no
+    #     callback, builds no boto3 client, archives nothing (byte-stable). When
+    #     wired, LiteLLM's success-event hook drives the archiver per call.
+    try:
+        from ..log_archival import register_log_archival_callback
+
+        if register_log_archival_callback() is not None:
+            logger.info("S3 log archival callback wired into LiteLLM")
+    except Exception as exc:  # never block boot on archival wiring
+        logger.warning("Log archival wiring skipped/failed (non-fatal): %s", exc)
+
     # 4. Service discovery (informational only, never blocks startup)
     await _probe_services()
 
@@ -1023,6 +1181,21 @@ async def _routeiq_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await drain_manager.wait_for_drain()
     except Exception as exc:
         logger.warning("Drain manager error during shutdown: %s", exc)
+
+    # 1a. Leader-aware hand-off (RouteIQ-8387): after the in-flight requests have
+    #     drained, if this replica holds the HA leader lease, release it so a peer
+    #     takes over leader-only work (config sync, migrations) within one
+    #     acquisition cycle instead of waiting out the full lease TTL on a
+    #     voluntary disruption (SIGTERM). Triple-guarded by the helper:
+    #     no-op (never raises) when leader election is disabled, this replica is
+    #     not the leader, or ROUTEIQ_LEADER_DRAIN_HANDOFF is off (the default =>
+    #     byte-stable: the lease just expires naturally as today).
+    try:
+        from ..resilience import release_leadership_for_handoff
+
+        await release_leadership_for_handoff()
+    except Exception as exc:  # pragma: no cover - helper already swallows
+        logger.warning("Leader hand-off at shutdown skipped/failed: %s", exc)
 
     # 1b. Flush durable bandit posteriors (RouteIQ-95a8 DEFECT-2). After drain no
     #     more updates arrive, so persist the debounced tail (up to

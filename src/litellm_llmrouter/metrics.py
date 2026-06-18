@@ -640,7 +640,44 @@ def init_gateway_metrics(meter: Meter) -> GatewayMetrics:
     """
     global _gateway_metrics
     _gateway_metrics = GatewayMetrics(meter)
+    # RouteIQ-c714: optionally re-baseline the circuit-breaker state gauge to
+    # CLOSED at startup. The gauge (``circuit_breaker_state``, owned by this
+    # metrics layer) is delta-driven, so a worker that crashed while a breaker
+    # was OPEN leaves a STALE non-zero series until the next transition / scrape
+    # staleness. A fresh worker starts with all breakers closed, so the reset
+    # drives the series to that real boot-time state here — at the init of the
+    # layer that owns the gauge — giving the otherwise-dark
+    # ``reset_circuit_breaker_state_metrics`` helper its live callsite.
+    #
+    # Default OFF (gated on ``resilience.reset_circuit_breaker_state_on_start``)
+    # so the metric stream at init is byte-stable; operators who prefer
+    # Prometheus scrape staleness leave it off. Best-effort: any failure
+    # (settings, resilience import, OTel) is swallowed so metrics init never
+    # breaks startup.
+    _maybe_reset_circuit_breaker_state()
     return _gateway_metrics
+
+
+def _maybe_reset_circuit_breaker_state() -> None:
+    """Re-baseline the circuit-breaker state gauge at startup when opted in.
+
+    Gated default-OFF on ``settings.resilience.reset_circuit_breaker_state_on_start``
+    (RouteIQ-c714) so the prior metric stream at init is byte-stable. Live
+    callsite for ``resilience.reset_circuit_breaker_state_metrics`` — without
+    this the helper had no real caller.
+    """
+    try:
+        from litellm_llmrouter.settings import get_settings
+
+        if not get_settings().resilience.reset_circuit_breaker_state_on_start:
+            return
+        from litellm_llmrouter.resilience import (
+            reset_circuit_breaker_state_metrics,
+        )
+
+        reset_circuit_breaker_state_metrics()
+    except Exception:  # pragma: no cover - telemetry must not break startup
+        logger.debug("circuit-breaker state re-baseline skipped", exc_info=True)
 
 
 def get_gateway_metrics() -> Optional[GatewayMetrics]:
