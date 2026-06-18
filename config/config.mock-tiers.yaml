@@ -1,0 +1,92 @@
+# RouteIQ -- CREDS-FREE mock-tier validation rig for the intelligence-first router
+# =============================================================================
+# Purpose: validate the capability-tier FLOOR + the Kumaraswamy-Thompson bandit
+# (reward_profile=intelligence_first) with ZERO cloud credentials, using LiteLLM
+# `mock_response` deployments. Every arm returns canned text -- NO provider call.
+#
+# WHAT THIS RIG PROVES (creds-free):
+#   * tier resolution from the arm name (Option B operator model_tiers map)
+#   * the capability floor DROPS sub-tier arms pre-scoring for a reasoning prompt
+#   * strict vs soft floor behaviour
+#   * the bandit selects among mock arms; with IN-PROCESS reward injection the
+#     selection distribution converges to the high-reward arm
+#   * eval-loop PLUMBING end-to-end IF a JSON-shaped mock judge is wired
+# WHAT IT CANNOT PROVE: real model quality, real centroid embedding
+#   classification (needs warm sentence-transformer), differential quality
+#   LEARNING through the natural eval loop (mock judge = uniform score, and the
+#   eval->bandit attribution is mis-keyed). See the SPEC notValidatable list.
+#
+# GOTCHA (verified): mock_response arms REQUIRE a provider prefix, e.g.
+#   model: openai/mock-expert. LiteLLM echoes the response-body `model` as the
+#   litellm_params.model with the `openai/` prefix STRIPPED -> "mock-expert".
+#   The stress-harness verdicts key on that stripped string, so the arms carry
+#   DISTINCT public/concrete names. The leading `openai` token does NOT block
+#   the operator model_tiers token-boundary match ("mock-expert" run [mock,expert]
+#   is contained in [openai,mock,expert]).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model list -- the "claude-auto" GROUP: 3 mock arms, ONE model_name.
+# -----------------------------------------------------------------------------
+# LiteLLM treats every row sharing a model_name as an arm of that group; the
+# RouteIQ bandit picks between them. Each arm is a pure mock_response (no creds).
+# Arm tier is resolved by the OPERATOR model_tiers map (Option B -- deterministic,
+# immune to the built-in dict-order traps). The bandit arm key == litellm_params.model
+# (i.e. "openai/mock-expert"); use those EXACT strings for in-process update().
+model_list:
+  # NOTE: do NOT put `tier:` under model_info — litellm's ModelInfo.tier is a
+  # constrained literal ('free'|'paid') and rejects the whole deployment.
+  # RouteIQ's capability gate resolves tiers from the arm NAME via the operator
+  # model_tiers env map (ROUTEIQ_CAPABILITY_ROUTING__MODEL_TIERS), so the tier
+  # metadata lives there, not here.
+  # --- EXPERT arm (the floor keeps ONLY this for a complex/reasoning request) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: openai/mock-expert
+      mock_response: "EXPERT mock answer: a careful step-by-step derivation."
+    model_info:
+      arm_id: mock-expert
+
+  # --- ADVANCED arm (dropped pre-scoring when the complex floor = expert) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: openai/mock-advanced
+      mock_response: "ADVANCED mock answer."
+    model_info:
+      arm_id: mock-advanced
+
+  # --- FAST arm (dropped pre-scoring when the complex floor = expert) ---
+  - model_name: claude-auto
+    litellm_params:
+      model: openai/mock-fast
+      mock_response: "FAST mock answer."
+    model_info:
+      arm_id: mock-fast
+
+  # --- JSON-shaped MOCK JUDGE (full-loop plumbing only; OPTIONAL) ---------------
+  # The eval LLM-as-judge calls litellm.acompletion DIRECTLY (not via the router)
+  # and parses the content as JSON 1-5 ratings. mock_response MUST be EXACTLY this
+  # JSON or the judge silently yields {} (no score). Wire only for the full-loop
+  # smoke; it gives a UNIFORM score to every arm (no differential learning) and is
+  # mis-keyed to the bandit -- it proves PLUMBING, not learning. Point the judge at
+  # this with ROUTEIQ_EVAL_JUDGE_MODEL=openai/mock-judge.
+  - model_name: mock-judge
+    litellm_params:
+      model: openai/mock-judge
+      mock_response: '{"relevance": 5, "helpfulness": 5, "coherence": 5}'
+
+router_settings:
+  # RouteIQ installs its OWN CustomRoutingStrategyBase plugin; the bandit is
+  # selected via ROUTEIQ_KUMARASWAMY_THOMPSON__ENABLED=true +
+  # ROUTEIQ_ROUTING__ACTIVE_STRATEGY=routeiq-kumaraswamy-thompson (env, below).
+  # This LiteLLM-level strategy is only the pre-plugin fallback.
+  routing_strategy: simple-shuffle
+  num_retries: 0
+  timeout: 60
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  # No success/failure callbacks needed for the creds-free smoke; OTel off by env.
