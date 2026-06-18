@@ -963,10 +963,14 @@ class MCPGateway:
                 headers["X-API-Key"] = key
 
         # Proxy the request to the upstream server
+        # RouteIQ-ef9e: httpx (>=0.28) requires all four Timeout params OR a
+        # default; the prior 3-arg form (no pool=) raised ValueError on the wire.
+        # Matches the sibling mcp_jsonrpc_client._timeout construction.
         timeout = httpx.Timeout(
             connect=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
             read=self.TOOL_INVOCATION_READ_TIMEOUT,
             write=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
+            pool=self.TOOL_INVOCATION_CONNECT_TIMEOUT,
         )
 
         try:
