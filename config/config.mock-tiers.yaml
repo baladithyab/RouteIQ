@@ -40,7 +40,7 @@ model_list:
   # model_tiers env map (ROUTEIQ_CAPABILITY_ROUTING__MODEL_TIERS), so the tier
   # metadata lives there, not here.
   # --- EXPERT arm (the floor keeps ONLY this for a complex/reasoning request) ---
-  - model_name: claude-auto
+  - model_name: auto
     litellm_params:
       model: openai/mock-expert
       mock_response: "EXPERT mock answer: a careful step-by-step derivation."
@@ -48,7 +48,7 @@ model_list:
       arm_id: mock-expert
 
   # --- ADVANCED arm (dropped pre-scoring when the complex floor = expert) ---
-  - model_name: claude-auto
+  - model_name: auto
     litellm_params:
       model: openai/mock-advanced
       mock_response: "ADVANCED mock answer."
@@ -56,7 +56,7 @@ model_list:
       arm_id: mock-advanced
 
   # --- FAST arm (dropped pre-scoring when the complex floor = expert) ---
-  - model_name: claude-auto
+  - model_name: auto
     litellm_params:
       model: openai/mock-fast
       mock_response: "FAST mock answer."
