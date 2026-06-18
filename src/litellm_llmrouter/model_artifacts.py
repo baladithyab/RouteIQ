@@ -265,7 +265,17 @@ class ModelArtifactVerifier:
         self.public_key_path = public_key_path or os.environ.get(
             "LLMROUTER_MODEL_PUBLIC_KEY_PATH"
         )
-        self.hmac_secret = hmac_secret or os.environ.get("LLMROUTER_MODEL_HMAC_SECRET")
+        # RouteIQ-5410: route the model-signing HMAC secret through the secrets
+        # vault (vault-first, os.getenv fallback). Byte-stable when the vault is
+        # disabled (default): resolve_provider_key == os.getenv. This is the one
+        # genuinely RouteIQ-owned provider/signing secret env read — the config
+        # model_list api_key / WANDB / HF surfaces named in the seed are read by
+        # upstream LiteLLM, not RouteIQ (verified: no such reads in src/).
+        from litellm_llmrouter.secrets_vault import resolve_provider_key
+
+        self.hmac_secret = hmac_secret or resolve_provider_key(
+            "LLMROUTER_MODEL_HMAC_SECRET"
+        )
 
         # Determine enforcement mode
         # LLMROUTER_ENFORCE_SIGNED_MODELS is NOT ROUTEIQ_-prefixed, so check
