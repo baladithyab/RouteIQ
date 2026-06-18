@@ -44,6 +44,12 @@ class MLOpsCoordinator:
         self._adapters: Dict[str, Any] = {}
         self._manifests: Dict[str, AdapterManifest] = {}
         self._lock = threading.RLock()
+        # The eval pipeline this coordinator was wired to (RouteIQ-e019). Set by
+        # ``wire_mlops_feedback_loop`` so ``_bucket_qualities`` reads the
+        # per-(bucket, model) aggregate from the SAME pipeline that fires the
+        # feedback callback (the firing pipeline is authoritative; the module
+        # singleton may differ in tests). Falls back to the singleton when unset.
+        self._eval_pipeline: Any = None
 
     # ------------------------------------------------------------------
     # Registration
@@ -143,6 +149,19 @@ class MLOpsCoordinator:
 
         This is the signature ``EvalPipeline`` invokes its feedback callbacks
         with. It is generic — works for the bandit AND a stub classifier.
+
+        Per-bucket attribution (RouteIQ-e019): the bandit keys its posteriors by
+        ``(bucket, model)`` and its hot path READS ``(_bucket(context), model)``.
+        A per-model-only fan-out (``RoutingFeedback`` with no ``bucket``) makes
+        the bandit ``update`` resolve ``bucket or ... or "default"`` and land EVERY
+        eval-derived update on the inert ``("default", model)`` posterior the
+        router never samples. To fix that, when the eval pipeline tracked quality
+        per ``(bandit_bucket, model)`` (a decision-time bucket was recovered at
+        COLLECT), this fans out one ``RoutingFeedback(model, score, bucket=bucket)``
+        per ``(bucket, model)`` so ``update`` keys the SAME posterior the router
+        samples. Models with NO per-bucket data fall back to the byte-stable
+        per-model dispatch (``bucket=None``) so non-bandit adapters and the prior
+        behaviour are unchanged.
         """
         if not model_qualities:
             return
@@ -151,15 +170,70 @@ class MLOpsCoordinator:
                 (name, self._adapters[name], self._manifests[name])
                 for name in self._adapters
             ]
+
+        # Pull the per-(bucket, model) aggregate from the live eval pipeline (the
+        # same seam ``_mlops_aggregate_feedback`` uses to reach per-strategy
+        # quality). The build is grouped per-model so a model with per-bucket data
+        # is dispatched ONLY per-bucket (no double-counting) and a model without
+        # falls back to a single per-model dispatch.
+        bucket_qualities = self._bucket_qualities_for_dispatch()
+        per_model_buckets: Dict[str, list] = {}
+        for (bucket, model), quality in bucket_qualities.items():
+            per_model_buckets.setdefault(model, []).append((bucket, quality))
+
         for name, adapter, manifest in targets:
             if manifest.train_mode != TRAIN_MODE_CONTINUOUS:
                 continue
             for model, quality in model_qualities.items():
-                score = quality * 2.0 - 1.0  # [0,1] -> [-1,1]
-                feedback = RoutingFeedback(
-                    model=model, score=score, metadata={"source": "eval_aggregate"}
-                )
-                self._dispatch_update(name, adapter, feedback)
+                buckets = per_model_buckets.get(model)
+                if buckets:
+                    # Per-(bucket, model): key the posterior the router samples.
+                    for bucket, b_quality in buckets:
+                        score = b_quality * 2.0 - 1.0  # [0,1] -> [-1,1]
+                        feedback = RoutingFeedback(
+                            model=model,
+                            score=score,
+                            bucket=bucket,
+                            metadata={"source": "eval_aggregate"},
+                        )
+                        self._dispatch_update(name, adapter, feedback)
+                else:
+                    # No bandit bucket for this model -> byte-stable per-model path.
+                    score = quality * 2.0 - 1.0  # [0,1] -> [-1,1]
+                    feedback = RoutingFeedback(
+                        model=model, score=score, metadata={"source": "eval_aggregate"}
+                    )
+                    self._dispatch_update(name, adapter, feedback)
+
+    def _bucket_qualities_for_dispatch(self) -> Dict[tuple, float]:
+        """Per-``(bandit_bucket, model)`` aggregate from the live eval pipeline.
+
+        Prefers the pipeline this coordinator was wired to (``self._eval_pipeline``
+        — the pipeline that actually fires the feedback callback), then the module
+        singleton. Best-effort: returns ``{}`` when no pipeline is available /
+        disabled or it carried no per-bucket samples, in which case
+        ``on_aggregate_feedback`` degrades to the byte-stable per-model fan-out.
+        Never raises.
+        """
+        pipeline = self._eval_pipeline
+        if pipeline is None:
+            try:
+                from litellm_llmrouter.eval_pipeline import get_eval_pipeline
+
+                pipeline = get_eval_pipeline()
+            except Exception:  # pragma: no cover - defensive
+                pipeline = None
+        if pipeline is None:
+            return {}
+        try:
+            tracker = getattr(pipeline, "tracker", None)
+            getter = getattr(tracker, "get_all_bucket_qualities", None)
+            if not callable(getter):
+                return {}
+            data = getter()
+            return data if isinstance(data, dict) else {}
+        except Exception:  # pragma: no cover - defensive, never break the loop
+            return {}
 
     @staticmethod
     def _dispatch_update(name: str, adapter: Any, feedback: RoutingFeedback) -> None:
@@ -337,6 +411,11 @@ def wire_mlops_feedback_loop(
     if not callable(add_cb):
         logger.debug("MLOps: eval pipeline has no add_feedback_callback")
         return False
+
+    # Remember the firing pipeline so the per-(bucket, model) aggregate read in
+    # on_aggregate_feedback comes from the SAME pipeline that fires the callback
+    # (RouteIQ-e019) -- authoritative even when it differs from the singleton.
+    coord._eval_pipeline = pipeline
 
     try:
         added = add_cb(coord.on_aggregate_feedback)

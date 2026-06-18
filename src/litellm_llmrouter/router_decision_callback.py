@@ -1724,6 +1724,47 @@ def _resolve_tier_from_model(model: str) -> str:
     return "complex"
 
 
+def _recover_bandit_bucket(request_id: Optional[str]) -> str:
+    """Recover the EXACT bandit task-bucket logged at decision time (RouteIQ-e019).
+
+    The Kumaraswamy-Thompson bandit logs the bucket it keyed the posterior on per
+    ``request_id`` at decision time (``_log_bucket``); ``RoutingContext.request_id``
+    is the request's ``litellm_call_id``, which is also the ``EvalSample.sample_id``.
+    Recovering that bucket here threads the EXACT string the routing hot path keyed
+    on through COLLECT so AGGREGATE/FEEDBACK can attribute quality to the
+    ``(bucket, model)`` posterior ``select_deployment`` actually samples — closing
+    the inert-feedback gap where every eval-derived update landed on the
+    never-sampled ``("default", model)`` slot.
+
+    Fully fail-open and best-effort: returns ``""`` when the bandit is not
+    registered, no bucket was logged for this request (non-bandit route, or the
+    log entry was evicted), or anything raises. An empty bucket falls back to the
+    byte-stable per-model aggregation in the tracker.
+
+    Args:
+        request_id: The decision-time ``request_id`` / ``litellm_call_id``.
+
+    Returns:
+        The logged bandit bucket string, or ``""`` if unavailable.
+    """
+    if not request_id:
+        return ""
+    try:
+        from litellm_llmrouter.kumaraswamy_thompson import STRATEGY_NAME
+        from litellm_llmrouter.strategy_registry import get_routing_registry
+
+        strategy = get_routing_registry().get(STRATEGY_NAME)
+        if strategy is None:
+            return ""
+        recover = getattr(strategy, "_recover_bucket", None)
+        if not callable(recover):
+            return ""
+        bucket = recover(request_id)
+        return str(bucket) if bucket else ""
+    except Exception:  # pragma: no cover - recovery must never break collection
+        return ""
+
+
 def _collect_eval_sample(
     kwargs: Dict[str, Any],
     response_obj: Any,
@@ -1808,14 +1849,21 @@ def _collect_eval_sample(
 
         latency_ms = _compute_duration(start_time, end_time) * 1000.0
 
+        # RouteIQ-e019: the bandit logs its decision-time bucket per request_id
+        # (== litellm_call_id == the sample_id), so recover the EXACT bucket the
+        # routing hot path keyed on and carry it onto the sample. This is what
+        # lets AGGREGATE/FEEDBACK key the SAME (bucket, model) posterior the bandit
+        # samples instead of the inert ("default", model) slot.
+        call_id = kwargs.get("litellm_call_id") or metadata.get("request_id")
+        bandit_bucket = _recover_bandit_bucket(str(call_id) if call_id else None)
+
         sample = EvalSample(
-            sample_id=str(
-                kwargs.get("litellm_call_id") or f"eval-{time.time()}-{id(kwargs)}"
-            ),
+            sample_id=str(call_id or f"eval-{time.time()}-{id(kwargs)}"),
             timestamp=time.time(),
             model=str(model),
             strategy=str(strategy),
             tier=str(tier),
+            bandit_bucket=bandit_bucket,
             messages=messages,
             request_tokens=int(input_tokens),
             response_content=_extract_response_content(response_obj),
@@ -1925,14 +1973,19 @@ def _collect_failure_eval_sample(
 
         latency_ms = _compute_duration(start_time, end_time) * 1000.0
 
+        # RouteIQ-e019: recover the decision-time bandit bucket (see the success
+        # arm) so a downweighting failure sample also lands on the right
+        # (bucket, model) posterior the bandit samples.
+        call_id = kwargs.get("litellm_call_id") or metadata.get("request_id")
+        bandit_bucket = _recover_bandit_bucket(str(call_id) if call_id else None)
+
         sample = EvalSample(
-            sample_id=str(
-                kwargs.get("litellm_call_id") or f"evalfail-{time.time()}-{id(kwargs)}"
-            ),
+            sample_id=str(call_id or f"evalfail-{time.time()}-{id(kwargs)}"),
             timestamp=time.time(),
             model=str(model),
             strategy=str(strategy),
             tier=str(tier),
+            bandit_bucket=bandit_bucket,
             messages=messages,
             response_content="",
             latency_ms=float(latency_ms),

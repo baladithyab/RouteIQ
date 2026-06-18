@@ -100,6 +100,20 @@ class EvalSample:
     messages: List[Dict[str, Any]]
     request_tokens: int = 0
 
+    # The EXACT bandit task-bucket the routing hot path keyed on at decision
+    # time (``KumaraswamyThompsonStrategy._bucket(context)`` — e.g. ``"len:s"``
+    # or a warm-centroid ``"tier:..."``), recovered at COLLECT from the active
+    # bandit's per-request bucket log (RouteIQ-e019). This is DISTINCT from
+    # ``tier`` above: ``tier`` is a coarse model-name/profile complexity tier
+    # (``"simple"`` / ``"complex"`` / ``"reasoning"``), NOT the string the bandit
+    # posterior is keyed by. Per-bucket quality attribution (AGGREGATE → FEEDBACK)
+    # uses THIS field so an eval-derived quality update lands on the
+    # ``(bandit_bucket, model)`` posterior that ``select_deployment`` actually
+    # samples — not the inert ``("default", model)`` slot. Empty when no bandit
+    # bucket was logged for this request (non-bandit route / bandit disabled), in
+    # which case AGGREGATE falls back to the byte-stable per-model behaviour.
+    bandit_bucket: str = ""
+
     # Response
     response_content: str = ""
     response_tokens: int = 0
@@ -224,9 +238,26 @@ class ModelQualityTracker:
         # never reaches it. Tracking strategy quality here closes that gap
         # (RouteIQ-fc5c part c) without changing the model-keyed behaviour.
         self._strategy_scores: Dict[str, List[float]] = defaultdict(list)
+        # Per-(bandit_bucket, model) sliding window (RouteIQ-e019), parallel to
+        # the per-model window above. The Kumaraswamy-Thompson bandit keys its
+        # posteriors by ``(bucket, model)`` and the hot path READS
+        # ``(_bucket(context), model)``; aggregating quality per-model alone made
+        # the eval→bandit feedback land on the inert ``("default", model)``
+        # posterior the router never samples. This per-(bucket, model) window is
+        # what the MLOps fan-out reads so a quality update keys the SAME posterior
+        # ``select_deployment`` samples. Keyed by the EXACT decision-time bucket
+        # string (e.g. ``"len:s"``), never recomputed.
+        self._bucket_scores: Dict[tuple[str, str], List[float]] = defaultdict(list)
         self._window_size = window_size
 
-    def record(self, model: str, score: float, strategy: Optional[str] = None) -> None:
+    def record(
+        self,
+        model: str,
+        score: float,
+        strategy: Optional[str] = None,
+        *,
+        bandit_bucket: Optional[str] = None,
+    ) -> None:
         """Record an evaluation score for a model (and optionally its strategy).
 
         Args:
@@ -237,6 +268,13 @@ class ModelQualityTracker:
                 champion/challenger promoter (which keys by strategy) sees real
                 quality. Optional/backward-compatible: omitting it preserves the
                 prior model-only behaviour.
+            bandit_bucket: The EXACT decision-time bandit task-bucket the routing
+                hot path keyed on (``KumaraswamyThompsonStrategy._bucket``, e.g.
+                ``"len:s"``). When non-empty, the score is ALSO recorded into the
+                per-(bucket, model) window so the eval→bandit FEEDBACK arm can fan
+                quality out per-(bucket, model) and key the posterior the router
+                actually samples (RouteIQ-e019). Empty/None preserves the prior
+                per-model-only behaviour byte-for-byte.
         """
         scores = self._scores[model]
         scores.append(score)
@@ -248,6 +286,12 @@ class ModelQualityTracker:
             sscores.append(score)
             if len(sscores) > self._window_size:
                 sscores.pop(0)
+
+        if bandit_bucket:
+            bscores = self._bucket_scores[(bandit_bucket, model)]
+            bscores.append(score)
+            if len(bscores) > self._window_size:
+                bscores.pop(0)
 
     def get_strategy_quality(self, strategy: str) -> Optional[float]:
         """Average quality score for a routing strategy, or None if no data."""
@@ -285,6 +329,24 @@ class ModelQualityTracker:
             Dictionary mapping model names to average quality scores.
         """
         return {m: sum(s) / len(s) for m, s in self._scores.items() if s}
+
+    def get_all_bucket_qualities(self) -> Dict[tuple[str, str], float]:
+        """Average quality per ``(bandit_bucket, model)`` (RouteIQ-e019).
+
+        Returns the per-bucket aggregate the eval→bandit FEEDBACK arm fans out so
+        each quality update keys the ``(bucket, model)`` posterior the routing hot
+        path actually samples — not the inert ``("default", model)`` slot. Empty
+        until a sample carrying a non-empty ``bandit_bucket`` is recorded, so the
+        per-model behaviour is unchanged when no bandit bucket is available.
+
+        Returns:
+            ``{(bucket, model): average_quality}`` over the sliding window.
+        """
+        return {key: sum(v) / len(v) for key, v in self._bucket_scores.items() if v}
+
+    def get_bucket_sample_counts(self) -> Dict[tuple[str, str], int]:
+        """Number of evaluation samples per ``(bandit_bucket, model)``."""
+        return {key: len(v) for key, v in self._bucket_scores.items() if v}
 
     def get_ranking(self) -> List[tuple]:
         """Get models ranked by quality (best first).
@@ -443,7 +505,12 @@ class EvalPipeline:
                 # window (RouteIQ-fc5c) is what the champion/challenger promoter
                 # reads -- it keys by strategy, not model.
                 avg_score = sum(scores.values()) / len(scores) if scores else 0.5
-                self._tracker.record(sample.model, avg_score, strategy=sample.strategy)
+                self._tracker.record(
+                    sample.model,
+                    avg_score,
+                    strategy=sample.strategy,
+                    bandit_bucket=sample.bandit_bucket,
+                )
                 _record_eval_sample_metric(
                     "pass" if avg_score >= _EVAL_PASS_THRESHOLD else "fail"
                 )
@@ -454,7 +521,10 @@ class EvalPipeline:
             sample.evaluated = True
             sample.evaluated_at = time.time()
             self._tracker.record(
-                sample.model, _FAILURE_SAMPLE_QUALITY, strategy=sample.strategy
+                sample.model,
+                _FAILURE_SAMPLE_QUALITY,
+                strategy=sample.strategy,
+                bandit_bucket=sample.bandit_bucket,
             )
             _record_eval_sample_metric("fail")
             evaluated += 1
