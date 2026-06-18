@@ -37,6 +37,20 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
+# RouteIQ-0a01: the callback MUST subclass litellm's CustomLogger or LiteLLM's
+# logging dispatcher will SKIP it entirely.  ``Logging.pre_call`` (and the proxy
+# success/failure dispatch) only invoke ``log_pre_api_call`` /
+# ``async_log_success_event`` on callbacks for which
+# ``isinstance(callback, CustomLogger)`` is True.  A duck-typed plain ``object``
+# with matching method names is registered in ``litellm.callbacks`` but its
+# hooks are never called -- which is why the stats accumulator stayed write-dead
+# on the live proxy path even though the callback "registered".  We fall back to
+# ``object`` only if litellm is unavailable so the module still imports.
+try:  # pragma: no cover - exercised at import; trivial
+    from litellm.integrations.custom_logger import CustomLogger as _CustomLoggerBase
+except Exception:  # pragma: no cover - litellm always present in this project
+    _CustomLoggerBase = object  # type: ignore[assignment,misc]
+
 # Strategy name used by the centroid router (centroid decision identification).
 _CENTROID_STRATEGY_NAME = "llmrouter-nadirclaw-centroid"
 
@@ -833,12 +847,18 @@ def register_router_decision_middleware(app: Any) -> bool:
 # =============================================================================
 
 
-class RouterDecisionCallback:
+class RouterDecisionCallback(_CustomLoggerBase):
     """
     LiteLLM custom callback that emits TG4.1 router decision span attributes
     and records OTel metrics for request duration, token usage, and errors.
 
-    Compatible with LiteLLM's custom callback interface.
+    Subclasses :class:`litellm.integrations.custom_logger.CustomLogger` so that
+    LiteLLM's logging dispatcher actually invokes its hooks: ``Logging.pre_call``
+    and the proxy success/failure dispatch only call ``log_pre_api_call`` /
+    ``async_log_success_event`` on callbacks that pass
+    ``isinstance(callback, CustomLogger)`` (RouteIQ-0a01).  Without this base a
+    duck-typed instance is registered but never called, so the stats accumulator
+    stays write-dead on the live proxy path.
     """
 
     def __init__(
@@ -853,6 +873,11 @@ class RouterDecisionCallback:
             strategy_name: Override strategy name in telemetry
             enabled: Whether the callback is active
         """
+        # Initialise the CustomLogger base (no-op if base is ``object``).
+        try:
+            super().__init__()
+        except Exception:  # pragma: no cover - defensive
+            pass
         self._strategy_name = (
             strategy_name or OVERRIDE_STRATEGY_NAME or "litellm-builtin"
         )
@@ -872,9 +897,38 @@ class RouterDecisionCallback:
         kwargs: Dict[str, Any],
     ) -> None:
         """
-        Called before each API call - emits router decision telemetry
-        and records start time + increments the active request gauge.
+        Called before each API call - records the in-process routing stats,
+        emits router decision telemetry, records start time, and increments the
+        active request gauge.
+
+        STATS RECORDING IS UNCONDITIONAL (RouteIQ-0a01).  The process-local
+        :class:`RoutingStatsAccumulator` is an aggregate COUNTER, not an OTel
+        span -- it must increment on EVERY routing decision regardless of
+        whether OTel is on (``self._enabled``) or whether there is a recording
+        span.  Previously the only call site for :func:`_record_decision_stats`
+        lived INSIDE :meth:`_emit_router_telemetry`, behind both the
+        ``self._enabled`` early-return here AND the ``span.is_recording()``
+        guard there -- so with OTel OFF the accumulator was write-dead and
+        ``/stats/global`` reported ``total_decisions == 0`` after live traffic.
+
+        We therefore record stats FIRST, before any ``self._enabled`` gate.
+        Span-attribute emission (``_emit_router_telemetry``) stays OTel-gated.
+        This is the SINGLE recorder for the live path: the
+        :class:`RouterDecisionMiddleware` deliberately does NOT touch the
+        accumulator, so there is no double-count.
         """
+        # --- UNCONDITIONAL: feed the process-local stats accumulator. ---------
+        # Resolve strategy/metadata the same way _emit_router_telemetry does so
+        # the recorded decision carries the resolved model + strategy + scope
+        # even when OTel is off.  Fully fail-open: never breaks the call path.
+        try:
+            metadata = kwargs.get("metadata", {}) or {}
+            strategy = metadata.get("routing_strategy") or self._resolve_strategy()
+            _record_decision_stats(model, strategy, metadata)
+            _record_mlops_hot_path(model, strategy, messages, metadata)
+        except Exception as e:  # pragma: no cover - stats must never break path
+            logger.debug(f"Failed to record routing decision stats: {e}")
+
         if not self._enabled:
             return
 
@@ -896,6 +950,23 @@ class RouterDecisionCallback:
                 gm.request_active.add(1, {"model": model})
         except Exception as e:
             logger.debug(f"Failed to record pre-call metrics: {e}")
+
+    def _resolve_strategy(self) -> str:
+        """Resolve the active routing strategy name for a recorded decision.
+
+        Prefers the live strategy registry's active strategy (so the recorded
+        ``strategy_distribution`` reflects what is actually serving), falling
+        back to the callback's configured ``_strategy_name``.  Never raises.
+        """
+        try:
+            from litellm_llmrouter.strategy_registry import get_routing_registry
+
+            active = get_routing_registry().get_active()
+            if active:
+                return str(active)
+        except Exception:
+            pass
+        return self._strategy_name
 
     def _emit_router_telemetry(
         self,
@@ -968,17 +1039,12 @@ class RouterDecisionCallback:
         if provider:
             span.set_attribute(GA.SYSTEM, provider)
 
-        # Feed the in-process stats accumulator (RouteIQ-aba9).  This is the
-        # per-decision seam with the resolved model + strategy + governance
-        # scope, so the global stats + /me/stats endpoints read real aggregates.
-        _record_decision_stats(model, strategy, metadata)
-
-        # Feed the MLOps hot-path observers (RouteIQ-fc5c part b): the drift
-        # detector's request-bucket window and the shadow/mirror candidate. Both
-        # are settings-gated singletons that return None when disabled, so this
-        # is a byte-stable no-op until an operator opts in. Cheap + fully
-        # fail-open: never breaks the routing/telemetry path.
-        _record_mlops_hot_path(model, strategy, messages, metadata)
+        # NOTE (RouteIQ-0a01): the in-process stats accumulator + MLOps hot-path
+        # observers are now fed UNCONDITIONALLY from log_pre_api_call, BEFORE the
+        # self._enabled gate and OUTSIDE this span.is_recording()-guarded method,
+        # so they record on every decision even with OTel off.  Do NOT call
+        # _record_decision_stats / _record_mlops_hot_path here -- doing so would
+        # double-count whenever a recording span IS present.
 
         logger.debug(
             f"Emitted router telemetry: model={model}, strategy={strategy}, "
@@ -2108,13 +2174,23 @@ def register_router_decision_callback() -> Optional[RouterDecisionCallback]:
     """
     Register the router decision callback with LiteLLM.
 
-    Returns:
-        The registered callback instance, or None if disabled.
-    """
-    if not ROUTER_CALLBACK_ENABLED:
-        logger.debug("Router decision callback disabled")
-        return None
+    RouteIQ-0a01: registration is NO LONGER gated on the OTel-derived
+    ``ROUTER_CALLBACK_ENABLED`` flag.  The callback is the live recorder for the
+    process-local :class:`RoutingStatsAccumulator` (``/stats/global``,
+    ``/me/stats``, the Admin UI routing-stats panel), and that aggregate must be
+    fed on EVERY routing decision regardless of whether OTel telemetry is on.
+    Previously this early-returned ``None`` when OTel was off, so with OTel
+    disabled the callback was never appended to ``litellm.callbacks`` at all and
+    the stats stayed write-dead (``total_decisions == 0`` after live traffic).
 
+    The callback's own ``_enabled`` flag (``enabled and ROUTER_CALLBACK_ENABLED``)
+    still gates the OTel span-attribute emission inside ``_emit_router_telemetry``
+    -- only the unconditional stats/MLOps recording runs when OTel is off.
+
+    Returns:
+        The registered callback instance, or None only if LiteLLM is
+        unavailable / registration raised.
+    """
     try:
         import litellm
 

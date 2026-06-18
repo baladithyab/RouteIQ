@@ -26,6 +26,7 @@ from litellm_llmrouter.router_decision_callback import (
     _streaming_generation_seconds,
     _streaming_ttft_seconds,
     get_router_decision_callback,
+    get_stats_accumulator,
     register_router_decision_callback,
     register_router_decision_middleware,
 )
@@ -642,9 +643,28 @@ class TestComputeDuration:
 
 class TestRegisterCallback:
     @patch("litellm_llmrouter.router_decision_callback.ROUTER_CALLBACK_ENABLED", False)
-    def test_disabled_returns_none(self):
-        result = register_router_decision_callback()
-        assert result is None
+    def test_registers_even_with_otel_off(self):
+        """RouteIQ-0a01: registration is NOT gated on the OTel flag.
+
+        Even with OTel off (``ROUTER_CALLBACK_ENABLED`` False) the callback MUST
+        be registered, because it is the live recorder for the process-local
+        stats accumulator (``/stats/global`` etc.).  Its ``_enabled`` flag (the
+        OTel span-emission gate) is False, but the instance is still returned
+        and appended to ``litellm.callbacks``.
+        """
+        import litellm
+
+        original_callbacks = getattr(litellm, "callbacks", [])
+        litellm.callbacks = []
+        try:
+            result = register_router_decision_callback()
+            assert result is not None
+            assert isinstance(result, RouterDecisionCallback)
+            assert result in litellm.callbacks
+            # OTel span emission is still gated off.
+            assert result._enabled is False
+        finally:
+            litellm.callbacks = original_callbacks
 
     @patch("litellm_llmrouter.router_decision_callback.ROUTER_CALLBACK_ENABLED", True)
     def test_registers_with_litellm(self):
@@ -775,3 +795,140 @@ class TestGovernanceSpendTrackingGate:
         reset_settings()
         get_settings()
         assert _governance_spend_tracking_enabled() is False
+
+
+# =============================================================================
+# RouteIQ-0a01: live-path stats recording with OTel OFF
+# =============================================================================
+
+
+class TestStatsRecordedWithOtelOff:
+    """Regression for RouteIQ-0a01 (LIVE-DEAD stats).
+
+    The process-local RoutingStatsAccumulator must increment on EVERY routing
+    decision even with OTel OFF -- i.e. when the callback's ``_enabled`` flag is
+    False (no OTEL endpoint) AND there is no recording span.  The prior fix was
+    unit-green but live-dead because the only recorder lived behind both gates;
+    these tests drive the callback the way LiteLLM does (async_log_pre_api_call
+    on a constructed instance) and assert the GLOBAL snapshot increments.
+    """
+
+    async def test_async_log_pre_api_call_records_with_callback_disabled(self):
+        """OTel-off live path: _enabled=False, no recording span -> still records."""
+        # Simulate OTel off exactly as on the live GATE: callback constructed
+        # disabled (no OTEL endpoint -> ROUTER_CALLBACK_ENABLED False).
+        cb = RouterDecisionCallback(enabled=False)
+        assert cb._enabled is False  # OTel-off precondition
+
+        acc = get_stats_accumulator()
+        assert acc.global_snapshot()["total_decisions"] == 0
+
+        for _ in range(25):
+            await cb.async_log_pre_api_call(
+                model="mock-expert",
+                messages=[{"role": "user", "content": "hi"}],
+                kwargs={"metadata": {"user_api_key": "k1"}},
+            )
+
+        snap = acc.global_snapshot()
+        assert snap["total_decisions"] == 25
+        assert snap["model_distribution"].get("mock-expert") == 25
+
+    async def test_records_exactly_once_per_call_no_double_count(self):
+        """Even with a recording span present, record_decision fires EXACTLY once."""
+        cb = RouterDecisionCallback(enabled=True)
+        # Force the OTel gate ON for this instance regardless of env default so
+        # _emit_router_telemetry runs its span path too.
+        cb._enabled = True
+
+        acc = get_stats_accumulator()
+
+        # A recording span: _emit_router_telemetry will run its attribute path.
+        recording_span = MagicMock()
+        recording_span.is_recording.return_value = True
+
+        with patch(
+            "litellm_llmrouter.router_decision_callback.trace.get_current_span",
+            return_value=recording_span,
+        ):
+            for _ in range(10):
+                await cb.async_log_pre_api_call(
+                    model="mock-fast",
+                    messages=[{"role": "user", "content": "x"}],
+                    kwargs={"metadata": {"user_api_key": "k2"}},
+                )
+
+        # 10 calls -> 10 decisions, NOT 20 (no double count when span present).
+        assert acc.global_snapshot()["total_decisions"] == 10
+
+    async def test_registered_callback_instance_records_live(self):
+        """Drive the REGISTERED callback instance (what LiteLLM appends)."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+            cb = register_router_decision_callback()
+
+        assert cb is not None
+        acc = get_stats_accumulator()
+        start = acc.global_snapshot()["total_decisions"]
+
+        for _ in range(5):
+            await cb.async_log_pre_api_call(
+                model="mock-advanced",
+                messages=[{"role": "user", "content": "hi"}],
+                kwargs={"metadata": {}},
+            )
+
+        assert acc.global_snapshot()["total_decisions"] == start + 5
+
+    async def test_key_scoped_stats_recorded_with_otel_off(self):
+        """/me/stats path: per-key rollup increments even with OTel off."""
+        cb = RouterDecisionCallback(enabled=False)
+        acc = get_stats_accumulator()
+
+        for _ in range(7):
+            await cb.async_log_pre_api_call(
+                model="mock-expert",
+                messages=[{"role": "user", "content": "hi"}],
+                kwargs={"metadata": {"user_api_key": "key-abc"}},
+            )
+
+        assert acc.key_snapshot("key-abc")["decisions"] == 7
+
+    def test_callback_is_a_litellm_customlogger(self):
+        """ROOT CAUSE GUARD (RouteIQ-0a01): LiteLLM only dispatches hooks to
+        ``CustomLogger`` instances.
+
+        ``Logging.pre_call`` invokes ``log_pre_api_call`` ONLY when
+        ``isinstance(callback, CustomLogger)``.  If RouterDecisionCallback ever
+        stops subclassing CustomLogger, the live proxy path silently stops
+        calling our hooks and the stats accumulator goes write-dead again --
+        exactly the live-dead regression this fix addresses.  This is the seam
+        the prior (private-method) test could not see.
+        """
+        from litellm.integrations.custom_logger import CustomLogger
+
+        assert issubclass(RouterDecisionCallback, CustomLogger)
+        cb = RouterDecisionCallback(enabled=False)
+        assert isinstance(cb, CustomLogger)
+
+    def test_live_sync_log_pre_api_call_records_with_otel_off(self):
+        """LIVE-PATH shape: LiteLLM's proxy uses the SYNC log_pre_api_call.
+
+        The live proxy dispatch calls the sync ``log_pre_api_call`` (NOT the
+        async variant), with ``_enabled`` False under OTel off.  Drive it that
+        way and assert the global accumulator increments -- mirrors the GATE.
+        """
+        cb = RouterDecisionCallback(enabled=False)
+        acc = get_stats_accumulator()
+        start = acc.global_snapshot()["total_decisions"]
+
+        for _ in range(25):
+            cb.log_pre_api_call(
+                model="mock-advanced",
+                messages=[{"role": "user", "content": "hi"}],
+                kwargs={"metadata": {"user_api_key": "live-key"}},
+            )
+
+        snap = acc.global_snapshot()
+        assert snap["total_decisions"] == start + 25
+        assert snap["model_distribution"].get("mock-advanced") == 25
