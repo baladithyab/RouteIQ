@@ -24,6 +24,7 @@ which replaces the Router's ``get_available_deployment`` and
 
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import HTTPException
@@ -115,6 +116,56 @@ USE_PIPELINE_ROUTING, CENTROID_ROUTING_ENABLED, DEFAULT_ROUTING_PROFILE = (
 
 # Maximum routing attempts per request to prevent amplification loops
 MAX_ROUTING_ATTEMPTS = 3
+
+
+@dataclass
+class _CandidateSet:
+    """The per-request candidate picture every selection path needs (RouteIQ-5007).
+
+    Carries not just the scored ``model_list`` but the FILTERED ``routable`` set,
+    the unfiltered ``healthy_deployments`` (legacy match pool), the pre-filter
+    ``group_matched`` members, and the ``context`` so callers can DISTINGUISH a
+    fail-closed empty (a HARD residency / STRICT capability constraint excluded
+    every arm) from a genuinely-empty group or the legacy no-context path.
+
+    Without this distinction the ML path repopulated an empty (fail-closed)
+    ``model_list`` to ``[model]`` and matched it against the UNFILTERED
+    ``healthy_deployments`` -- leaking an out-of-region arm for a hard-residency
+    request (the RouteIQ-5007 leak).
+    """
+
+    model_list: List[str] = field(default_factory=list)
+    healthy_deployments: List[Dict] = field(default_factory=list)
+    routable: List[Dict] = field(default_factory=list)
+    group_matched: List[Dict] = field(default_factory=list)
+    context: Optional[Any] = None
+
+    @property
+    def filtered_empty(self) -> bool:
+        """True when a per-request filter excluded EVERY arm of a non-empty group.
+
+        This is the fail-closed verdict: candidates existed
+        (``group_matched`` non-empty) but a context-driven HARD residency /
+        STRICT capability filter dropped them all (``routable`` empty). The
+        selection path MUST return None here -- NEVER repopulate from the
+        unfiltered set. When ``context`` is ``None`` (legacy / no per-request
+        signal) OR the group genuinely had no members, this is False and the
+        legacy ``[model]`` fallback is preserved (byte-stable).
+        """
+        return (
+            self.context is not None and bool(self.group_matched) and not self.routable
+        )
+
+    @property
+    def context_constrained(self) -> bool:
+        """True when a per-request signal context was applied to a non-empty group.
+
+        On this path the FILTERED ``routable`` set (not the unfiltered
+        ``healthy_deployments``) is the safe match pool, so a group-fallback can
+        never reach an out-of-region / sub-tier arm. False keeps the legacy
+        ``healthy_deployments`` match pool (byte-stable for no-context callers).
+        """
+        return self.context is not None and bool(self.group_matched)
 
 
 def _resolve_routing_profile(
@@ -647,15 +698,29 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
         # Extract query
         query = self._extract_query(messages, input)
 
-        # Get model list and deployment map (RouteIQ-60cc: pass request_kwargs so
+        # Get the full candidate picture (RouteIQ-60cc: pass request_kwargs so
         # the per-request region / data-residency pre-filter activates here;
         # RouteIQ-8e37: pass messages so the capability-tier floor resolves the
         # request difficulty on the ML path).
-        model_list, healthy_deployments = self._get_model_list(
-            model, request_kwargs, messages
-        )
+        candidates = self._get_candidates(model, request_kwargs, messages)
+        model_list = candidates.model_list
 
         if not model_list:
+            # RouteIQ-5007: a context-driven HARD residency / STRICT capability
+            # filter that excluded EVERY arm of a NON-empty group is a fail-CLOSED
+            # verdict -- do NOT repopulate to [model] and match against the
+            # unfiltered healthy_deployments (that leaked an out-of-region arm).
+            # Return None so the request fails closed / falls back safely.
+            if candidates.filtered_empty:
+                logger.warning(
+                    "LLMRouter: per-request residency/capability filter excluded "
+                    "all arms for model=%s -> failing closed (no out-of-region / "
+                    "sub-tier leak).",
+                    model,
+                )
+                return None
+            # No per-request signal (legacy) OR a genuinely empty group: preserve
+            # the byte-stable legacy [model] fallback.
             model_list = [model]
 
         # Route using ML strategy
@@ -668,8 +733,17 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             )
             return None
 
-        # Match selected model to a deployment dict
-        return self._match_deployment(selected_model, model, healthy_deployments)
+        # Match the selected model to a deployment dict. When a per-request filter
+        # context was applied (RouteIQ-5007), match against the FILTERED routable
+        # set -- never the unfiltered healthy_deployments -- so the group-fallback
+        # branch of _match_deployment cannot reach an out-of-region / sub-tier arm.
+        # No context (legacy) -> the full healthy_deployments (byte-stable).
+        match_pool = (
+            candidates.routable
+            if candidates.context_constrained
+            else candidates.healthy_deployments
+        )
+        return self._match_deployment(selected_model, model, match_pool)
 
     # ------------------------------------------------------------------
     # Internal: Centroid routing (zero-config fallback)
@@ -889,9 +963,14 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             # Get candidate models from healthy deployments (RouteIQ-60cc:
             # pass request_kwargs so region / residency is honoured here too;
             # RouteIQ-8e37: pass messages so the capability-tier floor applies).
-            model_list, healthy_deployments = self._get_model_list(
-                model, request_kwargs, messages
-            )
+            candidates = self._get_candidates(model, request_kwargs, messages)
+            model_list = candidates.model_list
+            # RouteIQ-5007: the `< 2` guard already fails closed when a hard
+            # residency / strict capability filter empties the routable set
+            # (model_list == [] => return None, never repopulated). No leak on
+            # this path. The match pool below is still narrowed to the FILTERED
+            # routable set when a context applied, for defense-in-depth against a
+            # cross-group partial match reaching an out-of-region / sub-tier arm.
             if not model_list or len(model_list) < 2:
                 # No point re-ranking with 0 or 1 candidates
                 return None
@@ -901,9 +980,15 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             if not ranked:
                 return None
 
-            # Select the top-ranked model and map to deployment
+            # Select the top-ranked model and map to deployment (filtered pool
+            # when context-constrained -- RouteIQ-5007 -- else legacy full set).
             top_model = ranked[0][0]
-            result = self._match_deployment(top_model, model, healthy_deployments)
+            match_pool = (
+                candidates.routable
+                if candidates.context_constrained
+                else candidates.healthy_deployments
+            )
+            result = self._match_deployment(top_model, model, match_pool)
 
             # Emit the routing.selection metric from the LIVE personalized path.
             # (get_top_model() is not on the live dispatch path, so the metric
@@ -1006,26 +1091,33 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
     # Internal: Helper methods
     # ------------------------------------------------------------------
 
-    def _get_model_list(
+    def _get_candidates(
         self,
         model: str,
         request_kwargs: Optional[Dict] = None,
         messages: Optional[List[Dict[str, str]]] = None,
-    ) -> tuple:
-        """
-        Get available deployments from the Router.
+    ) -> "_CandidateSet":
+        """Resolve the per-request candidate set WITH the fail-closed verdict.
 
-        Prefers ``healthy_deployments`` over ``model_list`` for freshness.
+        Unlike :meth:`_get_model_list` (the legacy 2-tuple shape), this returns
+        the full picture every selection path needs to fail-closed correctly:
 
-        ``request_kwargs`` / ``messages`` are OPTIONAL: when supplied, a minimal
-        :class:`RoutingContext` is built so the per-request region /
-        data-residency pre-filter (RouteIQ-60cc) AND the capability-tier FLOOR
-        (RouteIQ-8e37) activate on the ML (``LLMRouterStrategyFamily``) path.
-        ``messages`` feed the capability floor's difficulty resolution. When both
-        are absent both filters no-op (byte-stable for callers with no context).
+        - ``model_list``: the litellm model ids the strategy scores (from the
+          FILTERED ``routable`` set).
+        - ``healthy_deployments``: the FULL unfiltered alias (legacy match pool).
+        - ``routable``: the gov-ban / cooldown / capability / region FILTERED
+          subset of the model group -- the ONLY arms that may be selected.
+        - ``group_matched``: the pre-filter members of the model group.
+        - ``context``: the region/capability signal context, or ``None`` when
+          there is no per-request signal (legacy byte-stable path).
 
-        Returns:
-            Tuple of (model_name_list, healthy_deployments_list)
+        RouteIQ-5007: an EMPTY ``routable`` derived from a NON-empty
+        ``group_matched`` while a ``context`` is present is a HARD fail-closed
+        verdict (a hard data-residency / strict capability constraint excluded
+        every arm). Callers MUST treat that as "no selection" and NOT repopulate
+        the candidate set with the unfiltered ``[model]`` / ``healthy_deployments``
+        -- doing so leaks an out-of-region (or sub-tier) arm. See
+        :attr:`_CandidateSet.filtered_empty`.
         """
         healthy_deployments = getattr(
             self._router, "healthy_deployments", self._router.model_list
@@ -1056,7 +1148,40 @@ class RouteIQRoutingStrategy(CustomRoutingStrategyBase):
             if litellm_model:
                 model_list.append(litellm_model)
 
-        return model_list, healthy_deployments
+        return _CandidateSet(
+            model_list=model_list,
+            healthy_deployments=healthy_deployments,
+            routable=routable,
+            group_matched=group_matched,
+            context=context,
+        )
+
+    def _get_model_list(
+        self,
+        model: str,
+        request_kwargs: Optional[Dict] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+    ) -> tuple:
+        """
+        Get available deployments from the Router.
+
+        Prefers ``healthy_deployments`` over ``model_list`` for freshness.
+
+        ``request_kwargs`` / ``messages`` are OPTIONAL: when supplied, a minimal
+        :class:`RoutingContext` is built so the per-request region /
+        data-residency pre-filter (RouteIQ-60cc) AND the capability-tier FLOOR
+        (RouteIQ-8e37) activate on the ML (``LLMRouterStrategyFamily``) path.
+        ``messages`` feed the capability floor's difficulty resolution. When both
+        are absent both filters no-op (byte-stable for callers with no context).
+
+        Legacy 2-tuple shape (kept for backwards compatibility); selection paths
+        that must honour the fail-closed verdict use :meth:`_get_candidates`.
+
+        Returns:
+            Tuple of (model_name_list, healthy_deployments_list)
+        """
+        candidates = self._get_candidates(model, request_kwargs, messages)
+        return candidates.model_list, candidates.healthy_deployments
 
     def _region_context(
         self,

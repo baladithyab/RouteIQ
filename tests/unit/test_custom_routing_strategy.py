@@ -1129,3 +1129,298 @@ class TestPreScoringCandidateFilter:
         strategy = RouteIQRoutingStrategy(router_instance=router)
         model_list, _ = strategy._get_model_list("g")
         assert set(model_list) == {"bedrock/a", "bedrock/b"}
+
+
+# ======================================================================
+# RouteIQ-5007 — FAIL-OPEN data-residency leak on the ML path
+# ======================================================================
+#
+# The region pre-filter (RouteIQ-60cc) correctly EMPTIES the candidate set for a
+# HARD-residency request that has no in-region arm. But _route_via_llmrouter then
+# did `if not model_list: model_list = [model]` — DISCARDING the fail-closed empty
+# verdict — and _match_deployment was handed the FULL UNFILTERED
+# healthy_deployments, whose group-fallback branch returned the FIRST out-of-region
+# arm. Net: a hard-residency request leaked an out-of-region deployment on the
+# primary ML path. _guard_selected only re-checks gov-ban, NOT region, so it could
+# not catch the leak.
+#
+# The existing region tests only cover DefaultStrategy._get_deployments and
+# KumaraswamyThompson.select_deployment — the RouteIQRoutingStrategy ML path was
+# UNTESTED, which is why this slipped. These tests drive the REAL
+# _route_via_llmrouter AND async_get_available_deployment end-to-end (a controlled
+# _strategy_instance stub stands in for the ML scorer, exactly as the other ML-path
+# tests do) and assert NO out-of-region arm is ever returned.
+
+
+class _StubScorer:
+    """Deterministic stand-in for LLMRouterStrategyFamily.route_with_observability.
+
+    Mirrors what a real ML strategy does when handed a candidate list: returns a
+    chosen model name from it (here, configurable). Used to drive the REAL
+    _route_via_llmrouter without ML deps."""
+
+    def __init__(self, returns: Any) -> None:
+        self._returns = returns
+        self.seen_model_lists: List[List[str]] = []
+
+    def route_with_observability(self, query: str, model_list: List[str]) -> Any:
+        self.seen_model_lists.append(list(model_list))
+        # Echo the configured return, or (callable) compute it from the list.
+        if callable(self._returns):
+            return self._returns(model_list)
+        return self._returns
+
+
+class TestRegionResidencyMLPath:
+    """RouteIQ-5007: the ML (LLMRouterStrategyFamily) path must fail CLOSED for a
+    HARD-residency request with no in-region arm — never leak out-of-region."""
+
+    @staticmethod
+    def _dep(arm: str, region: str, dep_id: str, model_name: str = "claude") -> Dict:
+        return {
+            "model_name": model_name,
+            "litellm_params": {"model": arm, "aws_region_name": region},
+            "model_info": {"id": dep_id},
+        }
+
+    @staticmethod
+    def _configure_hard_eu() -> None:
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings(
+            region_routing={
+                "enabled": True,
+                "region_header": "X-RouteIQ-Region",
+                "region_map": {"eu": ["eu-west-1", "eu-central-1"]},
+            }
+        )
+
+    @staticmethod
+    def _hard_eu_kwargs() -> Dict[str, Any]:
+        # request_kwargs is the FIRST source the region filter scans; the header
+        # carries the region token and a truthy residency flag makes it HARD.
+        return {"headers": {"X-RouteIQ-Region": "eu"}, "residency": True}
+
+    def _strategy(self, deployments: List[Dict], scorer: _StubScorer):
+        router = _make_mock_router(
+            model_list=deployments, healthy_deployments=deployments
+        )
+        strat = RouteIQRoutingStrategy(
+            router_instance=router, strategy_name="llmrouter-knn"
+        )
+        strat._strategy_instance = scorer  # bypass lazy ML load
+        return strat
+
+    def test_route_via_llmrouter_fails_closed_no_in_region(self, monkeypatch) -> None:
+        """ACCEPTANCE (the P8 repro): _route_via_llmrouter returns None for a
+        HARD-residency eu request when only us-* arms exist — the fail-closed empty
+        verdict is NOT repopulated to [model], and no out-of-region arm leaks."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        self._configure_hard_eu()
+        us1 = self._dep("us-east/claude", "us-east-1", "d1")
+        us2 = self._dep("us-west/claude", "us-west-2", "d2")
+        # If the strategy WERE consulted with [model] (the bug), it would echo
+        # the group name and _match_deployment would group-fall-back to us1.
+        scorer = _StubScorer(returns="claude")
+        strat = self._strategy([us1, us2], scorer)
+
+        result = strat._route_via_llmrouter(
+            model="claude",
+            messages=[{"role": "user", "content": "Hello"}],
+            request_kwargs=self._hard_eu_kwargs(),
+        )
+
+        assert result is None
+        # The fail-closed branch returns BEFORE scoring -> the stub was never
+        # handed the unfiltered [model] candidate set.
+        assert scorer.seen_model_lists == []
+
+    async def test_async_end_to_end_no_out_of_region_leak(self, monkeypatch) -> None:
+        """ACCEPTANCE: async_get_available_deployment (the public entry LiteLLM
+        calls) returns None / no out-of-region arm for a HARD-residency request
+        with only us-* arms — through the full pipeline -> ML -> personalized ->
+        centroid -> fallback chain AND the _guard_selected chokepoint."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        self._configure_hard_eu()
+        us1 = self._dep("us-east/claude", "us-east-1", "d1")
+        us2 = self._dep("us-west/claude", "us-west-2", "d2")
+        scorer = _StubScorer(returns="claude")
+        strat = self._strategy([us1, us2], scorer)
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ):
+            result = await strat.async_get_available_deployment(
+                model="claude",
+                messages=[{"role": "user", "content": "Hello"}],
+                request_kwargs=self._hard_eu_kwargs(),
+            )
+
+        # No deployment may be returned (every arm is out-of-region for a HARD
+        # residency request). Critically: NOT an out-of-region arm.
+        assert result is None
+
+    def test_sync_end_to_end_no_out_of_region_leak(self, monkeypatch) -> None:
+        """ACCEPTANCE (sync entry): get_available_deployment likewise never leaks
+        an out-of-region arm for a HARD-residency request."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        self._configure_hard_eu()
+        us1 = self._dep("us-east/claude", "us-east-1", "d1")
+        us2 = self._dep("us-west/claude", "us-west-2", "d2")
+        scorer = _StubScorer(returns="claude")
+        strat = self._strategy([us1, us2], scorer)
+
+        with patch(
+            "litellm_llmrouter.custom_routing_strategy.USE_PIPELINE_ROUTING",
+            False,
+        ):
+            result = strat.get_available_deployment(
+                model="claude",
+                messages=[{"role": "user", "content": "Hello"}],
+                request_kwargs=self._hard_eu_kwargs(),
+            )
+
+        assert result is None
+
+    def test_match_pool_is_filtered_not_unfiltered(self, monkeypatch) -> None:
+        """Even if the scorer (perversely) returns an out-of-region arm NAME, the
+        match pool is the FILTERED routable set, so _match_deployment cannot reach
+        the out-of-region arm — it returns the in-region arm or None."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        self._configure_hard_eu()
+        us = self._dep("us-east/claude", "us-east-1", "d1")
+        eu = self._dep("eu-west/claude", "eu-west-1", "d2")
+        # The scorer maliciously names the out-of-region arm; the filtered pool
+        # (eu only) means _match_deployment can never return us.
+        scorer = _StubScorer(returns="us-east/claude")
+        strat = self._strategy([us, eu], scorer)
+
+        result = strat._route_via_llmrouter(
+            model="claude",
+            messages=[{"role": "user", "content": "Hello"}],
+            request_kwargs=self._hard_eu_kwargs(),
+        )
+
+        # The scorer's out-of-region name has no match in the eu-only filtered
+        # pool -> no exact/partial match, group-fallback yields the eu arm.
+        assert result is not None
+        assert result["litellm_params"]["aws_region_name"] == "eu-west-1"
+        assert result["litellm_params"]["model"] != "us-east/claude"
+        # The candidate set scored was the FILTERED (eu-only) set, not [model].
+        assert scorer.seen_model_lists == [["eu-west/claude"]]
+
+    def test_in_region_arm_is_selectable(self, monkeypatch) -> None:
+        """CONTROL: a HARD-residency request DOES select the in-region arm when
+        one exists (the filter is active, not a blanket empty)."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        self._configure_hard_eu()
+        us = self._dep("us-east/claude", "us-east-1", "d1")
+        eu = self._dep("eu-west/claude", "eu-west-1", "d2")
+        scorer = _StubScorer(returns="eu-west/claude")
+        strat = self._strategy([us, eu], scorer)
+
+        result = strat._route_via_llmrouter(
+            model="claude",
+            messages=[{"role": "user", "content": "Hello"}],
+            request_kwargs=self._hard_eu_kwargs(),
+        )
+
+        assert result is not None
+        assert result["litellm_params"]["model"] == "eu-west/claude"
+        assert result["litellm_params"]["aws_region_name"] == "eu-west-1"
+
+
+class TestNoContextByteStable:
+    """RouteIQ-5007 byte-stability: with NO per-request context the legacy [model]
+    fallback + full-healthy_deployments match pool are preserved unchanged."""
+
+    @staticmethod
+    def _dep(arm: str, dep_id: str, model_name: str = "gpt-4") -> Dict:
+        return {
+            "model_name": model_name,
+            "litellm_params": {"model": arm},
+            "model_info": {"id": dep_id},
+        }
+
+    def test_no_context_empty_group_falls_back_to_model(self, monkeypatch) -> None:
+        """No request_kwargs AND no messages (context is None) + a requested group
+        with NO members (genuinely empty group): the legacy `model_list = [model]`
+        fallback is preserved (NOT failed-closed), the stub is handed [model], and
+        the group-fallback resolves against the full healthy_deployments. This is
+        the byte-stable legacy behaviour that MUST remain."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings()  # region_routing disabled by default
+
+        # healthy_deployments hold a DIFFERENT group; the requested "gpt-4" group
+        # is empty -> model_list == [] with context None -> legacy [model] path.
+        other = self._dep("openai/gpt-4o", "d1", model_name="other-group")
+        router = _make_mock_router(model_list=[other], healthy_deployments=[other])
+        # The scorer echoes the requested group name; the legacy match pool is the
+        # FULL healthy_deployments, so a substring/partial match can resolve it.
+        scorer = _StubScorer(returns="gpt-4")
+        strat = RouteIQRoutingStrategy(
+            router_instance=router, strategy_name="llmrouter-knn"
+        )
+        strat._strategy_instance = scorer
+
+        # No messages, no request_kwargs -> context is None -> legacy path.
+        result = strat._route_via_llmrouter(model="gpt-4")
+
+        # Legacy: model_list was [] (empty group) but context is None, so it is
+        # repopulated to ["gpt-4"] (NOT failed-closed) and the stub sees ["gpt-4"].
+        assert scorer.seen_model_lists == [["gpt-4"]]
+        # Partial match ("gpt-4" in "openai/gpt-4o") against the FULL set resolves;
+        # this is the legacy behaviour preserved byte-stable.
+        assert result is not None
+        assert result["litellm_params"]["model"] == "openai/gpt-4o"
+
+    def test_no_context_nonempty_group_scores_filtered_set(self, monkeypatch) -> None:
+        """No context + a non-empty group: the strategy scores the gov-ban/cooldown
+        filtered group (legacy), NOT [model], and the match pool is the full
+        healthy_deployments (byte-stable, unchanged from before the fix)."""
+        monkeypatch.setattr(
+            "litellm_llmrouter.candidate_filter.cooled_down_ids",
+            lambda router: set(),
+        )
+        from litellm_llmrouter.settings import get_settings, reset_settings
+
+        reset_settings()
+        get_settings()
+        a = self._dep("openai/gpt-4", "d1", model_name="gpt-4")
+        b = self._dep("anthropic/claude-3-opus", "d2", model_name="gpt-4")
+        router = _make_mock_router(model_list=[a, b], healthy_deployments=[a, b])
+        scorer = _StubScorer(returns="anthropic/claude-3-opus")
+        strat = RouteIQRoutingStrategy(
+            router_instance=router, strategy_name="llmrouter-knn"
+        )
+        strat._strategy_instance = scorer
+
+        result = strat._route_via_llmrouter(model="gpt-4")
+
+        # The scored set is the real group arms (NOT [model]).
+        assert scorer.seen_model_lists == [["openai/gpt-4", "anthropic/claude-3-opus"]]
+        assert result is not None
+        assert result["litellm_params"]["model"] == "anthropic/claude-3-opus"
