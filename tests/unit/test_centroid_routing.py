@@ -402,6 +402,95 @@ class TestReasoningDetector:
         result = ReasoningDetector.detect("Hello")
         assert isinstance(result, ReasoningResult)
         assert isinstance(result.markers, list)
+        assert result.high_confidence_count == 0
+
+    # --- Two-tier scheme (RouteIQ-a9da) ---------------------------------
+
+    def test_single_high_confidence_marker_triggers(self):
+        """A single high-confidence marker single-triggers reasoning.
+
+        This is the core fix: a genuinely-hard prompt with one strong
+        signal must resolve to reasoning so the capability floor pins the
+        expert tier (previously under-routed at threshold 2).
+        """
+        result = ReasoningDetector.detect("prove that the sum equals n(n+1)/2")
+        assert result.is_reasoning is True
+        assert result.high_confidence_count == 1
+        assert result.marker_count == 1
+
+    def test_two_weak_markers_trigger(self):
+        """Two distinct weak markers reach threshold 2 with no high marker."""
+        result = ReasoningDetector.detect(
+            "compare and contrast the algorithms and analyze the trade-offs"
+        )
+        assert result.is_reasoning is True
+        assert result.high_confidence_count == 0
+        assert result.marker_count >= 2
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "prove that the sum equals n(n+1)/2",
+            "think step-by-step about this proof",
+            "use chain-of-thought to solve",
+            "give a formal proof that P=NP is unresolved",
+            # multi-marker hard
+            "derive the closed-form solution and prove that it converges "
+            "and explain why",
+            # multi-weak hard
+            "let us reason: compare and contrast the two algorithms and "
+            "analyze the trade-offs",
+            "provide a mathematical derivation of the gradient",
+            "logically deduce the conclusion from these premises",
+            # 4 more varied single-strong-marker hard prompts
+            "walk me through the formal verification of this lock-free queue",
+            "use chain of thought reasoning to reach the answer",
+            "think step by step",
+            "logically infer what must follow from the axioms",
+        ],
+    )
+    def test_calibration_hard_prompts_are_reasoning(self, prompt):
+        """Calibration gate: every genuinely-hard prompt -> is_reasoning True."""
+        result = ReasoningDetector.detect(prompt)
+        assert result.is_reasoning is True, (
+            f"hard prompt under-classified as simple: {prompt!r} "
+            f"(high={result.high_confidence_count}, n={result.marker_count})"
+        )
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            # bare-object 'derive the' idioms must stay simple
+            "derive the meaning from context",
+            "derive the lesson from this fable",
+            "derive the main idea from this paragraph",
+            "derive the average of these numbers",
+            # bare-object 'prove the/this' idioms must stay simple
+            "prove the point you were making earlier",
+            "I want to prove the haters wrong",
+            "prove the recipe works",
+            "Let me prove this to you",
+            # 'mathematically show' is weak, single -> simple
+            "mathematically show the answer is 4",
+            # casual prompts with no markers at all
+            "hi what is the capital of france",
+            "what time is it",
+            "tell me a joke",
+        ],
+    )
+    def test_calibration_casual_prompts_are_not_reasoning(self, prompt):
+        """Over-classification guard: casual prompts must stay simple.
+
+        A single casual probe routing to the expensive complex tier is a
+        failure. ``prove the``/``prove this``/``derive the``/
+        ``mathematically show`` are weak (threshold 2), not high-confidence.
+        """
+        result = ReasoningDetector.detect(prompt)
+        assert result.is_reasoning is False, (
+            f"casual prompt over-classified as reasoning: {prompt!r} "
+            f"(high={result.high_confidence_count}, "
+            f"markers={result.markers})"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -10,8 +10,8 @@ Features:
   against pre-computed simple/complex centroid vectors (384-dim embeddings).
 - **AgenticDetector**: Cumulative scoring for agentic patterns (tool use,
   multi-step execution, agentic keywords).
-- **ReasoningDetector**: Regex-based reasoning marker detection (step-by-step,
-  chain-of-thought, proofs, etc.).
+- **ReasoningDetector**: Two-tier regex reasoning marker detection
+  (high-confidence markers single-trigger; weak markers need 2+).
 - **SessionCache**: Routing affinity cache with TTL and LRU eviction.
   Redis-backed when available (multi-worker safe), in-memory fallback.
 - **CentroidRoutingStrategy**: ``RoutingStrategy`` implementation that combines
@@ -728,10 +728,19 @@ class ReasoningResult:
     """Whether the request requires reasoning capabilities."""
 
     marker_count: int
-    """Number of distinct reasoning markers found."""
+    """Number of distinct reasoning markers found (high + weak combined)."""
 
     markers: List[str] = field(default_factory=list)
-    """List of detected reasoning markers."""
+    """List of detected reasoning markers (high-confidence + weak)."""
+
+    high_confidence_count: int = 0
+    """Number of distinct high-confidence markers found.
+
+    High-confidence markers (e.g. ``prove that``, ``step by step``,
+    ``mathematical proof``) single-trigger reasoning detection because they
+    are rarely present in casual text. A single one is sufficient for
+    ``is_reasoning`` to be True.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -1121,62 +1130,124 @@ class AgenticDetector:
 class ReasoningDetector:
     """Detects reasoning-heavy prompts (math, logic, analysis, proofs).
 
-    Ported from NadirClaw's ``detect_reasoning()`` function. Uses regex
-    pattern matching with a threshold of 2+ distinct markers.
+    Ported from NadirClaw's ``detect_reasoning()`` function, then split into
+    a **two-tier** marker scheme (RouteIQ-a9da) so that a genuinely-hard
+    reasoning prompt with a *single* strong signal resolves to reasoning
+    (pinning the expert tier via the capability floor) **without** casual
+    prompts over-classifying to the expensive complex tier.
+
+    Two tiers:
+
+    * **High-confidence markers** (``_HIGH_CONFIDENCE_MARKERS``) — phrases
+      that are rarely present in casual text (``prove that``,
+      ``step by step``, ``chain of thought``, ``formal proof``,
+      ``mathematical proof``/``derivation``, ``logically deduce`` …).
+      **One** is sufficient: they single-trigger at threshold 1.
+    * **Weak markers** (``_WEAK_MARKERS``) — phrases that also appear in
+      casual prompts (the bare-object idioms ``prove the``, ``prove this``,
+      ``derive the/a/an``, ``mathematically show`` plus softer analysis
+      idioms). These need **2+ distinct** markers to fire, so they never
+      single-trigger.
+
+    Detection: ``is_reasoning = (high_confidence_count >= 1)
+    OR (total_distinct_markers >= 2)``.
+
+    The split deliberately keeps ``prove the`` / ``prove this`` /
+    ``derive the`` / ``mathematically show`` in the *weak* set so casual
+    sentences like "I want to prove the haters wrong", "derive the meaning
+    from context" and "mathematically show the answer is 4" stay SIMPLE.
     """
 
-    _REASONING_MARKERS = re.compile(
-        r"\b(step[- ]by[- ]step"
-        r"|think (?:through|carefully|deeply|about)"
+    # High-confidence: a single distinct match classifies as reasoning.
+    # ``think step[- ]by[- ]step`` is listed before ``step[- ]by[- ]step`` so
+    # ``findall`` consumes the longer phrase when both could match; either way
+    # both are high-confidence, so the threshold-1 outcome is identical.
+    _HIGH_CONFIDENCE_MARKERS = re.compile(
+        r"\b(think step[- ]by[- ]step"
+        r"|step[- ]by[- ]step"
         r"|chain[- ]of[- ]thought"
-        r"|let'?s? reason"
-        r"|reason(?:ing)? (?:about|through)"
-        r"|prove (?:that|this|the)"
-        r"|formal (?:proof|verification)"
-        r"|mathematical(?:ly)? (?:prove|show|derive)"
+        r"|chain of thought"
+        r"|prove that"
+        r"|formal proof"
+        r"|formal verification"
+        r"|mathematical proof"
+        r"|mathematical derivation"
+        r"|logically deduce"
+        r"|logically infer"
+        r"|logically conclude)\b",
+        re.IGNORECASE,
+    )
+
+    # Weak: need 2+ distinct matches (these also appear in casual prompts).
+    # ``analyze the ... tradeoffs`` is loosened to allow 0-3 intervening words.
+    _WEAK_MARKERS = re.compile(
+        r"\b(prove the"
+        r"|prove this"
         r"|derive (?:the|a|an)"
-        r"|analyze the (?:tradeoffs?|trade-offs?|implications?|consequences?)"
+        r"|mathematically show"
+        r"|think (?:through|carefully|deeply|about)"
+        r"|let'?s reason"
+        r"|reason (?:about|through)"
+        r"|analyze the (?:\w+ ){0,3}"
+        r"(?:tradeoffs?|trade-offs?|implications?|consequences?)"
         r"|compare and contrast"
-        r"|what are the (?:pros? and cons?|advantages? and disadvantages?)"
+        r"|pros? and cons?"
+        r"|advantages? and disadvantages?"
         r"|evaluate (?:the|whether|if)"
         r"|critically (?:analyze|assess|examine)"
         r"|explain (?:why|how|the reasoning)"
         r"|work through"
-        r"|break (?:this|it) down"
-        r"|logical(?:ly)? (?:deduce|infer|conclude))\b",
+        r"|break (?:this|it) down)\b",
         re.IGNORECASE,
     )
 
     MARKER_THRESHOLD = 2
-    """Need 2+ distinct markers to classify as reasoning."""
+    """Distinct markers needed to classify as reasoning via the weak path.
+
+    A single high-confidence marker bypasses this threshold; only the weak
+    path (and high+weak combinations totalling 2) relies on it.
+    """
 
     @classmethod
     def detect(cls, prompt: str, system_message: str = "") -> ReasoningResult:
         """Detect if a prompt requires reasoning capabilities.
 
-        Combines ``system_message`` and ``prompt``, finds all regex
-        matches, and counts unique markers. ``is_reasoning`` is True
-        when 2+ distinct markers are found.
+        Combines ``system_message`` and ``prompt``, then runs both the
+        high-confidence and weak marker passes. ``is_reasoning`` is True
+        when **either** a single high-confidence marker is present **or**
+        2+ distinct markers (across both tiers) are found.
 
         Args:
             prompt: User prompt text.
             system_message: System message text (optional).
 
         Returns:
-            :class:`ReasoningResult` with marker count and detection status.
+            :class:`ReasoningResult` with marker counts and detection status.
         """
         combined = f"{system_message} {prompt}"
-        matches = cls._REASONING_MARKERS.findall(combined)
-        # Unique markers (case-insensitive dedup)
-        unique_markers = list({m.lower() for m in matches})
-        marker_count = len(unique_markers)
 
-        is_reasoning = marker_count >= cls.MARKER_THRESHOLD
+        high_matches = cls._HIGH_CONFIDENCE_MARKERS.findall(combined)
+        weak_matches = cls._WEAK_MARKERS.findall(combined)
+
+        # Case-insensitive dedup per tier.
+        high_unique = {m.lower() for m in high_matches}
+        weak_unique = {m.lower() for m in weak_matches}
+
+        high_confidence_count = len(high_unique)
+        # Union so a marker counted in both tiers (cannot happen given the
+        # disjoint phrase sets, but defensive) is not double-counted.
+        all_unique = sorted(high_unique | weak_unique)
+        marker_count = len(all_unique)
+
+        is_reasoning = (
+            high_confidence_count >= 1 or marker_count >= cls.MARKER_THRESHOLD
+        )
 
         return ReasoningResult(
             is_reasoning=is_reasoning,
             marker_count=marker_count,
-            markers=unique_markers,
+            markers=all_unique,
+            high_confidence_count=high_confidence_count,
         )
 
 
