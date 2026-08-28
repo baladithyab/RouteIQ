@@ -4,6 +4,10 @@ domains:
   container: {}
   kumaraswamy-thompson: {}
   testing: {}
+  secrets_vault: {}
+  routing: {}
+  observability: {}
+  router_decision_callback: {}
 governance:
   max_entries: 100
   warn_entries: 150
